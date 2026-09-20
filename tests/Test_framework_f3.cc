@@ -47,9 +47,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -126,21 +128,36 @@ private:
 
 constexpr std::chrono::milliseconds kWait{15000};
 
-// ── 业务协议类型：只写字段声明与 schema 名，编解码由框架生成。──
+// ── CoRpc 位置参数测试辅助 ──
 
-struct EchoReq   { std::int32_t v = 0; };
-struct EchoReply { std::int32_t v = 0; };
-// ActorSerial 服务的请求：acct 为声明式 actor key 字段（"acct-<v>"），
-// v 透传给被调方。
-struct AcctReq   { std::string acct; std::int32_t v = 0; };
+fw::result<std::int32_t> IntArg(const fw::CoRpcReq& req) {
+    auto args = req.Parse<std::int32_t>();
+    if (!args) return fw::result<std::int32_t>::err(args.error());
+    return fw::result<std::int32_t>::ok(std::get<0>(args.value()));
+}
 
-} // namespace
+fw::result<std::tuple<std::string, std::int32_t>> AcctArgs(
+    const fw::CoRpcReq& req) {
+    return req.Parse<std::string, std::int32_t>();
+}
 
-BBT_MESSAGE_FIELDS(EchoReq, "test.EchoReq/v1", v)
-BBT_MESSAGE_FIELDS(EchoReply, "test.EchoReply/v1", v)
-BBT_MESSAGE_FIELDS(AcctReq, "test.AcctReq/v1", acct, v)
+fw::CoRpcReq RequestInt(std::int32_t value) {
+    auto req = fw::CoRpcReq::From(value);
+    if (!req) throw std::logic_error("request encode failed");
+    return std::move(req).value();
+}
 
-namespace {
+fw::CoRpcReq RequestAcct(std::string account, std::int32_t value) {
+    auto req = fw::CoRpcReq::From(
+        std::tuple{std::move(account), value});
+    if (!req) throw std::logic_error("request encode failed");
+    return std::move(req).value();
+}
+
+fw::CoRpcResp ReplyInt(const fw::result<std::int32_t>& value) {
+    if (!value) return fw::CoRpcResp::Error(value.error());
+    return fw::CoRpcResp::From(value.value());
+}
 
 // 线桥别名：框架默认 bridge（internal/RpcHttpBridge.hpp），测试侧不再
 // 手撸 header 映射（与 F1-b2 同一形态）。
@@ -202,52 +219,50 @@ fw::Error WaitErr(co::WaitStatus st, const char* what) {
 class RelaySvc final : public fw::CoService<RelaySvc> {
 public:
     static constexpr std::string_view kServiceName = "relay";
-    fw::result<EchoReply> Ping(const EchoReq& req) {
-        return fw::result<EchoReply>::ok(EchoReply{req.v});
+    fw::CoRpcResp Ping(fw::CoRpcReq req) {
+        return ReplyInt(IntArg(req));
     }
-    fw::result<EchoReply> WaitDial(const EchoReq& req) {
+    fw::CoRpcResp WaitDial(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
-            return fw::result<EchoReply>::err(fw::MakeError(
+            return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::InternalError, "no probe"));
         auto gate = p->Gate();
         p->arrived.CountDown();
         const auto st = gate->Wait(
             {ctx.value()->deadline, ctx.value()->cancel});
         if (st != co::WaitStatus::Completed)
-            return fw::result<EchoReply>::err(WaitErr(st, "wait_dial gate"));
-        // 放行时刻可能已处于关闭序列：出站能力本身就是被测对象。
-        auto r = this->call<EchoReply>("echo", "ping", req);
+            return fw::CoRpcResp::Error(WaitErr(st, "wait_dial gate"));
+        auto response = this->call("echo", "ping", req);
         p->Event(std::string("outbound:") +
-                 (r ? "ok" : "code" +
-                      std::to_string(static_cast<int>(r.error().code))));
-        return r;
+                 (response ? "ok" : "code" +
+                  std::to_string(static_cast<int>(response.error().code))));
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
-    fw::result<EchoReply> WaitDialLong(const EchoReq& req) {
+    fw::CoRpcResp WaitDialLong(fw::CoRpcReq req) {
+        auto value = IntArg(req);
+        if (!value) return fw::CoRpcResp::Error(value.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
-            return fw::result<EchoReply>::err(fw::MakeError(
+            return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::InternalError, "no probe"));
         auto gate = p->Gate();
         p->arrived.CountDown();
-        // 无界挂起：物理在途刻意超过 incoming 看门，验证「逻辑请求结束
-        // ≠ 物理清理完成」。
         const auto st = gate->Wait(
             {co::Deadline::max(), co::CancellationToken{}});
         if (st != co::WaitStatus::Completed)
-            return fw::result<EchoReply>::err(WaitErr(st, "wait_dial_long"));
+            return fw::CoRpcResp::Error(WaitErr(st, "wait_dial_long"));
         p->Event("late_handler_resumed");
-        // 迟到回调仍在受管上下文里执行：ctx/服务实例/出站注入点必须仍
-        // 有效。此时 ctx 预算已过期 → 适配器在发起 I/O 前 TimedOut。
-        auto r = this->call<EchoReply>("echo", "ping", req);
+        auto response = this->call("echo", "ping", req);
         p->Event(std::string("late_outbound:") +
-                 (r ? "ok" : "code" +
-                      std::to_string(static_cast<int>(r.error().code))));
-        return fw::result<EchoReply>::ok(EchoReply{req.v});
+                 (response ? "ok" : "code" +
+                  std::to_string(static_cast<int>(response.error().code))));
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&RelaySvc::Ping>("ping"),
@@ -255,33 +270,35 @@ public:
         fw::Method<&RelaySvc::WaitDialLong>("wait_dial_long"));
 };
 
-// "acct"：ActorSerial。park_dial 在 gate 上挂起（mailbox drain 协程持有
-// 执行资格），放行后真实出站到 echo peer。actor key 取自 AcctReq 的
-// 声明字段 acct（客户端填 "acct-<v>"）。
+// "acct"：ActorSerial。park_dial 挂起后出站；第一个位置参数为 key。
 class AcctRelaySvc final : public fw::CoService<AcctRelaySvc> {
 public:
     static constexpr std::string_view kServiceName = "acct";
-    fw::result<EchoReply> ParkDial(const AcctReq& req) {
+    fw::CoRpcResp ParkDial(fw::CoRpcReq req) {
+        auto args = AcctArgs(req);
+        if (!args) return fw::CoRpcResp::Error(args.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
-            return fw::result<EchoReply>::err(fw::MakeError(
+            return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::InternalError, "no probe"));
         auto gate = p->Gate();
         p->arrived.CountDown();
         const auto st = gate->Wait(
             {ctx.value()->deadline, ctx.value()->cancel});
         if (st != co::WaitStatus::Completed)
-            return fw::result<EchoReply>::err(WaitErr(st, "park_dial gate"));
-        auto r = this->call<EchoReply>("echo", "ping", EchoReq{req.v});
+            return fw::CoRpcResp::Error(WaitErr(st, "park_dial gate"));
+        auto response = this->call(
+            "echo", "ping", RequestInt(std::get<1>(args.value())));
         p->Event(std::string("actor_outbound:") +
-                 (r ? "ok" : "code" +
-                      std::to_string(static_cast<int>(r.error().code))));
-        return r;
+                 (response ? "ok" : "code" +
+                  std::to_string(static_cast<int>(response.error().code))));
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
-        fw::ActorMethod<&AcctRelaySvc::ParkDial, &AcctReq::acct>(
+        fw::ActorMethodAt<&AcctRelaySvc::ParkDial, std::string>(
             "park_dial"));
 };
 
@@ -509,7 +526,7 @@ TestClient StartClient(inf::NetworkLimits limits) {
     return c;
 }
 
-// ── 独立 echo peer：裸 infra runtime 上的 HTTP 端点，回 EchoReply{v+100}
+// ── 独立 echo peer：裸 infra runtime 上的 HTTP 端点，回位置参数 v+100
 //    （+100 证明回复确由对端处理产生，非本地伪造）。──
 
 struct EchoPeer {
@@ -544,19 +561,24 @@ std::unique_ptr<EchoPeer> StartEchoPeer(inf::NetworkLimits limits) {
                         fw::result<inf::RpcEnvelope>::err(
                             std::move(env.error()))));
             auto decoded =
-                fw::MessageCodec<EchoReq>::Decode(env.value().payload);
+                fw::CoRpcReq(env.value().payload).Parse<std::int32_t>();
             if (!decoded)
                 return fw::result<inf::HttpResponse>::ok(
                     Wire::ToHttpResponse(
                         fw::result<inf::RpcEnvelope>::err(
                             std::move(decoded.error()))));
+            auto encoded = fw::CoRpcResp::From(
+                std::get<0>(decoded.value()) + 100);
+            if (!encoded.ok())
+                return fw::result<inf::HttpResponse>::ok(
+                    Wire::ToHttpResponse(
+                        fw::result<inf::RpcEnvelope>::err(encoded.error())));
             inf::RpcEnvelope reply;
             reply.service         = env.value().service;
             reply.method          = env.value().method;
             reply.request_id      = env.value().request_id;
             reply.response_schema = env.value().response_schema;
-            reply.payload         = fw::MessageCodec<EchoReply>::Encode(
-                EchoReply{decoded.value().v + 100}).value();
+            reply.payload         = encoded.payload();
             return fw::result<inf::HttpResponse>::ok(
                 Wire::ToHttpResponse(
                     fw::result<inf::RpcEnvelope>::ok(std::move(reply))));
@@ -576,35 +598,31 @@ inf::RpcEnvelope MakeEnv(std::string service, std::string method,
     env.service         = std::move(service);
     env.method          = std::move(method);
     env.request_id      = std::move(rid);
-    env.request_schema  = std::string(fw::MessageCodec<EchoReq>::SchemaId());
-    env.response_schema =
-        std::string(fw::MessageCodec<EchoReply>::SchemaId());
-    env.payload         =
-        fw::MessageCodec<EchoReq>::Encode(EchoReq{v}).value();
+    env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
+    env.response_schema = std::string(fw::kCoRpcPositionalSchema);
+    env.payload         = RequestInt(v).payload();
     return env;
 }
 
-// ActorSerial 服务的入站：acct 为声明式 actor key 字段（"acct-<v>"）。
+// ActorSerial 服务的入站：第一个位置参数为 actor key，第二个为 v。
 inf::RpcEnvelope MakeAcctEnv(std::string method, std::string rid,
                              std::int32_t v) {
     inf::RpcEnvelope env;
     env.service         = "acct";
     env.method          = std::move(method);
     env.request_id      = std::move(rid);
-    env.request_schema  = std::string(fw::MessageCodec<AcctReq>::SchemaId());
-    env.response_schema =
-        std::string(fw::MessageCodec<EchoReply>::SchemaId());
-    env.payload         = fw::MessageCodec<AcctReq>::Encode(
-        AcctReq{"acct-" + std::to_string(v), v}).value();
+    env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
+    env.response_schema = std::string(fw::kCoRpcPositionalSchema);
+    env.payload         = RequestAcct("acct-" + std::to_string(v), v).payload();
     return env;
 }
 
-fw::result<EchoReply> DecodeReply(
+fw::result<std::int32_t> DecodeReply(
     const fw::result<inf::RpcEnvelope>& r) {
-    if (!r) return fw::result<EchoReply>::err(r.error());
-    auto d = fw::MessageCodec<EchoReply>::Decode(r.value().payload);
-    if (!d) return fw::result<EchoReply>::err(d.error());
-    return fw::result<EchoReply>::ok(std::move(d.value()));
+    if (!r) return fw::result<std::int32_t>::err(r.error());
+    auto d = fw::CoRpcReq(r.value().payload).Parse<std::int32_t>();
+    if (!d) return fw::result<std::int32_t>::err(d.error());
+    return fw::result<std::int32_t>::ok(std::get<0>(d.value()));
 }
 
 // 在协程内向被测 app 发一条 envelope（client->Request 是协程阻塞调用）。
@@ -718,7 +736,7 @@ BOOST_AUTO_TEST_CASE(request_shutdown_external_thread_clean_rc0) {
     // 正路径对照：运行中真实请求可达。
     auto r = CallRpc(tc, box.endpoint, MakeEnv("relay", "ping", "t1-a", 7));
     BOOST_REQUIRE(r);
-    BOOST_CHECK(DecodeReply(r).value().v == 7);
+    BOOST_CHECK(DecodeReply(r).value() == 7);
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Running);
 
     // 关闭请求来自独立于 run 控制线程与测试主线程的外部线程。
@@ -776,7 +794,7 @@ BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
     BOOST_REQUIRE(inflight_res.has_value());
     BOOST_REQUIRE(inflight_res.value());
     // +100 为 peer 处理产生：出站确实经 loopback 到达对端并回来。
-    BOOST_CHECK(DecodeReply(inflight_res.value()).value().v == 109);
+    BOOST_CHECK(DecodeReply(inflight_res.value()).value() == 109);
     BOOST_CHECK(g_probe->HasEvent("outbound:ok"));
     BOOST_CHECK(peer->hits.load() == 1);
 
@@ -863,7 +881,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
     BOOST_REQUIRE(inflight_res.value());
-    BOOST_CHECK(DecodeReply(inflight_res.value()).value().v == 103);
+    BOOST_CHECK(DecodeReply(inflight_res.value()).value() == 103);
     BOOST_CHECK(g_probe->HasEvent("actor_outbound:ok"));
     BOOST_CHECK(peer->hits.load() == 1);
 
