@@ -1,74 +1,42 @@
-name: CI
+# Issue #6：最小构建 + CTest 冒烟。不在本 workflow 跑 compose/压测。
+name: ci
 
 on:
   pull_request:
   push:
     branches: [main]
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  BUILD_DIR: ${{ github.workspace }}/build
-  INFRA_DIR: ${{ github.workspace }}/infra
-  COROUTINE_DIR: ${{ github.workspace }}/coroutine
-
 jobs:
-  build-and-test:
-    name: 编译 & ctest
-    runs-on: arc-s4-framework
+  build-test:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    env:
+      BBT_JOBS: "1"
+      BBT_NEED_TEST: "ON"
     steps:
-      - name: 拉取 bbt-framework
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: framework
 
-      - name: 拉取 bbtools-infra @ main
-        uses: actions/checkout@v4
-        with:
-          repository: yqm-307/bbtools-infra
-          ref: main
-          path: infra
+      - name: Fetch pinned deps
+        env:
+          BBT_DEPS_DIR: ${{ github.workspace }}/.deps
+        run: bash scripts/fetch_deps.sh
 
-      - name: 拉取 bbtools-coroutine @ main
-        uses: actions/checkout@v4
-        with:
-          repository: yqm-307/bbtools-coroutine
-          ref: main
-          path: coroutine
+      - name: Build and CTest
+        env:
+          BBT_DEPS_DIR: ${{ github.workspace }}/.deps
+          BBT_WORK_DIR: ${{ runner.temp }}/bbt-work
+        run: bash scripts/local_build.sh
 
-      - name: 打印依赖来源
+      - name: Link-source evidence
+        env:
+          BBT_WORK_DIR: ${{ runner.temp }}/bbt-work
         run: |
-          echo "=== infra HEAD ==="
-          git -C "$INFRA_DIR" log -1 --format='%H %s (%ci)'
-          echo "=== coroutine HEAD ==="
-          git -C "$COROUTINE_DIR" log -1 --format='%H %s (%ci)'
-          echo "=== framework HEAD ==="
-          git -C framework log -1 --format='%H %s (%ci)'
-
-      - name: cmake configure
-        run: |
-          cmake -S framework -B "$BUILD_DIR" -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNEED_TEST=ON \
-            -DBBT_INFRA_SOURCE_DIR="$INFRA_DIR" \
-            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
-
-      - name: ninja build
-        run: ninja -C "$BUILD_DIR" -j"$(nproc)"
-
-      - name: ctest -j1
-        run: ctest -j1 --output-on-failure --timeout 300
-        working-directory: ${{ env.BUILD_DIR }}
-
-      - name: 依赖来源核查
-        run: |
-          echo "=== _deps 下产物 ==="
-          find "$BUILD_DIR/_deps" -name '*.so' -o -name '*.a' 2>/dev/null | sort || true
-          echo "=== test 二进制 ldd（关键依赖） ==="
-          for t in "$BUILD_DIR"/tests/Test_*; do
-            [ -x "$t" ] || continue
-            echo "--- $t ---"
-            ldd "$t" 2>/dev/null | grep -E 'bbt|boost' || echo "(静态/无外部依赖)"
-          done
+          test -f "$BBT_WORK_DIR/deps-manifest.txt"
+          test -f "$BBT_WORK_DIR/link-sources.txt"
+          cat "$BBT_WORK_DIR/deps-manifest.txt"
+          cat "$BBT_WORK_DIR/link-sources.txt"
+          if grep -q /usr/local/ "$BBT_WORK_DIR/link-sources.txt"; then
+            echo "FATAL: 链接到 /usr/local" >&2
+            exit 7
+          fi
