@@ -148,8 +148,8 @@ echo "## [diag] Test_framework_f0 RUNPATH"
 readelf -d "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>/dev/null | grep -iE 'RPATH|RUNPATH' || true
 echo "## [diag] built core lib on disk"
 ls -la "$BBT_BUILD_DIR/_deps/bbtools-core/lib/" 2>/dev/null || echo "(no core lib dir)"
-echo "## [diag] ld.so search trace for libbbt_core"
-LD_DEBUG=libs ldd "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>&1 | grep -iE 'libbbt_core|trying|search path' | head -30 || true
+echo "## [diag] libbbt_coroutine RUNPATH (its NEEDED bbt_core resolves here)"
+readelf -d "$BBT_BUILD_DIR/_deps/bbtools-coroutine/lib/libbbt_coroutine.so" 2>/dev/null | grep -iE 'RPATH|RUNPATH|NEEDED' || true
 
 # 可判定门禁：干净 runner 不许依赖 /usr/local 旧产物；core 必须经
 # add_subdirectory 解析到 build 树内的真实 target（路径含 $BBT_BUILD_DIR）。
