@@ -88,6 +88,7 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/InfraHttpHost.hpp
     internal/ActorMailbox.hpp
     internal/ActorRegistry.hpp
+    internal/OrderedIngress.hpp
     internal/RpcHttpBridge.hpp
     internal/CoAppSeam.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
