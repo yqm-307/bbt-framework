@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-test:
-    runs-on: [self-hosted, linux]
+    runs-on: arc-s4-framework
     timeout-minutes: 20
     env:
       BBT_JOBS: "1"
