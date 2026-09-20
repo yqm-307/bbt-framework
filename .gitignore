@@ -70,3 +70,6 @@ Testing/
 
 # git worktree 工作区
 .worktrees/
+
+# CI 临时依赖树（scripts/fetch_deps.sh 默认落到仓库外 ../deps）
+.deps/
