@@ -42,6 +42,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -654,6 +655,40 @@ bool WaitState(const fw::CoApp& app, fw::ShutdownState want,
     return true;
 }
 
+// [DIAG-TEMP]
+void DiagDump(const char* tag,
+              const std::optional<fw::result<inf::RpcEnvelope>>& res,
+              const fw::CoApp& app, const std::unique_ptr<EchoPeer>& peer) {
+    std::fprintf(stderr, "[DIAG:%s] state=%d\n", tag,
+                 static_cast<int>(app.shutdown_state()));
+    if (res.has_value()) {
+        if (static_cast<bool>(*res))
+            std::fprintf(stderr, "[DIAG:%s] client=ok payload=%zu\n", tag,
+                         res->value().payload.size());
+        else
+            std::fprintf(stderr,
+                "[DIAG:%s] client=err code=%d domain=%s domain_code=%s "
+                "msg=%s\n",
+                tag, static_cast<int>(res->error().code),
+                res->error().domain.c_str(),
+                res->error().domain_code.c_str(),
+                res->error().message.c_str());
+    } else {
+        std::fprintf(stderr, "[DIAG:%s] client=no-result\n", tag);
+    }
+    if (g_probe) {
+        std::lock_guard<std::mutex> lk(g_probe->mtx);
+        for (const auto& e : g_probe->events)
+            std::fprintf(stderr, "[DIAG:%s] probe=%s\n", tag, e.c_str());
+    }
+    for (const auto& f : app.lifecycle_failures())
+        std::fprintf(stderr, "[DIAG:%s] failure=%s\n", tag, f.c_str());
+    for (const auto& p : app.pending_cleanup())
+        std::fprintf(stderr, "[DIAG:%s] pending=%s\n", tag, p.c_str());
+    std::fprintf(stderr, "[DIAG:%s] peer_hits=%d\n", tag,
+                 peer ? peer->hits.load(std::memory_order_relaxed) : -1);
+}
+
 // ── INetworkHost 桩：记录调用序列；T6 用于驱动 WaitClosed 预算耗尽路径 ──
 
 class StubNetHost final : public fw::INetworkHost {
@@ -774,6 +809,7 @@ BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
     g_probe->CompleteGate();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
+    DiagDump("t2", inflight_res, *box.app, peer);
     BOOST_REQUIRE(inflight_res.value());
     // +100 为 peer 处理产生：出站确实经 loopback 到达对端并回来。
     BOOST_CHECK(DecodeReply(inflight_res.value()).value().v == 109);
@@ -862,6 +898,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     g_probe->CompleteGate();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
+    DiagDump("t4", inflight_res, *box.app, peer);
     BOOST_REQUIRE(inflight_res.value());
     BOOST_CHECK(DecodeReply(inflight_res.value()).value().v == 103);
     BOOST_CHECK(g_probe->HasEvent("actor_outbound:ok"));
