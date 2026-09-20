@@ -21,6 +21,15 @@ target_compile_options(Test_framework_f2b1 PRIVATE -Wall -Wextra)
 add_test(NAME Test_framework_f2b1 COMMAND Test_framework_f2b1)
 set_tests_properties(Test_framework_f2b1 PROPERTIES TIMEOUT 30)
 
+# F2-b2：有序入口接收侧——授权流校验、每流序号状态机与去重终态缓存；
+# 缺口/在途/冲突/淘汰/epoch 切换/无票据均由组件语义核直接断言，
+# 不依赖入站接线（接线属 F2-b3）。
+add_executable(Test_framework_f2b2 Test_framework_f2b2.cc)
+target_link_libraries(Test_framework_f2b2 PRIVATE bbt::framework)
+target_compile_options(Test_framework_f2b2 PRIVATE -Wall -Wextra)
+add_test(NAME Test_framework_f2b2 COMMAND Test_framework_f2b2)
+set_tests_properties(Test_framework_f2b2 PROPERTIES TIMEOUT 30)
+
 # F1-a：deadline/cancel 继承与受管请求上下文；真实协程调度器 + 注入点断言。
 add_executable(Test_framework_f1a Test_framework_f1a.cc)
 target_link_libraries(Test_framework_f1a PRIVATE bbt::framework)
