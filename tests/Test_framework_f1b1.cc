@@ -166,7 +166,7 @@ public:
     fw::CoRpcResp Ping(fw::CoRpcReq req) {
         auto value = req.Parse<std::int32_t>();
         if (!value) return fw::CoRpcResp::Error(value.error());
-        return fw::CoRpcResp::From(std::get<0>(value.value()));
+        return fw::CoRpcResp::From(value.value());
     }
     // 资源缝观察口（业务侧 protected context() 的测试出口）。
     template <class R>
@@ -182,7 +182,7 @@ public:
     fw::CoRpcResp Ping(fw::CoRpcReq req) {
         auto value = req.Parse<std::int32_t>();
         if (!value) return fw::CoRpcResp::Error(value.error());
-        return fw::CoRpcResp::From(std::get<0>(value.value()));
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoDupSvc::Ping>("ping"));
@@ -194,7 +194,7 @@ public:
     fw::CoRpcResp Get(fw::CoRpcReq req) {
         auto value = req.Parse<std::int32_t>();
         if (!value) return fw::CoRpcResp::Error(value.error());
-        return fw::CoRpcResp::From(std::get<0>(value.value()));
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&KeyedSvc::Get, std::int32_t>("get"));
@@ -207,7 +207,7 @@ public:
     fw::CoRpcResp Ping(fw::CoRpcReq req) {
         auto value = req.Parse<std::int32_t>();
         if (!value) return fw::CoRpcResp::Error(value.error());
-        return fw::CoRpcResp::From(std::get<0>(value.value()));
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&UnkeyedSvc::Ping>("ping"));

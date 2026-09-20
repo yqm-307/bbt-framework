@@ -133,7 +133,7 @@ constexpr std::chrono::milliseconds kWait{15000};
 fw::result<std::int32_t> IntArg(const fw::CoRpcReq& req) {
     auto args = req.Parse<std::int32_t>();
     if (!args) return fw::result<std::int32_t>::err(args.error());
-    return fw::result<std::int32_t>::ok(std::get<0>(args.value()));
+    return fw::result<std::int32_t>::ok(args.value());
 }
 
 fw::result<std::tuple<std::string, std::int32_t>> AcctArgs(
@@ -568,7 +568,7 @@ std::unique_ptr<EchoPeer> StartEchoPeer(inf::NetworkLimits limits) {
                         fw::result<inf::RpcEnvelope>::err(
                             std::move(decoded.error()))));
             auto encoded = fw::CoRpcResp::From(
-                std::get<0>(decoded.value()) + 100);
+                decoded.value() + 100);
             if (!encoded.ok())
                 return fw::result<inf::HttpResponse>::ok(
                     Wire::ToHttpResponse(
@@ -622,7 +622,7 @@ fw::result<std::int32_t> DecodeReply(
     if (!r) return fw::result<std::int32_t>::err(r.error());
     auto d = fw::CoRpcReq(r.value().payload).Parse<std::int32_t>();
     if (!d) return fw::result<std::int32_t>::err(d.error());
-    return fw::result<std::int32_t>::ok(std::get<0>(d.value()));
+    return fw::result<std::int32_t>::ok(d.value());
 }
 
 // 在协程内向被测 app 发一条 envelope（client->Request 是协程阻塞调用）。

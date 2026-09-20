@@ -67,12 +67,13 @@ struct bbt::framework::rpc_detail::ProtoCodec<FakeProto> {
 namespace {
 
 // Parse 返回类型契约（编译期钉死）：
-// 位置参数路径任意 Ts... → result<tuple<Ts...>>，单参也是 1-tuple；
-// proto codec 路径 Parse<Proto>/ParseProto<Proto> → result<Proto> 整包
-// 直出，不包 tuple。错误体系唯一：ErrorType 即 bbt::infra::Error。
+// 位置参数路径：单参 Parse<T> → result<T>（裸值）；多参 Parse<Ts...>
+// → result<tuple<Ts...>>；proto codec 路径 Parse<Proto>/ParseProto<Proto>
+// → result<Proto> 整包直出，不包 tuple。错误体系唯一：ErrorType 即
+// bbt::infra::Error。
 static_assert(std::is_same_v<
     decltype(std::declval<const fw::CoRpcReq&>().Parse<std::int32_t>()),
-    fw::result<std::tuple<std::int32_t>>>);
+    fw::result<std::int32_t>>);
 static_assert(std::is_same_v<
     decltype(std::declval<const fw::CoRpcReq&>()
                  .Parse<std::int32_t, std::string>()),
@@ -142,7 +143,7 @@ public:
     fw::CoRpcResp ById(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t>();
         if (!args) return fw::CoRpcResp::Error(args.error());
-        return fw::CoRpcResp::From(std::get<0>(args.value()) + 1);
+        return fw::CoRpcResp::From(args.value() + 1);
     }
 
     static constexpr auto kRpcMethods = fw::RpcMethods(

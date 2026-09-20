@@ -287,6 +287,16 @@ public:
         return result<CoRpcReq>::ok(CoRpcReq(std::move(encoded.value())));
     }
 
+    // 可变参数便捷形：From(v0, v1, ...) ≡ From(std::tuple{v0, v1, ...})，
+    // 业务不必手写 std::tuple。仅在 ≥2 个参数时启用——单参 From(v)
+    // 走上面的 T 版本（保留 proto 类型分流）。
+    template <class... Ts,
+              class = std::enable_if_t<(sizeof...(Ts) >= 2)>>
+    static result<CoRpcReq> From(Ts&&... values) {
+        return From(std::tuple<std::decay_t<Ts>...>{
+            std::forward<Ts>(values)...});
+    }
+
     template <class Proto>
     static result<CoRpcReq> FromProto(const Proto& value) {
         static_assert(rpc_detail::is_proto_codec_v<Proto>,
@@ -304,9 +314,13 @@ public:
             using T = std::tuple_element_t<0, std::tuple<Ts...>>;
             if constexpr (rpc_detail::is_proto_codec_v<T>)
                 return rpc_detail::ProtoCodec<T>::Decode(m_payload);
-            else
-                return rpc_detail::DecodeTuple<Ts...>(m_payload,
+            else {
+                auto tup = rpc_detail::DecodeTuple<Ts...>(m_payload,
                     std::index_sequence_for<Ts...>{});
+                if (!tup)
+                    return result<T>::err(std::move(tup.error()));
+                return result<T>::ok(std::move(std::get<0>(tup.value())));
+            }
         } else {
             return rpc_detail::DecodeTuple<Ts...>(m_payload,
                 std::index_sequence_for<Ts...>{});
@@ -350,9 +364,18 @@ public:
     template <class... Ts>
     static CoRpcResp From(const std::tuple<Ts...>& values) {
         auto encoded = rpc_detail::EncodeTuple(values,
-                                                std::index_sequence_for<Ts...>{});
+                                               std::index_sequence_for<Ts...>{});
         if (!encoded) return Error(std::move(encoded.error()));
         return FromPayload(std::move(encoded.value()));
+    }
+
+    // 可变参数便捷形：From(v0, v1, ...) ≡ From(std::tuple{v0, v1, ...})。
+    // 仅在 ≥2 个参数时启用——单参 From(v) 走上面的 T 版本（proto 分流）。
+    template <class... Ts,
+              class = std::enable_if_t<(sizeof...(Ts) >= 2)>>
+    static CoRpcResp From(Ts&&... values) {
+        return From(std::tuple<std::decay_t<Ts>...>{
+            std::forward<Ts>(values)...});
     }
 
     template <class Proto>

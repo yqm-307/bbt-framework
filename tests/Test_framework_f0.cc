@@ -55,7 +55,7 @@ public:
     fw::CoRpcResp Echo(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
         if (!args) return fw::CoRpcResp::Error(args.error());
-        return fw::CoRpcResp::From("echo:" + std::get<0>(args.value()));
+        return fw::CoRpcResp::From("echo:" + args.value());
     }
     fw::CoRpcResp Reset(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
@@ -65,7 +65,7 @@ public:
     fw::CoRpcResp Notify(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
         if (!args) return fw::CoRpcResp::Error(args.error());
-        m_last_notify = std::get<0>(args.value());
+        m_last_notify = args.value();
         return fw::CoRpcResp::From(std::tuple<>{});
     }
     fw::CoRpcResp Fail(fw::CoRpcReq) {
@@ -78,7 +78,7 @@ public:
     fw::CoRpcResp WhoAmI(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
         if (!args) return fw::CoRpcResp::Error(args.error());
-        return fw::CoRpcResp::From("player:" + std::get<0>(args.value()));
+        return fw::CoRpcResp::From("player:" + args.value());
     }
 
     fw::result<fw::CoRpcResp> CallOut(fw::CoRpcReq req) {
@@ -164,7 +164,7 @@ BOOST_AUTO_TEST_CASE(dispatch_roundtrip) {
     BOOST_REQUIRE(out);
     auto reply = fw::CoRpcReq(std::move(out.value())).Parse<std::string>();
     BOOST_REQUIRE(reply);
-    BOOST_TEST(std::get<0>(reply.value()) == "echo:hi");
+    BOOST_TEST(reply.value() == "echo:hi");
 }
 
 BOOST_AUTO_TEST_CASE(empty_success_and_side_effect) {
