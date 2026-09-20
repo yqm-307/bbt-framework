@@ -140,6 +140,13 @@ done < <(find "$BBT_BUILD_DIR" -maxdepth 3 -type f -perm -u+x \
 log "链接来源报告: $LINK_REPORT"
 cat "$LINK_REPORT"
 
+# 诊断（不进 link-sources.txt，避免污染门禁）：core 是否以 target 全路径链接。
+# 若链接退化成 -lbbt_core，运行时 ld.so 按 SONAME 落到系统 /usr/local 旧产物。
+echo "## [diag] bbt_core link line (build.ninja)"
+grep -oE '[^ ]*libbbt_core[^ ]*' "$BBT_BUILD_DIR/build.ninja" 2>/dev/null | sort -u | head
+echo "## [diag] Test_framework_f0 RUNPATH"
+readelf -d "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>/dev/null | grep -iE 'RPATH|RUNPATH' || true
+
 # 可判定门禁：干净 runner 不许依赖 /usr/local 旧产物；core 必须经
 # add_subdirectory 解析到 build 树内的真实 target（路径含 $BBT_BUILD_DIR）。
 if grep -q "/usr/local/" "$LINK_REPORT"; then
