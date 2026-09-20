@@ -146,6 +146,10 @@ echo "## [diag] bbt_core link line (build.ninja)"
 grep -oE '[^ ]*libbbt_core[^ ]*' "$BBT_BUILD_DIR/build.ninja" 2>/dev/null | sort -u | head
 echo "## [diag] Test_framework_f0 RUNPATH"
 readelf -d "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>/dev/null | grep -iE 'RPATH|RUNPATH' || true
+echo "## [diag] built core lib on disk"
+ls -la "$BBT_BUILD_DIR/_deps/bbtools-core/lib/" 2>/dev/null || echo "(no core lib dir)"
+echo "## [diag] ld.so search trace for libbbt_core"
+LD_DEBUG=libs ldd "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>&1 | grep -iE 'libbbt_core|trying|search path' | head -30 || true
 
 # 可判定门禁：干净 runner 不许依赖 /usr/local 旧产物；core 必须经
 # add_subdirectory 解析到 build 树内的真实 target（路径含 $BBT_BUILD_DIR）。
