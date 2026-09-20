@@ -13,7 +13,8 @@ fi
 
 mkdir -p "$BBT_DEPS_DIR"
 
-while read -r name rest; do
+# 末行无换行时 read 返回非零但变量已读到内容，|| [ -n ] 保证最后一条也处理。
+while read -r name rest || [ -n "$name$rest" ]; do
     case "$name" in
         ''|'#'*) continue ;;
     esac

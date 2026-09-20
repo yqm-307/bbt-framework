@@ -61,6 +61,33 @@ mkdir -p "$BBT_WORK_DIR"
     done
 } | tee "$MANIFEST"
 
+# ---- 0b) 依赖树与 deps.lock 对账：本机/候选分支的依赖漂移必须被拦住 ---------
+# deps.lock 是唯一事实源（"CI 与 fetch_deps.sh 只认本文件"）。本机依赖树若被
+# 别处（共享 ../deps、手动 checkout）改到非 pin SHA，构建照常绿却与 pin 不符；
+# 此处把 manifest 的实测 SHA 与 deps.lock 逐条比对，不一致即 fail-closed。
+# 逃生阀：BBT_ALLOW_OFF_PIN=1 跳过（仅本机调试用）。
+LOCK="$REPO_DIR/deps.lock"
+if [ "${BBT_ALLOW_OFF_PIN:-0}" != "1" ] && [ -f "$LOCK" ]; then
+    while read -r name rest || [ -n "$name$rest" ]; do
+        case "$name" in ''|'#'*) continue ;; esac
+        want_sha=""; want_dir=""
+        for kv in $rest; do
+            case "$kv" in
+                sha=*) want_sha="${kv#sha=}" ;;
+                dir=*) want_dir="${kv#dir=}" ;;
+            esac
+        done
+        [ -z "$want_sha" ] && continue
+        have_sha="$(git -C "$BBT_DEPS_DIR/$want_dir" rev-parse HEAD 2>/dev/null || echo MISSING)"
+        if [ "$have_sha" != "$want_sha" ]; then
+            echo "[build_stack] FATAL: 依赖 '$name' 漂移: pin=$want_sha 实际=$have_sha" >&2
+            echo "[build_stack]   修法: 跑 scripts/fetch_deps.sh 拉齐 deps.lock；或 BBT_ALLOW_OFF_PIN=1 跳过（本机调试）" >&2
+            exit 8
+        fi
+    done < "$LOCK"
+    log "依赖树与 deps.lock 一致"
+fi
+
 # ---- 1) core：经 BBT_CORE_SOURCE_DIR 由 infra add_subdirectory 接入 ----------
 # infra（94a835a 起）的 fail-closed 契约要求 coroutine 按名字链 bbt_core 时
 # 本构建必须已有真实 bbt_core target——prefix（只给 .so+头）不产生 target，
@@ -120,8 +147,15 @@ if grep -q "/usr/local/" "$LINK_REPORT"; then
     grep -n "/usr/local/" "$LINK_REPORT" >&2
     exit 7
 fi
-if [ -s "$LINK_REPORT" ] && ! grep -q "libbbt_core" "$LINK_REPORT"; then
-    echo "[build_stack] FATAL: 构建产物未链接 libbbt_core（core 应经 add_subdirectory 进入 build 树）" >&2
+# core 断言必须是路径断言，不能只匹配子串：非 /usr/local 的旧前缀（/opt、~/prefix）
+# 也会产生 libbbt_core.so 行；报告为空（目标改名/移深/NEED_TEST=OFF）时整条
+# 门禁不得静默失效。
+if [ ! -s "$LINK_REPORT" ]; then
+    echo "[build_stack] FATAL: 链接来源报告为空——未收集到任何可执行产物，无法证明依赖来源" >&2
+    exit 7
+fi
+if ! grep -q "libbbt_core.*$BBT_BUILD_DIR" "$LINK_REPORT"; then
+    echo "[build_stack] FATAL: 构建产物未解析到 build 树内的 bbt_core（应含 $BBT_BUILD_DIR 路径）" >&2
     exit 7
 fi
 log "完成：build=$BBT_BUILD_DIR（core/coroutine/infra 均源码接入，无外部前缀）"
