@@ -84,6 +84,19 @@ private:
     int                     m_count;
 };
 
+// 轮询等待谓词成立（带超时）：用于「最终收敛」类断言——被测动作与观测
+// 点之间有调度间隙，立即检查会在慢 runner 上抖动。
+template <typename Pred>
+bool WaitUntil(Pred&& pred, std::chrono::milliseconds ms) {
+    const auto deadline = std::chrono::steady_clock::now() + ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return pred();
+}
+
 // 顺序记录仪：handler 并发/串行写都安全。
 struct OrderRecorder {
     void Push(int i) {
@@ -303,7 +316,9 @@ BOOST_AUTO_TEST_CASE(mailbox_non_reentrant) {
     BOOST_TEST(!leaked);
     BOOST_TEST(max_exec.load() == 1);
     BOOST_TEST(rec.Snapshot() == std::vector<int>({1, 2}));
-    BOOST_TEST(!mb->IsDraining());            // 执行资格已释放
+    // done 归零（handler 内 CountDown）早于 drain 协程回环清 m_draining；
+    // 立即断言 IsDraining() 会撞上窗口，改为带超时等收敛。
+    BOOST_TEST(WaitUntil([&] { return !mb->IsDraining(); }, kWait));
 }
 
 // 容量：等待队列满后再接纳返回 Overloaded，被拒任务不得执行。
