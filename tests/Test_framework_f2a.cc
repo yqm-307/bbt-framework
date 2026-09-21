@@ -110,40 +110,40 @@ struct SchedulerFixture {
     }
 };
 
-struct DummyRequest { std::int32_t v = 0; };
-
 } // namespace
-
-BBT_MESSAGE_FIELDS(DummyRequest, "test.DummyRequest/v1", v)
 
 BOOST_TEST_GLOBAL_FIXTURE(SchedulerFixture);
 
 namespace {
 
-// 混合声明：一个无 key 的普通方法 + 一个 ActorMethod。
+// 混合声明：一个无 key 的普通方法 + 一个 ActorMethodAt。
 class MixedService final : public fw::CoService<MixedService> {
 public:
     static constexpr std::string_view kServiceName = "mixed";
-    fw::result<void> Unkeyed(const DummyRequest&) {
-        return fw::result<void>::ok();
+    fw::CoRpcResp Unkeyed(fw::CoRpcReq) {
+        return fw::CoRpcResp::From(std::tuple<>{});
     }
-    fw::result<void> Keyed(const DummyRequest&) {
-        return fw::result<void>::ok();
+    fw::CoRpcResp Keyed(fw::CoRpcReq) {
+        return fw::CoRpcResp::From(std::tuple<>{});
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&MixedService::Unkeyed>("unkeyed"),
-        fw::ActorMethod<&MixedService::Keyed, &DummyRequest::v>("keyed"));
+        fw::ActorMethodAt<&MixedService::Keyed, std::int32_t>("keyed"));
 };
 
-// 全部方法都经 ActorMethod 声明。
+// 全部方法都经 ActorMethodAt 声明。
 class AllKeyedService final : public fw::CoService<AllKeyedService> {
 public:
     static constexpr std::string_view kServiceName = "keyed";
-    fw::result<void> A(const DummyRequest&) { return fw::result<void>::ok(); }
-    fw::result<void> B(const DummyRequest&) { return fw::result<void>::ok(); }
+    fw::CoRpcResp A(fw::CoRpcReq) {
+        return fw::CoRpcResp::From(std::tuple<>{});
+    }
+    fw::CoRpcResp B(fw::CoRpcReq) {
+        return fw::CoRpcResp::From(std::tuple<>{});
+    }
     static constexpr auto kRpcMethods = fw::RpcMethods(
-        fw::ActorMethod<&AllKeyedService::A, &DummyRequest::v>("a"),
-        fw::ActorMethod<&AllKeyedService::B, &DummyRequest::v>("b"));
+        fw::ActorMethodAt<&AllKeyedService::A, std::int32_t>("a"),
+        fw::ActorMethodAt<&AllKeyedService::B, std::int32_t>("b"));
 };
 
 // 注册表测试服务：构造计数验证「至多一次」。无 RPC 方法声明 → 空表。

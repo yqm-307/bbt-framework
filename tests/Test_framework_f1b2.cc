@@ -27,7 +27,7 @@
 //                                    并发推进；邮箱容量上限 → Overloaded。
 //
 // 线桥用框架默认 RpcHttpBridge（internal/）：x-bbt-* header ↔ envelope，
-// 业务消息序列化由框架 MessageCodec 供给。静态路由的 endpoint 值
+// 业务负载使用 CoRpcReq/CoRpcResp 位置参数 codec。静态路由的 endpoint 值
 // 对 loopback 用 "self" 逻辑标记，测试缝发送闭包替换为宿主真实绑定
 // 地址——路由门（服务名白名单）仍完整生效。
 //
@@ -45,9 +45,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -100,21 +102,36 @@ private:
 
 constexpr std::chrono::milliseconds kWait{15000};
 
-// ── 业务协议类型：只写字段声明与 schema 名，编解码由框架生成。──
+// ── CoRpc 位置参数测试辅助 ──
 
-struct EchoReq   { std::int32_t v = 0; };
-struct EchoReply { std::int32_t v = 0; };
-// ActorSerial 服务的请求：acct 为声明式 actor key 字段（"acct-<n>"），
-// v 透传给被调方。
-struct AcctReq   { std::string acct; std::int32_t v = 0; };
+fw::result<std::int32_t> IntArg(const fw::CoRpcReq& req) {
+    auto args = req.Parse<std::int32_t>();
+    if (!args) return fw::result<std::int32_t>::err(args.error());
+    return fw::result<std::int32_t>::ok(args.value());
+}
 
-} // namespace
+fw::result<std::tuple<std::string, std::int32_t>> AcctArgs(
+    const fw::CoRpcReq& req) {
+    return req.Parse<std::string, std::int32_t>();
+}
 
-BBT_MESSAGE_FIELDS(EchoReq, "test.EchoReq/v1", v)
-BBT_MESSAGE_FIELDS(EchoReply, "test.EchoReply/v1", v)
-BBT_MESSAGE_FIELDS(AcctReq, "test.AcctReq/v1", acct, v)
+fw::CoRpcReq RequestInt(std::int32_t value) {
+    auto req = fw::CoRpcReq::From(value);
+    if (!req) throw std::logic_error("request encode failed");
+    return std::move(req).value();
+}
 
-namespace {
+fw::CoRpcReq RequestAcct(std::string account, std::int32_t value) {
+    auto req = fw::CoRpcReq::From(
+        std::tuple{std::move(account), value});
+    if (!req) throw std::logic_error("request encode failed");
+    return std::move(req).value();
+}
+
+fw::CoRpcResp ReplyInt(const fw::result<std::int32_t>& value) {
+    if (!value) return fw::CoRpcResp::Error(value.error());
+    return fw::CoRpcResp::From(value.value());
+}
 
 // 线桥别名：框架默认 bridge（internal/RpcHttpBridge.hpp），测试侧不再
 // 手撸 header 映射。
@@ -234,23 +251,27 @@ fw::Error WaitErr(co::WaitStatus st, const char* what) {
 class ProbeSvc final : public fw::CoService<ProbeSvc> {
 public:
     static constexpr std::string_view kServiceName = "probe";
-    fw::result<EchoReply> Inspect(const EchoReq& req) {
+    fw::CoRpcResp Inspect(fw::CoRpcReq req) {
+        auto value = IntArg(req);
+        if (!value) return fw::CoRpcResp::Error(value.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
-            return fw::result<EchoReply>::err(fw::MakeError(
+            return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::InternalError, "no probe"));
         p->Snapshot(p->before, ctx.value()->request_id,
                     SnapCtx(*ctx.value()));
-        return fw::result<EchoReply>::ok(EchoReply{req.v});
+        return fw::CoRpcResp::From(value.value());
     }
-    fw::result<EchoReply> WaitEcho(const EchoReq& req) {
+    fw::CoRpcResp WaitEcho(fw::CoRpcReq req) {
+        auto value = IntArg(req);
+        if (!value) return fw::CoRpcResp::Error(value.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
-            return fw::result<EchoReply>::err(fw::MakeError(
+            return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::InternalError, "no probe"));
         const std::string rid = ctx.value()->request_id;
         p->Snapshot(p->before, rid, SnapCtx(*ctx.value()));
@@ -259,10 +280,9 @@ public:
         const auto st = gate->Wait(
             {ctx.value()->deadline, ctx.value()->cancel});
         if (st != co::WaitStatus::Completed)
-            return fw::result<EchoReply>::err(
-                WaitErr(st, "wait_echo gate"));
+            return fw::CoRpcResp::Error(WaitErr(st, "wait_echo gate"));
         p->Snapshot(p->after, rid, SnapCtx(*ctx.value()));
-        return fw::result<EchoReply>::ok(EchoReply{req.v});
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&ProbeSvc::Inspect>("inspect"),
@@ -273,18 +293,20 @@ public:
 class EchoSvc final : public fw::CoService<EchoSvc> {
 public:
     static constexpr std::string_view kServiceName = "echo";
-    fw::result<EchoReply> Ping(const EchoReq& req) {
-        return fw::result<EchoReply>::ok(EchoReply{req.v});
+    fw::CoRpcResp Ping(fw::CoRpcReq req) {
+        return ReplyInt(IntArg(req));
     }
-    fw::result<EchoReply> Slow(const EchoReq& req) {
+    fw::CoRpcResp Slow(fw::CoRpcReq req) {
+        auto value = IntArg(req);
+        if (!value) return fw::CoRpcResp::Error(value.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         const auto st = p->GateFor("slow")->Wait(
             {ctx.value()->deadline, ctx.value()->cancel});
         if (st != co::WaitStatus::Completed)
-            return fw::result<EchoReply>::err(WaitErr(st, "echo slow"));
-        return fw::result<EchoReply>::ok(EchoReply{req.v});
+            return fw::CoRpcResp::Error(WaitErr(st, "echo slow"));
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoSvc::Ping>("ping"),
@@ -295,16 +317,14 @@ public:
 class CallerSvc final : public fw::CoService<CallerSvc> {
 public:
     static constexpr std::string_view kServiceName = "caller";
-    // 受管 handler 内的真实出站调用（正路径对照）。
-    fw::result<EchoReply> Dial(const EchoReq& req) {
-        return this->call<EchoReply>("echo", "ping", req);
+    fw::CoRpcResp Dial(fw::CoRpcReq req) {
+        auto response = this->call("echo", "ping", req);
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
-    // 受管 handler 内 spawn 一个不受管子协程发起调用：
-    // 子协程无 RequestScope → 端到端 InvalidContext；观察到的真实
-    // 错误码编码进回复负载带回（v = 错误码 int 值）。
-    fw::result<EchoReply> SpawnDial(const EchoReq& req) {
+    fw::CoRpcResp SpawnDial(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         const auto parent_co = co::GetLocalCoroutineId();
         struct Slot {
@@ -315,26 +335,24 @@ public:
         auto sig  = std::make_shared<co::CompletionSignal>();
         bbtco [this, req, slot, sig]() {
             slot->co_id = co::GetLocalCoroutineId();
-            auto r = this->call<EchoReply>("echo", "ping", req);
-            if (r)
-                slot->code = fw::ErrorCode::InternalError;  // 不应到达
+            auto response = this->call("echo", "ping", req);
+            if (response)
+                slot->code = fw::ErrorCode::InternalError;
             else
-                slot->code = r.error().code;
+                slot->code = response.error().code;
             sig->Complete();
         };
         const auto st = sig->Wait(
             {ctx.value()->deadline, ctx.value()->cancel});
         if (st != co::WaitStatus::Completed)
-            return fw::result<EchoReply>::err(
-                WaitErr(st, "spawn_dial wait"));
+            return fw::CoRpcResp::Error(WaitErr(st, "spawn_dial wait"));
         p->Event("parent_co:" + std::to_string(parent_co));
         p->Event("child_co:" + std::to_string(slot->co_id));
-        return fw::result<EchoReply>::ok(
-            EchoReply{static_cast<std::int32_t>(slot->code)});
+        return fw::CoRpcResp::From(
+            static_cast<std::int32_t>(slot->code));
     }
-    // 公开非 RPC 方法：测试在非受管协程里直接调用实例 → InvalidContext。
-    fw::result<EchoReply> DirectDial(const EchoReq& req) {
-        return this->call<EchoReply>("echo", "ping", req);
+    fw::result<fw::CoRpcResp> DirectDial(fw::CoRpcReq req) {
+        return this->call("echo", "ping", req);
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&CallerSvc::Dial>("dial"),
@@ -345,38 +363,38 @@ public:
 class RelaySvc final : public fw::CoService<RelaySvc> {
 public:
     static constexpr std::string_view kServiceName = "relay";
-    fw::result<EchoReply> CallDefault(const EchoReq& req) {
+    fw::CoRpcResp CallDefault(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         g_probe->Snapshot(g_probe->before, ctx.value()->request_id,
                           SnapCtx(*ctx.value()));
-        return this->call<EchoReply>("echo", "ping", req);
+        auto response = this->call("echo", "ping", req);
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
-    fw::result<EchoReply> CallLonger(const EchoReq& req) {
+    fw::CoRpcResp CallLonger(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         g_probe->Snapshot(g_probe->before, ctx.value()->request_id,
                           SnapCtx(*ctx.value()));
         fw::CallOptions opt;
         opt.deadline = Clock::now() + std::chrono::minutes{10};
-        return this->call<EchoReply>("echo", "ping", req, {}, opt);
+        auto response = this->call("echo", "ping", req, {}, opt);
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
-    // 等到父预算到期再发起出站：适配器必须在任何 I/O 之前 TimedOut。
-    fw::result<EchoReply> CallExpired(const EchoReq& req) {
+    fw::CoRpcResp CallExpired(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
-        // 永不完成的信号：等到 ctx deadline（TimedOut/Cancelled 均可，
-        // 两者都表示父预算已到期）。
         auto sig = std::make_shared<co::CompletionSignal>();
         (void)sig->Wait({ctx.value()->deadline, ctx.value()->cancel});
         p->expired_sends_before.store(
             p->egress_calls.load(std::memory_order_acquire),
             std::memory_order_release);
-        auto r = this->call<EchoReply>("echo", "ping", req);
-        if (r)
-            return r;
-        return fw::result<EchoReply>::err(r.error());
+        auto response = this->call("echo", "ping", req);
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&RelaySvc::CallDefault>("call_default"),
@@ -384,37 +402,45 @@ public:
         fw::Method<&RelaySvc::CallExpired>("call_expired"));
 };
 
-// "acct"：ActorSerial；actor key 取自 AcctReq 的声明字段 acct
+// "acct"：ActorSerial；actor key 取自第一个位置参数
 // （客户端填 "acct-<v>"）。Xfer 在远端（echo.slow）等待，XferFast 走
 // 即时远端；事件日志证明同 key 不重入、异 key 并发。
 class AcctSvc final : public fw::CoService<AcctSvc> {
 public:
     static constexpr std::string_view kServiceName = "acct";
-    fw::result<EchoReply> Xfer(const AcctReq& req) {
+    fw::CoRpcResp Xfer(fw::CoRpcReq req) {
+        auto args = AcctArgs(req);
+        if (!args) return fw::CoRpcResp::Error(args.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         const std::string rid = ctx.value()->request_id;
         p->Snapshot(p->before, rid, SnapCtx(*ctx.value()));
         p->Event("start:" + rid);
-        auto r = this->call<EchoReply>("echo", "slow", EchoReq{req.v});
+        auto response = this->call(
+            "echo", "slow", RequestInt(std::get<1>(args.value())));
         p->Event("end:" + rid);
-        return r;
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
-    fw::result<EchoReply> XferFast(const AcctReq& req) {
+    fw::CoRpcResp XferFast(fw::CoRpcReq req) {
+        auto args = AcctArgs(req);
+        if (!args) return fw::CoRpcResp::Error(args.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::result<EchoReply>::err(ctx.error());
+        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         const std::string rid = ctx.value()->request_id;
         p->Snapshot(p->before, rid, SnapCtx(*ctx.value()));
         p->Event("start:" + rid);
-        auto r = this->call<EchoReply>("echo", "ping", EchoReq{req.v});
+        auto response = this->call(
+            "echo", "ping", RequestInt(std::get<1>(args.value())));
         p->Event("end:" + rid);
-        return r;
+        if (!response) return fw::CoRpcResp::Error(response.error());
+        return response.value();
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
-        fw::ActorMethod<&AcctSvc::Xfer, &AcctReq::acct>("xfer"),
-        fw::ActorMethod<&AcctSvc::XferFast, &AcctReq::acct>("xfer_fast"));
+        fw::ActorMethodAt<&AcctSvc::Xfer, std::string>("xfer"),
+        fw::ActorMethodAt<&AcctSvc::XferFast, std::string>("xfer_fast"));
 };
 
 // ── 装配选项与宿主夹具 ──
@@ -676,35 +702,31 @@ inf::RpcEnvelope MakeEnv(std::string service, std::string method,
     env.service         = std::move(service);
     env.method          = std::move(method);
     env.request_id      = std::move(rid);
-    env.request_schema  = std::string(fw::MessageCodec<EchoReq>::SchemaId());
-    env.response_schema =
-        std::string(fw::MessageCodec<EchoReply>::SchemaId());
-    env.payload         =
-        fw::MessageCodec<EchoReq>::Encode(EchoReq{v}).value();
+    env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
+    env.response_schema = std::string(fw::kCoRpcPositionalSchema);
+    env.payload         = RequestInt(v).payload();
     return env;
 }
 
-// ActorSerial 服务的入站：acct 为声明式 actor key 字段（"acct-<v>"）。
+// ActorSerial 服务的入站：第一个位置参数为 actor key，第二个为 v。
 inf::RpcEnvelope MakeAcctEnv(std::string method, std::string rid,
                              std::int32_t v) {
     inf::RpcEnvelope env;
     env.service         = "acct";
     env.method          = std::move(method);
     env.request_id      = std::move(rid);
-    env.request_schema  = std::string(fw::MessageCodec<AcctReq>::SchemaId());
-    env.response_schema =
-        std::string(fw::MessageCodec<EchoReply>::SchemaId());
-    env.payload         = fw::MessageCodec<AcctReq>::Encode(
-        AcctReq{"acct-" + std::to_string(v), v}).value();
+    env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
+    env.response_schema = std::string(fw::kCoRpcPositionalSchema);
+    env.payload         = RequestAcct("acct-" + std::to_string(v), v).payload();
     return env;
 }
 
-fw::result<EchoReply> DecodeReply(
+fw::result<std::int32_t> DecodeReply(
     const fw::result<inf::RpcEnvelope>& r) {
-    if (!r) return fw::result<EchoReply>::err(r.error());
-    auto d = fw::MessageCodec<EchoReply>::Decode(r.value().payload);
-    if (!d) return fw::result<EchoReply>::err(d.error());
-    return fw::result<EchoReply>::ok(std::move(d.value()));
+    if (!r) return fw::result<std::int32_t>::err(r.error());
+    auto d = fw::CoRpcReq(r.value().payload).Parse<std::int32_t>();
+    if (!d) return fw::result<std::int32_t>::err(d.error());
+    return fw::result<std::int32_t>::ok(d.value());
 }
 
 BOOST_AUTO_TEST_SUITE(framework_f1b2)
@@ -731,7 +753,7 @@ BOOST_AUTO_TEST_CASE(inbound_context_fields_land) {
     BOOST_CHECK(r.value().request_id == "t1-a");
     auto rep = DecodeReply(r);
     BOOST_REQUIRE(rep);
-    BOOST_CHECK(rep.value().v == 7);
+    BOOST_CHECK(rep.value() == 7);
 
     const auto snap = g_probe->At(g_probe->before, "t1-a");
     BOOST_CHECK(snap.request_id == "t1-a");          // 非 forged
@@ -843,7 +865,7 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
         BOOST_CHECK(results[i].value().value().request_id == rid);
         auto rep = DecodeReply(results[i].value());
         BOOST_REQUIRE(rep);
-        BOOST_CHECK(rep.value().v == i);
+        BOOST_CHECK(rep.value() == i);
 
         const auto b = g_probe->At(g_probe->before, rid);
         const auto a = g_probe->At(g_probe->after, rid);
@@ -886,7 +908,7 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
     BOOST_REQUIRE(r);
     auto rep = DecodeReply(r);
     BOOST_REQUIRE(rep);
-    BOOST_CHECK(rep.value().v ==
+    BOOST_CHECK(rep.value() ==
                 static_cast<std::int32_t>(fw::ErrorCode::InvalidContext));
     // 确属另一个协程（不是同一协程丢失上下文）。
     std::uint64_t parent_co = 0, child_co = 0;
@@ -908,9 +930,9 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
     BOOST_REQUIRE(svc);
     auto caller = std::static_pointer_cast<CallerSvc>(svc.value());
     TestLatch l{1};
-    std::optional<fw::result<EchoReply>> direct;
+    std::optional<fw::result<fw::CoRpcResp>> direct;
     bbtco [caller, &direct, &l]() {
-        direct.emplace(caller->DirectDial(EchoReq{5}));
+        direct.emplace(caller->DirectDial(RequestInt(5)));
         l.CountDown();
     };
     BOOST_REQUIRE(l.WaitFor(kWait));
@@ -925,7 +947,7 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
     BOOST_REQUIRE(ok);
     auto rep2 = DecodeReply(ok);
     BOOST_REQUIRE(rep2);
-    BOOST_CHECK(rep2.value().v == 42);
+    BOOST_CHECK(rep2.value() == 42);
     BOOST_CHECK(ok.value().request_id == "t3-c");
 
     StopApp(box);
@@ -946,14 +968,14 @@ BOOST_AUTO_TEST_CASE(outbound_deadline_min_and_expired_before_io) {
     // 缺省期限 → 出站获得的就是父 ctx deadline（继承）。
     auto r1 = CallRpc(box, MakeEnv("relay", "call_default", "t4-d", 1));
     BOOST_REQUIRE(r1);
-    BOOST_CHECK(DecodeReply(r1).value().v == 1);
+    BOOST_CHECK(DecodeReply(r1).value() == 1);
     const auto snap_d = g_probe->At(g_probe->before, "t4-d");
     BOOST_CHECK(g_probe->EgressDeadline() == snap_d.deadline);
 
     // 显式期限（10min）远超父预算（300ms）→ min 规则取父预算。
     auto r2 = CallRpc(box, MakeEnv("relay", "call_longer", "t4-l", 2));
     BOOST_REQUIRE(r2);
-    BOOST_CHECK(DecodeReply(r2).value().v == 2);
+    BOOST_CHECK(DecodeReply(r2).value() == 2);
     const auto snap_l = g_probe->At(g_probe->before, "t4-l");
     BOOST_CHECK(g_probe->EgressDeadline() == snap_l.deadline);
 
@@ -1150,9 +1172,9 @@ BOOST_AUTO_TEST_CASE(actor_serial_remote_wait_no_reenter) {
     {
         std::lock_guard<std::mutex> lk(res_mtx);
         BOOST_CHECK(res.at("a1"));
-        BOOST_CHECK(DecodeReply(res.at("a1")).value().v == 1);
+        BOOST_CHECK(DecodeReply(res.at("a1")).value() == 1);
         BOOST_CHECK(res.at("b1"));
-        BOOST_CHECK(DecodeReply(res.at("b1")).value().v == 2);
+        BOOST_CHECK(DecodeReply(res.at("b1")).value() == 2);
         int overloaded = 0;
         for (const char* rid : {"a2", "a3"}) {
             if (res.at(rid)) {
@@ -1165,7 +1187,7 @@ BOOST_AUTO_TEST_CASE(actor_serial_remote_wait_no_reenter) {
         }
         BOOST_REQUIRE(overloaded == 1);
         BOOST_REQUIRE(!queued.empty());
-        BOOST_CHECK(DecodeReply(res.at(queued)).value().v == 1);
+        BOOST_CHECK(DecodeReply(res.at(queued)).value() == 1);
     }
 
     // 事件序：start:a1 < end:b1 < end:a1 < start:<queued> < end:<queued>

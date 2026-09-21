@@ -61,3 +61,9 @@ add_test(NAME Test_framework_f3 COMMAND Test_framework_f3)
 # 各用例的真实时长由 infra keep-alive 连接的 runtime 排空决定
 # （单用例实测 ~30s，全套 ~107s），60s 限时必然误杀，按实测×1.5 留裕量。
 set_tests_properties(Test_framework_f3 PROPERTIES TIMEOUT 180)
+
+add_executable(Test_framework_rpc Test_framework_rpc.cc)
+target_link_libraries(Test_framework_rpc PRIVATE bbt::framework)
+target_compile_options(Test_framework_rpc PRIVATE -Wall -Wextra)
+add_test(NAME Test_framework_rpc COMMAND Test_framework_rpc)
+set_tests_properties(Test_framework_rpc PROPERTIES TIMEOUT 15)

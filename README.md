@@ -3,8 +3,10 @@
 
 ## 现状
 
-业务公共面：`BBT_MESSAGE_FIELDS` 声明消息，`kRpcMethods` + `this->call` 声明/发起 RPC，
-`CoService<T>` / `ICoService` 继承服务，`CoApp` 注册并运行。
+业务公共面：handler 签名统一 `CoRpcResp(CoRpcReq)`，请求/回复经位置参数 codec
+（`CoRpcReq::From` / `req.Parse<Ts...>` / `CoRpcResp::From`）；`kRpcMethods` +
+`this->call` 声明/发起 RPC，`CoService<T>` / `ICoService` 继承服务，`CoApp` 注册并运行。
+跨语言/结构化负载走 Protobuf 适配（`ProtoCodec` seam）。
 
 ```cpp
 #include <bbt/framework/Framework.hpp>
@@ -13,7 +15,7 @@
 class EchoSvc final : public fw::CoService<EchoSvc> {
 public:
     static constexpr std::string_view kServiceName = "echo";
-    fw::result<EchoReply> Ping(const EchoReq& req);
+    fw::CoRpcResp Ping(fw::CoRpcReq req);   // req.Parse<std::string>() 取第 0 个位置参数
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoSvc::Ping>("ping"));
 };
@@ -23,7 +25,7 @@ app.add_service<EchoSvc>(service_opts);
 app.run();
 ```
 
-`Framework.hpp` 汇总消息/服务/RPC 声明头，不含宿主。`CoApp.hpp` 是宿主头
+`Framework.hpp` 汇总服务/RPC 声明头，不含宿主。`CoApp.hpp` 是宿主头
 （`add_service` 会展开方法表）。编解码、envelope、分发器、发送注入在框架内部；
 测试缝在 `internal/`。
 

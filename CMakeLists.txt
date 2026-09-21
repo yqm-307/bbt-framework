@@ -62,7 +62,7 @@ add_subdirectory(framework/src)
 # 每个公共头单独编译 TU，验证头文件自给
 set(BBT_FRAMEWORK_PUBLIC_HEADERS
     Result.hpp
-    Message.hpp
+    CoRpc.hpp
     Route.hpp
     CallOptions.hpp
     OrderedTypes.hpp
@@ -74,6 +74,7 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     RpcMethods.hpp
     ICoService.hpp
     CoService.hpp
+    CoRpc.hpp
     CoApp.hpp
     Framework.hpp)
 # internal/ 机器面头文件同样做自给自检（Framework.hpp 不传递包含它们，

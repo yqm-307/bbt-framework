@@ -28,7 +28,7 @@
 #include <bbt/infra/NetworkTypes.hpp>
 
 #include <bbt/framework/CallOptions.hpp>
-#include <bbt/framework/Message.hpp>
+#include <bbt/framework/CoRpc.hpp>
 #include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/Route.hpp>
@@ -40,18 +40,6 @@ class RpcMethodTable;
 class CoApp;
 class ActorRegistry;
 
-namespace detail {
-
-// 负载 codec 选择（call<T> 与 internal 方法表共用的机器面别名）：
-// 已声明消息走框架生成的 MessageCodec；其余类型走 infra::Codec<T>
-// （缺特化即编译期错误，不存在隐式序列化）。业务不写本别名——
-// call 只需给出消息类型。
-template <class T>
-using PayloadCodec = std::conditional_t<has_message_traits_v<T>,
-    MessageCodec<T>, bbt::infra::Codec<T>>;
-
-} // namespace detail
-
 class ICoService : public bbt::infra::ICoNetwork {
 public:
     virtual ~ICoService() = default;
@@ -60,13 +48,13 @@ public:
     std::optional<std::string> co_actor_key() const;
 
 protected:
-    // 显式给 Reply 模板参数，Request 自动推导；服务与方法始终是显式字符串。
-    // custom 是有上限的拥有型路由字段；目标不经类型推导决定。
-    template <class Reply, class Request>
-    [[nodiscard]] result<Reply> call(
+    // call(service, method, CoRpcReq) → result<CoRpcResp>，请求经
+    // CoRpcReq::From/FromProto 构造（CoRpc.hpp）。custom 是有上限的
+    // 拥有型路由字段；目标不经类型推导决定。
+    [[nodiscard]] result<CoRpcResp> call(
         std::string_view service_name,
         std::string_view method_name,
-        const Request& request,
+        const CoRpcReq& request,
         const RouteFields& custom = {},
         const CallOptions& options = {});
 
@@ -150,39 +138,21 @@ inline std::string ICoService::_NextRequestId() {
             s_call_seq.fetch_add(1, std::memory_order_relaxed) + 1);
 }
 
-template <class Reply, class Request>
-inline result<Reply> ICoService::call(
+inline auto ICoService::call(
     std::string_view service_name,
     std::string_view method_name,
-    const Request& request,
+    const CoRpcReq& request,
     const RouteFields& custom,
-    const CallOptions& options)
-{
-    using ReqCodec = detail::PayloadCodec<Request>;
-    using RepCodec = detail::PayloadCodec<Reply>;
-    // 实例化 codec：缺 codec/缺消息声明在编译期暴露，不做隐式序列化。
-    (void)ReqCodec::SchemaId();
-    (void)RepCodec::SchemaId();
-    auto payload = ReqCodec::Encode(request);
-    if (!payload)
-        return result<Reply>::err(std::move(payload.error()));
-
-    // 机器面在 .cc：受管校验、隐式请求上下文、envelope、票据元数据、
-    // deadline/cancel 适配、发送与回复封包校验——业务只见返回值。
+    const CallOptions& options) -> result<CoRpcResp> {
     auto reply = _CallSend(service_name, method_name,
-        ReqCodec::SchemaId(), RepCodec::SchemaId(),
-        std::move(payload.value()), custom, options);
+        kCoRpcPositionalSchema, kCoRpcPositionalSchema,
+        std::vector<std::uint8_t>(request.payload().begin(),
+                                  request.payload().end()),
+        custom, options);
     if (!reply)
-        return result<Reply>::err(std::move(reply.error()));
-
-    auto decoded = RepCodec::Decode(reply.value());
-    if (!decoded)
-        return result<Reply>::err(std::move(decoded.error()));
-    if constexpr (std::is_void_v<Reply>) {
-        return result<Reply>::ok();
-    } else {
-        return result<Reply>::ok(std::move(decoded.value()));
-    }
+        return result<CoRpcResp>::err(std::move(reply.error()));
+    return result<CoRpcResp>::ok(CoRpcResp::FromPayload(
+        std::move(reply.value())));
 }
 
 } // namespace bbt::framework

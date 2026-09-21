@@ -5,10 +5,10 @@
 //   class EchoSvc final : public fw::CoService<EchoSvc> {
 //   public:
 //       static constexpr std::string_view kServiceName = "echo";
-//       fw::result<EchoReply> Ping(const EchoReq& req);
+//       fw::CoRpcResp Ping(fw::CoRpcReq req);
 //       static constexpr auto kRpcMethods = fw::RpcMethods(
 //           fw::Method<&EchoSvc::Ping>("ping"),
-//           fw::ActorMethod<&EchoSvc::Xfer, &XferReq::acct>("xfer"));
+//           fw::ActorMethodAt<&EchoSvc::Xfer, std::string>("xfer"));
 //   };
 // CoService<T> 只供给服务名。方法表由 CoApp::add_service 在内部展开，
 // 业务不写 binder，也不拿 RpcMethodTable。

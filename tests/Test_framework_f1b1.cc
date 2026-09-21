@@ -158,23 +158,15 @@ private:
     std::vector<NetCall>  m_calls;
 };
 
-// ── 业务桩类型：消息只声明字段；编解码由框架生成。──
-
-struct PingRequest { std::int32_t v = 0; };
-struct PingReply   { std::int32_t v = 0; };
-
-} // namespace
-
-BBT_MESSAGE_FIELDS(PingRequest, "test.PingRequest/v1", v)
-BBT_MESSAGE_FIELDS(PingReply, "test.PingReply/v1", v)
-
-namespace {
+// ── 业务桩类型：统一 CoRpcReq/CoRpcResp 公共面。──
 
 class EchoSvc final : public fw::CoService<EchoSvc> {
 public:
     static constexpr std::string_view kServiceName = "echo";
-    fw::result<PingReply> Ping(const PingRequest& req) {
-        return fw::result<PingReply>::ok(PingReply{req.v});
+    fw::CoRpcResp Ping(fw::CoRpcReq req) {
+        auto value = req.Parse<std::int32_t>();
+        if (!value) return fw::CoRpcResp::Error(value.error());
+        return fw::CoRpcResp::From(value.value());
     }
     // 资源缝观察口（业务侧 protected context() 的测试出口）。
     template <class R>
@@ -187,8 +179,10 @@ public:
 class EchoDupSvc final : public fw::CoService<EchoDupSvc> {
 public:
     static constexpr std::string_view kServiceName = "echo";
-    fw::result<PingReply> Ping(const PingRequest& req) {
-        return fw::result<PingReply>::ok(PingReply{req.v});
+    fw::CoRpcResp Ping(fw::CoRpcReq req) {
+        auto value = req.Parse<std::int32_t>();
+        if (!value) return fw::CoRpcResp::Error(value.error());
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoDupSvc::Ping>("ping"));
@@ -197,19 +191,23 @@ public:
 class KeyedSvc final : public fw::CoService<KeyedSvc> {
 public:
     static constexpr std::string_view kServiceName = "keyed";
-    fw::result<PingReply> Get(const PingRequest& req) {
-        return fw::result<PingReply>::ok(PingReply{req.v});
+    fw::CoRpcResp Get(fw::CoRpcReq req) {
+        auto value = req.Parse<std::int32_t>();
+        if (!value) return fw::CoRpcResp::Error(value.error());
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
-        fw::ActorMethod<&KeyedSvc::Get, &PingRequest::v>("get"));
+        fw::ActorMethodAt<&KeyedSvc::Get, std::int32_t>("get"));
 };
 
 // ActorSerial 缺 key 提取器（声明为普通 Method）：启动期校验失败用。
 class UnkeyedSvc final : public fw::CoService<UnkeyedSvc> {
 public:
     static constexpr std::string_view kServiceName = "unkeyed";
-    fw::result<PingReply> Ping(const PingRequest& req) {
-        return fw::result<PingReply>::ok(PingReply{req.v});
+    fw::CoRpcResp Ping(fw::CoRpcReq req) {
+        auto value = req.Parse<std::int32_t>();
+        if (!value) return fw::CoRpcResp::Error(value.error());
+        return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&UnkeyedSvc::Ping>("ping"));
