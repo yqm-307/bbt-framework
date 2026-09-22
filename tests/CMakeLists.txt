@@ -30,6 +30,12 @@ target_compile_options(Test_framework_f2b2 PRIVATE -Wall -Wextra)
 add_test(NAME Test_framework_f2b2 COMMAND Test_framework_f2b2)
 set_tests_properties(Test_framework_f2b2 PROPERTIES TIMEOUT 30)
 
+add_executable(Test_framework_f2b3 Test_framework_f2b3.cc)
+target_link_libraries(Test_framework_f2b3 PRIVATE bbt::framework)
+target_compile_options(Test_framework_f2b3 PRIVATE -Wall -Wextra)
+add_test(NAME Test_framework_f2b3 COMMAND Test_framework_f2b3)
+set_tests_properties(Test_framework_f2b3 PROPERTIES TIMEOUT 60)
+
 # F1-a：deadline/cancel 继承与受管请求上下文；真实协程调度器 + 注入点断言。
 add_executable(Test_framework_f1a Test_framework_f1a.cc)
 target_link_libraries(Test_framework_f1a PRIVATE bbt::framework)

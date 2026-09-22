@@ -39,6 +39,7 @@
 
 #include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/OrderedTypes.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/ServiceContext.hpp>
 #include <bbt/framework/ShutdownState.hpp>
@@ -51,6 +52,7 @@ class HostLifecycle;
 class HttpEgress;
 class InboundDispatcher;
 class InfraHttpHost;
+class OrderedIngress;
 class INetworkHost;
 struct CoAppOptions;
 struct CoAppSeam;
@@ -173,6 +175,11 @@ public:
     result<bbt::infra::RpcAddress> find_route(
         std::string_view service_name) const;
 
+    // 安装接收端有序流授权。仅允许在 run() 前调用；run 开始后返回 Closed。
+    // service 必须已注册且启用 ordered_ingress，授权字段由调用方提供，
+    // 不自动创建未知服务或隐式放宽其他匹配条件。
+    result<void> grant_ordered_stream(OrderedGrant grant);
+
     // 已托管实例观察口：Concurrent 服务返回启动期绑定的单实例；
     // ActorSerial 服务返回 err(InvalidArgument)（实例按 key 经
     // actor_registry() 激活）；未注册名 → err(NotFound)；
@@ -208,6 +215,7 @@ private:
         ServiceOptions options;
         RpcMethodTable table;
         std::function<std::shared_ptr<ICoService>()> factory;
+        std::shared_ptr<OrderedIngress> ordered_ingress;
     };
 
     // 测试缝出站签名（internal/CoAppSeam.hpp 的 RpcSendAppFn）；

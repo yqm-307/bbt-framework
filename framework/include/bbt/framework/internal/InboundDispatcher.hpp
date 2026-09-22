@@ -40,6 +40,9 @@
 
 namespace bbt::framework {
 
+class InboundDispatcher;
+class OrderedIngress;
+
 class InboundDispatcher {
 public:
     // 每个已注册服务的分发表项：Concurrent 给启动期单实例；
@@ -49,6 +52,7 @@ public:
         const RpcMethodTable*   table;
         std::shared_ptr<ICoService> instance;      // 仅 Concurrent
         ActorRegistry*              registry = nullptr; // 仅 ActorSerial
+        std::shared_ptr<OrderedIngress> ordered_ingress; // 仅 ordered ActorSerial
     };
 
     explicit InboundDispatcher(

@@ -13,7 +13,8 @@
 //    不消费序号（契约第 249 行）。
 //  - 授权流由装配者安装（对应 CoApp::grant_ordered_stream）：只接受匹配
 //    service/actor/producer_epoch/receiver_epoch 且 peer_principal 获授权的
-//    流；任何字段校验失败一律拒绝，不自动建流（契约第 247 行）。
+//    流；loopback 的空 peer_principal 表示匿名本地身份，仍要求请求精确
+//    匹配；任何其他字段校验失败一律拒绝，不自动建流（契约第 247 行）。
 //  - 序号状态按 (actor-key, producer_id, producer_epoch) 维护，从 1 起、
 //    只在「接纳同步边界」自增，永不回退（契约第 253/257 行）。
 //  - 未来序号 → err(SequenceGap) + Error.details[expected_sequence]，
@@ -117,7 +118,8 @@ public:
     static result<SPtr> Create(OrderedIngressConfig config);
 
     // 安装一条授权流（接收端会话权威，对应 CoApp::grant_ordered_stream）。
-    //  - service 与本组件服务不符、或任一字段为空 → err(InvalidArgument)；
+    //  - service 与本组件服务不符、或除 peer_principal 外任一字段为空
+    //    → err(InvalidArgument)；peer_principal 为空仅用于 loopback 匿名身份；
     //  - 同一流标识且完整 grant 相同 → ok（幂等，不重建、不重置序号）；
     //  - 同一流标识但完整 grant 冲突 → err(StreamRejected)；
     //  - 同一 (actor-key, producer_id, producer_epoch) 的新 receiver_epoch

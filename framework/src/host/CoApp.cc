@@ -9,6 +9,7 @@
 #include <bbt/framework/internal/HostLifecycle.hpp>
 #include <bbt/framework/internal/InboundDispatcher.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
+#include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
 
 namespace bbt::framework {
@@ -159,6 +160,39 @@ result<bbt::infra::RpcAddress> CoApp::find_route(
     return result<bbt::infra::RpcAddress>::ok(it->second);
 }
 
+result<void> CoApp::grant_ordered_stream(OrderedGrant grant) {
+    std::lock_guard<std::mutex> lk(m_mtx);
+    if (!m_registration_open)
+        return result<void>::err(MakeError(
+            ErrorCode::Closed,
+            "grant_ordered_stream: registration closed (run already started)"));
+
+    auto it = m_services.find(grant.service);
+    if (it == m_services.end())
+        return result<void>::err(MakeError(
+            ErrorCode::NotFound,
+            "grant_ordered_stream: service '" + grant.service +
+                "' is not registered"));
+    ServiceEntry& service = it->second;
+    if (!service.options.ordered_ingress)
+        return result<void>::err(MakeError(
+            ErrorCode::InvalidArgument,
+            "grant_ordered_stream: service '" + grant.service +
+                "' does not enable ordered_ingress"));
+
+    if (!service.ordered_ingress) {
+        auto created = OrderedIngress::Create(OrderedIngressConfig{
+            grant.service,
+            service.options.max_ordered_streams,
+            service.options.max_cached_results,
+            service.options.max_cached_result_bytes});
+        if (!created)
+            return result<void>::err(std::move(created.error()));
+        service.ordered_ingress = std::move(created.value());
+    }
+    return service.ordered_ingress->GrantStream(grant);
+}
+
 result<std::shared_ptr<ICoService>> CoApp::find_service(
     std::string_view service_name) const {
     std::lock_guard<std::mutex> lk(m_mtx);
@@ -226,8 +260,18 @@ result<void> CoApp::_BindServices() {
     std::map<std::string, InboundDispatcher::ServiceEntry> dispatch;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        for (const auto& [name, entry] : m_services) {
+        for (auto& [name, entry] : m_services) {
             try {
+                if (entry.options.ordered_ingress && !entry.ordered_ingress) {
+                    auto created = OrderedIngress::Create(OrderedIngressConfig{
+                        name,
+                        entry.options.max_ordered_streams,
+                        entry.options.max_cached_results,
+                        entry.options.max_cached_result_bytes});
+                    if (!created)
+                        return result<void>::err(std::move(created.error()));
+                    entry.ordered_ingress = std::move(created.value());
+                }
                 if (entry.options.execution == ExecutionPolicy::Concurrent) {
                     auto inst = entry.factory();
                     inst->_bind_runtime(
@@ -237,7 +281,7 @@ result<void> CoApp::_BindServices() {
                     dispatch.emplace(name,
                         InboundDispatcher::ServiceEntry{
                             entry.options, &entry.table,
-                            std::move(inst), nullptr});
+                            std::move(inst), nullptr, entry.ordered_ingress});
                 } else {
                     const auto factory = entry.factory;
                     const auto max_actors = entry.options.max_actors;
@@ -259,7 +303,7 @@ result<void> CoApp::_BindServices() {
                     dispatch.emplace(name,
                         InboundDispatcher::ServiceEntry{
                             entry.options, &entry.table,
-                            nullptr, registry.get()});
+                            nullptr, registry.get(), entry.ordered_ingress});
                 }
             } catch (const std::exception& e) {
                 return result<void>::err(MakeError(ErrorCode::InternalError,
