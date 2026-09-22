@@ -1,36 +1,134 @@
-# Issue #6：最小构建 + CTest 冒烟。不在本 workflow 跑 compose/压测。
+# Issue #6：最小构建 + CTest 冒烟门禁。不在本 workflow 跑 compose/压测。
+#
+# 去重审计（2026-09-22）：以 origin/main 62b6109 现役 CI 为基底
+# （scripts/fetch_deps.sh + deps.lock pin SHA + scripts/local_build.sh 配方 +
+# link-source 门禁），并吸收孤儿 .github/workflows/ci.yml（sha256 3d4f9397…，
+# 浮动 @main 依赖、无 JOBS 限额，已被本文件取代）中仍成立的要求：
+#   1) 单 job build-test -> build->test 两 job，build 树经 artifact 传递；
+#   2) changes 文档过滤 job（替代 paths-ignore，避免 required check 悬空）；
+#   3) concurrency 排队（不设 cancel-in-progress，同 ref 后到排队不取消）；
+#   4) 独立构建目录 /tmp/bbt-ci-work/<run_id>（按 run_id 隔离，避同机并发互踩）；
+#   5) ccache 可用则挂入（优雅降级）+ BBT_JOBS=3（12c 机 3 槽之一）+ flock 串行全量；
+#   6) ctest -j1 --timeout 300 保留（镜像 scripts/run_ctest.sh 的 SKIP 门禁并加 --timeout）。
 name: ci
 
 on:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
 
+concurrency:
+  # 排队语义：不设 cancel-in-progress，同 ref 的后续运行排队等待而非取消在跑
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+
+env:
+  # 独立构建目录：每次 run 隔离；build 与 test 两 job 使用同一绝对路径，
+  # 保证产物 RUNPATH（指向 $BBT_BUILD_DIR 的绝对路径）在 artifact 传递后仍有效。
+  BBT_WORK_DIR: /tmp/bbt-ci-work/${{ github.run_id }}
+  BBT_BUILD_DIR: /tmp/bbt-ci-work/${{ github.run_id }}/project-build
+
 jobs:
-  build-test:
+  # docs-only 变更检测：纯文档/LICENSE PR 时 required check 直接上报 success，
+  # 避免 paths-ignore 与 ruleset required check 冲突导致无法 merge。
+  # 模板：bbtools-coroutine unit_test.yml changes job + bbtools-infra ci.yml。
+  changes:
+    name: "变更类型检测"
     runs-on: arc-s4-framework
-    timeout-minutes: 20
-    env:
-      BBT_JOBS: "1"
-      BBT_NEED_TEST: "ON"
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "判断是否含代码变更"
+        id: filter
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # checkout 已全量拉取（fetch-depth: 0），直接用现有的 origin/<base>，
+            # 不再额外浅抓（浅边界会改变三点 diff 的 merge-base 解析）。
+            RANGE="origin/${{ github.base_ref }}...HEAD"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # 新分支首推：before 为空/全零，改用 HEAD^ 对比；根提交保守视为代码变更
+            if git rev-parse --verify --quiet HEAD^ >/dev/null; then
+              RANGE="HEAD^..HEAD"
+            else
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # force-push 或 before 不可达时保守视为代码变更，避免 git diff 报
+            # unknown revision 导致 changes 失败、下游被 needs 跳过而挂起。
+            if git rev-parse --verify --quiet "$BEFORE^{commit}" >/dev/null; then
+              RANGE="$BEFORE..${{ github.sha }}"
+            else
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # 非文档路径模式：命中任一即视为代码变更（与原 paths-ignore 口径对齐 + LICENSE/图片）
+          if git diff --name-only $RANGE | grep -vE '\.md$|^docs/|^LICENSE$|\.png$|\.jpg$|\.svg$' | grep -q .; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (pinned deps)
+    needs: [changes]
+    runs-on: arc-s4-framework
+    timeout-minutes: 20
+    env:
+      BBT_JOBS: "3"
+      # BBT_NEED_TEST=ON 编译测试目标（传给工程 -DNEED_TEST，见 build_stack.sh），
+      # BBT_SKIP_CTEST=1 跳过 local_build.sh 尾部的捆绑 ctest（见 local_build.sh:30），
+      # ctest 由独立 test job 按 --timeout 300 + SKIP 门禁执行，二者不互斥。
+      BBT_NEED_TEST: "ON"
+      BBT_SKIP_CTEST: "1"
+      BBT_DEPS_DIR: ${{ github.workspace }}/.deps
+    steps:
+      - name: "docs-only 变更直接通过"
+        if: needs.changes.outputs.code == 'false'
+        run: echo "docs-only change, skipping build; check reports success."
+
+      - name: Checkout
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Print framework HEAD
+        if: needs.changes.outputs.code == 'true'
+        run: git log -1 --format='%H %s (%ci)'
 
       - name: Fetch pinned deps
-        env:
-          BBT_DEPS_DIR: ${{ github.workspace }}/.deps
+        if: needs.changes.outputs.code == 'true'
         run: bash scripts/fetch_deps.sh
 
-      - name: Build and CTest
-        env:
-          BBT_DEPS_DIR: ${{ github.workspace }}/.deps
-          BBT_WORK_DIR: ${{ runner.temp }}/bbt-work
-        run: bash scripts/local_build.sh
+      - name: Build (flock 串行全量)
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          # ccache 可用则经 launcher 挂入（优雅降级，不作为硬依赖；
+          # BBT_CMAKE_ARGS 由 build_stack.sh:114-122 透传给 cmake 配置）。
+          if command -v ccache >/dev/null 2>&1; then
+            export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/bbt-ccache}"
+            export BBT_CMAKE_ARGS="${BBT_CMAKE_ARGS:-} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            echo "ccache: $(ccache --version | head -1) dir=$CCACHE_DIR"
+          else
+            echo "ccache 在 runner 上不可用，跳过挂入直编"
+          fi
+          # -w 900：拿不到锁 900s 即明确报排队超时（flock 返回非零），不占用整个 20min job 超时；
+          # 锁文件全局唯一（/tmp/bbt-build.lock），见 AGENTS.md 本地验证边界。
+          # 注意：flock 透传内层退出码，构建失败码（4/5/7/8）原样保留，不掩盖。
+          flock -w 900 /tmp/bbt-build.lock bash scripts/local_build.sh
 
-      - name: Link-source evidence
-        env:
-          BBT_WORK_DIR: ${{ runner.temp }}/bbt-work
+      - name: Build evidence
+        if: needs.changes.outputs.code == 'true'
         run: |
           test -f "$BBT_WORK_DIR/deps-manifest.txt"
           test -f "$BBT_WORK_DIR/link-sources.txt"
@@ -40,3 +138,125 @@ jobs:
             echo "FATAL: 链接到 /usr/local" >&2
             exit 7
           fi
+          if command -v ccache >/dev/null 2>&1; then ccache -s || true; fi
+
+      - name: Upload build tree
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbt-build-${{ github.run_id }}
+          path: ${{ env.BBT_WORK_DIR }}
+          retention-days: 1
+
+      - name: Cleanup build dir (build 侧，防跨 runner 留痕)
+        # test job 跑在另一个 runner 上，清不到这里的 /tmp；上传完成后本地必清。
+        if: always()
+        run: rm -rf "$BBT_WORK_DIR"
+
+  test:
+    name: Test (ctest -j1)
+    needs: [changes, build]
+    runs-on: arc-s4-framework
+    timeout-minutes: 20
+    steps:
+      - name: "docs-only 变更直接通过"
+        if: needs.changes.outputs.code == 'false'
+        run: echo "docs-only change, skipping test; check reports success."
+
+      - name: Download build tree
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: bbt-build-${{ github.run_id }}
+          path: ${{ env.BBT_WORK_DIR }}
+
+      - name: Restore exec bits (artifact 往返丢 +x)
+        # 首轮真实 run 实证：Verify 循环零输出（[ -x ] 全跳过），而 ldd 直读同路径
+        # 却命中 /usr/local —— upload/download-artifact 往返丢了执行位。这里显式恢复，
+        # 并列出目录证据；Verify 另有 found 计数，零命中时明确失败，不再静默。
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          chmod +x "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null || true
+          ls -la "$BBT_BUILD_DIR"/tests/ | head -n 20
+
+      - name: Verify test binaries resolve libs (fail-fast)
+        # .deps 源码树只在 build 期需要；运行时 .so 已编进 $BBT_BUILD_DIR/_deps
+        # 并随 artifact 到同一绝对路径（见 build_stack.sh:91-128）。ldd 逐个核对
+        # Test_framework_* 的 bbt 依赖可解析，缺库时明确失败而不是 ctest 集体红。
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          # test 跑在新 runner 上，build 期 local_build.sh 的 LD 清理带不过来：
+          # 镜像 LD_LIBRARY_PATH=/opt/boost/lib:/usr/local/lib 优先于 RUNPATH，
+          # 会把已指对 build 树的 NEEDED 抢绑到 /usr/local 旧产物。这里重做同款剔除。
+          if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            LD_LIBRARY_PATH="$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -vE '^/usr/local(/|$)' | paste -sd: -)"
+            export LD_LIBRARY_PATH
+          fi
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}"
+          missing=0
+          found=0
+          for bin in "$BBT_BUILD_DIR"/tests/Test_framework_*; do
+            [ -x "$bin" ] || continue
+            found=$((found + 1))
+            echo "--- $bin ---"
+            ldd "$bin" 2>/dev/null | grep -E 'bbt|boost' || echo "(静态/无外部依赖)"
+            if ldd "$bin" 2>/dev/null | grep -q 'not found'; then
+              echo "FATAL: $bin 有未解析依赖" >&2
+              missing=1
+            fi
+          done
+          # 零命中必须明确失败：禁止 [ -x ] 全跳过后带着空证据混过去。
+          if [ "$found" -eq 0 ]; then
+            echo "FATAL: 未找到可执行测试二进制 ($BBT_BUILD_DIR/tests/Test_framework_*)" >&2
+            ls -la "$BBT_BUILD_DIR"/tests/ >&2 || true
+            exit 9
+          fi
+          echo "verified binaries: $found"
+          # bbt 必须解析到 build 树内（干净 runner 不许吃 /usr/local 旧产物）
+          if ldd "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null | grep -q '/usr/local/.*bbt'; then
+            echo "FATAL: 链接到 /usr/local 下的 bbt 旧产物" >&2
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: CTest (镜像 scripts/run_ctest.sh 门禁 + --timeout 300)
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          # 同 Verify：ctest 子进程继承本 step 环境，先剔除 /usr/local，
+          # 否则用例运行时 NEEDED 被 LD 抢绑到旧产物（RUNPATH 救不回来）。
+          if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            LD_LIBRARY_PATH="$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -vE '^/usr/local(/|$)' | paste -sd: -)"
+            export LD_LIBRARY_PATH
+          fi
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}"
+          set +e
+          ctest --test-dir "$BBT_BUILD_DIR" -j1 --timeout 300 --output-on-failure --no-tests=error | tee "$BBT_BUILD_DIR/ctest.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          # 只认 ctest 自身的结果行（"1/12 Test #1: ..."），不用例 stdout，
+          # 避免用例打印 "Not Run" 文字造成误判；同时要求 100% 全绿。
+          if grep -Eq '^[ ]*[0-9]+/[0-9]+ Test #[0-9]+:.*\*\*\*(Skipped|Not Run)' "$BBT_BUILD_DIR/ctest.log"; then
+            echo "FATAL: 检测到 SKIP/Not Run，禁止报全绿" >&2
+            exit 8
+          fi
+          if ! grep -Eq '100% tests passed, 0 tests failed' "$BBT_BUILD_DIR/ctest.log"; then
+            echo "FATAL: 未达成 100% 全绿" >&2
+            exit 8
+          fi
+          exit "$rc"
+
+      - name: Link-source evidence 复核
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          test -f "$BBT_WORK_DIR/deps-manifest.txt"
+          test -f "$BBT_WORK_DIR/link-sources.txt"
+          cat "$BBT_WORK_DIR/deps-manifest.txt"
+          cat "$BBT_WORK_DIR/link-sources.txt"
+          if grep -q /usr/local/ "$BBT_WORK_DIR/link-sources.txt"; then
+            echo "FATAL: 链接到 /usr/local" >&2
+            exit 7
+          fi
+
+      - name: Cleanup build dir
+        if: always()
+        run: rm -rf "$BBT_WORK_DIR"
