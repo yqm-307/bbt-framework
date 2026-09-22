@@ -1,11 +1,16 @@
 #include <bbt/framework/internal/InboundDispatcher.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include <bbt/coroutine/sync/CompletionSignal.hpp>
+
+#include <bbt/framework/internal/OrderedIngress.hpp>
 
 #include <bbt/framework/internal/RequestScope.hpp>
 #include <bbt/framework/Route.hpp>
@@ -44,6 +49,40 @@ bool IsUnsignedDecimal(std::string_view s) {
     return true;
 }
 
+bool ParseUnsignedDecimal(std::string_view s, std::uint64_t& out) {
+    if (!IsUnsignedDecimal(s)) return false;
+    std::uint64_t value = 0;
+    for (char c : s) {
+        const auto digit = static_cast<std::uint64_t>(c - '0');
+        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    out = value;
+    return true;
+}
+
+std::string OrderedRequestDigest(std::string_view method,
+                                 std::string_view actor_key,
+                                 const std::vector<std::uint8_t>& payload) {
+    // 长度前缀避免分隔符碰撞；这是协议内一致性标识，不宣称密码学哈希。
+    std::string digest;
+    digest.reserve(method.size() + actor_key.size() + payload.size() + 32);
+    const auto append = [&digest](const void* data, std::size_t size) {
+        digest += std::to_string(size);
+        digest.push_back(':');
+        digest.append(static_cast<const char*>(data), size);
+        digest.push_back('|');
+    };
+    append(method.data(), method.size());
+    append(actor_key.data(), actor_key.size());
+    if (!payload.empty())
+        append(payload.data(), payload.size());
+    else
+        append("", 0);
+    return digest;
+}
+
 Error ErrInvalid(std::string what) {
     return MakeError(ErrorCode::InvalidArgument, std::move(what));
 }
@@ -78,6 +117,11 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
     //    custom 字段只来自 route.*，系统字段只来自 fw.*——不互相伪造。
     RouteFields custom;
     std::optional<std::string> trace_id;
+    std::string ordered_producer_id;
+    std::string ordered_producer_epoch;
+    std::string ordered_receiver_epoch;
+    std::uint64_t ordered_sequence = 0;
+    bool has_sequence_field = false;
     for (const auto& [k, v] : request.metadata) {
         if (k.compare(0, kRoutePrefix.size(), kRoutePrefix) == 0) {
             const std::string name = k.substr(kRoutePrefix.size());
@@ -96,9 +140,21 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             if (v.empty())
                 return result<RpcEnvelope>::err(
                     ErrInvalid("malformed " + k));
-            if (k == "fw.sequence" && !IsUnsignedDecimal(v))
-                return result<RpcEnvelope>::err(
-                    ErrInvalid("fw.sequence must be unsigned decimal"));
+            if (k == "fw.sequence") {
+                if (!IsUnsignedDecimal(v))
+                    return result<RpcEnvelope>::err(
+                        ErrInvalid("fw.sequence must be unsigned decimal"));
+                if (!ParseUnsignedDecimal(v, ordered_sequence))
+                    return result<RpcEnvelope>::err(
+                        ErrInvalid("fw.sequence exceeds uint64 range"));
+                has_sequence_field = true;
+            } else if (k == "fw.producer_id") {
+                ordered_producer_id = v;
+            } else if (k == "fw.producer_epoch") {
+                ordered_producer_epoch = v;
+            } else if (k == "fw.receiver_epoch") {
+                ordered_receiver_epoch = v;
+            }
         } else {
             return result<RpcEnvelope>::err(
                 ErrInvalid("metadata key outside route.*: " + k));
@@ -149,13 +205,69 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         if (!key)
             return result<RpcEnvelope>::err(std::move(key.error()));
         ctx->actor_key = key.value();
+
+        std::shared_ptr<OrderedIngress> ordered_ingress;
+        std::optional<OrderedIngress::Admission> ordered_admission;
+        if (svc.entry.options.ordered_ingress) {
+            ordered_ingress = svc.entry.ordered_ingress;
+            if (!ordered_ingress)
+                return result<RpcEnvelope>::err(MakeError(
+                    ErrorCode::RuntimeUnavailable,
+                    "ordered ingress is not bound for service '" +
+                        request.service + "'"));
+
+            OrderedIngressRequest ordered_request;
+            ordered_request.method            = request.method;
+            ordered_request.actor_key         = key.value();
+            ordered_request.peer_principal    = incoming.peer_principal;
+            ordered_request.has_ordered_stamp = has_sequence_field;
+            ordered_request.producer_id       = ordered_producer_id;
+            ordered_request.producer_epoch    = ordered_producer_epoch;
+            ordered_request.receiver_epoch    = ordered_receiver_epoch;
+            ordered_request.sequence          = ordered_sequence;
+            ordered_request.request_id        = request.request_id;
+            ordered_request.request_digest = OrderedRequestDigest(
+                request.method, key.value(), request.payload);
+
+            auto admitted = ordered_ingress->Admit(ordered_request);
+            if (!admitted)
+                return result<RpcEnvelope>::err(std::move(admitted.error()));
+            if (admitted.value().kind == OrderedIngress::DecisionKind::Replay) {
+                const auto& replay = admitted.value().replay;
+                if (!replay.is_ok)
+                    return result<RpcEnvelope>::err(replay.error);
+                RpcEnvelope reply;
+                reply.service         = request.service;
+                reply.method          = request.method;
+                reply.request_id      = request.request_id;
+                reply.response_schema = method->response_schema;
+                reply.payload.assign(replay.payload.begin(), replay.payload.end());
+                return result<RpcEnvelope>::ok(std::move(reply));
+            }
+            ordered_admission = std::move(admitted.value());
+        }
+
+        auto finish_ordered_error = [&](Error error)
+            -> result<RpcEnvelope> {
+            if (!ordered_admission)
+                return result<RpcEnvelope>::err(std::move(error));
+            OrderedTerminalReply terminal;
+            terminal.is_ok = false;
+            terminal.error = error;
+            auto completed = ordered_ingress->Complete(
+                *ordered_admission, std::move(terminal));
+            if (!completed)
+                return result<RpcEnvelope>::err(std::move(completed.error()));
+            return result<RpcEnvelope>::err(std::move(error));
+        };
+
         auto inst = svc.entry.registry->GetOrCreate(request.service,
-                                                  key.value());
+                                                   key.value());
         if (!inst)
-            return result<RpcEnvelope>::err(std::move(inst.error()));
+            return finish_ordered_error(std::move(inst.error()));
         auto mailbox = _MailboxFor(svc, key.value());
         if (!mailbox)
-            return result<RpcEnvelope>::err(MakeError(
+            return finish_ordered_error(MakeError(
                 ErrorCode::InternalError, "mailbox create failed"));
 
         // 每请求一个完成信号；业务结果经 slot 回传。完成先于 Wait
@@ -170,7 +282,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         try {
             sig = std::make_shared<bbt::coroutine::CompletionSignal>();
         } catch (...) {
-            return result<RpcEnvelope>::err(MakeError(
+            return finish_ordered_error(MakeError(
                 ErrorCode::RuntimeUnavailable,
                 "completion signal unavailable"));
         }
@@ -182,7 +294,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
                 sig->Complete();
             });
         if (!enq)
-            return result<RpcEnvelope>::err(std::move(enq.error()));
+            return finish_ordered_error(std::move(enq.error()));
 
         WaitOptions wo;
         wo.deadline = ctx->deadline;
@@ -192,26 +304,35 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         case WaitStatus::Completed:
             break;
         case WaitStatus::TimedOut:
-            return result<RpcEnvelope>::err(MakeError(ErrorCode::TimedOut,
+            return finish_ordered_error(MakeError(ErrorCode::TimedOut,
                 "actor handler did not finish within request budget"));
         case WaitStatus::Cancelled:
-            return result<RpcEnvelope>::err(MakeError(ErrorCode::Cancelled,
+            return finish_ordered_error(MakeError(ErrorCode::Cancelled,
                 "inbound request cancelled while queued/running"));
         case WaitStatus::RuntimeUnavailable:
-            return result<RpcEnvelope>::err(MakeError(
+            return finish_ordered_error(MakeError(
                 ErrorCode::RuntimeUnavailable,
                 "runtime unavailable while waiting actor result"));
         default:
             // InvalidContext/AlreadyWaiting：派发约定内不应出现，
             // 不静默吞掉，如实上报内部错误。
-            return result<RpcEnvelope>::err(MakeError(
+            return finish_ordered_error(MakeError(
                 ErrorCode::InternalError,
                 "unexpected wait status " +
                     std::to_string(static_cast<int>(st))));
         }
         if (!slot->r)
-            return result<RpcEnvelope>::err(std::move(slot->r.error()));
+            return finish_ordered_error(std::move(slot->r.error()));
         reply_payload = std::move(slot->r.value());
+        if (ordered_admission) {
+            OrderedTerminalReply terminal;
+            terminal.is_ok = true;
+            terminal.payload.assign(reply_payload.begin(), reply_payload.end());
+            auto completed = ordered_ingress->Complete(
+                *ordered_admission, std::move(terminal));
+            if (!completed)
+                return result<RpcEnvelope>::err(std::move(completed.error()));
+        }
     } else {
         // Concurrent：派发协程内联执行，实例并发安全由业务负责。
         auto& inst = svc.entry.instance;

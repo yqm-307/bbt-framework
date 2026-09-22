@@ -87,7 +87,7 @@ result<void> OrderedIngress::GrantStream(const OrderedGrant& grant) {
     }
     if (grant.service.empty() || grant.actor_key.empty() ||
         grant.producer_id.empty() || grant.producer_epoch.empty() ||
-        grant.receiver_epoch.empty() || grant.peer_principal.empty()) {
+        grant.receiver_epoch.empty()) {
         return result<void>::err(OrderedIngestInvalid(
             "ordered ingress: grant has empty field; refusing to install"));
     }
