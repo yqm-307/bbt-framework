@@ -170,15 +170,34 @@ jobs:
           name: bbt-build-${{ github.run_id }}
           path: ${{ env.BBT_WORK_DIR }}
 
+      - name: Restore exec bits (artifact 往返丢 +x)
+        # 首轮真实 run 实证：Verify 循环零输出（[ -x ] 全跳过），而 ldd 直读同路径
+        # 却命中 /usr/local —— upload/download-artifact 往返丢了执行位。这里显式恢复，
+        # 并列出目录证据；Verify 另有 found 计数，零命中时明确失败，不再静默。
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          chmod +x "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null || true
+          ls -la "$BBT_BUILD_DIR"/tests/ | head -n 20
+
       - name: Verify test binaries resolve libs (fail-fast)
         # .deps 源码树只在 build 期需要；运行时 .so 已编进 $BBT_BUILD_DIR/_deps
         # 并随 artifact 到同一绝对路径（见 build_stack.sh:91-128）。ldd 逐个核对
         # Test_framework_* 的 bbt 依赖可解析，缺库时明确失败而不是 ctest 集体红。
         if: needs.changes.outputs.code == 'true'
         run: |
+          # test 跑在新 runner 上，build 期 local_build.sh 的 LD 清理带不过来：
+          # 镜像 LD_LIBRARY_PATH=/opt/boost/lib:/usr/local/lib 优先于 RUNPATH，
+          # 会把已指对 build 树的 NEEDED 抢绑到 /usr/local 旧产物。这里重做同款剔除。
+          if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            LD_LIBRARY_PATH="$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -vE '^/usr/local(/|$)' | paste -sd: -)"
+            export LD_LIBRARY_PATH
+          fi
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}"
           missing=0
+          found=0
           for bin in "$BBT_BUILD_DIR"/tests/Test_framework_*; do
             [ -x "$bin" ] || continue
+            found=$((found + 1))
             echo "--- $bin ---"
             ldd "$bin" 2>/dev/null | grep -E 'bbt|boost' || echo "(静态/无外部依赖)"
             if ldd "$bin" 2>/dev/null | grep -q 'not found'; then
@@ -186,7 +205,14 @@ jobs:
               missing=1
             fi
           done
-          # bbt_core 必须解析到 build 树内（干净 runner 不许吃 /usr/local 旧产物）
+          # 零命中必须明确失败：禁止 [ -x ] 全跳过后带着空证据混过去。
+          if [ "$found" -eq 0 ]; then
+            echo "FATAL: 未找到可执行测试二进制 ($BBT_BUILD_DIR/tests/Test_framework_*)" >&2
+            ls -la "$BBT_BUILD_DIR"/tests/ >&2 || true
+            exit 9
+          fi
+          echo "verified binaries: $found"
+          # bbt 必须解析到 build 树内（干净 runner 不许吃 /usr/local 旧产物）
           if ldd "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null | grep -q '/usr/local/.*bbt'; then
             echo "FATAL: 链接到 /usr/local 下的 bbt 旧产物" >&2
             missing=1
@@ -196,6 +222,13 @@ jobs:
       - name: CTest (镜像 scripts/run_ctest.sh 门禁 + --timeout 300)
         if: needs.changes.outputs.code == 'true'
         run: |
+          # 同 Verify：ctest 子进程继承本 step 环境，先剔除 /usr/local，
+          # 否则用例运行时 NEEDED 被 LD 抢绑到旧产物（RUNPATH 救不回来）。
+          if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            LD_LIBRARY_PATH="$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -vE '^/usr/local(/|$)' | paste -sd: -)"
+            export LD_LIBRARY_PATH
+          fi
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}"
           set +e
           ctest --test-dir "$BBT_BUILD_DIR" -j1 --timeout 300 --output-on-failure --no-tests=error | tee "$BBT_BUILD_DIR/ctest.log"
           rc=${PIPESTATUS[0]}
