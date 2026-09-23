@@ -90,6 +90,11 @@ public:
     template <class R>
     std::shared_ptr<R> Resource() { return context().resource<R>(); }
 
+    template <class R>
+    std::shared_ptr<R> Resource(std::string_view name) {
+        return context().resource<R>(name);
+    }
+
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoService::Echo>("echo"),
         fw::Method<&EchoService::Reset>("reset"),
@@ -320,6 +325,35 @@ BOOST_AUTO_TEST_CASE(resource_seam_unbound_and_registration) {
     auto null_resource = app.add_resource(std::shared_ptr<DummyResource>{});
     BOOST_REQUIRE(!null_resource);
     BOOST_CHECK(null_resource.error().code == fw::ErrorCode::InvalidArgument);
+}
+
+BOOST_AUTO_TEST_CASE(named_resource_registration_and_lookup) {
+    EchoService svc;
+    BOOST_CHECK(svc.Resource<DummyResource>("missing") == nullptr);
+
+    fw::CoAppOptions options;
+    options.network_limits = bbt::infra::NetworkLimits{
+        64, 64, 16384, 65536, std::chrono::milliseconds{30000}};
+    options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
+    options.shutdown_step_budget = std::chrono::milliseconds{2000};
+    fw::CoApp app(options);
+
+    auto primary = std::make_shared<DummyResource>();
+    primary->n = 11;
+    auto replica = std::make_shared<DummyResource>();
+    replica->n = 22;
+
+    BOOST_CHECK(app.add_resource<DummyResource>("primary", primary));
+    BOOST_CHECK(app.add_resource<DummyResource>("replica", replica));
+
+    auto duplicate = app.add_resource<DummyResource>(
+        "primary", std::make_shared<DummyResource>());
+    BOOST_REQUIRE(!duplicate);
+    BOOST_CHECK(duplicate.error().code == fw::ErrorCode::InvalidArgument);
+
+    auto empty_name = app.add_resource<DummyResource>("", primary);
+    BOOST_REQUIRE(!empty_name);
+    BOOST_CHECK(empty_name.error().code == fw::ErrorCode::InvalidArgument);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

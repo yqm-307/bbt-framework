@@ -149,24 +149,22 @@ public:
         return result<void>::ok();
     }
 
-    // 资源缝登记：按类型装配资源客户端（CoRedisCli 等未来 infra
-    // client mixin 的登记口）。T 重复装配 → err(InvalidArgument)；
-    // 空指针 → err(InvalidArgument)；run 开始后 → err(Closed)。
-    // 本框架不提供任何数据库客户端实现——资源由扩展/应用装配真实类型。
+    // 资源缝登记：旧重载装配无名默认资源；命名重载以 (类型, 名称)
+    // 为键。公开命名 API 拒绝空名；重复键/空指针 → InvalidArgument；
+    // run 开始后 → Closed。本框架不提供数据库客户端实现。
     template <class R>
     result<void> add_resource(std::shared_ptr<R> resource) {
-        if (!resource)
+        return _AddResource<R>(kDefaultResourceName,
+            std::move(resource));
+    }
+
+    template <class R>
+    result<void> add_resource(std::string_view name,
+                              std::shared_ptr<R> resource) {
+        if (name.empty())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: null resource"));
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_registration_open)
-            return result<void>::err(MakeError(ErrorCode::Closed,
-                "add_resource: registration closed (run already started)"));
-        const auto key = detail::ResourceTypeId<R>();
-        if (!m_resources->emplace(key, std::move(resource)).second)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: duplicate resource type"));
-        return result<void>::ok();
+                "add_resource: empty resource name"));
+        return _AddResource<R>(name, std::move(resource));
     }
 
     // 出站目标解析（「自动连任意服务」不存在的落点）：只认显式配置的
@@ -217,6 +215,23 @@ private:
         std::function<std::shared_ptr<ICoService>()> factory;
         std::shared_ptr<OrderedIngress> ordered_ingress;
     };
+
+    template <class R>
+    result<void> _AddResource(std::string_view name,
+                              std::shared_ptr<R> resource) {
+        if (!resource)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "add_resource: null resource"));
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!m_registration_open)
+            return result<void>::err(MakeError(ErrorCode::Closed,
+                "add_resource: registration closed (run already started)"));
+        ResourceKey key{detail::ResourceTypeId<R>(), std::string{name}};
+        if (!m_resources->emplace(std::move(key), std::move(resource)).second)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "add_resource: duplicate resource key"));
+        return result<void>::ok();
+    }
 
     // 测试缝出站签名（internal/CoAppSeam.hpp 的 RpcSendAppFn）；
     // 本头不复述机器面签名，私有别名保持公共面干净。
