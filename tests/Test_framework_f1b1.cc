@@ -171,6 +171,10 @@ public:
     // 资源缝观察口（业务侧 protected context() 的测试出口）。
     template <class R>
     std::shared_ptr<R> Resource() { return context().resource<R>(); }
+    template <class R>
+    std::shared_ptr<R> Resource(std::string_view name) {
+        return context().resource<R>(name);
+    }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoSvc::Ping>("ping"));
 };
@@ -297,7 +301,13 @@ BOOST_AUTO_TEST_CASE(add_service_registers_and_rejects_duplicate) {
     BOOST_REQUIRE(app->add_service<EchoSvc>(ConcurrentOpts()));
     BOOST_REQUIRE(app->add_service<KeyedSvc>(ActorOpts()));
     auto res = std::make_shared<DummyResource>();
+    auto primary = std::make_shared<DummyResource>();
+    primary->n = 11;
+    auto replica = std::make_shared<DummyResource>();
+    replica->n = 22;
     BOOST_REQUIRE(app->add_resource(res));
+    BOOST_REQUIRE(app->add_resource<DummyResource>("primary", primary));
+    BOOST_REQUIRE(app->add_resource<DummyResource>("replica", replica));
 
     auto dup = app->add_service<EchoDupSvc>(ConcurrentOpts());
     BOOST_REQUIRE(!dup);
@@ -321,6 +331,15 @@ BOOST_AUTO_TEST_CASE(add_service_registers_and_rejects_duplicate) {
     BOOST_REQUIRE(got != nullptr);
     BOOST_TEST(got.get() == res.get());
     BOOST_TEST(got->n == 7);
+    auto got_primary = echo->Resource<DummyResource>("primary");
+    auto got_replica = echo->Resource<DummyResource>("replica");
+    BOOST_REQUIRE(got_primary != nullptr);
+    BOOST_REQUIRE(got_replica != nullptr);
+    BOOST_TEST(got_primary.get() == primary.get());
+    BOOST_TEST(got_replica.get() == replica.get());
+    BOOST_TEST(got_primary->n == 11);
+    BOOST_TEST(got_replica->n == 22);
+    BOOST_CHECK(echo->Resource<DummyResource>("missing") == nullptr);
 
     // ActorSerial：注册表激活时绑定身份 + actor key。
     auto* reg = app->actor_registry();

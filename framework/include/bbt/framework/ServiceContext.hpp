@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <bbt/framework/RequestContext.hpp>
@@ -39,9 +41,29 @@ std::size_t ResourceTypeId() noexcept {
 
 } // namespace detail
 
-// 应用级资源表：类型键 → 类型擦除的共享资源。由 CoApp 装配期写入，
-// 运行期只读；键由 detail::ResourceTypeId<R>() 产生。
-using ResourceMap = std::unordered_map<std::size_t, std::shared_ptr<void>>;
+struct ResourceKey {
+    std::size_t type_id{0};
+    std::string name;
+
+    bool operator==(const ResourceKey& other) const noexcept {
+        return type_id == other.type_id && name == other.name;
+    }
+};
+
+struct ResourceKeyHash {
+    std::size_t operator()(const ResourceKey& key) const noexcept {
+        const auto name_hash = std::hash<std::string>{}(key.name);
+        return key.type_id ^ (name_hash + 0x9e3779b9U +
+            (key.type_id << 6U) + (key.type_id >> 2U));
+    }
+};
+
+inline constexpr std::string_view kDefaultResourceName{""};
+
+// 应用级资源表：(类型键, 名称) → 类型擦除的共享资源。由 CoApp 装配期
+// 写入，运行期只读；旧无名 API 使用内部默认槽位。
+using ResourceMap = std::unordered_map<ResourceKey, std::shared_ptr<void>,
+    ResourceKeyHash>;
 
 class ServiceContext {
 public:
@@ -50,12 +72,18 @@ public:
         return CurrentRequestContext();
     }
 
-    // 资源缝：取已装配的类型 R 客户端；未装配 → nullptr。
+    // 资源缝：取旧无名槽位或按名称取已装配的类型 R 客户端；未装配 → nullptr。
     template <class R>
     std::shared_ptr<R> resource() const {
+        return resource<R>(kDefaultResourceName);
+    }
+
+    template <class R>
+    std::shared_ptr<R> resource(std::string_view name) const {
         if (!m_resources)
             return nullptr;
-        const auto it = m_resources->find(detail::ResourceTypeId<R>());
+        const ResourceKey key{detail::ResourceTypeId<R>(), std::string{name}};
+        const auto it = m_resources->find(key);
         if (it == m_resources->end())
             return nullptr;
         return std::static_pointer_cast<R>(it->second);
