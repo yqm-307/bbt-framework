@@ -3,9 +3,10 @@
 ## 定位与职责
 
 - 本仓是可 fork 的 C++ 正式服务框架与工程脚手架：App/Service 基类、启动/生命周期、配置、注册发现、Stub 等分布式基础能力；使用者在应用层目录开发业务。
+- 本仓的分布式服务端框架架构基调真源是 [`docs/architecture/distributed-framework-baseline.md`](docs/architecture/distributed-framework-baseline.md)，配套验收矩阵和证据索引也位于同目录。具体 API、依赖、注册中心、状态存储和实现任务仍须按对应 Issue/ADR 单独确认。
 - 本仓通过 `bbtools-infra` 的公开构建目标统一获得 HTTP、RPC、MCP 和第三方适配；infra 按需消费 core/coroutine。旧 http/rpc/network/conet 仅为迁移来源，禁止新增直接依赖。
 - 框架上游不硬编码具体产品业务；fork 后应用层正是业务开发位置。通用注册发现和 Stub 属于框架/扩展，不与 Workbench 业务任务/租约混淆。不强制其他语言应用或 collab-services 成为本仓 fork。
-- 当前仅规范初始化，尚无框架构建/测试入口；不要把目标能力写成现有事实。
+- 当前 README 已提供框架的构建与测试入口；不要把尚未实现的分布式扩展能力写成现有事实。
 
 ## 工作方式
 
