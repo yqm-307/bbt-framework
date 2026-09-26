@@ -6,6 +6,8 @@
 #include <limits>
 #include <utility>
 
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
+
 namespace bbt::framework {
 
 std::mutex OrderedSession::s_registry_mtx;
@@ -14,10 +16,23 @@ std::vector<OrderedSession::RegistryEntry> OrderedSession::s_registry;
 namespace {
 
 // 契约第 213 行：六个错误统一 RemoteError + domain="framework.actor"。
+// infra #39：本函数是 actor 域错误的真实构造边界，经
+// ValidateErrorAtBoundary 落实域保留键归属/格式校验后才返回；
+// 校验失败整体降级为 ProtocolError，不放行非法 actor 错误。
 Error OrderedDomainError(const char* domain_code, std::string message) {
     Error e = MakeError(ErrorCode::RemoteError, std::move(message));
     e.domain = kOrderedErrorDomain;
     e.domain_code = domain_code;
+    return e;
+}
+
+// 带 details 的 actor 域错误：构造后即过边界校验，非法形态不进入调用方。
+Error OrderedDomainErrorWithDetails(const char* domain_code,
+                                    std::string message, ErrorDetails details) {
+    Error e = OrderedDomainError(domain_code, std::move(message));
+    e.details = std::move(details);
+    auto v = ValidateErrorAtBoundary(e);
+    if (!v) return v.error();
     return e;
 }
 
@@ -137,12 +152,11 @@ result<void> OrderedSession::BindForSend(
     }
     // 首次发送不得越过仍未发送的更小序号票据（契约第 209 行）。
     if (ticket->sequence() != bind_watermark_ + 1) {
-        Error e = OrderedDomainError(
+        return result<void>::err(OrderedDomainErrorWithDetails(
             ordered_domain_code::kSequenceGap,
-            "first send would skip an unsent ticket");
-        e.details.emplace_back("expected_sequence",
-                               std::to_string(bind_watermark_ + 1));
-        return result<void>::err(std::move(e));
+            "first send would skip an unsent ticket",
+            {{std::string(kErrorDetailExpectedSequence),
+              std::to_string(bind_watermark_ + 1)}}));
     }
     ticket->BindOrCheck(content);  // 未绑定，必然成功
     ++bind_watermark_;

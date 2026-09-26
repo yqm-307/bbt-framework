@@ -7,19 +7,25 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/infra/HttpClient.hpp>
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/Framework.hpp>
+#include <bbt/framework/internal/ActorRegistry.hpp>
 #include <bbt/framework/internal/CoAppSeam.hpp>
+#include <bbt/framework/internal/InboundDispatcher.hpp>
+#include <bbt/framework/internal/MethodTable.hpp>
+#include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
 
@@ -40,10 +46,21 @@ public:
         auto args = req.Parse<std::string, std::int32_t>();
         if (!args) return fw::CoRpcResp::Error(args.error());
         if (g_hits != nullptr) g_hits->fetch_add(1, std::memory_order_acq_rel);
-        if (std::get<1>(args.value()) == -1)
+        const auto value = std::get<1>(args.value());
+        if (value == -1)
             return fw::CoRpcResp::Error(
                 fw::MakeError(fw::ErrorCode::RemoteError, "business failure"));
-        return fw::CoRpcResp::From(std::get<1>(args.value()));
+        if (value == -2 || value == -3 || value == -4) {
+            auto error = fw::MakeError(fw::ErrorCode::RemoteError,
+                                       "ordered business failure");
+            error.domain = value == -4 ? "app.billing" : "framework.actor";
+            error.domain_code = value == -4 ? "InvoiceDenied" : "SequenceGap";
+            error.details.emplace_back(
+                value == -4 ? "invoice_id" : "expected_sequence",
+                value == -2 ? "not-a-number" : value == -3 ? "7" : "INV-1");
+            return fw::CoRpcResp::Error(std::move(error));
+        }
+        return fw::CoRpcResp::From(value);
     }
 
     static constexpr auto kRpcMethods = fw::RpcMethods(
@@ -187,6 +204,28 @@ struct Fixture {
         return std::move(*state->out);
     }
 
+    fw::result<inf::RpcEnvelope> CallDirect(
+        fw::InboundDispatcher& dispatcher, const inf::RpcEnvelope& env) {
+        auto state = std::make_shared<CallState>();
+        const auto request = env;
+        bool registered = false;
+        g_scheduler->RegistCoroutineTask(
+            [&dispatcher, state, request] {
+                inf::IncomingCallContext incoming;
+                incoming.deadline = Clock::now() + std::chrono::seconds{10};
+                state->out.emplace(dispatcher.Dispatch(incoming, request));
+                state->done.store(true, std::memory_order_release);
+            },
+            registered);
+        BOOST_REQUIRE(registered);
+        const auto until = Clock::now() + std::chrono::seconds{10};
+        while (!state->done.load(std::memory_order_acquire) &&
+               Clock::now() < until)
+            std::this_thread::yield();
+        BOOST_REQUIRE(state->done.load(std::memory_order_acquire));
+        return std::move(*state->out);
+    }
+
     ~Fixture() {
         if (client) client->RequestClose();
         if (client_runtime) client_runtime->RequestClose();
@@ -244,6 +283,70 @@ BOOST_AUTO_TEST_CASE(ordered_ingress_loopback_replays_and_rejects_conflicts) {
         MakeEnvelope("ordered-3", "acct-1", -1, 3));
     BOOST_REQUIRE(!failed_replay);
     BOOST_CHECK_EQUAL(failed_replay.error().message, failed.error().message);
+    BOOST_CHECK_EQUAL(hits.load(), 3);
+}
+
+BOOST_AUTO_TEST_CASE(ordered_direct_error_boundary_matches_replay) {
+    std::atomic<int> hits{0};
+    Fixture fixture;
+    fixture.Start(hits);
+
+    fw::ActorRegistry registry;
+    BOOST_REQUIRE(registry.RegisterFactory(
+        "ordered", [] { return std::make_shared<OrderedSvc>(); }, 16));
+    auto table = fw::BuildMethodTable<OrderedSvc>();
+    auto created = fw::OrderedIngress::Create(
+        fw::OrderedIngressConfig{"ordered", 8, 64, 65536});
+    BOOST_REQUIRE(created);
+    auto ingress = created.value();
+    fw::OrderedGrant grant;
+    grant.service = "ordered";
+    grant.actor_key = "acct-1";
+    grant.producer_id = "producer.test";
+    grant.producer_epoch = "producer-epoch-1";
+    grant.receiver_epoch = "receiver-epoch-1";
+    BOOST_REQUIRE(ingress->GrantStream(grant));
+    const fw::ServiceOptions opts{
+        fw::ExecutionPolicy::ActorSerial, 64, 16, 8,
+        true, 8, 64, 65536};
+    std::map<std::string, fw::InboundDispatcher::ServiceEntry> services;
+    services.emplace("ordered", fw::InboundDispatcher::ServiceEntry{
+        opts, &table, nullptr, &registry, ingress});
+    fw::InboundDispatcher dispatcher(std::move(services));
+
+    const auto invalid = MakeEnvelope("invalid-1", "acct-1", -2, 1);
+    auto first = fixture.CallDirect(dispatcher, invalid);
+    auto replay = fixture.CallDirect(dispatcher, invalid);
+    BOOST_REQUIRE(!first);
+    BOOST_REQUIRE(!replay);
+    BOOST_CHECK(first.error().code == fw::ErrorCode::ProtocolError);
+    BOOST_CHECK(replay.error().code == fw::ErrorCode::ProtocolError);
+    BOOST_CHECK(first.error().details.empty());
+    BOOST_CHECK(replay.error().details.empty());
+    BOOST_CHECK_EQUAL(first.error().domain, replay.error().domain);
+    BOOST_CHECK_EQUAL(hits.load(), 1);
+
+    const auto actor = MakeEnvelope("valid-actor-2", "acct-1", -3, 2);
+    auto actor_first = fixture.CallDirect(dispatcher, actor);
+    auto actor_replay = fixture.CallDirect(dispatcher, actor);
+    BOOST_REQUIRE(!actor_first);
+    BOOST_REQUIRE(!actor_replay);
+    BOOST_CHECK_EQUAL(actor_first.error().domain, "framework.actor");
+    BOOST_CHECK_EQUAL(actor_first.error().domain_code, "SequenceGap");
+    BOOST_REQUIRE_EQUAL(actor_first.error().details.size(), 1u);
+    BOOST_CHECK_EQUAL(actor_first.error().details[0].second, "7");
+    BOOST_CHECK(actor_replay.error().details == actor_first.error().details);
+
+    const auto extension = MakeEnvelope("valid-extension-3", "acct-1", -4, 3);
+    auto app_first = fixture.CallDirect(dispatcher, extension);
+    auto app_replay = fixture.CallDirect(dispatcher, extension);
+    BOOST_REQUIRE(!app_first);
+    BOOST_REQUIRE(!app_replay);
+    BOOST_CHECK_EQUAL(app_first.error().domain, "app.billing");
+    BOOST_CHECK_EQUAL(app_first.error().domain_code, "InvoiceDenied");
+    BOOST_REQUIRE_EQUAL(app_first.error().details.size(), 1u);
+    BOOST_CHECK_EQUAL(app_first.error().details[0].second, "INV-1");
+    BOOST_CHECK(app_replay.error().details == app_first.error().details);
     BOOST_CHECK_EQUAL(hits.load(), 3);
 }
 

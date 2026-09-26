@@ -11,6 +11,7 @@ using result = bbt::infra::result<T>;
 
 using bbt::infra::Error;
 using bbt::infra::ErrorCode;
+using bbt::infra::ErrorDetails;
 using bbt::infra::MakeError;
 
 } // namespace bbt::framework
