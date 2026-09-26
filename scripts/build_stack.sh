@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # 依赖与构建唯一配方：core/coroutine/infra 全部经 add_subdirectory 源码接入，
-# 由 infra 顶层统一编排（core → coroutine → infra → 目标工程）。
+# 由 infra 顶层统一编排（core → coroutine → infra → 目标工程）。infra 的新版本
+# 可能使用 coroutine 的 core/pollevent 直依赖，不再生成 bbt_core；旧版本仍按
+# bbt_core 链接。脚本末尾按实际链接架构分别做来源门禁。
 #
-# 为什么需要它：bbtools-coroutine 按名字链接 bbt_core 并按 <bbt/core/...>
-# 包含 core 头；三个上游仓都不导出可消费 CMake 包（无 install/export），
-# 源码消费只能经显式 *_SOURCE_DIR 路径接入。infra（94a835a 起）在校验
-# coroutine 仍引用 bbt_core 时要求本构建已有真实 bbt_core target，否则
-# fail-closed——因此必须把 BBT_CORE_SOURCE_DIR 传给 infra 由它 add_subdirectory，
+# 为什么需要它：旧版 bbtools-coroutine 按名字链接 bbt_core 并按 <bbt/core/...>
+# 包含 core 头；新版可将 core/pollevent 作为 coroutine 直依赖。三个上游仓
+# 都不导出可消费 CMake 包（无 install/export），源码消费只能经显式 *_SOURCE_DIR
+# 路径接入。对仍引用 bbt_core 的旧版 coroutine，infra 在校验时要求本构建已有
+# 真实 bbt_core target，否则 fail-closed；因此保留 BBT_CORE_SOURCE_DIR 传递，
 # 不能用「装 .so+头到前缀」的方式绕过（prefix 不产生 target）。
 #
 # 可用环境变量（均有默认值）：
@@ -88,12 +90,9 @@ if [ "${BBT_ALLOW_OFF_PIN:-0}" != "1" ] && [ -f "$LOCK" ]; then
     log "依赖树与 deps.lock 一致"
 fi
 
-# ---- 1) core：经 BBT_CORE_SOURCE_DIR 由 infra add_subdirectory 接入 ----------
-# infra（94a835a 起）的 fail-closed 契约要求 coroutine 按名字链 bbt_core 时
-# 本构建必须已有真实 bbt_core target——prefix（只给 .so+头）不产生 target，
-# 无法通过该校验。因此改为把 core 源码树显式传给 infra，由它 add_subdirectory
-# 建立真实 target；coroutine 的 -lbbt_core 与 <bbt/core/...> 头都由该 target
-# 的 usage requirements 解析，不再依赖本脚本前缀或 /usr/local。
+# ---- 1) core：由 infra 依赖图按需接入 ---------------------------------------
+# 旧版 coroutine/infra 仍需 core target；新版 coroutine 可直接携带 core/pollevent。
+# 两种架构都使用源码树接入，避免依赖前缀或 /usr/local 的旧产物。
 _need() { # $1=必须存在的路径  $2=角色说明
     if [ ! -e "$1" ]; then
         echo "[build_stack] FATAL: 依赖闭包缺口: $1 —— $2" >&2
@@ -148,25 +147,27 @@ echo "## [diag] Test_framework_f0 RUNPATH"
 readelf -d "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>/dev/null | grep -iE 'RPATH|RUNPATH' || true
 echo "## [diag] built core lib on disk"
 ls -la "$BBT_BUILD_DIR/_deps/bbtools-core/lib/" 2>/dev/null || echo "(no core lib dir)"
-echo "## [diag] libbbt_coroutine RUNPATH (its NEEDED bbt_core resolves here)"
+echo "## [diag] libbbt_coroutine runtime dependencies"
 readelf -d "$BBT_BUILD_DIR/_deps/bbtools-coroutine/lib/libbbt_coroutine.so" 2>/dev/null | grep -iE 'RPATH|RUNPATH|NEEDED' || true
 
-# 可判定门禁：干净 runner 不许依赖 /usr/local 旧产物；core 必须经
-# add_subdirectory 解析到 build 树内的真实 target（路径含 $BBT_BUILD_DIR）。
+# 可判定门禁：干净 runner 不许依赖 /usr/local 旧产物；旧架构检查
+# bbt_core，新架构检查 coroutine 直依赖。两者都必须解析到当前 build 树，
+# 报告为空或未命中任一架构时均失败，避免门禁静默失效。
 if grep -q "/usr/local/" "$LINK_REPORT"; then
     echo "[build_stack] FATAL: 构建产物链接到 /usr/local 下的库（干净 runner 要求不依赖旧安装）" >&2
     grep -n "/usr/local/" "$LINK_REPORT" >&2
     exit 7
 fi
-# core 断言必须是路径断言，不能只匹配子串：非 /usr/local 的旧前缀（/opt、~/prefix）
-# 也会产生 libbbt_core.so 行；报告为空（目标改名/移深/NEED_TEST=OFF）时整条
-# 门禁不得静默失效。
 if [ ! -s "$LINK_REPORT" ]; then
     echo "[build_stack] FATAL: 链接来源报告为空——未收集到任何可执行产物，无法证明依赖来源" >&2
     exit 7
 fi
-if ! grep -q "libbbt_core.*$BBT_BUILD_DIR" "$LINK_REPORT"; then
-    echo "[build_stack] FATAL: 构建产物未解析到 build 树内的 bbt_core（应含 $BBT_BUILD_DIR 路径）" >&2
+if grep -q "libbbt_core.*$BBT_BUILD_DIR" "$LINK_REPORT"; then
+    log "链接门禁：检测到 build 树内 bbt_core（旧架构）"
+elif grep -q "libbbt_coroutine.*$BBT_BUILD_DIR" "$LINK_REPORT"; then
+    log "链接门禁：检测到 build 树内 bbt_coroutine（直依赖架构）"
+else
+    echo "[build_stack] FATAL: 构建产物未解析到 build 树内的 bbt_core 或 bbt_coroutine" >&2
     exit 7
 fi
 log "完成：build=$BBT_BUILD_DIR（core/coroutine/infra 均源码接入，无外部前缀）"
