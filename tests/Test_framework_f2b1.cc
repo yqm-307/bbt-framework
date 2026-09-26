@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -16,8 +17,11 @@
 
 #include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/OrderedTypes.hpp>
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
+#include <bbt/framework/internal/RpcHttpBridge.hpp>
 
 namespace fw = bbt::framework;
+namespace inf = bbt::infra;
 
 namespace {
 
@@ -272,6 +276,179 @@ BOOST_AUTO_TEST_CASE(domain_code_constants_match_contract) {
     BOOST_CHECK_EQUAL(std::string(fw::ordered_domain_code::kStreamRejected),
                       "StreamRejected");
     BOOST_CHECK_EQUAL(std::string(fw::kOrderedErrorDomain), "framework.actor");
+}
+
+// 用例 8（infra #39）：actor 域专属语义校验迁回 framework 边界后的归属回归。
+// infra::ValidateErrorDetails 只做通用结构校验，不再拒绝非法 actor 键；
+// framework 边界（ValidateErrorAtBoundary）必须维持旧版拒绝集：
+//   合法 actor 错误通过、非 actor 合法扩展通过、跨域写保留键拒绝、
+//   保留键非法值拒绝、非法编码/重复键/越界长度仍拒绝。
+BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
+    using fw::ValidateErrorAtBoundary;
+    using fw::ValidateErrorDomainRules;
+
+    // 正常 actor 错误：域归属正确 + 无符号十进制 → 通过
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap");
+        e.domain = std::string(fw::kErrorDomainFrameworkActor);
+        e.domain_code = fw::ordered_domain_code::kSequenceGap;
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "7"}};
+        auto r = ValidateErrorAtBoundary(e);
+        BOOST_CHECK(r);
+    }
+
+    // 合法非 actor 扩展：自定义域 + 自定义键 → 通过（不被 actor 规则误伤）
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "app");
+        e.domain = "app.billing";
+        e.details = {{"invoice_id", "INV-1"}, {"attempt", "2"}};
+        BOOST_CHECK(ValidateErrorAtBoundary(e));
+    }
+
+    // 非法值：actor 域的 expected_sequence 非无符号十进制 → 拒绝
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap");
+        e.domain = std::string(fw::kErrorDomainFrameworkActor);
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "x7"}};
+        auto r = ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!r);
+        BOOST_CHECK(r.error().code == fw::ErrorCode::ProtocolError);
+    }
+
+    // 跨域写保留键：infra 域/其他域携带 expected_sequence → 拒绝
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::ProtocolError, "x");
+        e.domain = std::string(bbt::infra::kErrorDomainInfra);
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "7"}};
+        auto r = ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!r);
+        BOOST_CHECK(r.error().code == fw::ErrorCode::ProtocolError);
+    }
+
+    // 结构违规仍由 infra 通用层拒绝：重复键 / 非法 UTF-8 / 越界长度
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "s");
+        e.domain = std::string(fw::kErrorDomainFrameworkActor);
+        e.details = {{"a", "1"}, {"a", "2"}};
+        auto r = ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!r);
+        BOOST_CHECK(r.error().code == fw::ErrorCode::ProtocolError);
+
+        e.details = {{"k", "\xff\xfe"}};
+        r = ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!r);
+
+        e.details = {{std::string(65, 'k'), "v"}};
+        r = ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!r);
+    }
+
+    // 分层确认：同一非法 actor 错误，infra 通用层不再拒绝、
+    // framework 边界仍拒绝——旧版拒绝集没有因迁移被静默放宽。
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap");
+        e.domain = std::string(fw::kErrorDomainFrameworkActor);
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "x7"}};
+        BOOST_CHECK(bbt::infra::ValidateErrorDetails(e));
+        BOOST_CHECK(!ValidateErrorDomainRules(e));
+        BOOST_CHECK(!ValidateErrorAtBoundary(e));
+    }
+}
+
+// 用例 9（infra #39 R2）：真实 ToHttpResponse 出站边界的降级回归。
+// 不走 helper 直连——构造 result<RpcEnvelope>::err(...) 喂给
+// http_bridge::ToHttpResponse，断言 wire 输出本身：
+//   a) actor 域非法 expected_sequence → 降级为 ProtocolError，且
+//      原始非法值/保留键不出现在任何 header；
+//   b) 跨域携带保留键 → 同样降级；
+//   c) 合法 actor 错误 → 既有 code/domain/domain_code/message 映射不变；
+//   d) 合法错误的 details 不上 wire（#8 未实现，不得宣称传递）。
+BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
+    namespace Wire = fw::http_bridge;
+    using inf::RpcEnvelope;
+
+    auto header_of = [](const inf::HttpResponse& r,
+                        std::string_view name) -> std::optional<std::string> {
+        for (const auto& [k, v] : r.headers)
+            if (k == name) return v;
+        return std::nullopt;
+    };
+
+    // a) actor 域非法 expected_sequence：真实出站必须降级且不泄露原值
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError,
+                                    "actor gap detail");
+        e.domain = std::string(fw::kErrorDomainFrameworkActor);
+        e.domain_code = fw::ordered_domain_code::kSequenceGap;
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "x7"}};
+
+        const auto res = Wire::ToHttpResponse(
+            fw::result<RpcEnvelope>::err(std::move(e)));
+
+        BOOST_REQUIRE_EQUAL(res.status, 400u);
+        const auto code = header_of(res, "x-bbt-err-code");
+        BOOST_REQUIRE(code);
+        BOOST_CHECK_EQUAL(*code,
+            std::to_string(static_cast<int>(fw::ErrorCode::ProtocolError)));
+        // 降级后是通用 ProtocolError：不保留原 domain/domain_code/message
+        BOOST_CHECK(header_of(res, "x-bbt-err-domain"));
+        BOOST_CHECK(!header_of(res, "x-bbt-err-domain-code") ||
+                    header_of(res, "x-bbt-err-domain-code")->empty());
+        // 原始非法值 "x7" 与保留键名不得出现在任何 header 值/键中
+        for (const auto& [k, v] : res.headers) {
+            BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
+            BOOST_CHECK(v.find("x7") == std::string::npos);
+            BOOST_CHECK(v.find("SequenceGap") == std::string::npos);
+            BOOST_CHECK(v.find("actor gap detail") == std::string::npos);
+        }
+    }
+
+    // b) 跨域携带保留键：infra 域错误带 expected_sequence → 出站降级
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::ProtocolError, "x");
+        e.domain = std::string(bbt::infra::kErrorDomainInfra);
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "7"}};
+
+        const auto res = Wire::ToHttpResponse(
+            fw::result<RpcEnvelope>::err(std::move(e)));
+
+        BOOST_REQUIRE_EQUAL(res.status, 400u);
+        const auto code = header_of(res, "x-bbt-err-code");
+        BOOST_REQUIRE(code);
+        BOOST_CHECK_EQUAL(*code,
+            std::to_string(static_cast<int>(fw::ErrorCode::ProtocolError)));
+        for (const auto& [k, v] : res.headers)
+            BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
+    }
+
+    // c) 合法 actor 错误：既有 wire 映射不回归——code/domain/domain_code/
+    //    message 原样落 header，details 本身不上 wire
+    {
+        fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap msg");
+        e.domain = std::string(fw::kErrorDomainFrameworkActor);
+        e.domain_code = fw::ordered_domain_code::kSequenceGap;
+        e.details = {{std::string(fw::kErrorDetailExpectedSequence), "42"}};
+
+        const auto res = Wire::ToHttpResponse(
+            fw::result<RpcEnvelope>::err(std::move(e)));
+
+        BOOST_REQUIRE_EQUAL(res.status, 400u);
+        BOOST_CHECK_EQUAL(
+            header_of(res, "x-bbt-err-code").value_or(""),
+            std::to_string(static_cast<int>(fw::ErrorCode::RemoteError)));
+        BOOST_CHECK_EQUAL(header_of(res, "x-bbt-err-domain").value_or(""),
+                          "framework.actor");
+        BOOST_CHECK_EQUAL(
+            header_of(res, "x-bbt-err-domain-code").value_or(""),
+            "SequenceGap");
+        BOOST_CHECK_EQUAL(header_of(res, "x-bbt-err-message").value_or(""),
+                          "gap msg");
+        // details 不经现有 wire 传递（#8 范围）：无 header 携带 42
+        for (const auto& [k, v] : res.headers) {
+            BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
+            BOOST_CHECK(v != "42");
+        }
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -4,6 +4,8 @@
 
 #include <utility>
 
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
+
 namespace bbt::framework {
 
 namespace {
@@ -74,9 +76,14 @@ std::size_t OrderedIngress::ReplyBytes(const OrderedTerminalReply& reply) {
 }
 
 Error OrderedIngress::_GapError(std::uint64_t next_sequence) const {
+    // infra #39：带 details 的 actor 域错误在构造边界过
+    // ValidateErrorAtBoundary；非法形态整体降级为 ProtocolError。
     Error e = OrderedIngestError(ordered_domain_code::kSequenceGap,
         "ordered sequence gap: future sequence not buffered");
-    e.details.emplace_back("expected_sequence", std::to_string(next_sequence));
+    e.details.emplace_back(std::string(kErrorDetailExpectedSequence),
+                           std::to_string(next_sequence));
+    auto v = ValidateErrorAtBoundary(e);
+    if (!v) return v.error();
     return e;
 }
 
@@ -297,6 +304,19 @@ result<void> OrderedIngress::Complete(const Admission& admission,
     const std::string request_id = in_flight->second.request_id;
     const std::string digest     = in_flight->second.digest;
     state.in_flight.erase(in_flight);
+
+    // infra #39 收口：缓存终态前过 framework.actor 域边界校验。违规错误
+    // （如非本域写入 expected_sequence 保留键或值格式非法）不进入缓存——
+    // 规范化为无 details 的 ProtocolError 终态，保证后续非 HTTP Replay
+    // 不会把非法 actor details 重放到框架内部消费路径。序号终态语义不变：
+    // 已消耗序号仍保留终态，重复请求仍重放（只是内容已是安全错误）。
+    if (!reply.is_ok) {
+        if (auto v = ValidateErrorAtBoundary(reply.error); !v) {
+            Error safe = v.error();          // 边界校验自身返回的 ProtocolError
+            reply.error      = std::move(safe);
+            reply.error.details.clear();     // 防御：确保无非法 details 入缓存
+        }
+    }
 
     // 接纳后取消、排队到期、业务失败都保留终态：后续重复请求重放该终态，
     // 不重新执行（契约第 257 行）。

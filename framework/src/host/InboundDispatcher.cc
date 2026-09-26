@@ -12,6 +12,7 @@
 
 #include <bbt/framework/internal/OrderedIngress.hpp>
 
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
 #include <bbt/framework/internal/RequestScope.hpp>
 #include <bbt/framework/Route.hpp>
 
@@ -234,8 +235,19 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
                 return result<RpcEnvelope>::err(std::move(admitted.error()));
             if (admitted.value().kind == OrderedIngress::DecisionKind::Replay) {
                 const auto& replay = admitted.value().replay;
-                if (!replay.is_ok)
-                    return result<RpcEnvelope>::err(replay.error);
+                if (!replay.is_ok) {
+                    // infra #39 收口：Replay 是缓存终态离开本组件的边界。
+                    // 尽管 Complete 入缓存前已规范化，这里仍对出缓存的
+                    // 错误做同一边界校验作防御——任何经其他路径进入缓存的
+                    // 非法错误不会经非 HTTP Dispatch 原样重放。
+                    const Error* rep = &replay.error;
+                    Error safe;
+                    if (auto v = ValidateErrorAtBoundary(*rep); !v) {
+                        safe = v.error();
+                        rep = &safe;
+                    }
+                    return result<RpcEnvelope>::err(*rep);
+                }
                 RpcEnvelope reply;
                 reply.service         = request.service;
                 reply.method          = request.method;
@@ -249,6 +261,10 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
 
         auto finish_ordered_error = [&](Error error)
             -> result<RpcEnvelope> {
+            // 首发结果与 Complete 缓存的终态须使用同一安全错误；
+            // 不能只规范化缓存，让非 HTTP 首发路径泄露非法 details。
+            if (auto valid = ValidateErrorAtBoundary(error); !valid)
+                error = std::move(valid.error());
             if (!ordered_admission)
                 return result<RpcEnvelope>::err(std::move(error));
             OrderedTerminalReply terminal;

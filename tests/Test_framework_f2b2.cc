@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <bbt/framework/OrderedTypes.hpp>
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
 #include <bbt/framework/internal/OrderedIngress.hpp>
 
 namespace fw = bbt::framework;
@@ -240,8 +241,8 @@ BOOST_AUTO_TEST_CASE(future_sequence_returns_gap_with_expected) {
     const std::string* expected = DetailValue(gap.error(), "expected_sequence");
     BOOST_REQUIRE(expected != nullptr);
     BOOST_CHECK_EQUAL(*expected, "2");
-    // 期望序号是 infra 保留键要求的无符号十进制，且域归属正确
-    BOOST_CHECK(bbt::infra::ValidateErrorDetails(gap.error()));
+    // infra #39：期望序号的域归属/十进制格式由 framework 边界校验负责
+    BOOST_CHECK(fw::ValidateErrorAtBoundary(gap.error()));
     // 未消费序号、未登记在途
     BOOST_CHECK_EQUAL(NextSequenceOf(ing, g), 2u);
 
@@ -724,6 +725,116 @@ BOOST_AUTO_TEST_CASE(complete_rejects_foreign_admission) {
     auto r2 = ing->Complete(replay, OkReply("ok"));
     BOOST_REQUIRE(!r2);
     BOOST_CHECK(r2.error().code == fw::ErrorCode::InvalidArgument);
+}
+
+// 用例 17（infra #39 收口）：非法 actor details 的终态错误在 Complete
+// 入缓存前被边界校验规范化为安全的 ProtocolError；同一请求重发走
+// Replay（非 HTTP 路径）时观察到的是规范化后的错误，不再携带非法
+// framework.actor/expected_sequence。覆盖审查 t_8380ad3d 的 🟡 阻断：
+// 非法 actor details 不能缓存也不能经 Replay 绕过边界。
+BOOST_AUTO_TEST_CASE(complete_normalizes_invalid_actor_error_before_replay) {
+    auto ing = MakeIngress();
+    const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
+    BOOST_REQUIRE(ing->GrantStream(g));
+
+    // 业务失败携带非法 details：expected_sequence 值不是无符号十进制。
+    // 该错误若原样入缓存，Replay 会把非法保留键值重放到非 HTTP 消费路径。
+    const auto req = MakeRequest(g, 1, "digest.bad");
+    auto admission = AdmitExecute(ing, req);
+    fw::OrderedTerminalReply bad = ErrReply(fw::ErrorCode::RemoteError,
+                                            "business failed",
+                                            "framework.actor",
+                                            "BusinessFailed");
+    bad.error.details.emplace_back(
+        std::string(fw::kErrorDetailExpectedSequence), "not-a-number");
+    // 构造时校验确认这确实是个非法 actor 错误（防止用例本身写错）
+    BOOST_REQUIRE(!fw::ValidateErrorAtBoundary(bad.error));
+
+    // Complete 仍消耗序号（终态语义保持），但缓存的是规范化后的安全错误
+    auto completed = ing->Complete(admission, std::move(bad));
+    BOOST_REQUIRE_MESSAGE(static_cast<bool>(completed),
+                          "complete must succeed; sequence terminal kept");
+    BOOST_CHECK_EQUAL(NextSequenceOf(ing, g), 2u);
+
+    // 非 HTTP Replay：同一票据重发 → Replay 返回的是规范化后的错误
+    auto replay = AdmitReplay(ing, req);
+    BOOST_CHECK(!replay.replay.is_ok);
+    const fw::Error& e = replay.replay.error;
+    // 规范化为 ProtocolError、无非法 details、无 actor 域伪装
+    BOOST_CHECK(e.code == fw::ErrorCode::ProtocolError);
+    BOOST_CHECK_EQUAL(DetailValue(e, std::string(fw::kErrorDetailExpectedSequence)),
+                      nullptr);
+    BOOST_CHECK(e.details.empty());
+    // 规范化后的错误自身必须过边界（不会再次触发降级）
+    BOOST_CHECK(fw::ValidateErrorAtBoundary(e));
+}
+
+// 用例 18（infra #39 收口）：跨域写保留键的终态错误同样被规范化；
+// 合法 actor 错误与合法非 actor 扩展错误经 Complete→Replay 原样保留，
+// 边界校验不误伤合规终态。
+BOOST_AUTO_TEST_CASE(complete_preserves_legal_terminal_errors) {
+    auto ing = MakeIngress();
+    const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
+    BOOST_REQUIRE(ing->GrantStream(g));
+
+    // 合法 actor 错误（domain=framework.actor + 十进制 expected_sequence）
+    const auto req_ok_actor = MakeRequest(g, 1, "d.ok.actor");
+    {
+        auto a = AdmitExecute(ing, req_ok_actor);
+        fw::OrderedTerminalReply r = ErrReply(fw::ErrorCode::RemoteError,
+                                              "sequence gap",
+                                              "framework.actor",
+                                              "SequenceGap");
+        r.error.details.emplace_back(
+            std::string(fw::kErrorDetailExpectedSequence), "7");
+        BOOST_REQUIRE(fw::ValidateErrorAtBoundary(r.error));
+        BOOST_REQUIRE(ing->Complete(a, std::move(r)));
+    }
+    auto replay_actor = AdmitReplay(ing, req_ok_actor);
+    BOOST_CHECK(!replay_actor.replay.is_ok);
+    BOOST_CHECK(replay_actor.replay.error.code == fw::ErrorCode::RemoteError);
+    BOOST_CHECK_EQUAL(replay_actor.replay.error.domain, "framework.actor");
+    BOOST_CHECK_EQUAL(replay_actor.replay.error.domain_code, "SequenceGap");
+    const std::string* es =
+        DetailValue(replay_actor.replay.error, "expected_sequence");
+    BOOST_REQUIRE(es != nullptr);
+    BOOST_CHECK_EQUAL(*es, "7");
+
+    // 合法非 actor 扩展错误（自定义域 + 自定义键）原样重放
+    const auto req_app = MakeRequest(g, 2, "d.ok.app");
+    {
+        auto a = AdmitExecute(ing, req_app);
+        fw::OrderedTerminalReply r = ErrReply(fw::ErrorCode::RemoteError,
+                                              "billing rejected",
+                                              "app.billing", "InvoiceDenied");
+        r.error.details.emplace_back("invoice_id", "INV-1");
+        BOOST_REQUIRE(fw::ValidateErrorAtBoundary(r.error));
+        BOOST_REQUIRE(ing->Complete(a, std::move(r)));
+    }
+    auto replay_app = AdmitReplay(ing, req_app);
+    BOOST_CHECK(!replay_app.replay.is_ok);
+    BOOST_CHECK_EQUAL(replay_app.replay.error.domain, "app.billing");
+    BOOST_CHECK_EQUAL(replay_app.replay.error.domain_code, "InvoiceDenied");
+    const std::string* inv =
+        DetailValue(replay_app.replay.error, "invoice_id");
+    BOOST_REQUIRE(inv != nullptr);
+    BOOST_CHECK_EQUAL(*inv, "INV-1");
+
+    // 跨域写保留键：infra 域错误携带 expected_sequence → 规范化
+    const auto req_cross = MakeRequest(g, 3, "d.cross");
+    {
+        auto a = AdmitExecute(ing, req_cross);
+        fw::OrderedTerminalReply r = ErrReply(fw::ErrorCode::RemoteError,
+                                              "infra failure", "infra", "");
+        r.error.details.emplace_back(
+            std::string(fw::kErrorDetailExpectedSequence), "7");
+        BOOST_REQUIRE(!fw::ValidateErrorAtBoundary(r.error));
+        BOOST_REQUIRE(ing->Complete(a, std::move(r)));
+    }
+    auto replay_cross = AdmitReplay(ing, req_cross);
+    BOOST_CHECK(!replay_cross.replay.is_ok);
+    BOOST_CHECK(replay_cross.replay.error.code == fw::ErrorCode::ProtocolError);
+    BOOST_CHECK(replay_cross.replay.error.details.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

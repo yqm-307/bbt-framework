@@ -3,6 +3,7 @@
 #include <utility>
 
 #include <bbt/framework/CoApp.hpp>
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 
 namespace bbt::framework::http_bridge {
@@ -76,8 +77,17 @@ bbt::infra::HttpResponse ToHttpResponse(
         res.body.assign(r.value().payload.begin(), r.value().payload.end());
         return res;
     }
+    // infra #39：回复出站是框架可信边界——携带 details 的错误在离开本进程前
+    // 过一遍完整校验（通用结构 + framework 域保留键），非法错误不序列化上
+    // wire；校验失败降级为通用 ProtocolError，不静默放行。
+    const Error* ep = &r.error();
+    Error downgraded;
+    if (auto v = ValidateErrorAtBoundary(*ep); !v) {
+        downgraded = v.error();
+        ep = &downgraded;
+    }
+    const Error& e = *ep;
     res.status = 400;
-    const auto& e = r.error();
     res.headers = {
         {"x-bbt-err-code",        std::to_string(static_cast<int>(e.code))},
         {"x-bbt-err-domain",      e.domain},
