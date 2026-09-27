@@ -91,7 +91,8 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/ActorRegistry.hpp
     internal/OrderedIngress.hpp
     internal/RpcHttpBridge.hpp
-    internal/CoAppSeam.hpp)
+    internal/CoAppSeam.hpp
+    internal/ResourceClose.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")
 set(_selfcheck_srcs "")

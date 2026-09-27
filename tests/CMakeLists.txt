@@ -73,3 +73,56 @@ target_link_libraries(Test_framework_rpc PRIVATE bbt::framework)
 target_compile_options(Test_framework_rpc PRIVATE -Wall -Wextra)
 add_test(NAME Test_framework_rpc COMMAND Test_framework_rpc)
 set_tests_properties(Test_framework_rpc PROPERTIES TIMEOUT 15)
+
+# issue #8：资源生命周期——工厂装配、Create/Start 相位、失败回滚与
+# shutdown budget 下的 RequestClose/WaitClosed 收束（INetworkHost 桩驱动）。
+add_executable(Test_framework_resource Test_framework_resource.cc)
+target_link_libraries(Test_framework_resource PRIVATE bbt::framework)
+target_compile_options(Test_framework_resource PRIVATE -Wall -Wextra)
+add_test(NAME Test_framework_resource COMMAND Test_framework_resource)
+set_tests_properties(Test_framework_resource PROPERTIES TIMEOUT 30)
+
+# issue #8 live 验收：真实 Redis/MongoDB 容器经工厂装配 + service 资源缝
+# 消费 + 关闭收束到 IsClosed。Redis 与 Mongo 是两个独立 target/CTest 用例，
+# 各自显式要求对应 infra 模块已构建（缺 target → 编译期失败而不是静默
+# 消失）；环境变量缺失时进程以 77 退出，配合 SKIP_RETURN_CODE 标为
+# CTest Skipped——缺后端必须显式 skipped 或非零失败，不得记为 Passed。
+if(TARGET bbt::infra_redis)
+    add_executable(Test_framework_resource_live_redis
+        Test_framework_resource_live.cc)
+    target_link_libraries(Test_framework_resource_live_redis PRIVATE
+        bbt::framework bbt::infra_redis)
+    target_compile_options(Test_framework_resource_live_redis PRIVATE
+        -Wall -Wextra)
+    target_compile_definitions(Test_framework_resource_live_redis PRIVATE
+        BBT_LIVE_HAS_REDIS=1)
+    add_test(NAME framework.resource.live.redis
+        COMMAND Test_framework_resource_live_redis)
+    set_tests_properties(framework.resource.live.redis PROPERTIES
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77)
+else()
+    message(STATUS
+        "framework.resource.live.redis: 未构建 bbt::infra_redis "
+        "(BBT_HIREDIS_PREFIX)，本配置无 Redis live 门禁")
+endif()
+
+if(TARGET bbt::infra_mongo)
+    add_executable(Test_framework_resource_live_mongo
+        Test_framework_resource_live.cc)
+    target_link_libraries(Test_framework_resource_live_mongo PRIVATE
+        bbt::framework bbt::infra_mongo)
+    target_compile_options(Test_framework_resource_live_mongo PRIVATE
+        -Wall -Wextra)
+    target_compile_definitions(Test_framework_resource_live_mongo PRIVATE
+        BBT_LIVE_HAS_MONGO=1)
+    add_test(NAME framework.resource.live.mongo
+        COMMAND Test_framework_resource_live_mongo)
+    set_tests_properties(framework.resource.live.mongo PROPERTIES
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77)
+else()
+    message(STATUS
+        "framework.resource.live.mongo: 未构建 bbt::infra_mongo "
+        "(BBT_MONGOC_PREFIX+BBT_MONGOCXX_PREFIX)，本配置无 Mongo live 门禁")
+endif()

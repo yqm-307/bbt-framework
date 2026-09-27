@@ -32,9 +32,11 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
 #include <bbt/framework/ExecutionPolicy.hpp>
@@ -87,6 +89,11 @@ class CoApp {
     friend std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions,
                                                    CoAppSeam);
     friend void InstallRpcHttpBridge(InfraHttpHost&, CoApp&);
+    // 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
+    // dispatch_inbound，不新增业务可见面。
+    friend result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
+        CoApp&, const bbt::infra::IncomingCallContext&,
+        bbt::infra::RpcEnvelope);
 
 public:
     // 业务路径：宿主（InfraHttpHost）、入站线桥（RpcHttpBridge）与
@@ -167,6 +174,24 @@ public:
         return _AddResource<R>(name, std::move(resource));
     }
 
+    // 延迟工厂装配：factory 的 Create 在 Scheduler 启动后、绑定 Service
+    // 之前执行（on_scheduler_started 相位），满足「Create 要求 Scheduler
+    // 已启动」的资源形态（如 infra CoRedisCli/CoMongoCli）。factory 须返回
+    // result<std::shared_ptr<R>>；创建出的实例若暴露 Start() 且该返回
+    // result<void> 则由框架在登记后调用一次，若实现
+    // bbt::infra::ICoCloseable 则由关闭序列统一 RequestClose/WaitClosed。
+    // 任一资源创建/启动失败 → 启动失败回退，不留半装配资源。
+    // name 约束与 add_resource(ptr) 相同；重复键/空工厂 → InvalidArgument。
+    template <class R, class F,
+              class = std::enable_if_t<
+                  std::is_invocable_r_v<result<std::shared_ptr<R>>, F>>>
+    result<void> add_resource(std::string_view name, F&& factory) {
+        if (name.empty())
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "add_resource: empty resource name"));
+        return _AddResourceFactory<R>(name, std::forward<F>(factory));
+    }
+
     // 出站目标解析（「自动连任意服务」不存在的落点）：只认显式配置的
     // 静态路由；未配置目标 → err(NotFound)。run 前后均可调用；
     // 出站分发必须经此门，不允许绕过。
@@ -216,6 +241,50 @@ private:
         std::shared_ptr<OrderedIngress> ordered_ingress;
     };
 
+    // 资源装配记录：登记期建立，运行期只读（关闭序列消费 closeable）。
+    // factory 为空表示 shared_ptr 预创建入口；instance 始终持有已装配实例
+    // （预创建即登记时填入，工厂入口在启动成功后填入），供关闭序列与
+    // ShutdownIncomplete 期间强持有。
+    struct ResourceSpec {
+        std::function<result<std::shared_ptr<void>>()> factory;
+        // 类型擦除的 Start 调用（仅当 R 提供 result<void> Start()）；
+        // 与类型擦除的 ICoCloseable 视图（仅当 R 继承 ICoCloseable）。
+        std::function<result<void>(const std::shared_ptr<void>&)> start;
+        std::function<std::shared_ptr<bbt::infra::ICoCloseable>(
+            const std::shared_ptr<void>&)>                      as_closeable;
+        std::shared_ptr<void>                                 instance;
+        bool closed{false};   // 关闭序列幂等标记
+    };
+    using ResourceSpecMap = std::unordered_map<ResourceKey, ResourceSpec,
+                                               ResourceKeyHash>;
+
+    // 检测 R 是否提供 result<void> R::Start()（资源可选启动口）。
+    template <class R, class = void>
+    struct HasResourceStart : std::false_type {};
+    template <class R>
+    struct HasResourceStart<R,
+        std::void_t<decltype(std::declval<R*>()->Start())>>
+        : std::is_same<decltype(std::declval<R*>()->Start()), result<void>> {};
+
+    template <class R>
+    static ResourceSpec _MakeSpec() {
+        ResourceSpec spec;
+        if constexpr (HasResourceStart<R>::value) {
+            spec.start = [](const std::shared_ptr<void>& p) -> result<void> {
+                return std::static_pointer_cast<R>(p)->Start();
+            };
+        }
+        if constexpr (std::is_base_of_v<bbt::infra::ICoCloseable, R>) {
+            spec.as_closeable =
+                [](const std::shared_ptr<void>& p)
+                    -> std::shared_ptr<bbt::infra::ICoCloseable> {
+                return std::static_pointer_cast<bbt::infra::ICoCloseable>(
+                    std::static_pointer_cast<R>(p));
+            };
+        }
+        return spec;
+    }
+
     template <class R>
     result<void> _AddResource(std::string_view name,
                               std::shared_ptr<R> resource) {
@@ -227,7 +296,43 @@ private:
             return result<void>::err(MakeError(ErrorCode::Closed,
                 "add_resource: registration closed (run already started)"));
         ResourceKey key{detail::ResourceTypeId<R>(), std::string{name}};
-        if (!m_resources->emplace(std::move(key), std::move(resource)).second)
+        ResourceSpec spec = _MakeSpec<R>();
+        spec.instance = std::move(resource);
+        const std::shared_ptr<void> inst = spec.instance;
+        if (!m_resource_specs.emplace(key, std::move(spec)).second)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "add_resource: duplicate resource key"));
+        // 预创建实例立即可见：m_resources 是 service 的实例视图。
+        m_resources->emplace(std::move(key), std::move(inst));
+        return result<void>::ok();
+    }
+
+    template <class R, class F>
+    result<void> _AddResourceFactory(std::string_view name, F&& factory) {
+        // 归一成 std::function 再判空：lambda 等 callable 无 operator!，
+        // std::function 的显式 bool 转换才表达「空工厂」。
+        std::function<result<std::shared_ptr<R>>()> fn =
+            std::forward<F>(factory);
+        if (!fn)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "add_resource: null factory"));
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!m_registration_open)
+            return result<void>::err(MakeError(ErrorCode::Closed,
+                "add_resource: registration closed (run already started)"));
+        ResourceKey key{detail::ResourceTypeId<R>(), std::string{name}};
+        ResourceSpec spec = _MakeSpec<R>();
+        spec.factory =
+            [f = std::move(fn)]() mutable
+                -> result<std::shared_ptr<void>> {
+                auto r = f();
+                if (!r)
+                    return result<std::shared_ptr<void>>::err(
+                        std::move(r.error()));
+                return result<std::shared_ptr<void>>::ok(
+                    std::shared_ptr<void>(std::move(r.value())));
+            };
+        if (!m_resource_specs.emplace(std::move(key), std::move(spec)).second)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
                 "add_resource: duplicate resource key"));
         return result<void>::ok();
@@ -252,6 +357,12 @@ private:
 
     result<void> _ValidateConfig() const;   // run 前校验，不启动任何组件
     result<void> _BindServices();           // Scheduler::Start 后建立对象身份
+    // 资源生命周期（#8）：on_scheduler_started 相位内先 _StartResources
+    // （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
+    // handler 排空后（on_handlers_drained）与回退路径（on_release）统一
+    // 经 _CloseResources 收束。两者幂等（ResourceSpec::closed）。
+    result<void> _StartResources();
+    void         _CloseResources(HostLifecycle& lifecycle) noexcept;
     void         _ReleaseServices() noexcept;
     // find_route 路由门 + 出站实现（ICoService::RpcSendFn 是
     // ICoService 的私有别名；CoApp 经友元命名）。
@@ -270,6 +381,9 @@ private:
     std::map<std::string, bbt::infra::RpcAddress> m_routes;
     std::shared_ptr<ResourceMap>    m_resources{
         std::make_shared<ResourceMap>()};
+    // 资源装配记录表（登记期写入，启动期消费 factory、关闭期消费
+    // closeable/instance/closed）；与 m_resources 同受 m_mtx 保护。
+    ResourceSpecMap                 m_resource_specs;
     bool                            m_registration_open{true};
 
     // 运行期持有的受管对象（ShutdownIncomplete 期间仍强持有）。

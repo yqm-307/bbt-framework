@@ -97,12 +97,19 @@ public:
 
     // 启动/关闭期挂接点（CoApp 用）：
     //  - on_scheduler_started：Scheduler::Start 之后、网络 Create 之前执行
-    //    （服务身份绑定等）；失败按启动失败回退；
+    //    （资源创建/启动 + 服务身份绑定等）；失败按启动失败回退；
+    //  - on_handlers_drained：StopAccepting → WaitHandlersDone 之后、网络
+    //    RequestClose 之前执行（资源 RequestClose/WaitClosed 收束）。仅在
+    //    网络组件已立起（Create 成功）的关闭序列中调用；签名为
+    //    void(HostLifecycle&)，实现经 RunCloseStep 获得每步预算与
+    //    ShutdownIncomplete 记账。不得抛异常（抛出按失败项记录）；
     //  - on_release：网络对象释放之后、Scheduler::Stop 之前执行
-    //    （业务对象回收）；不得抛异常。
+    //    （业务对象回收 + 启动失败回退时的资源收束兜底）；签名
+    //    void(HostLifecycle&) 供经 RunCloseStep 复用预算/记账；不得抛异常。
     struct Hooks {
-        std::function<result<void>()> on_scheduler_started;
-        std::function<void()>         on_release;
+        std::function<result<void>()>      on_scheduler_started;
+        std::function<void(HostLifecycle&)> on_handlers_drained;
+        std::function<void(HostLifecycle&)> on_release;
     };
 
     // step_budget：每个等待步的有限预算（WaitHandlersDone/WaitClosed 各自
@@ -127,12 +134,30 @@ public:
     // 收尾失败步名与原因（预算超时不算失败，算 kExitShutdownLate）。
     std::vector<std::string> Failures() const;
 
+    // ---- 关闭步骤原语（供 on_handlers_drained/on_release 钩子使用）----
+    // 以本步预算（now()+step_budget）调用 wait_fn；返回非 Closed 且为
+    // TimedOut 时按固定语义处理：记 incomplete(name)、置 ShutdownIncomplete、
+    // 以无界期限续等同一等待、迟到完成后 LeaveIncomplete 并置
+    // exceeded_budget（最终以 kExitShutdownLate 收尾）。其余非 Closed 结果
+    // 记为失败项。name 用于 IncompleteSteps/Failures 的可观察标识。
+    // 仅在 Run 的关闭序列内（控制线程）调用。
+    void RunCloseStep(
+        const std::string& name,
+        const std::function<bbt::infra::CloseStatus(
+            bbt::coroutine::Deadline,
+            bbt::coroutine::CancellationToken)>& wait_fn);
+    // 本步等待的期限（now()+step_budget）；供钩子构造 wait_fn。
+    bbt::coroutine::Deadline StepDeadline() const;
+    // 关闭期取消令牌（控制线程 RequestClose 源）；供钩子构造 wait_fn。
+    bbt::coroutine::CancellationToken CloseToken() const noexcept;
+
 private:
     result<void> _StartUp(const Hooks& hooks);
     void         _WaitShutdownRequest();
     int          _ShutDown(const Hooks& hooks);   // 返回 kExit*，固定顺序收束
     void         _WaitHandlersDone();             // 预算 + 迟到续等
     void         _WaitClosed();                   // 同上（CloseStatus 形态）
+    void         _OnHandlersDrained(const Hooks& hooks);  // 资源关闭挂接点
     bbt::coroutine::Deadline _StepDeadline() const;
     void         _EnterIncomplete(const char* step);
     void         _LeaveIncomplete(const char* step);

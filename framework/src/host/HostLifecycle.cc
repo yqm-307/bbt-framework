@@ -39,8 +39,20 @@ int HostLifecycle::Run(const Hooks& hooks) {
     }
     g_scheduler->Start();
 
-    if (auto r = _StartUp(hooks); !r) {
-        _AddFailure("startup: " + r.error().message);
+    result<void> startup = result<void>::ok();
+    try {
+        startup = _StartUp(hooks);
+    } catch (const std::exception& e) {
+        // on_scheduler_started / host Create/Start 抛出的异常一律收口为
+        // 启动失败：异常不得越过 Run 逃逸，固定回退序列仍须执行。
+        startup = result<void>::err(MakeError(ErrorCode::InternalError,
+            std::string("startup threw: ") + e.what()));
+    } catch (...) {
+        startup = result<void>::err(MakeError(ErrorCode::InternalError,
+            "startup threw (non-std::exception)"));
+    }
+    if (!startup) {
+        _AddFailure("startup: " + startup.error().message);
         // 启动中途失败：按同一固定顺序回退已立起的组件，不留半启动状态。
         (void)_ShutDown(hooks);
         _SetPhase(Phase::Failed);
@@ -86,10 +98,12 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
     _SetPhase(Phase::Closing);
 
     if (m_host_created.load(std::memory_order_acquire)) {
-        // 顺序：StopAccepting → 等 handler 结束 → RequestClose/WaitClosed
-        // → 释放已关闭网络对象。任何一步超时都不跳过、不提前释放。
+        // 顺序：StopAccepting → 等 handler 结束 → 资源收束挂接点 →
+        // RequestClose/WaitClosed → 释放已关闭网络对象。任何一步超时都不
+        // 跳过、不提前释放。
         m_host->StopAccepting();
         _WaitHandlersDone();
+        _OnHandlersDrained(hooks);
         m_host->RequestClose();
         _WaitClosed();
         m_host->ReleaseClosed();
@@ -97,7 +111,7 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
     // 业务对象回收与「释放已关闭网络对象」同组，均在 Scheduler::Stop 前。
     if (hooks.on_release) {
         try {
-            hooks.on_release();
+            hooks.on_release(*this);
         } catch (...) {
             _AddFailure("on_release hook threw");
         }
@@ -149,6 +163,46 @@ void HostLifecycle::_WaitClosed() {
         }
     }
     _AddFailure("WaitClosed: status " + std::to_string(static_cast<int>(st)));
+}
+
+void HostLifecycle::_OnHandlersDrained(const Hooks& hooks) {
+    if (!hooks.on_handlers_drained)
+        return;
+    try {
+        hooks.on_handlers_drained(*this);
+    } catch (const std::exception& e) {
+        _AddFailure(std::string("on_handlers_drained: ") + e.what());
+    } catch (...) {
+        _AddFailure("on_handlers_drained threw");
+    }
+}
+
+void HostLifecycle::RunCloseStep(
+    const std::string& name,
+    const std::function<bbt::infra::CloseStatus(
+        bbt::coroutine::Deadline,
+        bbt::coroutine::CancellationToken)>& wait_fn) {
+    auto st = wait_fn(_StepDeadline(), m_close_cancel.Token());
+    if (st == bbt::infra::CloseStatus::Closed)
+        return;
+    if (st == bbt::infra::CloseStatus::TimedOut) {
+        _EnterIncomplete(name.c_str());
+        st = wait_fn(bbt::coroutine::Deadline::max(), m_close_cancel.Token());
+        _LeaveIncomplete(name.c_str());
+        if (st == bbt::infra::CloseStatus::Closed) {
+            m_exceeded_budget.store(true, std::memory_order_release);
+            return;
+        }
+    }
+    _AddFailure(name + ": status " + std::to_string(static_cast<int>(st)));
+}
+
+bbt::coroutine::Deadline HostLifecycle::StepDeadline() const {
+    return _StepDeadline();
+}
+
+bbt::coroutine::CancellationToken HostLifecycle::CloseToken() const noexcept {
+    return m_close_cancel.Token();
 }
 
 bbt::coroutine::Deadline HostLifecycle::_StepDeadline() const {

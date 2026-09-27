@@ -43,4 +43,13 @@ struct CoAppSeam {
 std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
                                         CoAppSeam seam);
 
+// 测试侧入站分发观察口：转发到 CoApp 的私有 dispatch_inbound（经
+// InboundDispatcher 与 RequestScope 的真实分发链路，不绕过 Dispatcher）。
+// 业务路径不直接调用 dispatch_inbound；本入口仅框架测试用于断言
+// envelope→Dispatcher→handler→资源缝→reply 全链，不新增业务可见面。
+result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
+    CoApp& app,
+    const bbt::infra::IncomingCallContext& incoming,
+    bbt::infra::RpcEnvelope request);
+
 } // namespace bbt::framework

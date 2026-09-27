@@ -10,6 +10,7 @@
 #include <bbt/framework/internal/InboundDispatcher.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/internal/OrderedIngress.hpp>
+#include <bbt/framework/internal/ResourceClose.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
 
 namespace bbt::framework {
@@ -98,8 +99,23 @@ int CoApp::run() {
     m_lifecycle.store(&lifecycle, std::memory_order_release);
 
     HostLifecycle::Hooks hooks;
-    hooks.on_scheduler_started = [this] { return _BindServices(); };
-    hooks.on_release           = [this] { _ReleaseServices(); };
+    // 启动：Scheduler::Start 之后、网络 Create 之前先创建/启动资源，再
+    // 绑定 Service——满足资源「Create 要求 Scheduler 已启动」与「资源就绪
+    // 后再接纳」的装配顺序。
+    hooks.on_scheduler_started = [this] {
+        if (auto r = _StartResources(); !r)
+            return r;
+        return _BindServices();
+    };
+    // 关闭：handler 排空后、网络 RequestClose 前收束资源（资源可能在途
+    // handler 仍被引用；网络对象尚未关闭，资源可安全收尾）。
+    hooks.on_handlers_drained = [this](HostLifecycle& lc) {
+        _CloseResources(lc);
+    };
+    hooks.on_release           = [this](HostLifecycle& lc) {
+        _CloseResources(lc);   // 回退路径兜底（spec.closed 幂等）
+        _ReleaseServices();
+    };
 
     const int rc = lifecycle.Run(hooks);
 
@@ -318,6 +334,97 @@ result<void> CoApp::_BindServices() {
     return result<void>::ok();
 }
 
+result<void> CoApp::_StartResources() {
+    // Scheduler::Start 之后（on_scheduler_started）、绑定 Service 之前：
+    // 逐个执行工厂资源的 Create→Start→登记实例视图。m_resource_specs 是
+    // unordered_map（ResourceKeyHash），本处无跨资源依赖约定，顺序不敏感；
+    // 如需登记序请改存有序容器，不在注释中宣称确定性。任一失败即返回，
+    // 由 HostLifecycle 回退：已启动资源在回退路径（on_release→
+    // _CloseResources）统一收束。factory()/spec.start() 抛出的异常在此
+    // 收口为 err(InternalError)，不越过 HostLifecycle::_StartUp——保证
+    // 启动失败同样走固定回退序列，不留半启动状态。
+    std::lock_guard<std::mutex> lk(m_mtx);
+    for (auto& [key, spec] : m_resource_specs) {
+        if (!spec.factory)
+            continue;   // 预创建实例登记期已可见
+        std::shared_ptr<void> instance;
+        try {
+            auto created = spec.factory();
+            if (!created)
+                return result<void>::err(std::move(created.error()));
+            instance = std::move(created.value());
+        } catch (const std::exception& e) {
+            return result<void>::err(MakeError(ErrorCode::InternalError,
+                "add_resource factory threw for '" + key.name + "': " +
+                    e.what()));
+        } catch (...) {
+            return result<void>::err(MakeError(ErrorCode::InternalError,
+                "add_resource factory threw for '" + key.name +
+                    "' (non-std::exception)"));
+        }
+        if (!instance)
+            return result<void>::err(MakeError(ErrorCode::InternalError,
+                "add_resource factory returned null"));
+        if (spec.start) {
+            try {
+                if (auto r = spec.start(instance); !r) {
+                    // 半装配资源：留在 spec.instance 供回退收束，但不进
+                    // m_resources 实例视图（service 不可见半成品）。
+                    spec.instance = std::move(instance);
+                    return result<void>::err(std::move(r.error()));
+                }
+            } catch (const std::exception& e) {
+                spec.instance = std::move(instance);
+                return result<void>::err(MakeError(ErrorCode::InternalError,
+                    "add_resource Start threw for '" + key.name + "': " +
+                        e.what()));
+            } catch (...) {
+                spec.instance = std::move(instance);
+                return result<void>::err(MakeError(ErrorCode::InternalError,
+                    "add_resource Start threw for '" + key.name +
+                        "' (non-std::exception)"));
+            }
+        }
+        spec.instance = instance;
+        m_resources->emplace(key, std::move(instance));
+    }
+    return result<void>::ok();
+}
+
+void CoApp::_CloseResources(HostLifecycle& lifecycle) noexcept {
+    // 收集需收束的资源（持锁拷贝句柄，避免在锁内做可能阻塞的等待）。
+    struct Item {
+        std::string                                name;
+        std::shared_ptr<bbt::infra::ICoCloseable>  closeable;
+        ResourceSpec*                              spec;
+    };
+    std::vector<Item> items;
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (auto& [key, spec] : m_resource_specs) {
+            if (spec.closed || !spec.instance || !spec.as_closeable)
+                continue;
+            if (auto c = spec.as_closeable(spec.instance)) {
+                items.push_back(Item{key.name, std::move(c), &spec});
+                spec.closed = true;   // 幂等：回退路径不重复收束
+            }
+        }
+    }
+    for (auto& item : items) {
+        // RequestClose 幂等、任意线程可调；WaitClosed 桥接到协程等待，
+        // 预算与 ShutdownIncomplete 记账由 RunCloseStep 统一处理。
+        item.closeable->RequestClose();
+        auto closeable = item.closeable;
+        lifecycle.RunCloseStep(
+            "resource:" + item.name,
+            [closeable](bbt::coroutine::Deadline d,
+                        bbt::coroutine::CancellationToken c) {
+                return internal::WaitClosedOnControlThread(
+                    closeable, d, std::move(c));
+            });
+    }
+}
+
 void CoApp::_ReleaseServices() noexcept {
     std::lock_guard<std::mutex> lk(m_mtx);
     // 分发器先于注册表/实例销毁：不再接受的入站才不再有执行入口。
@@ -359,6 +466,16 @@ result<bbt::infra::RpcEnvelope> CoApp::dispatch_inbound(
             ErrorCode::RuntimeUnavailable,
             "dispatch_inbound: app not running"));
     return dispatcher->Dispatch(incoming, std::move(request));
+}
+
+result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
+    CoApp& app,
+    const bbt::infra::IncomingCallContext& incoming,
+    bbt::infra::RpcEnvelope request) {
+    // 转发私有 dispatch_inbound：测试侧拿到真实 Dispatcher/RequestContext
+    // 链路（envelope 校验 → 上下文落地 → 执行策略分发 → 回复封包），
+    // 不绕过 InboundDispatcher 直接触 handler。
+    return app.dispatch_inbound(incoming, std::move(request));
 }
 
 } // namespace bbt::framework
