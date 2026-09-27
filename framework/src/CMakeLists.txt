@@ -16,6 +16,7 @@ add_library(bbt_framework STATIC
     host/HostLifecycle.cc
     host/InboundDispatcher.cc
     host/InfraHttpHost.cc
+    host/ResourceClose.cc
     host/RpcHttpBridge.cc)
 add_library(bbt::framework ALIAS bbt_framework)
 target_include_directories(bbt_framework PUBLIC
