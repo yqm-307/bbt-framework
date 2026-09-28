@@ -126,3 +126,36 @@ else()
         "framework.resource.live.mongo: 未构建 bbt::infra_mongo "
         "(BBT_MONGOC_PREFIX+BBT_MONGOCXX_PREFIX)，本配置无 Mongo live 门禁")
 endif()
+
+# framework #4：G5 RpcEnvelope wire profile 的跨语言互通验证。
+# C++ 服务端消费 bbt::infra_rpc + bbt::infra_http；Python 客户端经
+# http.client 真实 POST /rpc 收发 protobuf body。
+# fail-closed：本测试是 issue #4 验收的强制项。infra 未注册
+# bbt_infra_rpc 目标（例如接入时漏给 BBT_PROTOBUF_PREFIX）时必须在
+# configure 阶段非零失败，不允许静默跳过导致验收证据缺口。
+if(NOT TARGET bbt_infra_rpc)
+    message(FATAL_ERROR
+        "bbt_infra_rpc 目标未注册：framework.rpc_xlang 是强制验收测试，"
+        "不允许静默跳过。请为接入的 infra 提供 "
+        "-DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12 前缀>（须含 protoc 与 "
+        "libprotobuf，详见 infra docs/dependencies/protobuf-3.21.12.provenance.md），"
+        "使 bbt_infra_rpc 目标被注册后重新配置。")
+endif()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Boost REQUIRED)
+find_package(Threads REQUIRED)
+
+add_executable(rpc_xlang_server rpc_xlang_server.cc)
+target_link_libraries(rpc_xlang_server PRIVATE
+    bbt::infra_rpc bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(rpc_xlang_server PRIVATE -Wall -Wextra)
+
+# Python 客户端零依赖（手写 proto3 wire format），仅需解释器本体；
+# 该手写解码同时验证了 wire 字段的字节级布局，不依赖同一 protobuf 库。
+add_test(
+    NAME framework.rpc_xlang
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/rpc_xlang_run.py"
+            --server-bin "$<TARGET_FILE:rpc_xlang_server>"
+            --client-py "${CMAKE_CURRENT_SOURCE_DIR}/rpc_xlang_client.py")
+set_tests_properties(framework.rpc_xlang PROPERTIES TIMEOUT 60)
