@@ -110,9 +110,14 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: bash scripts/fetch_deps.sh
 
+      - name: Prepare locked protobuf
+        if: needs.changes.outputs.code == 'true'
+        run: bash scripts/prepare_protobuf.sh "$GITHUB_WORKSPACE/.deps/protobuf-3.21.12"
+
       - name: Build (flock 串行全量)
         if: needs.changes.outputs.code == 'true'
         run: |
+          export BBT_CMAKE_ARGS="-DBBT_PROTOBUF_PREFIX=$GITHUB_WORKSPACE/.deps/protobuf-3.21.12 ${BBT_CMAKE_ARGS:-}"
           # ccache 可用则经 launcher 挂入（优雅降级，不作为硬依赖；
           # BBT_CMAKE_ARGS 由 build_stack.sh:114-122 透传给 cmake 配置）。
           if command -v ccache >/dev/null 2>&1; then
@@ -163,6 +168,12 @@ jobs:
         if: needs.changes.outputs.code == 'false'
         run: echo "docs-only change, skipping test; check reports success."
 
+      - name: Checkout test sources
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download build tree
         if: needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v4
@@ -177,6 +188,8 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: |
           chmod +x "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null || true
+          test -f "$BBT_BUILD_DIR/tests/rpc_xlang_server"
+          chmod +x "$BBT_BUILD_DIR/tests/rpc_xlang_server"
           ls -la "$BBT_BUILD_DIR"/tests/ | head -n 20
 
       - name: Verify test binaries resolve libs (fail-fast)
@@ -210,6 +223,10 @@ jobs:
             echo "FATAL: 未找到可执行测试二进制 ($BBT_BUILD_DIR/tests/Test_framework_*)" >&2
             ls -la "$BBT_BUILD_DIR"/tests/ >&2 || true
             exit 9
+          fi
+          if ldd "$BBT_BUILD_DIR/tests/rpc_xlang_server" | grep -q 'not found'; then
+            echo "FATAL: rpc_xlang_server 有未解析依赖" >&2
+            missing=1
           fi
           echo "verified binaries: $found"
           # bbt 必须解析到 build 树内（干净 runner 不许吃 /usr/local 旧产物）
