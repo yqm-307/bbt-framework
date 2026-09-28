@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(NEED_TEST "编译本仓 unit test 文件" OFF)
+option(NEED_EXAMPLE "编译 examples/ 下的可运行示例（Issue #5）" ON)
 
 # 框架库目标：F0 为 header-only INTERFACE；F2-a 起含编译产物，
 # 目标在 framework/src/CMakeLists.txt 定义（需先接入 bbt::infra_common，
@@ -107,6 +108,10 @@ add_library(bbt_framework_header_selfcheck STATIC ${_selfcheck_srcs})
 target_link_libraries(bbt_framework_header_selfcheck PRIVATE bbt::framework)
 target_compile_options(bbt_framework_header_selfcheck PRIVATE -Wall -Wextra)
 set_target_properties(bbt_framework_header_selfcheck PROPERTIES LINKER_LANGUAGE CXX)
+
+if(NEED_EXAMPLE)
+    add_subdirectory(examples)
+endif()
 
 if(NEED_TEST)
     enable_testing()

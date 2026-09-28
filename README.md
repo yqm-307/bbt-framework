@@ -64,3 +64,19 @@ ctest --test-dir build -j1 --output-on-failure
 - `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名
   `NEED_TEST`、`BUILD_TESTING` 开关在接入时被局部屏蔽。
 - 构建产物只进已忽略的 `build/`。
+
+## 可运行示例
+
+`examples/dual_service/` 提供 Issue #5 阶段 2 的双进程示例：
+`svc_a`（storage，经 `add_resource` 工厂装配真实 Redis/Mongo 后端）
++ `svc_b`（gateway，`this->call` 跨进程到 svc_a，`static_routes`
+显式路由）+ `driver`（第三进程演示客户端）。svc_a 需配置
+`BBT_HIREDIS_PREFIX` 与 `BBT_MONGOCXX_PREFIX`+`BBT_MONGOC_PREFIX`
+构建真实后端模块。构建后运行：
+
+```bash
+./examples/dual_service/run_demo.sh
+```
+
+覆盖正常请求/响应、业务错误透传、超时、未路由、对端下线与
+SIGINT/SIGTERM 优雅关闭。详见 `examples/dual_service/README.md`。
