@@ -3,9 +3,9 @@
 // NetworkRuntime + HttpServer（已验收的真实 HTTP loopback 传输）。
 //
 // 口径差异（契约 F1/F3 与 infra N0）：
-//  - infra 关闭是同步契约（ICoCloseable::Close 返回即物理释放，无
-//    RequestClose/WaitClosed 等待）；本类 Close 在控制线程直接调用
-//    NetworkRuntime::Close，与 infra 同一语义，不做协程等待桥接。
+//  - infra 关闭是同步契约（ICoCloseable::Close 返回即物理释放）；本类
+//    Close 在控制线程直接调用 NetworkRuntime::Close，与 infra 同一语义，
+//    不做协程等待桥接。
 //  - handler 在 Close 前完成的出站回复按 infra 的正常发送语义处理；Close
 //    开始后仍在途且尚未交给传输层的回复不承诺送达原客户端，测试应断言
 //    handler/owner 侧收口证据而不是伪造 flush 保证。

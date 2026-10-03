@@ -99,8 +99,8 @@ int CoApp::run() {
     m_lifecycle.store(&lifecycle, std::memory_order_release);
 
     HostLifecycle::Hooks hooks;
-    // 启动：Scheduler::Start 之后、网络 Create 之前先创建/启动资源，再
-    // 绑定 Service——满足资源「Create 要求 Scheduler 已启动」与「资源就绪
+    // 启动：runtime 初始化之后、网络 Create 之前先创建/启动资源，再
+    // 绑定 Service——满足资源「Create 要求 runtime 已初始化」与「资源就绪
     // 后再接纳」的装配顺序。
     hooks.on_scheduler_started = [this] {
         if (auto r = _StartResources(); !r)
@@ -264,7 +264,7 @@ result<void> CoApp::_ValidateConfig() const {
 }
 
 result<void> CoApp::_BindServices() {
-    // Scheduler::Start 之后调用（generation 已就位）。Concurrent → 单实例
+    // runtime 初始化之后调用（runtime 已就绪）。Concurrent → 单实例
     // 绑定；ActorSerial → 注册表工厂在激活时绑定身份，actor key 由注册表
     // 经 _bind_actor_key 绑定。所有实例共享同一出站注入点（经路由门）
     // 与同一应用级资源表（context().resource<R>() 的数据源）。
@@ -333,7 +333,7 @@ result<void> CoApp::_BindServices() {
 }
 
 result<void> CoApp::_StartResources() {
-    // Scheduler::Start 之后（on_scheduler_started）、绑定 Service 之前：
+    // runtime 初始化之后（on_scheduler_started）、绑定 Service 之前：
     // 逐个执行工厂资源的 Create→Start→登记实例视图。m_resource_specs 是
     // unordered_map（ResourceKeyHash），本处无跨资源依赖约定，顺序不敏感；
     // 如需登记序请改存有序容器，不在注释中宣称确定性。任一失败即返回，

@@ -5,9 +5,9 @@
 //   Create/Start（开始接纳）→ 运行 → StopAccepting → 等 handler 结束
 //   → 资源 Close（同步）→ 网络 Close（同步收口）→ 释放网络/业务对象
 //   → run 返回。
-// 每一步等待有有限预算；预算耗尽进入 ShutdownIncomplete——控制线程仍在
-// Run 内继续等待迟到收尾，不提前走「关闭/释放/返回」三步，不假装成功，
-// 不 _Exit/abort、不强杀线程。迟到收尾最终完成后照常走完整收束，
+// 每个等待步先使用有限预算；当前关闭等待步为 WaitHandlersDone。预算耗尽
+// 进入 ShutdownIncomplete——控制线程仍在 Run 内继续等待迟到收尾，不提前走
+// 「关闭/释放/返回」三步，不假装成功，不 _Exit/abort、不强杀线程。迟到收尾最终完成后照常走完整收束，
 // Run 返回非零（kExitShutdownLate）。
 //
 // coroutine runtime 是进程寿命单例：没有 Stop/restart，也不改代际；本

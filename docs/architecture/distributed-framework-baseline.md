@@ -232,7 +232,7 @@ Envoy 区分面向上游调用的 circuit breaking 与面向本进程资源耗�
 
 建议启动：装配校验 → runtime/infra 资源 → 安装 handler → listener 就绪但业务未 ready → 依赖与发现能力就绪 → 发布 ready/实例 → 开放正常接纳。发布失败不对外宣称可服务。
 
-建议停机：本地 readiness 关闭/拒新 → 发布 draining 或注销（尽力但有期限）→ 等待/取消既有工作 → 关闭 transport 与所有 provider → 确认 completion/close → 释放服务与资源 → 停 runtime。
+建议停机：本地 readiness 关闭/拒新 → 发布 draining 或注销（尽力但有期限）→ 等待既有工作 → 关闭 transport 与所有 provider → 确认 completion/close → 释放服务与资源 → run 返回；coroutine runtime 随进程寿命复用，不在 framework 收口中 Stop。
 
 发现变更存在延迟，所以不能等远端都看见注销再本地拒新。数据面必须能对到达旧实例的新请求给出明确拒绝，状态调用不自动跨 owner 重放。
 

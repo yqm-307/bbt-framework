@@ -289,7 +289,7 @@ fw::Error WaitErr(co::WaitStatus st, const char* what) {
 // ── 测试服务 ──
 
 // "probe"：Concurrent；inspect 立即回显，wait_echo 在 per-rid 信号上
-// 真实挂起（用 ctx 的 deadline/cancel 作等待参数），恢复后再次快照上下文。
+//    真实挂起（用 ctx 的 deadline 作等待参数），恢复后再次快照上下文。
 class ProbeSvc final : public fw::CoService<ProbeSvc> {
 public:
     static constexpr std::string_view kServiceName = "probe";
