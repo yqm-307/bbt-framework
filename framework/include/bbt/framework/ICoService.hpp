@@ -4,7 +4,7 @@
 // 业务只感知三件事：
 //  - co_service_name()：服务名（CoService<T> 从 kServiceName 供给）；
 //  - this->call<Reply>(service, method, request, ...)：受管出站调用——
-//    envelope、deadline/cancel 适配、发送与回复校验全部在框架内部完成
+//    envelope、deadline 适配、发送与回复校验全部在框架内部完成
 //    （src/host/CoServiceCall.cc），业务拿不到 Codec/envelope/发送注入点；
 //  - context()：服务上下文（请求字段只读 + 资源缝）。
 // 对象身份/运行时绑定只能由 CoApp 建立；未托管对象调用 this->call
@@ -81,7 +81,7 @@ private:
     std::string _NextRequestId();
 
     // call 的机器面半身（src/host/CoServiceCall.cc）：受管校验、请求
-    // 上下文、envelope 组装、有序票据元数据、deadline/cancel 适配、
+    // 上下文、envelope 组装、有序票据元数据、deadline 适配、
     // 出站发送与回复校验；成功返回回复 payload 字节。
     result<std::vector<std::uint8_t>> _CallSend(
         std::string_view service_name,

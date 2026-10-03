@@ -122,7 +122,8 @@ result<HttpResponse> XlangRpcHandler(IncomingCallContext ctx, HttpRequest req) {
 void RuntimeSetup() {
     auto* cfg = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
     cfg->m_cfg_static_thread_num = 2;
-    g_scheduler->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
+    if (!g_scheduler->IsInitialized())
+        g_scheduler->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
 
     NetworkLimits limits{};
     limits.max_connections  = 16;
@@ -139,9 +140,10 @@ void RuntimeSetup() {
 }
 
 void RuntimeTeardown() {
-    if (g_server)  { g_server->RequestClose(); g_server.reset(); }
-    if (g_runtime) { g_runtime->RequestClose(); g_runtime.reset(); }
-    g_scheduler->Stop();
+    // infra 关闭是同步契约：Close() 返回即物理释放；runtime 是进程寿命
+    // 单例，无 Stop/restart。
+    if (g_server)  { g_server->Close(); g_server.reset(); }
+    if (g_runtime) { g_runtime->Close(); g_runtime.reset(); }
 }
 
 } // namespace

@@ -1,8 +1,8 @@
 // service-actor/v2 F1-b1 切片验证：CoApp 装配、run 前校验、生命周期
 // 启动/关闭顺序、启动中途失败回退、关闭超时 ShutdownIncomplete、多宿主
 // 拒绝。网络组件全部走 INetworkHost 桩（经 internal 测试缝注入）：断言
-// 真实调用序列、每步发生时的调度器代际、超时与异常路径；无真实 socket、
-// 无 sleep 凑时序、无空断言。
+// 真实调用序列、每步发生时 coroutine runtime 已初始化、超时与异常路径；
+// 无真实 socket、无 sleep 凑时序、无空断言。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -88,22 +88,20 @@ private:
 
 constexpr std::chrono::milliseconds kWait{5000};
 
-// ── INetworkHost 桩：记录每次调用的名字与当时调度器运行代际；代际 >0 即
-//    「Scheduler 已启动且未 Stop」，借此把真实调度器位置纳入同一序列断言。──
+// ── INetworkHost 桩：记录每次调用的名字与当时 runtime 是否已初始化（初始化
+//    在进程寿命内恒为 true）；借此把「调度器先于网络、使用期保持运行」纳入
+//    同一序列断言。──
 
 struct NetCall {
-    std::string   name;
-    std::uint64_t sched_gen;
+    std::string name;
+    bool        sched_ready;   // 调用发生时 coroutine runtime 已初始化
 };
 
 class StubNetHost final : public fw::INetworkHost {
 public:
     fw::result<void> create_rc = fw::result<void>::ok();
     fw::result<void> start_rc  = fw::result<void>::ok();
-    std::function<fw::result<void>(co::Deadline, co::CancellationToken)>
-        on_wait_handlers;
-    std::function<bbt::infra::CloseStatus(co::Deadline, co::CancellationToken)>
-        on_wait_closed;
+    std::function<fw::result<void>(co::Deadline)> on_wait_handlers;
     std::function<void()> on_started;   // Start 成功后回调（控制线程）
     TestLatch start_seen{1};   // Start() 被调用（启动完成、开始接纳）时倒计时
 
@@ -119,20 +117,12 @@ public:
         return rc;
     }
     void StopAccepting() noexcept override { _Record("net.stop_accepting"); }
-    fw::result<void> WaitHandlersDone(co::Deadline d,
-                                      co::CancellationToken t) override {
+    fw::result<void> WaitHandlersDone(co::Deadline d) override {
         _Record("net.wait_handlers");
-        if (on_wait_handlers) return on_wait_handlers(d, t);
+        if (on_wait_handlers) return on_wait_handlers(d);
         return fw::result<void>::ok();
     }
-    void RequestClose() noexcept override { _Record("net.request_close"); }
-    bbt::infra::CloseStatus WaitClosed(co::Deadline d,
-                                       co::CancellationToken t) override {
-        _Record("net.wait_closed");
-        if (on_wait_closed) return on_wait_closed(d, t);
-        return bbt::infra::CloseStatus::Closed;
-    }
-    void ReleaseClosed() noexcept override { _Record("net.release"); }
+    void Close() noexcept override { _Record("net.close"); }
 
     std::vector<NetCall> Snapshot() const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -152,7 +142,7 @@ public:
 private:
     void _Record(const char* name) {
         std::lock_guard<std::mutex> lk(m_mtx);
-        m_calls.push_back(NetCall{name, g_scheduler->GetRunGeneration()});
+        m_calls.push_back(NetCall{name, g_scheduler->IsInitialized()});
     }
     mutable std::mutex    m_mtx;
     std::vector<NetCall>  m_calls;
@@ -287,7 +277,7 @@ void JoinRun(const std::unique_ptr<RunHandle>& h) {
 
 const std::vector<std::string> kCleanOrder{
     "net.create", "net.start", "net.stop_accepting", "net.wait_handlers",
-    "net.request_close", "net.wait_closed", "net.release"};
+    "net.close"};
 
 BOOST_AUTO_TEST_SUITE(framework_f1b1)
 
@@ -321,7 +311,6 @@ BOOST_AUTO_TEST_CASE(add_service_registers_and_rejects_duplicate) {
     auto svc = app->find_service("echo");
     BOOST_REQUIRE(svc);
     BOOST_TEST(svc.value()->GetObjectInfo().id != 0);
-    BOOST_TEST(svc.value()->GetObjectInfo().generation != 0);
     BOOST_TEST(svc.value()->GetObjectInfo().kind == "service");
     BOOST_TEST(svc.value()->GetObjectInfo().name == "echo");
 
@@ -360,7 +349,7 @@ BOOST_AUTO_TEST_CASE(add_service_registers_and_rejects_duplicate) {
 }
 
 // 用例 2：ServiceOptions 违反 F2-a 校验 → add_service 失败，任何组件未
-// 启动（桩计数 0、调度器代际 0）；run 自身配置非法同样 run 前失败。
+// 启动（桩计数 0）；run 自身配置非法同样 run 前失败。
 BOOST_AUTO_TEST_CASE(invalid_options_fail_before_any_startup) {
     auto host = std::make_shared<StubNetHost>();
     auto app = MakeApp(AppOpts(), host);
@@ -394,7 +383,6 @@ BOOST_AUTO_TEST_CASE(invalid_options_fail_before_any_startup) {
     auto app2 = MakeApp(bad_opts, host2);
     BOOST_CHECK(app2->run() == fw::HostLifecycle::kExitRejected);
     BOOST_TEST(host2->TotalCalls() == std::size_t{0});
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
     BOOST_TEST(app2->lifecycle_failures().size() == std::size_t{1});
 }
 
@@ -421,8 +409,8 @@ BOOST_AUTO_TEST_CASE(unconfigured_route_target_rejected) {
     BOOST_TEST(host->TotalCalls() == std::size_t{0});
 }
 
-// 用例 4：启动顺序 = Scheduler::Start → 网络 Create/Start（开始接纳）→
-// 运行；桩调用点记录代际证明调度器先于网络、且整个使用期保持运行。
+// 用例 4：启动顺序 = runtime 初始化 → 网络 Create/Start（开始接纳）→ 运行；
+// 桩调用点记录「runtime 已初始化」证明调度器先于网络、且整个使用期保持运行。
 BOOST_AUTO_TEST_CASE(startup_order_scheduler_then_network) {
     auto host = std::make_shared<StubNetHost>();
     auto app = MakeApp(AppOpts(), host);
@@ -440,16 +428,14 @@ BOOST_AUTO_TEST_CASE(startup_order_scheduler_then_network) {
     std::vector<std::string> names;
     for (const auto& c : calls) names.push_back(c.name);
     BOOST_TEST(names == kCleanOrder);
-    // 全部网络调用都发生在调度器运行代际内（Scheduler::Start 先于
-    // net.create，Scheduler::Stop 晚于 net.release）。
+    // 全部网络调用都发生在 runtime 已初始化之后（初始化先于 net.create，
+    // 且进程寿命内不复位）。
     for (const auto& c : calls)
-        BOOST_TEST(c.sched_gen != 0);
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);   // Stop 最后
+        BOOST_TEST(c.sched_ready);
 }
 
-// 用例 5：关闭顺序 = StopAccepting → 等 handler 结束 → RequestClose →
-// WaitClosed → 释放 → Scheduler::Stop；StopAccepting 严格先于
-// RequestClose/WaitClosed。
+// 用例 5：关闭顺序 = StopAccepting → 等 handler 结束 → Close；StopAccepting
+// 严格先于 Close。
 BOOST_AUTO_TEST_CASE(shutdown_order_stop_accepting_before_close) {
     auto host = std::make_shared<StubNetHost>();
     auto app = MakeApp(AppOpts(), host);
@@ -468,15 +454,12 @@ BOOST_AUTO_TEST_CASE(shutdown_order_stop_accepting_before_close) {
         return calls.size();
     };
     BOOST_TEST(pos("net.stop_accepting") < pos("net.wait_handlers"));
-    BOOST_TEST(pos("net.wait_handlers") < pos("net.request_close"));
-    BOOST_TEST(pos("net.request_close") < pos("net.wait_closed"));
-    BOOST_TEST(pos("net.wait_closed") < pos("net.release"));
+    BOOST_TEST(pos("net.wait_handlers") < pos("net.close"));
     BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 
-// 用例 6：启动中途失败——Create 失败只回退 Scheduler；Start 失败按同一
-// 固定顺序回退已立起的网络组件；不留半启动状态（代际归零、run 返回）。
+// 用例 6：启动中途失败——Create 失败只回退（网络关闭序列不适用）；Start
+// 失败按同一固定关闭顺序回退已立起的网络组件；不留半启动状态（run 返回）。
 BOOST_AUTO_TEST_CASE(startup_failure_rolls_back_in_order) {
     {   // 失败在第 1 个网络步（Create）
         auto host = std::make_shared<StubNetHost>();
@@ -486,9 +469,8 @@ BOOST_AUTO_TEST_CASE(startup_failure_rolls_back_in_order) {
         BOOST_REQUIRE(app->add_service<EchoSvc>(ConcurrentOpts()));
 
         BOOST_TEST(app->run() == fw::HostLifecycle::kExitStartFailed);
-        // Create 未成功 → 网络关闭序列不适用，只回退 Scheduler。
+        // Create 未成功 → 网络关闭序列不适用。
         BOOST_TEST(host->Names() == std::vector<std::string>{"net.create"});
-        BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
         BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closed);
         BOOST_TEST(!app->lifecycle_failures().empty());
     }
@@ -506,11 +488,9 @@ BOOST_AUTO_TEST_CASE(startup_failure_rolls_back_in_order) {
         // create/start 失败步 + 同一固定顺序的回退序列。
         BOOST_TEST(names == std::vector<std::string>({
             "net.create", "net.start", "net.stop_accepting",
-            "net.wait_handlers", "net.request_close", "net.wait_closed",
-            "net.release"}));
+            "net.wait_handlers", "net.close"}));
         for (const auto& c : calls)
-            BOOST_TEST(c.sched_gen != 0);   // 回退期间调度器仍在驱动
-        BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
+            BOOST_TEST(c.sched_ready);   // 回退期间 runtime 仍在驱动
     }
 }
 
@@ -524,7 +504,7 @@ BOOST_AUTO_TEST_CASE(shutdown_timeout_reports_incomplete_not_success) {
     std::atomic<int> drain_calls{0};
 
     host->on_wait_handlers =
-        [&](co::Deadline, co::CancellationToken) -> fw::result<void> {
+        [&](co::Deadline) -> fw::result<void> {
             if (drain_calls.fetch_add(1) == 0) {
                 // 预算内不结束 → 明确超时（不用 sleep：直接报 TimedOut，
                 // 由状态机决定后续）。
@@ -557,7 +537,7 @@ BOOST_AUTO_TEST_CASE(shutdown_timeout_reports_incomplete_not_success) {
     BOOST_CHECK(std::find(names.begin(), names.end(),
                           "net.stop_accepting") != names.end());
     BOOST_CHECK(std::find(names.begin(), names.end(),
-                          "net.release") == names.end());   // 未提前释放
+                          "net.close") == names.end());   // 未提前关闭
 
     // 迟到收尾完成：完整走完后序步骤，run 返回非零（曾超预算）。
     allow_drain.Open();
@@ -565,10 +545,9 @@ BOOST_AUTO_TEST_CASE(shutdown_timeout_reports_incomplete_not_success) {
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitShutdownLate);
     BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_TEST(app->pending_cleanup().empty());
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
     const auto after = host->Names();
     BOOST_CHECK(std::find(after.begin(), after.end(),
-                          "net.release") != after.end());
+                          "net.close") != after.end());
 }
 
 // 用例 8：多 CoApp——另一宿主活跃时第二个 run() 被明确拒绝；同一实例
@@ -605,7 +584,6 @@ BOOST_AUTO_TEST_CASE(second_active_app_run_rejected) {
     app3->request_shutdown();
     JoinRun(h3);
     BOOST_TEST(h3->rc == fw::HostLifecycle::kExitOk);
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 
 // 补充：早于 run 的 request_shutdown → 完成启动后立即进入关闭序列。

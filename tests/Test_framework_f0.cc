@@ -256,7 +256,6 @@ BOOST_AUTO_TEST_CASE(call_options_defaults) {
     fw::CallOptions options;
     BOOST_TEST(!options.deadline.has_value());
     BOOST_TEST(!options.ordered.has_value());
-    BOOST_TEST(!options.cancel.IsCancellationRequested());
 }
 
 BOOST_AUTO_TEST_CASE(positional_roundtrip_all_scalar_types) {

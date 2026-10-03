@@ -11,6 +11,7 @@
 #include <utility>
 
 #include <bbt/infra/ICoObject.hpp>
+#include <bbt/coroutine/sync/WaitTypes.hpp>
 #include <bbt/framework/OrderedTypes.hpp>
 
 namespace bbt::framework {
@@ -34,7 +35,6 @@ private:
 
 struct CallOptions {
     std::optional<bbt::coroutine::Deadline> deadline;
-    bbt::coroutine::CancellationToken       cancel;
     std::optional<OrderedStamp>             ordered;
 };
 

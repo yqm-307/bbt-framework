@@ -4,7 +4,7 @@
 // 已托管 Service/Actor 实例（契约 F1 第 139 行）。
 //
 // 字段来源纪律（不得伪造）：
-//  - deadline/cancel/peer_principal 只取 infra 已换算/已验证的
+//  - deadline/peer_principal 只取 infra 已换算/已验证的
 //    IncomingCallContext；request_id 与受限系统字段（fw.*）只取
 //    RpcEnvelope；业务 custom 只允许出现在 route.* 键下。
 //  - metadata 中 route.* 与受限 fw.* 白名单之外的键一律拒绝
@@ -17,8 +17,8 @@
 // 绑定语义：RequestContext 随逻辑请求/协程绑定（RequestScope），
 // 不用 thread_local 跨挂起缓存；Service 并发处理多请求互不串扰——
 // Concurrent 在派发协程内联执行，ActorSerial 经注册表取实例后交由
-// 该 (service,actor-key) 的 ActorMailbox 串行执行，派发协程以
-// 每请求一个 CompletionSignal 等待业务结果（等待期间让出 worker，
+// 该 (service,actor-key) 的 ActorMailbox 串行执行，派发协程以每请求
+// 一个 CoWaiter 等待业务结果（登记成功后再入队；等待期间让出 worker，
 // 执行资格仍由邮箱持有，不重入）。
 
 #include <atomic>
@@ -60,8 +60,8 @@ public:
 
     // 在受管协程内调用（infra 派发的 handler 上下文）。完成 envelope
     // 校验 → 上下文落地 → 执行策略分发 → 回复封包。ActorSerial 路径
-    // 的 CompletionSignal::Wait 要求协程上下文；非协程调用在 actor
-    // 路径会以错误返回而不是未定义行为。
+    // 的 CoWaiter::WaitWithCallback 要求协程上下文；非协程调用在 actor
+    // 路径返回 InvalidContext 错误而不是未定义行为。
     result<bbt::infra::RpcEnvelope> Dispatch(
         const bbt::infra::IncomingCallContext& incoming,
         bbt::infra::RpcEnvelope request);

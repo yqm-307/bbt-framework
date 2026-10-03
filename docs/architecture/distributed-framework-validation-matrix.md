@@ -8,7 +8,7 @@
 |---|---|---|---|
 | V01 | P0 M/I | 父预算 100ms，子显式预算 500ms，先排队 60ms | 子本地 deadline 不晚于父；发出前过期不做 I/O |
 | V02 | P0 I/D | A→B→C，每跳排队/处理，机器单调时钟原点不同 | wire 传剩余预算而非 time_point；原调用总等待不被每跳重置；不宣称远端副作用硬截止 |
-| V03 | P0 M/I | completion/cancel/deadline 同步到达，穷举所有交错 | 观察到至多一个调用终态；回调解绑与资源释放只发生一次，无悬挂访问 |
+| V03 | P0 M/I | completion/deadline 同步到达，穷举所有交错 | 观察到至多一个调用终态；回调解绑与资源释放只发生一次，无悬挂访问 |
 | V04 | P0 I | 请求挂起后换 worker，另一个请求在原 worker 执行 | CurrentRequestContext 始终对应逻辑协程，不泄漏身份/预算 |
 | V05 | P0 I/D | 服务端提交写入，客户端未收到回复就断连/超时 | 客户端记录未知结果，不把超时等同于未执行；无幂等协议时不自动重试 |
 | V06 | P0 M/I | 同 operation key 相同 payload 重发；再换 payload | 同请求依协议重放或 InProgress；冲突 payload 被拒绝，不能复用旧成功结果 |
@@ -18,7 +18,7 @@
 | V10 | P0 I/D | 伪造 peer_principal/fw.*、越权 method/actor key | 身份只来自认证通道；接收端独立授权；私有 C++ 构造不被当线上安全边界 |
 | V11 | P0 I | 请求先超时，底层 handler/driver 仍运行 | inflight/资源计数继续覆盖存活工作；容量不能因为返回错误被提前释放 |
 | V12 | P0 I | 等待队列/邮箱/Actor/出站并发/字节耗尽 | 固定上限始终成立，拒绝可观测，不产生无界补偿队列 |
-| V13 | P0 I | 关闭时有未完成 I/O、晚到回调、handler 不结束 | StopAccepting→drain→close→release→runtime stop；超预算标 incomplete，不 UAF |
+| V13 | P0 I | 关闭时有未完成 I/O、晚到回调、handler 不结束 | StopAccepting→drain→close→release；超预算标 incomplete，不 UAF；coroutine runtime 保持进程寿命 |
 | V14 | P0 D | supervisor 在硬停机时限到达后终止进程 | 记录非优雅终止和未完成请求；重启后不能宣称所有请求已完成 |
 | V15 | P1 M/I | 取 snapshot R 后、watch 建立前发生 R+1 更新 | 要么从 R 后无缝补齐，要么显式重建视图；不能静默永久漏更新 |
 | V16 | P1 M/I/D | watch 断线、重复事件、压缩历史、provider reset | 版本与 provider epoch 校验；旧视图不覆盖新视图；压缩后重新取快照 |

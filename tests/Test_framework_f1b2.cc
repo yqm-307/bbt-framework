@@ -2,7 +2,7 @@
 //
 // 覆盖（全部真实断言、无 mock/stub、无 sleep 凑时序）：
 //  T1 inbound_context_fields_land     入站字段落地：request_id/deadline/
-//                                    cancel/peer_principal/trace_id 取自
+//                                    peer_principal/trace_id 取自
 //                                    IncomingCallContext+RpcEnvelope；
 //                                    route.* 之外 metadata 与未授权 fw.*
 //                                    被拒；custom 不能伪造系统字段。
@@ -14,10 +14,9 @@
 //                                    受管入站路径作正路径对照（真实回路）。
 //  T4 outbound_deadline_min_and       出站期限缺省继承父预算、显式期限取
 //      _expired_before_io             min；父预算过期 → 发起 I/O 前 TimedOut。
-//  T5 waitclosed_bridging             infra WaitClosed 只许协程内：控制线程
-//                                    直接调用 InvalidContext；协程内调用收
-//                                    Closed；INetworkHost 桥接后控制线程
-//                                    同步收 Closed。
+//  T5 sync_close_on_control_thread    关闭是同步契约：控制线程直接 Close 即
+//                                    物理释放（无协程等待桥接）；重复 Close
+//                                    幂等。
 //  T6 handler_drain_shutdown_late     真实 in-flight handler 未排空 →
 //                                    WaitHandlersDone 预算耗尽 →
 //                                    ShutdownIncomplete → 放行后完整收束
@@ -55,7 +54,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/infra/HttpClient.hpp>
 #include <bbt/infra/HttpServer.hpp>
@@ -102,6 +101,48 @@ private:
 
 constexpr std::chrono::milliseconds kWait{15000};
 
+// ── 协程闩（CoWaiter 上的单次放行语义）──
+// Open 前 Wait 真实挂起；Open 后（含 Open 早于登记）全部放行，不丢唤醒；
+// 使用 CoWaiter 的单次等待语义，无 sleep。支持多等待者（每等待者独立
+// CoWaiter，登记成功后再发布/自唤醒）。
+class CoGate {
+public:
+    void Open() {
+        std::vector<co::sync::CoWaiter::SPtr> notify;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_open = true;
+            notify.swap(m_waiters);
+        }
+        for (auto& w : notify) w->Notify();
+    }
+    co::WaitStatus Wait(co::Deadline deadline) {
+        auto waiter = co::sync::CoWaiter::Create();
+        co::WaitOptions wo;
+        wo.deadline = deadline;
+        const auto st = waiter->WaitWithCallback(wo, [&]() -> bool {
+            // on_registered：登记成功后才发布；Open 早到则自唤醒（PENDING
+            // 早到路径），入队失败/早到都不丢通知。
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_open) waiter->Notify();
+            else        m_waiters.push_back(waiter);
+            return true;
+        });
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_waiters.erase(
+                std::remove(m_waiters.begin(), m_waiters.end(), waiter),
+                m_waiters.end());
+        }
+        return st;
+    }
+
+private:
+    std::mutex                            m_mtx;
+    bool                                  m_open = false;
+    std::vector<co::sync::CoWaiter::SPtr> m_waiters;
+};
+
 // ── CoRpc 位置参数测试辅助 ──
 
 fw::result<std::int32_t> IntArg(const fw::CoRpcReq& req) {
@@ -145,7 +186,6 @@ struct CtxSnapshot {
     std::string     actor_key;    // 无 → ""
     std::string     trace_id;     // 无 → ""
     co::Deadline    deadline{};
-    bool            cancel_req = false;
     std::uint64_t   co_id = 0;
     std::thread::id tid{};
 };
@@ -157,7 +197,7 @@ struct ProbeState {
 
     mutable std::mutex      mtx;
     std::condition_variable ev_cv;
-    std::map<std::string, std::shared_ptr<co::CompletionSignal>> gates;
+    std::map<std::string, std::shared_ptr<CoGate>> gates;
     std::map<std::string, CtxSnapshot> before;
     std::map<std::string, CtxSnapshot> after;
     std::vector<std::string>         events;
@@ -165,17 +205,20 @@ struct ProbeState {
     std::atomic<int>                 egress_calls{0};
     std::atomic<int>                 expired_sends_before{-1};
 
-    std::shared_ptr<co::CompletionSignal> GateFor(const std::string& rid) {
+    std::shared_ptr<CoGate> GateFor(const std::string& rid) {
         std::lock_guard<std::mutex> lk(mtx);
         auto& g = gates[rid];
         if (!g)
-            g = std::make_shared<co::CompletionSignal>();
+            g = std::make_shared<CoGate>();
         return g;
     }
     void CompleteAll() {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (auto& [rid, g] : gates)
-            g->Complete();
+        std::vector<std::shared_ptr<CoGate>> all;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (auto& [rid, g] : gates) all.push_back(g);
+        }
+        for (auto& g : all) g->Open();
     }
     void Event(std::string e) {
         {
@@ -227,7 +270,6 @@ CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     s.actor_key      = c.actor_key.value_or("");
     s.trace_id       = c.trace_id.value_or("");
     s.deadline       = c.deadline;
-    s.cancel_req     = c.cancel.IsCancellationRequested();
     s.co_id          = co::GetLocalCoroutineId();
     s.tid            = std::this_thread::get_id();
     return s;
@@ -277,8 +319,7 @@ public:
         p->Snapshot(p->before, rid, SnapCtx(*ctx.value()));
         auto gate = p->GateFor(rid);
         p->arrived.CountDown();
-        const auto st = gate->Wait(
-            {ctx.value()->deadline, ctx.value()->cancel});
+        const auto st = gate->Wait(ctx.value()->deadline);
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "wait_echo gate"));
         p->Snapshot(p->after, rid, SnapCtx(*ctx.value()));
@@ -302,8 +343,7 @@ public:
         auto ctx = fw::CurrentRequestContext();
         if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
-        const auto st = p->GateFor("slow")->Wait(
-            {ctx.value()->deadline, ctx.value()->cancel});
+        const auto st = p->GateFor("slow")->Wait(ctx.value()->deadline);
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "echo slow"));
         return fw::CoRpcResp::From(value.value());
@@ -332,18 +372,17 @@ public:
             std::uint64_t co_id = 0;
         };
         auto slot = std::make_shared<Slot>();
-        auto sig  = std::make_shared<co::CompletionSignal>();
-        bbtco [this, req, slot, sig]() {
+        auto gate = std::make_shared<CoGate>();
+        bbtco [this, req, slot, gate]() {
             slot->co_id = co::GetLocalCoroutineId();
             auto response = this->call("echo", "ping", req);
             if (response)
                 slot->code = fw::ErrorCode::InternalError;
             else
                 slot->code = response.error().code;
-            sig->Complete();
+            gate->Open();
         };
-        const auto st = sig->Wait(
-            {ctx.value()->deadline, ctx.value()->cancel});
+        const auto st = gate->Wait(ctx.value()->deadline);
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "spawn_dial wait"));
         p->Event("parent_co:" + std::to_string(parent_co));
@@ -387,8 +426,12 @@ public:
         auto ctx = fw::CurrentRequestContext();
         if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
-        auto sig = std::make_shared<co::CompletionSignal>();
-        (void)sig->Wait({ctx.value()->deadline, ctx.value()->cancel});
+        // 等到父预算真实到期（deadline 超时，无 sleep）：随后出站必然在
+        // 发起 I/O 之前被适配器判 TimedOut（egress 计数不增）。
+        auto waiter = co::sync::CoWaiter::Create();
+        co::WaitOptions wo;
+        wo.deadline = ctx.value()->deadline;
+        (void)waiter->Wait(wo);
         p->expired_sends_before.store(
             p->egress_calls.load(std::memory_order_acquire),
             std::memory_order_release);
@@ -530,9 +573,6 @@ std::shared_ptr<Spinner> LaunchSpinner() {
 // 测试期持有的 spinner；AppBox::Stop 先放行再关停，避免挂死。
 std::vector<std::shared_ptr<Spinner>> g_spinners;
 
-void WaitClosedOnThread(const std::shared_ptr<inf::NetworkRuntime>& rt,
-                        std::chrono::milliseconds ms);
-
 // 测试夹具：真实 InfraHttpHost + CoApp + 测试侧 client runtime。
 // 成员声明顺序即析构逆序：run 先于 app/host 收尾。
 struct AppBox {
@@ -558,11 +598,11 @@ struct AppBox {
         for (auto& s : g_spinners)
             s->release.store(true, std::memory_order_release);
         if (g_probe) g_probe->CompleteAll();
-        if (client)    client->RequestClose();
-        if (client_rt) client_rt->RequestClose();
+        // infra 关闭是同步契约：Close() 返回即物理释放，无需等待收束。
+        if (client)    client->Close();
+        if (client_rt) client_rt->Close();
         if (app)       app->request_shutdown();
         if (run && run->th.joinable()) run->th.join();
-        if (client_rt) WaitClosedOnThread(client_rt, kWait);
     }
 };
 
@@ -650,15 +690,6 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
     return box;
 }
 
-void WaitClosedOnThread(const std::shared_ptr<inf::NetworkRuntime>& rt,
-                        std::chrono::milliseconds ms) {
-    const auto until = Clock::now() + ms;
-    while (!rt->IsClosed()) {
-        if (Clock::now() > until) return;
-        std::this_thread::yield();
-    }
-}
-
 void StopApp(AppBox& box) { box.Stop(); }
 
 // 客户端发送一条 envelope 并等回包；在协程内调用。
@@ -669,7 +700,6 @@ fw::result<inf::RpcEnvelope> SendRpc(
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    o.cancel   = {};
     auto res = client->Request(
         Wire::ToHttpRequest(env, "http://" + endpoint + "/rpc"), o);
     if (!res)
@@ -759,7 +789,6 @@ BOOST_AUTO_TEST_CASE(inbound_context_fields_land) {
     BOOST_CHECK(snap.request_id == "t1-a");          // 非 forged
     BOOST_CHECK(snap.trace_id == "trace-9");
     BOOST_CHECK(snap.peer_principal == "");          // loopback 未认证
-    BOOST_CHECK(!snap.cancel_req);
     BOOST_CHECK(snap.co_id != 0);
     // deadline = accept + incoming_timeout：落在发送时刻后的 30s 窗口内。
     BOOST_CHECK(snap.deadline > send_at);
@@ -876,8 +905,6 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
         BOOST_CHECK(a.co_id == b.co_id);
         BOOST_CHECK(b.peer_principal == "");
         BOOST_CHECK(a.peer_principal == "");
-        BOOST_CHECK(!b.cancel_req);
-        BOOST_CHECK(!a.cancel_req);
         BOOST_CHECK(a.deadline == b.deadline);
         if (a.tid != b.tid) ++switched;
     }
@@ -993,8 +1020,8 @@ BOOST_AUTO_TEST_CASE(outbound_deadline_min_and_expired_before_io) {
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
 }
 
-// T5：WaitClosed 控制线程/协程两种口径与桥接。
-BOOST_AUTO_TEST_CASE(waitclosed_bridging) {
+// T5：关闭是同步契约——控制线程直接 Close 即物理释放；重复 Close 幂等。
+BOOST_AUTO_TEST_CASE(sync_close_on_control_thread) {
     g_probe = std::make_shared<ProbeState>(0);
     auto box = StartApp(std::chrono::milliseconds{30000},
                         std::chrono::milliseconds{2000},
@@ -1002,45 +1029,27 @@ BOOST_AUTO_TEST_CASE(waitclosed_bridging) {
                         [](fw::CoApp& app) {
         BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts()));
     });
-    auto server  = box.host->http_server();
+    // 应用运行中的默认宿主已有真实 NetworkRuntime。
     auto runtime = box.host->network_runtime();
-    BOOST_REQUIRE(server);
     BOOST_REQUIRE(runtime);
+    BOOST_CHECK(!runtime->IsClosed());
 
-    // (a) infra 语义：控制线程直接 WaitClosed → InvalidContext。
-    BOOST_CHECK(server->WaitClosed(Clock::now() + std::chrono::seconds{1},
-                                   {}) ==
-                inf::CloseStatus::InvalidContext);
-
-    // (b) 协程内 WaitClosed 为真实语义：RequestClose 触发关闭后
-    //     waiter 在协程内收 Closed（应用仍 Running、调度器活着）。
-    TestLatch waiter_done{1};
-    std::atomic<inf::CloseStatus> waiter_st{
-        inf::CloseStatus::InvalidContext};
-    bbtco [runtime, &waiter_done, &waiter_st]() {
-        waiter_st.store(runtime->WaitClosed(
-            Clock::now() + std::chrono::seconds{30}, {}),
-            std::memory_order_release);
-        waiter_done.CountDown();
-    };
-    box.host->RequestClose();
-    BOOST_REQUIRE(waiter_done.WaitFor(kWait));
-    BOOST_CHECK(waiter_st.load() == inf::CloseStatus::Closed);
-
-    // (c) INetworkHost::WaitClosed 控制线程桥接：第二个宿主在同一
-    //     运行时代际内 Create/Start/RequestClose，控制线程调用
-    //     WaitClosed 内部经协程桥接同步收 Closed——上层不感知
-    //     「只能在协程内」的 infra 约束差异。
+    // 第二个独立宿主：控制线程 Create/Start/Close 同步收口——Close 返回即
+    // 物理释放（无协程等待桥接、无 InvalidContext 约束），重复 Close 幂等。
     auto host2 = std::make_shared<fw::InfraHttpHost>(
         Limits(std::chrono::milliseconds{30000}),
         inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(host2->Create());
     BOOST_REQUIRE(host2->Start());
-    host2->RequestClose();
-    const auto bridged = host2->WaitClosed(
-        Clock::now() + std::chrono::seconds{10}, {});
-    BOOST_CHECK(bridged == inf::CloseStatus::Closed);
-    host2->ReleaseClosed();
+    auto rt2 = host2->network_runtime();
+    BOOST_REQUIRE(rt2);
+    BOOST_CHECK(!rt2->IsClosed());
+
+    host2->Close();                                    // 同步
+    BOOST_CHECK(rt2->IsClosed());                      // 返回即已释放
+    BOOST_CHECK(host2->network_runtime() == nullptr);  // 句柄已释放
+    BOOST_CHECK(host2->http_server() == nullptr);
+    host2->Close();                                    // 幂等
 
     StopApp(box);
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
@@ -1083,15 +1092,18 @@ BOOST_AUTO_TEST_CASE(handler_drain_shutdown_late) {
     // 迟到收尾：放行 in-flight handler → 排空 → 完整收束 → 非零返回。
     g_probe->CompleteAll();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
-    BOOST_REQUIRE(inflight_res.has_value());
-    BOOST_CHECK(inflight_res.value());   // handler 真实回了包
+    // 在途 handler 被放行后真实跑完请求全程：handler 侧 after 快照为证。
+    // 注意 infra 同步 Close 契约——owner Close 经 Abort 丢弃未发送响应、
+    // 不做 flush，故关闭期间完成的回复不保证送达原客户端（客户端结果可能
+    // 是传输层错误），不作为断言对象。
+    BOOST_CHECK(g_probe->At(g_probe->after, "t6-h").co_id != 0);
     JoinRun(box.run);
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitShutdownLate);
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_CHECK(box.app->pending_cleanup().empty());
 
-    if (box.client)    box.client->RequestClose();
-    if (box.client_rt) box.client_rt->RequestClose();
+    if (box.client)    box.client->Close();
+    if (box.client_rt) box.client_rt->Close();
 }
 
 // T7：同一 actor 远端等待期间不重入；不同 actor 并发推进；
@@ -1164,7 +1176,7 @@ BOOST_AUTO_TEST_CASE(actor_serial_remote_wait_no_reenter) {
     }
 
     // 放行远端 → A1 完成 → 排队者按序执行（不重入：先 end:a1 后 start）。
-    g_probe->GateFor("slow")->Complete();
+    g_probe->GateFor("slow")->Open();
     BOOST_REQUIRE(replies.WaitFor(kWait));
 
     // 四个回复全部落位：a1/b1/排队者成功，loser 为 Overloaded。

@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/framework/internal/OrderedIngress.hpp>
 
@@ -189,12 +189,11 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
     }
     InflightGuard guard(svc.inflight);
 
-    // 5. 请求上下文：字段只取已验证来源（infra 换算的 deadline/cancel、
-    //    已验证 peer_principal、envelope 顶层 request_id、fw.trace_id）。
+    // 5. 请求上下文：字段只取已验证来源（infra 换算的 deadline、已验证
+    //    peer_principal、envelope 顶层 request_id、fw.trace_id）。
     auto ctx = std::make_shared<RequestContext>();
     ctx->request_id     = request.request_id;
     ctx->deadline       = incoming.deadline - kReplyDeliveryReserve;
-    ctx->cancel         = incoming.cancel;
     ctx->peer_principal = incoming.peer_principal;
     ctx->trace_id       = std::move(trace_id);
 
@@ -286,36 +285,41 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             return finish_ordered_error(MakeError(
                 ErrorCode::InternalError, "mailbox create failed"));
 
-        // 每请求一个完成信号；业务结果经 slot 回传。完成先于 Wait
-        // 可见（先写结果再 Complete，acquire/release 语义由信号保证）。
+        // 每请求一个 CoWaiter：登记成功后（on_registered 内）再
+        // TryEnqueue——早到/入队失败不丢通知。业务结果或入队失败经 slot
+        // 回传；handler 完成即 Notify（登记后同步 Notify 走 PENDING 早到
+        // 路径），入队失败则记入 slot 并 Notify 自唤醒。
         struct Slot {
             result<std::vector<std::uint8_t>> r =
                 result<std::vector<std::uint8_t>>::err(MakeError(
                     ErrorCode::InternalError, "actor task produced no result"));
         };
         auto slot = std::make_shared<Slot>();
-        std::shared_ptr<bbt::coroutine::CompletionSignal> sig;
+        bbt::coroutine::sync::CoWaiter::SPtr waiter;
         try {
-            sig = std::make_shared<bbt::coroutine::CompletionSignal>();
+            waiter = bbt::coroutine::sync::CoWaiter::Create();
         } catch (...) {
             return finish_ordered_error(MakeError(
                 ErrorCode::RuntimeUnavailable,
-                "completion signal unavailable"));
+                "co waiter unavailable"));
         }
-        auto enq = mailbox->TryEnqueue(
-            [ctx, method, inst,
-             payload = std::move(request.payload), slot, sig]() mutable {
-                RequestScope scope(ctx);
-                slot->r = method->invoke(*inst.value(), payload);
-                sig->Complete();
-            });
-        if (!enq)
-            return finish_ordered_error(std::move(enq.error()));
-
         WaitOptions wo;
         wo.deadline = ctx->deadline;
-        wo.cancel   = ctx->cancel;
-        const WaitStatus st = sig->Wait(wo);
+        const WaitStatus st = waiter->WaitWithCallback(wo, [&]() -> bool {
+            auto enq = mailbox->TryEnqueue(
+                [ctx, method, inst, slot, waiter,
+                 payload = std::move(request.payload)]() mutable {
+                    RequestScope scope(ctx);
+                    slot->r = method->invoke(*inst.value(), payload);
+                    waiter->Notify();
+                });
+            if (!enq) {
+                slot->r = result<std::vector<std::uint8_t>>::err(
+                    std::move(enq.error()));
+                waiter->Notify();
+            }
+            return true;
+        });
         switch (st) {
         case WaitStatus::Completed:
             break;
@@ -329,9 +333,14 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             return finish_ordered_error(MakeError(
                 ErrorCode::RuntimeUnavailable,
                 "runtime unavailable while waiting actor result"));
+        case WaitStatus::InvalidContext:
+            // 非协程派发调用：不做等待、未入队，如实返回而非未定义行为。
+            return finish_ordered_error(MakeError(
+                ErrorCode::RuntimeUnavailable,
+                "inbound dispatch requires a coroutine context"));
+        case WaitStatus::AlreadyWaiting:
         default:
-            // InvalidContext/AlreadyWaiting：派发约定内不应出现，
-            // 不静默吞掉，如实上报内部错误。
+            // AlreadyWaiting 等在派发约定内不应出现，不静默吞掉。
             return finish_ordered_error(MakeError(
                 ErrorCode::InternalError,
                 "unexpected wait status " +

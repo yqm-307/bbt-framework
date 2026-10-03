@@ -107,13 +107,11 @@ int CoApp::run() {
             return r;
         return _BindServices();
     };
-    // 关闭：handler 排空后、网络 RequestClose 前收束资源（资源可能在途
+    // 关闭：handler 排空后、网络 Close 前同步收束资源（资源可能在途
     // handler 仍被引用；网络对象尚未关闭，资源可安全收尾）。
-    hooks.on_handlers_drained = [this](HostLifecycle& lc) {
-        _CloseResources(lc);
-    };
-    hooks.on_release           = [this](HostLifecycle& lc) {
-        _CloseResources(lc);   // 回退路径兜底（spec.closed 幂等）
+    hooks.on_handlers_drained = [this] { _CloseResources(); };
+    hooks.on_release           = [this] {
+        _CloseResources();   // 回退路径兜底（spec.closed 幂等）
         _ReleaseServices();
     };
 
@@ -391,38 +389,25 @@ result<void> CoApp::_StartResources() {
     return result<void>::ok();
 }
 
-void CoApp::_CloseResources(HostLifecycle& lifecycle) noexcept {
-    // 收集需收束的资源（持锁拷贝句柄，避免在锁内做可能阻塞的等待）。
-    struct Item {
-        std::string                                name;
-        std::shared_ptr<bbt::infra::ICoCloseable>  closeable;
-        ResourceSpec*                              spec;
-    };
-    std::vector<Item> items;
+void CoApp::_CloseResources() noexcept {
+    // 收集需收束的资源（持锁拷贝句柄，避免在锁内执行 Close）。
+    std::vector<std::shared_ptr<bbt::infra::ICoCloseable>> closeables;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        for (auto& [key, spec] : m_resource_specs) {
+        for (auto& kv : m_resource_specs) {
+            ResourceSpec& spec = kv.second;
             if (spec.closed || !spec.instance || !spec.as_closeable)
                 continue;
             if (auto c = spec.as_closeable(spec.instance)) {
-                items.push_back(Item{key.name, std::move(c), &spec});
+                closeables.push_back(std::move(c));
                 spec.closed = true;   // 幂等：回退路径不重复收束
             }
         }
     }
-    for (auto& item : items) {
-        // RequestClose 幂等、任意线程可调；WaitClosed 桥接到协程等待，
-        // 预算与 ShutdownIncomplete 记账由 RunCloseStep 统一处理。
-        item.closeable->RequestClose();
-        auto closeable = item.closeable;
-        lifecycle.RunCloseStep(
-            "resource:" + item.name,
-            [closeable](bbt::coroutine::Deadline d,
-                        bbt::coroutine::CancellationToken c) {
-                return internal::WaitClosedOnControlThread(
-                    closeable, d, std::move(c));
-            });
-    }
+    // infra 关闭是同步契约：Close() 返回即物理释放、幂等、noexcept，
+    // 无控制线程等待预算/迟到收尾（资源不再有独立等待步）。
+    for (auto& closeable : closeables)
+        internal::CloseResource(closeable);
 }
 
 void CoApp::_ReleaseServices() noexcept {

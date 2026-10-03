@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 按 deps.lock 准备 core/coroutine/infra 源码树。已在目标 SHA 上则跳过。
+# 按 deps.lock 准备 coroutine/infra 源码树。已在目标 SHA 上则跳过。
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -179,7 +179,7 @@ public:
     // 已启动」的资源形态（如 infra CoRedisCli/CoMongoCli）。factory 须返回
     // result<std::shared_ptr<R>>；创建出的实例若暴露 Start() 且该返回
     // result<void> 则由框架在登记后调用一次，若实现
-    // bbt::infra::ICoCloseable 则由关闭序列统一 RequestClose/WaitClosed。
+    // bbt::infra::ICoCloseable 则由关闭序列统一 Close()（同步收口）。
     // 任一资源创建/启动失败 → 启动失败回退，不留半装配资源。
     // name 约束与 add_resource(ptr) 相同；重复键/空工厂 → InvalidArgument。
     template <class R, class F,
@@ -360,9 +360,9 @@ private:
     // 资源生命周期（#8）：on_scheduler_started 相位内先 _StartResources
     // （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
     // handler 排空后（on_handlers_drained）与回退路径（on_release）统一
-    // 经 _CloseResources 收束。两者幂等（ResourceSpec::closed）。
+    // 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。
     result<void> _StartResources();
-    void         _CloseResources(HostLifecycle& lifecycle) noexcept;
+    void         _CloseResources() noexcept;
     void         _ReleaseServices() noexcept;
     // find_route 路由门 + 出站实现（ICoService::RpcSendFn 是
     // ICoService 的私有别名；CoApp 经友元命名）。
