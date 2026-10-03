@@ -1,6 +1,6 @@
 #pragma once
 // co-service-actor/v1 F1-b1：宿主生命周期状态机与网络宿主注入点。
-// 落实契约 F3（decisions/0001 第 231/233/235 行）的固定资源顺序：
+// 落实契约 F3 的固定资源顺序（仓内验收矩阵与 HostLifecycle 实现为真源）：
 //   coroutine runtime 初始化（一次 Start，已初始化则复用）→ 网络组件
 //   Create/Start（开始接纳）→ 运行 → StopAccepting → 等 handler 结束
 //   → 资源 Close（同步）→ 网络 Close（同步收口）→ 释放网络/业务对象

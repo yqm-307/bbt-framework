@@ -34,6 +34,10 @@ while read -r name rest || [ -n "$name$rest" ]; do
     # 已是 git 工作树（clone 或 worktree，.git 可是目录或文件）→ fetch+checkout；
     # 否则（目录不存在）→ clone。worktree 的 .git 是文件，不能只看 -d。
     if git -C "$dest" rev-parse --git-dir >/dev/null 2>&1; then
+        if [ -n "$(git -C "$dest" status --porcelain --untracked-files=all)" ]; then
+            echo "[fetch_deps] FATAL: $dest 是脏工作树，拒绝覆盖；请清理或更换 BBT_DEPS_DIR" >&2
+            exit 4
+        fi
         have="$(git -C "$dest" rev-parse HEAD 2>/dev/null || true)"
         if [ "$have" = "$sha" ]; then
             echo "[fetch_deps] $name 已在 $sha"

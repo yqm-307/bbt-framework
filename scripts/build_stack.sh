@@ -56,10 +56,12 @@ mkdir -p "$BBT_WORK_DIR"
     done
 } | tee "$MANIFEST"
 
-# ---- 0b) 依赖树与 deps.lock 对账：本机/候选分支的依赖漂移必须被拦住 ---------
+# ---- 0b) 实际编译依赖与 deps.lock 对账：依赖漂移必须被拦住 ---------------
 # deps.lock 是唯一事实源（"CI 与 fetch_deps.sh 只认本文件"）。本机依赖树若被
 # 别处（共享 ../deps、手动 checkout）改到非 pin SHA，构建照常绿却与 pin 不符；
-# 此处把 manifest 的实测 SHA 与 deps.lock 逐条比对，不一致即 fail-closed。
+# 此处把实际传给 CMake 的源码树 SHA 与 deps.lock 逐条比对，不一致即
+# fail-closed；不能只检查 BBT_DEPS_DIR 下的同名目录，否则会出现「检查 A、
+# 编译 B」的假通过/假失败。
 # 逃生阀：BBT_ALLOW_OFF_PIN=1 跳过（仅本机调试用）。
 LOCK="$REPO_DIR/deps.lock"
 if [ "${BBT_ALLOW_OFF_PIN:-0}" != "1" ] && [ -f "$LOCK" ]; then
@@ -73,9 +75,14 @@ if [ "${BBT_ALLOW_OFF_PIN:-0}" != "1" ] && [ -f "$LOCK" ]; then
             esac
         done
         [ -z "$want_sha" ] && continue
-        have_sha="$(git -C "$BBT_DEPS_DIR/$want_dir" rev-parse HEAD 2>/dev/null || echo MISSING)"
+        case "$name" in
+            coroutine) actual_dir="$BBT_COROUTINE_SOURCE_DIR" ;;
+            infra) actual_dir="$BBT_INFRA_SOURCE_DIR" ;;
+            *) echo "[build_stack] FATAL: deps.lock 中存在未接入的依赖: $name" >&2; exit 8 ;;
+        esac
+        have_sha="$(git -C "$actual_dir" rev-parse HEAD 2>/dev/null || echo MISSING)"
         if [ "$have_sha" != "$want_sha" ]; then
-            echo "[build_stack] FATAL: 依赖 '$name' 漂移: pin=$want_sha 实际=$have_sha" >&2
+            echo "[build_stack] FATAL: 实际编译依赖 '$name' 漂移: pin=$want_sha 实际=$have_sha 路径=$actual_dir" >&2
             echo "[build_stack]   修法: 跑 scripts/fetch_deps.sh 拉齐 deps.lock；或 BBT_ALLOW_OFF_PIN=1 跳过（本机调试）" >&2
             exit 8
         fi
