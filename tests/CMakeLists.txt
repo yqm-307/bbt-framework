@@ -51,7 +51,7 @@ add_test(NAME Test_framework_f1b1 COMMAND Test_framework_f1b1)
 set_tests_properties(Test_framework_f1b1 PROPERTIES TIMEOUT 30)
 
 # F1-b2：真实 HTTP loopback 入站→上下文落地→分发→回复；
-# InvalidContext 端到端、WaitClosed 桥接、跨 worker 不串扰。
+# InvalidContext 端到端、同步 Close、跨 worker 不串扰。
 add_executable(Test_framework_f1b2 Test_framework_f1b2.cc)
 target_link_libraries(Test_framework_f1b2 PRIVATE bbt::framework)
 target_compile_options(Test_framework_f1b2 PRIVATE -Wall -Wextra)
@@ -75,7 +75,7 @@ add_test(NAME Test_framework_rpc COMMAND Test_framework_rpc)
 set_tests_properties(Test_framework_rpc PROPERTIES TIMEOUT 15)
 
 # issue #8：资源生命周期——工厂装配、Create/Start 相位、失败回滚与
-# shutdown budget 下的 RequestClose/WaitClosed 收束（INetworkHost 桩驱动）。
+# 关闭序列下的同步 Close 收束（INetworkHost 桩驱动）。
 add_executable(Test_framework_resource Test_framework_resource.cc)
 target_link_libraries(Test_framework_resource PRIVATE bbt::framework)
 target_compile_options(Test_framework_resource PRIVATE -Wall -Wextra)

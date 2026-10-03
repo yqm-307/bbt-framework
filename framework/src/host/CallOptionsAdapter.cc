@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <exception>
 
 namespace bbt::framework {
 
@@ -11,7 +10,6 @@ result<bbt::infra::CallOptions> AdaptCallOptions(
     const CallOptions&     options,
     const CallEgressHooks& hooks)
 {
-    using bbt::coroutine::CancellationToken;
     using bbt::coroutine::Deadline;
 
     // 1. 有效期限：缺省继承父剩余预算；显式期限与父预算取最小值，
@@ -40,29 +38,10 @@ result<bbt::infra::CallOptions> AdaptCallOptions(
             ErrorCode::TimedOut,
             "call budget already expired before egress io"));
 
-    // 3. cancel：父 token（顶层为永不可取消的空 token）与 options.cancel
-    //    合并，合并后原样传入 infra；装配抛异常 → InternalError，
-    //    此时尚未发起 I/O、未消耗序号、票据保持未发送。
-    CancellationToken combined;
-    try {
-        const CancellationToken parent_cancel =
-            (parent != nullptr) ? parent->cancel : CancellationToken{};
-        combined = hooks.combine_cancel
-            ? hooks.combine_cancel(parent_cancel, options.cancel)
-            : CancellationToken::Combine(parent_cancel, options.cancel);
-    } catch (const std::exception& e) {
-        return result<bbt::infra::CallOptions>::err(MakeError(
-            ErrorCode::InternalError,
-            std::string("context assembly failed: ") + e.what()));
-    } catch (...) {
-        return result<bbt::infra::CallOptions>::err(MakeError(
-            ErrorCode::InternalError,
-            "context assembly failed with non-std exception"));
-    }
-
+    // 3. infra::CallOptions 只携带单调时钟绝对期限；业务级取消不由 infra
+    //    令牌表达，业务取消由流程按 CoXxx 返回值自行决定，见头文件规则。
     bbt::infra::CallOptions out;
     out.deadline = effective;
-    out.cancel   = combined;
 
     // 4. 发起 I/O 的能力检查先于任何副作用：无出站注入点 → 不消耗序号。
     if (!hooks.initiate_io)

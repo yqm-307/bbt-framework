@@ -2,7 +2,7 @@
 // add_resource<R>(name, factory) 装配进 CoApp，service handler 在受管
 // 请求上下文（协程 + InboundDispatcher 注入的 RequestScope）内经
 // context().resource<R>(name) 消费真实命令往返；request_shutdown 后
-// 关闭序列对资源 RequestClose/WaitClosed 到 IsClosed 终态。
+// 关闭序列对资源同步 Close 到 IsClosed 终态。
 //
 // 环境变量驱动（与 infra live 同一约定）：
 //   BBT_TEST_REDIS_ADDR=host:port         缺 → redis 用例 skip
@@ -32,8 +32,6 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
-#include <bbt/coroutine/sync/Cancellation.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
 
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
@@ -137,16 +135,10 @@ public:
     fw::result<void> Start() override {
         start_seen.CountDown(); return fw::result<void>::ok(); }
     void StopAccepting() noexcept override {}
-    fw::result<void> WaitHandlersDone(co::Deadline,
-                                      co::CancellationToken) override {
+    fw::result<void> WaitHandlersDone(co::Deadline) override {
         return fw::result<void>::ok();
     }
-    void RequestClose() noexcept override {}
-    inf::CloseStatus WaitClosed(co::Deadline,
-                                co::CancellationToken) override {
-        return inf::CloseStatus::Closed;
-    }
-    void ReleaseClosed() noexcept override {}
+    void Close() noexcept override {}
 };
 
 // ── BSON 裸字节编码（MongoDocument 是 owning bytes；只编码本测试用的
@@ -380,7 +372,7 @@ void JoinRun(const std::unique_ptr<RunHandle>& h) {
 
 // 经 DispatchInboundForTest 在受管协程内分发：envelope → InboundDispatcher
 // → RequestScope → handler → 资源缝 → reply，与真实线桥入站同源。
-// Dispatch 内的 handler 调用要求协程上下文（CompletionSignal::Wait 仅
+// Dispatch 内的 handler 调用要求协程上下文（CoWaiter::WaitWithCallback 仅
 // 协程内合法），故本条路径必须经 g_scheduler->RegistCoroutineTask。
 template <class Fn>
 auto DispatchRpc(fw::CoApp& app, Fn&& fn,
@@ -481,9 +473,8 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
     app->request_shutdown();
     JoinRun(h);
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
-    // 关闭序列对资源收束到 IsClosed 终态。
+    // 关闭序列对资源同步 Close 到 IsClosed 终态。
     BOOST_TEST(cli->IsClosed());
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 #endif
 
@@ -563,7 +554,6 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
     JoinRun(h);
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
     BOOST_TEST(cli->IsClosed());
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 #endif
 

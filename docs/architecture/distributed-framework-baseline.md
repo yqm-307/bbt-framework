@@ -27,7 +27,7 @@
 已读代码表明：
 
 - `CoApp` 已装配真实 HTTP 宿主和出站桥，按服务名查静态路由；不能再把整个仓库描述为“尚无构建入口”。`AGENTS.md` 中该旧进度与 README 有冲突，本次落库同步修正。[L01,L02,L03]
-- `CallOptionsAdapter` 已实施父子 deadline 取最小、顶层必须有限预算、出站前过期拒绝和取消合并；不是从零设计上下文。[L04]
+- `CallOptionsAdapter` 已实施父子 deadline 取最小、顶层必须有限预算和出站前过期拒绝；业务级取消由调用方按 `CoXxx` 返回值决定，不由框架提供单操作取消令牌。[L04]
 - `RequestScope` 以协程 id 维护请求上下文，非协程场景另按 thread id；需要保护这个语义，不把普通 thread_local 当请求作用域。[L05]
 - `ActorMailbox` 是一个本地单消费者 drain coroutine，handler 挂起时不释放该 Actor 的执行资格。它是执行策略，不是跨节点目录或分布式唯一 owner 的证明。[L06]
 - `OrderedIngress` 有授权流、sequence、in-flight 和有界终态缓存；同流的旧序号在途返回 InProgress，终态重放，淘汰后 ResultExpired，不重新执行。这里使用本地内存容器，不能据此宣称跨重启/跨迁移 exactly-once。[L07,L08]
@@ -49,7 +49,7 @@ framework 扩展：注册发现 provider、分片/owner、消息、工作流、�
 infra：协议/transport、客户端 adapter、编码、连接与 I/O 资源生命周期
        基础配置快照与 watch、错误映射、第三方执行域桥接
                          ↓
-coroutine：调度、等待/唤醒、deadline/cancellation、executor
+coroutine：调度、等待/唤醒、deadline、executor
 ```
 
 上图中的扩展依赖核心公开契约，核心不反向依赖某个具体扩展；装配由应用完成。运行时调用 provider 不是构建依赖反转。
@@ -68,7 +68,7 @@ coroutine：调度、等待/唤醒、deadline/cancellation、executor
 
 | 能力 | infra 负责 | framework 负责 | 应用负责 |
 |---|---|---|---|
-| RPC | 线上编码、传输、连接、I/O 取消与错误事实 | 逻辑服务调用、策略、上下文、路由、治理 | 方法/请求/回复及副作用语义 |
+| RPC | 线上编码、传输、连接、I/O 资源与错误事实 | 逻辑服务调用、策略、上下文、路由、治理 | 方法/请求/回复及副作用语义 |
 | 发现 | 后端客户端、watch/CAS 等基础机制 | 注册生命周期、实例视图、路由更新与陈旧策略 | namespace、部署与可用性选择 |
 | 配置 | 读取、版本观察、通知与关闭 | schema、校验、资源版本切换、回滚编排 | 业务配置约束 |
 | 身份 | TLS/凭证验证、可信 transport identity | service/method/tenant 授权执行点 | 领域资源授权 |
@@ -83,7 +83,7 @@ coroutine：调度、等待/唤醒、deadline/cancellation、executor
 
 1. **Host 与生命周期**：装配、启动、就绪、接纳、排空、资源释放。
 2. **Service 与方法契约**：服务名、方法名、schema、执行策略、调用权限和方法幂等属性。
-3. **Call/RequestContext**：预算、取消、逻辑 operation 标识、attempt、trace、已验证调用身份。
+3. **Call/RequestContext**：预算、逻辑 operation 标识、attempt、trace、已验证调用身份。业务级取消由调用方按 `CoXxx` 返回值处理，不由 framework 提供单操作取消令牌。
 4. **Resolver/Router**：把逻辑目标解析成一组候选实例，按调用类型选路由。
 5. **Admission 与资源边界**：服务并发、Actor 邮箱、出站并发、连接/字节/等待队列上限。
 6. **配置与资源编排**：不可变版本、预检、安装、旧实例排空、失败回退。
@@ -110,7 +110,7 @@ infra 解码与长度边界 → 可信身份上下文 → 协议/schema/路由�
 出站建议路径：
 
 ```text
-读取 RequestContext → 收紧预算与合并取消 → 方法策略
+读取 RequestContext → 收紧预算 → 方法策略
 → 读取版本化 endpoint/owner 视图 → 选目标 → 接纳出站 attempt
 → infra 发送 → 解释回复或未知结果 → 必要时按策略重试 → 一个调用终态
 ```
@@ -128,13 +128,13 @@ infra 解码与长度边界 → 可信身份上下文 → 协议/schema/路由�
 
 幂等键同名却 payload 不同必须拒绝；“返回同一个业务结果”与“避免再次执行”也不同，缓存淘汰可以保留去重水位而不再保存结果。
 
-### 4.3 Deadline 与 cancellation
+### 4.3 Deadline 与业务流程终止
 
-保留现有 min(parent, child) 和取消合并。用本地单调时钟管理本地 deadline；不得把某台机器的 `steady_clock::time_point` 原值发给另一台。[L04,E01]
+保留 `min(parent, child)` 的预算收紧规则。用本地单调时钟管理本地 deadline；不得把某台机器的 `steady_clock::time_point` 原值发给另一台。[L04,E01]
 
 线上传播剩余预算，接收方与自己的上限取较小值，再映射为本地期限。发送前扣除本地已耗时间；客户端始终执行原始总 deadline。需要诚实写明：没有时钟/传输时延额外约束，仅传 TTL 不能证明在任意网络延迟下所有远端副作用都在原始截止时刻前终止。
 
-Cancellation 是停止继续工作/等待的请求，不是事务回滚凭证；已经提交的数据库写入不能因为 RPC cancel 就被当作没发生。下游资源释放以实际 completion/close 确认为准。
+framework 不提供单操作业务取消令牌。业务根据 `CoXxx` 返回值按顺序决定是否继续后续调用；deadline、错误和协程运行时自身的等待结果仍按各自契约处理。已提交的数据库写入不能因为调用方停止后续流程而被当作没发生，下游资源释放以实际 completion/close 确认为准。
 
 ### 4.4 错误按“是否有结果证据”处理，不靠错误名字猜重试
 
@@ -232,7 +232,7 @@ Envoy 区分面向上游调用的 circuit breaking 与面向本进程资源耗�
 
 建议启动：装配校验 → runtime/infra 资源 → 安装 handler → listener 就绪但业务未 ready → 依赖与发现能力就绪 → 发布 ready/实例 → 开放正常接纳。发布失败不对外宣称可服务。
 
-建议停机：本地 readiness 关闭/拒新 → 发布 draining 或注销（尽力但有期限）→ 等待/取消既有工作 → 关闭 transport 与所有 provider → 确认 completion/close → 释放服务与资源 → 停 runtime。
+建议停机：本地 readiness 关闭/拒新 → 发布 draining 或注销（尽力但有期限）→ 等待既有工作 → 关闭 transport 与所有 provider → 确认 completion/close → 释放服务与资源 → run 返回；coroutine runtime 随进程寿命复用，不在 framework 收口中 Stop。
 
 发现变更存在延迟，所以不能等远端都看见注销再本地拒新。数据面必须能对到达旧实例的新请求给出明确拒绝，状态调用不自动跨 owner 重放。
 

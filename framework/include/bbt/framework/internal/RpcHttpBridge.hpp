@@ -57,8 +57,8 @@ void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 // infra 一致）；runtime 不可得 → RuntimeUnavailable。
 class HttpEgress {
 public:
-    // host 弱持有：宿主对象本身可空（纯出站宿主）或由 ReleaseClosed
-    // 释放；两者都以 RuntimeUnavailable 如实返回。
+    // host 弱持有：宿主对象本身可空（纯出站宿主）或经 Close() 释放；
+    // 两者都以 RuntimeUnavailable 如实返回。
     explicit HttpEgress(std::weak_ptr<InfraHttpHost> host);
 
     // 协程内调用。addr.transport 仅支持 "http"（其余 → InvalidArgument）。

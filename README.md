@@ -33,12 +33,11 @@ app.run();
 （未装配 → `nullptr`）。两种装配入口：
 - `add_resource<R>(name, shared_ptr<R>)`：预创建实例，登记即对服务可见；
 - `add_resource<R>(name, factory)`：延迟工厂——`factory` 返回
-  `result<shared_ptr<R>>`，在 Scheduler 启动后、绑定服务与开始接纳之前执行
+  `result<shared_ptr<R>>`，在运行时初始化后、绑定服务与开始接纳之前执行
   `Create`；若 `R` 暴露 `result<void> Start()` 由框架随即调用一次，若实现
-  `bbt::infra::ICoCloseable` 则由关闭序列统一 `RequestClose`/`WaitClosed`
-  （handler 排空之后、网络组件关闭之前，纳入 shutdown budget 与
-  `ShutdownIncomplete` 记账）。任一资源创建/启动失败 → 启动失败回退，
-  已启动资源按序收束，不留半装配状态。
+  `bbt::infra::ICoCloseable` 则由关闭序列统一 `Close()` 同步收口
+  （handler 排空之后、网络组件关闭之前）。任一资源创建/启动失败 →
+  启动失败回退，已启动资源按序收束，不留半装配状态。
 
 公共目标 `bbt::framework`（静态库）。
 

@@ -227,8 +227,9 @@ struct Fixture {
     }
 
     ~Fixture() {
-        if (client) client->RequestClose();
-        if (client_runtime) client_runtime->RequestClose();
+        // infra 关闭是同步契约：Close() 返回即物理释放。
+        if (client) client->Close();
+        if (client_runtime) client_runtime->Close();
         if (app) app->request_shutdown();
         if (run_thread.joinable()) run_thread.join();
         g_hits = nullptr;

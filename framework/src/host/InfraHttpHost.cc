@@ -1,19 +1,8 @@
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 
-#include <chrono>
 #include <utility>
 
-#include <bbt/coroutine/coroutine.hpp>
-
 namespace bbt::framework {
-
-namespace {
-
-// 控制线程等待的上限粒度：谓词之外的活性复查（外部 cancel、Scheduler
-// 意外停止）按此间隔重估，不是时序凑数。
-constexpr std::chrono::milliseconds kRecheck{50};
-
-} // namespace
 
 InfraHttpHost::InfraHttpHost(bbt::infra::NetworkLimits limits,
                              bbt::infra::ListenAddress listen)
@@ -27,8 +16,8 @@ result<void> InfraHttpHost::Create() {
     auto rt = bbt::infra::NetworkRuntime::Create(m_limits);
     if (!rt)
         return result<void>::err(std::move(rt.error()));
-    // m_runtime 经 m_mtx 发布：RequestClose/WaitClosed 允许从控制线程
-    // 并发读，不能与 Create/ReleaseClosed 的写并发。
+    // m_runtime 经 m_mtx 发布：只读口从控制线程并发读，不能与
+    // Create/Close 的写并发。
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_runtime = std::move(rt.value());
@@ -94,86 +83,31 @@ void InfraHttpHost::StopAccepting() noexcept {
 }
 
 result<void> InfraHttpHost::WaitHandlersDone(
-    bbt::coroutine::Deadline deadline,
-    bbt::coroutine::CancellationToken cancel) {
+    bbt::coroutine::Deadline deadline) {
     std::unique_lock<std::mutex> lk(m_mtx);
-    for (;;) {
-        if (m_inflight == 0)
-            return result<void>::ok();
-        if (cancel.IsCancellationRequested())
-            return result<void>::err(MakeError(ErrorCode::Cancelled,
-                "WaitHandlersDone cancelled"));
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
-            return result<void>::err(MakeError(ErrorCode::TimedOut,
-                "inbound handlers still running at deadline"));
-        const auto remain =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
-        // 谓词之外的活性复查点：token 没有通知通道，按有界间隔重估。
-        m_cv.wait_for(lk, remain < kRecheck ? remain : kRecheck);
-    }
+    // 谓词等待 + 到期判定：_Handle 每次减一都在同一锁序下 notify_all，
+    // 无遗漏唤醒；deadline 到点仍有在途 handler → TimedOut。
+    if (m_cv.wait_until(lk, deadline, [this] { return m_inflight == 0; }))
+        return result<void>::ok();
+    return result<void>::err(MakeError(ErrorCode::TimedOut,
+        "inbound handlers still running at deadline"));
 }
 
-void InfraHttpHost::RequestClose() noexcept {
+void InfraHttpHost::Close() noexcept {
     std::shared_ptr<bbt::infra::NetworkRuntime> rt;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         rt = m_runtime;
     }
+    // 同步收口：NetworkRuntime::Close 逐个收口子对象（含 HttpServer）、
+    // transport 与 io 域，返回即物理资源已释放；不重开、无协程等待。
     if (rt)
-        rt->RequestClose();
-}
-
-bbt::infra::CloseStatus InfraHttpHost::WaitClosed(
-    bbt::coroutine::Deadline deadline,
-    bbt::coroutine::CancellationToken cancel) {
-    std::shared_ptr<bbt::infra::NetworkRuntime> rt;
+        rt->Close();
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        rt = m_runtime;
+        m_server.reset();
+        m_runtime.reset();
     }
-    if (!rt || rt->IsClosed())
-        return bbt::infra::CloseStatus::Closed;
-
-    // 桥接：ICoCloseable::WaitClosed 只在协程内合法，INetworkHost 语义
-    // 是控制线程等待。注册一次性协程执行真实 WaitClosed（deadline/cancel
-    // 原样传递，不放宽），控制线程经条件变量收结果。
-    struct Slot {
-        std::mutex                                   m;
-        std::condition_variable                      cv;
-        std::optional<bbt::infra::CloseStatus>       st;
-    };
-    auto slot = std::make_shared<Slot>();
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [rt, deadline, cancel, slot]() mutable {
-            auto st = rt->WaitClosed(deadline, std::move(cancel));
-            {
-                std::lock_guard<std::mutex> lk(slot->m);
-                slot->st = st;
-            }
-            slot->cv.notify_all();
-        },
-        succ);
-    if (!succ)
-        return bbt::infra::CloseStatus::RuntimeUnavailable;
-
-    std::unique_lock<std::mutex> lk(slot->m);
-    while (!slot->st.has_value()) {
-        // 协程在 Scheduler Stop 排空时可能被整队丢弃而永不运行；
-        // 以活性复查退出，不把控制线程永久挂住。
-        if (!g_scheduler->IsRunning())
-            return bbt::infra::CloseStatus::RuntimeUnavailable;
-        slot->cv.wait_for(lk, kRecheck);
-    }
-    return *slot->st;
-}
-
-void InfraHttpHost::ReleaseClosed() noexcept {
-    std::lock_guard<std::mutex> lk(m_mtx);
-    m_server.reset();
-    m_runtime.reset();
 }
 
 std::optional<bbt::infra::ListenAddress> InfraHttpHost::bound_address() const {

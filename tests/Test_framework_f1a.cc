@@ -1,5 +1,6 @@
 // co-service-actor/v1 F1-a：RequestContext/RequestScope 与
-// CallOptionsAdapter 的 deadline/cancel 继承语义测试。
+// CallOptionsAdapter 的 deadline 继承语义测试。业务取消由流程按 CoXxx
+// 返回值决定，框架不提供单操作业务取消；协程等待结果按 coroutine 契约处理。
 // 全部确定性可测：通过注入点断言「未发起 I/O / 未消耗序号」，
 // 不用 sleep 凑时序、无空断言。
 #define BOOST_TEST_MAIN
@@ -36,17 +37,29 @@ static_assert(
     !std::is_convertible<bbt::infra::CallOptions, fw::CallOptions>::value,
     "framework::CallOptions and infra::CallOptions must not be convertible");
 
+// 取消令牌已从 framework/infra 的 CallOptions 与 RequestContext 移除：
+// 编译期断言无 cancel 字段，防止回退引入单操作业务取消。
+template <class T, class = void>
+struct HasCancelField : std::false_type {};
+template <class T>
+struct HasCancelField<T, std::void_t<decltype(std::declval<T&>().cancel)>>
+    : std::true_type {};
+static_assert(!HasCancelField<fw::CallOptions>::value,
+    "framework::CallOptions must not carry a cancel token");
+static_assert(!HasCancelField<bbt::infra::CallOptions>::value,
+    "infra::CallOptions must not carry a cancel token");
+static_assert(!HasCancelField<fw::RequestContext>::value,
+    "RequestContext must not carry a cancel token");
+
 namespace {
 
 std::shared_ptr<const fw::RequestContext> MakeCtx(
-    const std::string&       request_id,
-    co::Deadline             deadline,
-    co::CancellationToken    cancel = co::CancellationToken{})
+    const std::string& request_id,
+    co::Deadline       deadline)
 {
     auto ctx = std::make_shared<fw::RequestContext>();
     ctx->request_id = request_id;
     ctx->deadline   = deadline;
-    ctx->cancel     = cancel;
     return ctx;
 }
 
@@ -92,12 +105,13 @@ private:
 };
 
 // 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测）。
+// runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
 struct SchedulerFixture {
     SchedulerFixture() {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
-        g_scheduler->Start();
+        if (!g_scheduler->IsInitialized())
+            g_scheduler->Start();
     }
-    ~SchedulerFixture() { g_scheduler->Stop(); }
 };
 
 fw::OrderedGrant MakeGrant(const std::string& tag) {
@@ -194,53 +208,8 @@ BOOST_AUTO_TEST_CASE(expired_returns_timedout_before_any_io) {
     BOOST_CHECK(spy.io_calls == 0);
 }
 
-// 用例 5：合并后 token 任一侧取消即取消，两侧独立触发均生效。
-BOOST_AUTO_TEST_CASE(combined_cancel_either_side_works) {
-    // 5a：父 token 取消 → 合并 token 取消。
-    co::CancellationSource src_parent, src_call;
-    SpyHooks spy_a;
-    auto parent_a = MakeCtx("pa",
-        Clock::now() + std::chrono::seconds{30}, src_parent.Token());
-    fw::CallOptions opt_a;
-    opt_a.cancel = src_call.Token();
-    auto ra = fw::AdaptCallOptions(parent_a.get(), opt_a, spy_a.hooks);
-    BOOST_REQUIRE(ra);
-    auto combined_a = ra.value().cancel;
-    BOOST_CHECK(!combined_a.IsCancellationRequested());
-    src_parent.RequestCancel();
-    BOOST_CHECK(combined_a.IsCancellationRequested());
-
-    // 5b：本次 options.cancel 取消 → 合并 token 取消，父侧不受影响。
-    co::CancellationSource src_parent2, src_call2;
-    SpyHooks spy_b;
-    auto parent_b = MakeCtx("pb",
-        Clock::now() + std::chrono::seconds{30}, src_parent2.Token());
-    fw::CallOptions opt_b;
-    opt_b.cancel = src_call2.Token();
-    auto rb = fw::AdaptCallOptions(parent_b.get(), opt_b, spy_b.hooks);
-    BOOST_REQUIRE(rb);
-    auto combined_b = rb.value().cancel;
-    src_call2.RequestCancel();
-    BOOST_CHECK(combined_b.IsCancellationRequested());
-    BOOST_CHECK(!src_parent2.Token().IsCancellationRequested());
-}
-
-// 用例 6：传入 infra 的是合并后 token——撤销父预算后 infra 侧 token
-// 也取消；未合并的用户 token 不随父取消。
-BOOST_AUTO_TEST_CASE(infra_receives_combined_not_user_token) {
-    co::CancellationSource src_parent, src_call;
-    SpyHooks spy;
-    auto parent = MakeCtx("p",
-        Clock::now() + std::chrono::seconds{30}, src_parent.Token());
-    fw::CallOptions opt;
-    opt.cancel = src_call.Token();
-    auto r = fw::AdaptCallOptions(parent.get(), opt, spy.hooks);
-    BOOST_REQUIRE(r);
-    BOOST_CHECK(spy.io_calls == 1);
-    src_parent.RequestCancel();
-    BOOST_CHECK(spy.last_io_options.cancel.IsCancellationRequested());
-    BOOST_CHECK(!opt.cancel.IsCancellationRequested());
-}
+// 取消相关的旧用例已删除：framework 不经出站装配表达业务级取消；等待中的
+// 协程级取消由 coroutine 自身契约处理，业务级取消由 CoXxx 返回值决定。
 
 // 用例 7：非受管执行 → InvalidContext；受管作用域登记后可取出，
 // 嵌套内层遮蔽外层、退出后恢复。
@@ -299,33 +268,8 @@ BOOST_AUTO_TEST_CASE(unmanaged_context_returns_invalid_context) {
     BOOST_CHECK(seen2.load() == 1);
 }
 
-// 用例 8：装配抛异常 → InternalError，下游未调用、序号未消耗、
-// 票据仍为未发送。
-BOOST_AUTO_TEST_CASE(assembly_exception_internal_error_no_side_effects) {
-    auto session_r = fw::OrderedSession::Open(MakeGrant("f1a8"));
-    BOOST_REQUIRE(session_r);
-    auto session = session_r.value();
-    auto stamp_r = session->prepare();
-    BOOST_REQUIRE(stamp_r);
-    auto stamp = stamp_r.value();
-    BOOST_CHECK(!session->IsTicketSent(stamp));
-
-    SpyHooks spy;
-    spy.hooks.combine_cancel =
-        [](co::CancellationToken, co::CancellationToken)
-            -> co::CancellationToken {
-            throw std::bad_alloc();
-        };
-    auto parent = MakeCtx("p", Clock::now() + std::chrono::seconds{30});
-    fw::CallOptions opt;
-    opt.ordered = stamp;
-    auto r = fw::AdaptCallOptions(parent.get(), opt, spy.hooks);
-    BOOST_REQUIRE(!r);
-    BOOST_CHECK(r.error().code == fw::ErrorCode::InternalError);
-    BOOST_CHECK(spy.io_calls == 0);
-    BOOST_CHECK(spy.seq_calls == 0);
-    BOOST_CHECK(!session->IsTicketSent(stamp));
-}
+// 用例 8（已移除）：原用例验证旧取消装配注入点的异常边界。取消装配已从
+// framework 公共面删除，当前适配器只负责 deadline、顺序票据与 I/O 注入。
 
 // 用例 9：分层类型不可互换（编译期 static_assert 见文件头，
 // 此处给出运行期可报告断言）。
@@ -338,7 +282,8 @@ BOOST_AUTO_TEST_CASE(layered_types_not_interchangeable) {
 }
 
 // 补充正路径：成功装配 → 消耗序号（真实票据绑定）→ 发起 I/O，
-// infra::CallOptions 携带生效期限与合并 token。
+// infra::CallOptions 只承载 deadline；出站装配成功路径验证 budget、
+// sequence 绑定和 I/O 注入。
 BOOST_AUTO_TEST_CASE(success_path_consumes_sequence_and_initiates_io) {
     auto session_r = fw::OrderedSession::Open(MakeGrant("f1a9"));
     BOOST_REQUIRE(session_r);

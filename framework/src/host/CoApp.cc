@@ -99,21 +99,19 @@ int CoApp::run() {
     m_lifecycle.store(&lifecycle, std::memory_order_release);
 
     HostLifecycle::Hooks hooks;
-    // 启动：Scheduler::Start 之后、网络 Create 之前先创建/启动资源，再
-    // 绑定 Service——满足资源「Create 要求 Scheduler 已启动」与「资源就绪
+    // 启动：runtime 初始化之后、网络 Create 之前先创建/启动资源，再
+    // 绑定 Service——满足资源「Create 要求 runtime 已初始化」与「资源就绪
     // 后再接纳」的装配顺序。
     hooks.on_scheduler_started = [this] {
         if (auto r = _StartResources(); !r)
             return r;
         return _BindServices();
     };
-    // 关闭：handler 排空后、网络 RequestClose 前收束资源（资源可能在途
+    // 关闭：handler 排空后、网络 Close 前同步收束资源（资源可能在途
     // handler 仍被引用；网络对象尚未关闭，资源可安全收尾）。
-    hooks.on_handlers_drained = [this](HostLifecycle& lc) {
-        _CloseResources(lc);
-    };
-    hooks.on_release           = [this](HostLifecycle& lc) {
-        _CloseResources(lc);   // 回退路径兜底（spec.closed 幂等）
+    hooks.on_handlers_drained = [this] { _CloseResources(); };
+    hooks.on_release           = [this] {
+        _CloseResources();   // 回退路径兜底（spec.closed 幂等）
         _ReleaseServices();
     };
 
@@ -266,7 +264,7 @@ result<void> CoApp::_ValidateConfig() const {
 }
 
 result<void> CoApp::_BindServices() {
-    // Scheduler::Start 之后调用（generation 已就位）。Concurrent → 单实例
+    // runtime 初始化之后调用（runtime 已就绪）。Concurrent → 单实例
     // 绑定；ActorSerial → 注册表工厂在激活时绑定身份，actor key 由注册表
     // 经 _bind_actor_key 绑定。所有实例共享同一出站注入点（经路由门）
     // 与同一应用级资源表（context().resource<R>() 的数据源）。
@@ -335,7 +333,7 @@ result<void> CoApp::_BindServices() {
 }
 
 result<void> CoApp::_StartResources() {
-    // Scheduler::Start 之后（on_scheduler_started）、绑定 Service 之前：
+    // runtime 初始化之后（on_scheduler_started）、绑定 Service 之前：
     // 逐个执行工厂资源的 Create→Start→登记实例视图。m_resource_specs 是
     // unordered_map（ResourceKeyHash），本处无跨资源依赖约定，顺序不敏感；
     // 如需登记序请改存有序容器，不在注释中宣称确定性。任一失败即返回，
@@ -391,38 +389,25 @@ result<void> CoApp::_StartResources() {
     return result<void>::ok();
 }
 
-void CoApp::_CloseResources(HostLifecycle& lifecycle) noexcept {
-    // 收集需收束的资源（持锁拷贝句柄，避免在锁内做可能阻塞的等待）。
-    struct Item {
-        std::string                                name;
-        std::shared_ptr<bbt::infra::ICoCloseable>  closeable;
-        ResourceSpec*                              spec;
-    };
-    std::vector<Item> items;
+void CoApp::_CloseResources() noexcept {
+    // 收集需收束的资源（持锁拷贝句柄，避免在锁内执行 Close）。
+    std::vector<std::shared_ptr<bbt::infra::ICoCloseable>> closeables;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        for (auto& [key, spec] : m_resource_specs) {
+        for (auto& kv : m_resource_specs) {
+            ResourceSpec& spec = kv.second;
             if (spec.closed || !spec.instance || !spec.as_closeable)
                 continue;
             if (auto c = spec.as_closeable(spec.instance)) {
-                items.push_back(Item{key.name, std::move(c), &spec});
+                closeables.push_back(std::move(c));
                 spec.closed = true;   // 幂等：回退路径不重复收束
             }
         }
     }
-    for (auto& item : items) {
-        // RequestClose 幂等、任意线程可调；WaitClosed 桥接到协程等待，
-        // 预算与 ShutdownIncomplete 记账由 RunCloseStep 统一处理。
-        item.closeable->RequestClose();
-        auto closeable = item.closeable;
-        lifecycle.RunCloseStep(
-            "resource:" + item.name,
-            [closeable](bbt::coroutine::Deadline d,
-                        bbt::coroutine::CancellationToken c) {
-                return internal::WaitClosedOnControlThread(
-                    closeable, d, std::move(c));
-            });
-    }
+    // infra 关闭是同步契约：Close() 返回即物理释放、幂等、noexcept，
+    // 无控制线程等待预算/迟到收尾（资源不再有独立等待步）。
+    for (auto& closeable : closeables)
+        internal::CloseResource(closeable);
 }
 
 void CoApp::_ReleaseServices() noexcept {
