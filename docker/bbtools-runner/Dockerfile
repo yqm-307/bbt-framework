@@ -1,4 +1,5 @@
-# bbtools-runner v1：coroutine CI 专用 runner 镜像
+# bbtools-runner v2：coroutine CI 专用 runner 镜像
+# v2 在 v1 基础上预装 Valgrind 和 glibc 调试符号，供专用 memcheck scale set 使用。
 #
 # 基座 = 官方 actions-runner（保证与 ARC 控制器兼容），叠加工具链：
 # - 编译器/cmake/ninja：apt 安装
@@ -8,7 +9,7 @@
 # - 业务代码（coroutine/infra）仍在 Job 运行时 checkout，不烘进镜像
 #
 # 构建（s3 上，经 mihomo）：
-#   docker build --network=host -t bbtools-runner:v1 \
+#   docker build --network=host -t bbtools-runner:v2 \
 #     --build-arg RUNNER_BASE=ghcr.io/actions/actions-runner:<pin> -f Dockerfile .
 
 ARG RUNNER_BASE=ghcr.io/actions/actions-runner:latest
@@ -28,7 +29,17 @@ USER root
 RUN export http_proxy=${HTTP_PROXY} https_proxy=${HTTP_PROXY} && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        g++ cmake ninja-build make git python3 ccache pkg-config libevent-dev && \
+        g++ cmake ninja-build make git python3 ccache pkg-config libevent-dev \
+        valgrind libc6-dbg && \
+    valgrind --version && \
+    valgrind --tool=memcheck --error-exitcode=42 \
+        --log-file=/tmp/bbttools-valgrind-probe.log /bin/true && \
+    test -s /tmp/bbttools-valgrind-probe.log && \
+    ! grep -Eq 'valgrind: ?Fatal error|Cannot continue' \
+        /tmp/bbttools-valgrind-probe.log && \
+    mkdir -p /etc/bbttools-runner && \
+    printf '%s\n' 'bbtools-runner:v2-memcheck' > /etc/bbttools-runner/profile && \
+    rm -f /tmp/bbttools-valgrind-probe.log && \
     rm -rf /var/lib/apt/lists/*
 
 # Boost：复用 common-image 成果，不重编
