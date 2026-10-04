@@ -93,6 +93,11 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/RpcHttpBridge.hpp
     internal/CoAppSeam.hpp
     internal/ResourceClose.hpp)
+# Issue #4：正式 wire 桥头只在 protobuf 前缀锁定（infra 注册 bbt_infra_rpc）时
+# 进入自给自检；未配置时该头不参与（其 include 的上游头不可得）。
+if(TARGET bbt_infra_rpc)
+    list(APPEND BBT_FRAMEWORK_INTERNAL_HEADERS internal/RpcWireBridge.hpp)
+endif()
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")
 set(_selfcheck_srcs "")
@@ -108,7 +113,17 @@ target_link_libraries(bbt_framework_header_selfcheck PRIVATE bbt::framework)
 target_compile_options(bbt_framework_header_selfcheck PRIVATE -Wall -Wextra)
 set_target_properties(bbt_framework_header_selfcheck PROPERTIES LINKER_LANGUAGE CXX)
 
+# Issue #4（P0-A）：GetValue 业务切片示例（唯一业务 .proto 真源 + C++ 服务端 +
+# Python 标准库客户端）。仅在测试构建（NEED_TEST=ON）且 protobuf 前缀锁定、
+# bbt_infra_rpc 目标可用时构建/注册；仓库约定 `-DNEED_TEST=ON` 才开启本仓
+# tests 与示例 ctest，不给只想链接 bbt::framework 的库消费者强加 Python3/Boost
+# 示例工具链依赖，也不在非测试构建跑示例用例。未配置前缀时不注册（示例不静默
+# 降级为 echo/header 旁路）。
 if(NEED_TEST)
+    # add_test 需要先 enable_testing；示例与 tests 都在此块内。
     enable_testing()
+    if(TARGET bbt_infra_rpc)
+        add_subdirectory(examples)
+    endif()
     add_subdirectory(tests)
 endif()

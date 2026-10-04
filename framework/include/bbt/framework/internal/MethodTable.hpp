@@ -210,6 +210,26 @@ struct MethodDeclBuilder<PositionalActorMethodDecl<Ptr, Key, Index>> {
     }
 };
 
+// Issue #4：proto schema 方法。request/response_schema 从生成 message 的
+// descriptor full_name 推导——.proto 是唯一真源，杜绝手写漂移。本特化只在
+// 业务以真实 protobuf 类型实例化 ProtoMethod 时展开，框架库本体不依赖
+// protobuf 头。
+template <auto Ptr, class Req, class Resp>
+struct MethodDeclBuilder<ProtoMethodDecl<Ptr, Req, Resp>> {
+    static RpcMethod Build(const ProtoMethodDecl<Ptr, Req, Resp>& d) {
+        using Traits = rpc_traits<decltype(Ptr)>;
+        static_assert(Traits::kCoRpc,
+                      "ProtoMethod requires a CoRpcReq/CoRpcResp handler");
+        RpcMethod m;
+        m.name            = d.name;
+        m.request_schema  = Req::descriptor()->full_name();
+        m.response_schema = Resp::descriptor()->full_name();
+        m.actor_keyed     = false;
+        m.invoke          = SelectInvoker(Ptr);
+        return m;
+    }
+};
+
 } // namespace detail
 
 // 声明清单 → 方法表；重名/空名在构建期抛 std::invalid_argument。

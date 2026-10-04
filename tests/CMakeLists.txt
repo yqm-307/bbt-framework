@@ -159,3 +159,18 @@ add_test(
             --server-bin "$<TARGET_FILE:rpc_xlang_server>"
             --client-py "${CMAKE_CURRENT_SOURCE_DIR}/rpc_xlang_client.py")
 set_tests_properties(framework.rpc_xlang PROPERTIES TIMEOUT 60)
+
+# framework #4 P0-A：GetValue 业务切片单测（唯一 .proto 真源 → descriptor/方法表
+# schema/typed codec golden vectors/handler 分支）。仅在示例目标构建时注册。
+if(TARGET getvalue_proto)
+    add_executable(Test_framework_getvalue_codec
+        Test_framework_getvalue_codec.cc)
+    target_link_libraries(Test_framework_getvalue_codec PRIVATE
+        bbt::framework getvalue_proto)
+    target_include_directories(Test_framework_getvalue_codec PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/getvalue")
+    target_compile_options(Test_framework_getvalue_codec PRIVATE -Wall -Wextra)
+    add_test(NAME framework.getvalue.codec
+        COMMAND Test_framework_getvalue_codec)
+    set_tests_properties(framework.getvalue.codec PROPERTIES TIMEOUT 30)
+endif()

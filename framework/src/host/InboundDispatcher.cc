@@ -197,6 +197,15 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
     ctx->peer_principal = incoming.peer_principal;
     ctx->trace_id       = std::move(trace_id);
 
+    // R4/S4：入站「已过期不进 handler」在共享入口统一拒绝，actor 与
+    // Concurrent 两条策略一致——不再进入等待/内联执行，也不扩大 actor
+    // 路径职责。此处尚未做有序流接纳（Admit），故过期的请求不产生
+    // ordered 终态副作用；0 预算已在 wire 解码期拒绝，本门承载「可解码
+    // 但 handler 可见期限已过」。
+    if (ctx->deadline <= std::chrono::steady_clock::now())
+        return result<RpcEnvelope>::err(MakeError(ErrorCode::TimedOut,
+            "inbound request budget already expired before handler entry"));
+
     std::vector<std::uint8_t> reply_payload;
 
     if (method->actor_keyed) {

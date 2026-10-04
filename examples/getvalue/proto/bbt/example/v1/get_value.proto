@@ -1,0 +1,37 @@
+// bbt-framework Issue #4（P0-A）：首个业务切片的唯一 schema 真源。
+//
+// 这是 GetValue 示例业务的 .proto，**不是** wire profile。传输信封（service/
+// method/request_id/remaining_budget_ms/outcome 等）由 bbtools-infra 的
+// proto/bbt/infra/rpc/v1/rpc_envelope.proto 拥有；本文件只定义业务请求/响应，
+// 作为 bbt.example.v1.GetValueService.GetValue 的 payload codec。
+//
+// 单一真源约束（Issue #4 契约）：
+//   - C++ 服务端不手写 schema 字符串；方法表从生成本文件得到的 descriptor
+//     full_name（bbt.example.v1.GetValueRequest / GetValueResponse）推导，
+//     杜绝 .proto 与 C++ 类型表双写漂移。
+//   - 生成头只落到构建目录；仓库内不提交生成物。
+//
+// 字段号冻结（发布后不得复用/改号）：
+//   GetValueRequest  key   = 1  （业务必需；缺失/空 → InvalidArgument）
+//   GetValueResponse found = 1
+//   GetValueResponse value = 2  （found=false 时为空）
+//
+// 兼容升级样例（V2，仅用于验证未知字段前向兼容，不建立第二套 schema 真源）：
+//   V2 客户端会在 GetValueRequest 追加可选字段 client_note = 2；
+//   V1 服务端按 proto3 规则忽略未知字段并照常处理。
+//
+// protoc/runtime 必须同源锁定 3.21.12（见 infra 的
+// docs/dependencies/protobuf-3.21.12.provenance.md）。
+
+syntax = "proto3";
+
+package bbt.example.v1;
+
+message GetValueRequest {
+    string key = 1;   // 业务键；空字符串由服务端拒绝（InvalidArgument）
+}
+
+message GetValueResponse {
+    bool   found = 1;
+    string value = 2; // found=true 时的持久值；found=false 时为空
+}

@@ -63,3 +63,20 @@ ctest --test-dir build -j1 --output-on-failure
 - `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名
   `NEED_TEST`、`BUILD_TESTING` 开关在接入时被局部屏蔽。
 - 构建产物只进已忽略的 `build/`。
+
+## 跨语言 RPC 示例：GetValue（Issue #4 P0-A）
+
+`examples/getvalue/` 是首个真实业务切片：业务 `.proto`（唯一 schema 真源）
++ C++ framework 服务端（正式 infra body wire bridge）+ Python 标准库客户端。
+详见 [`examples/getvalue/README.md`](examples/getvalue/README.md)。
+
+- 业务 schema：`examples/getvalue/proto/bbt/example/v1/get_value.proto`
+  （`bbt.example.v1.GetValueRequest/Response`；`GetValue(key) -> {found, value}`）。
+- 正式 wire：`CoAppOptions::inbound_bridge = RpcInboundBridge::ProtoWireV1`
+  → HTTP `POST /rpc`、`Content-Type: application/x-protobuf`、body 为 infra
+  版本化 `RpcEnvelope`；不使用 `x-bbt-*` header 旁路。选择该桥需配置锁定
+  protobuf 前缀 `-DBBT_PROTOBUF_PREFIX=<prefix>`（未配置时框架只提供迁移期
+  header 桥，选择 ProtoWireV1 会在启动前显式失败）。
+- 运行/验收（ctest 名 `examples.getvalue.xlang` 与 `framework.getvalue.codec`）；
+  Python 客户端零依赖（手写 proto3 wire 编解码）。所有结构化结果带
+  `auth_state=unauthenticated_loopback`。

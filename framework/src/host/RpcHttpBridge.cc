@@ -1,6 +1,11 @@
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
 
+#include <chrono>
 #include <utility>
+
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+#include <bbt/infra/rpc/RpcWire.hpp>
+#endif
 
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/internal/ErrorDomainRule.hpp>
@@ -143,8 +148,70 @@ void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app) {
         });
 }
 
-HttpEgress::HttpEgress(std::weak_ptr<InfraHttpHost> host)
-    : m_host(std::move(host)) {}
+HttpEgress::HttpEgress(std::weak_ptr<InfraHttpHost> host,
+                       RpcEgressProfile profile)
+    : m_host(std::move(host)), m_profile(profile) {}
+
+result<bbt::infra::RpcEnvelope> HttpEgress::_SendWireProfile(
+    const bbt::infra::RpcAddress& addr,
+    const bbt::infra::RpcEnvelope& env,
+    const bbt::infra::CallOptions& opt,
+    const std::shared_ptr<bbt::infra::HttpClient>& client) {
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    namespace rpcw = bbt::infra::rpc;
+    // 发起 I/O 前再次检查本进程既定生效期限：已过期 → 不做任何 I/O。
+    // （AdaptCallOptions 已在出站口拦截一次；此处是 egress 自身最后一道，
+    // 防止 caller 传入已过期 deadline 时误发。）
+    const auto now = std::chrono::steady_clock::now();
+    if (opt.deadline <= now)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::TimedOut,
+            "http egress: budget expired before wire io"));
+    long long remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        opt.deadline - now).count();
+    if (remaining < 1)
+        remaining = 1;
+    if (remaining > static_cast<long long>(rpcw::kMaxRemainingBudgetMs))
+        remaining = static_cast<long long>(rpcw::kMaxRemainingBudgetMs);
+
+    auto wire = rpcw::ToWireEnvelope(env, static_cast<std::uint32_t>(remaining));
+    if (!wire)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(wire.error()));
+    auto req = rpcw::MakeRpcWireHttpRequest(
+        wire.value(), addr.transport + "://" + addr.endpoint);
+    if (!req)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(req.error()));
+
+    auto res = client->Request(req.value(), opt);
+    if (!res)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(res.error()));
+
+    auto parsed = rpcw::ParseRpcWireHttpResponse(res.value());
+    if (!parsed)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(parsed.error()));
+    const rpcw::RpcWireEnvelope& w = parsed.value();
+
+    // 关联字段校验：request_id 必须回显；错误分支（success=false）经既有
+    // Error 映射保留 code/domain/details，不被当成成功（含 OutcomeUnknown）。
+    if (w.request_id != env.request_id)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::ProtocolError,
+            "wire egress: reply request_id mismatch"));
+    if (!w.success)
+        return result<bbt::infra::RpcEnvelope>::err(w.error);
+    if (w.response_schema != env.response_schema)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::ProtocolError,
+            "wire egress: reply response_schema mismatch"));
+    return rpcw::FromWireEnvelope(w);
+#else
+    (void)addr; (void)env; (void)opt; (void)client;
+    return result<bbt::infra::RpcEnvelope>::err(MakeError(
+        ErrorCode::RuntimeUnavailable,
+        "http egress: ProtoWireV1 profile requires bbt::infra_rpc "
+        "(protobuf prefix not configured)"));
+#endif
+}
 
 result<bbt::infra::RpcEnvelope> HttpEgress::Send(
     const bbt::infra::RpcAddress& addr,
@@ -182,6 +249,9 @@ result<bbt::infra::RpcEnvelope> HttpEgress::Send(
             m_client = std::move(created.value());
         client = m_client;
     }
+
+    if (m_profile == RpcEgressProfile::ProtoWireV1)
+        return _SendWireProfile(addr, env, opt, client);
 
     auto res = client->Request(
         http_bridge::ToHttpRequest(
