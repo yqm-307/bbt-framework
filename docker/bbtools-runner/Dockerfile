@@ -1,7 +1,10 @@
 # bbtools-runner v2：纯工具链 runner 镜像（Issue #37）
+# 在纯工具链之上叠加 memcheck 专用 Valgrind 与 glibc 调试符号，供专用
+# memcheck scale set 使用（对齐 main #36，不改变「只提供工具」的边界）。
 #
 # 基座 = 官方 actions-runner（保证与 ARC 控制器兼容），叠加：
 # - 编译器 / cmake / ninja / git / ccache / pkg-config：apt 安装；
+# - Valgrind + libc6-dbg：apt 安装，供 memcheck job 使用；
 # - Boost 1.90：从 bbtools-common-image COPY（不重编）；
 # - 锁定 protobuf 3.21.12 隔离前缀 /opt/protobuf-3.21.12：
 #   复用 #30 的 scripts/prepare_protobuf.sh（不重写配方）。
@@ -35,11 +38,22 @@ ARG HTTP_PROXY
 USER root
 
 # 仅工具链：不加 libevent-dev（infra 已摘除该依赖），不加 core/git clone。
+# 追加 memcheck 专用 valgrind + glibc 调试符号（对齐 main #36），并在构建期跑一次
+# 真实 memcheck 冒烟（-error-exitcode=42）以自证可用；profile 标记本镜像身份。
 RUN export http_proxy=${HTTP_PROXY} https_proxy=${HTTP_PROXY} && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         g++ cmake ninja-build make git python3 ccache pkg-config \
-        ca-certificates curl xz-utils && \
+        ca-certificates curl xz-utils valgrind libc6-dbg && \
+    valgrind --version && \
+    valgrind --tool=memcheck --error-exitcode=42 \
+        --log-file=/tmp/bbttools-valgrind-probe.log /bin/true && \
+    test -s /tmp/bbttools-valgrind-probe.log && \
+    ! grep -Eq 'valgrind: ?Fatal error|Cannot continue' \
+        /tmp/bbttools-valgrind-probe.log && \
+    mkdir -p /etc/bbttools-runner && \
+    printf '%s\n' 'bbtools-runner:v2-memcheck' > /etc/bbttools-runner/profile && \
+    rm -f /tmp/bbttools-valgrind-probe.log && \
     rm -rf /var/lib/apt/lists/*
 
 # Boost：复用 common-image 成果，不重编

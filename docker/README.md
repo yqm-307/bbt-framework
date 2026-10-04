@@ -4,7 +4,9 @@
 
 - `bbtools-common-image`：Debian 13 + g++ + cmake + ninja + 源码构建的 Boost 1.90。
 - `bbtools-runner`：官方 actions-runner 基座 + 上述工具 + 锁定 protobuf 3.21.12
-  隔离前缀 `/opt/protobuf-3.21.12`。**刻意不装 bbtools-core，也不写 `/usr/local`**
+  隔离前缀 `/opt/protobuf-3.21.12` + memcheck 专用 `valgrind`/`libc6-dbg`
+  （镜像内 `/etc/bbttools-runner/profile` = `bbtools-runner:v2-memcheck`）。
+  **刻意不装 bbtools-core，也不写 `/usr/local`**
   ——旧配方把 core@master 编进 `/usr/local` 会被运行时抢绑（与本工单 R4/S5 相悖）。
 
 业务与 bbt 库在 job 内按 `deps.lock` 固定 SHA 隔离构建，镜像本身不携带。
