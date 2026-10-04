@@ -17,6 +17,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Issue #37：工具链身份校验候选。仅手动触发，不进 PR/push 的 required checks，
+  # 直到运维把 arc-s4 runner 切到 docker/toolchain.lock 固定的镜像
+  # （未切换时该 job 在旧 runner 上会 fail-closed，属预期 —— 见 docker/README.md）。
+  workflow_dispatch:
 
 concurrency:
   # 排队语义：不设 cancel-in-progress，同 ref 的后续运行排队等待而非取消在跑
@@ -293,3 +297,23 @@ jobs:
       - name: Cleanup build dir
         if: always()
         run: rm -rf "$BBT_WORK_DIR"
+
+  # Issue #37 候选接线：证明"实际 runner 用的工具链"满足 docker/toolchain.lock，
+  # 而不只是 Dockerfile 可构建。仅 workflow_dispatch 触发，不属 required checks。
+  # 未部署固定镜像前在旧 runner 上预期失败（fail-closed，不绿色 skipped）。
+  # 运维切换镜像后把它并入 build job 才成为 P0-A 的强制前置（CI-T3/R4/S4）。
+  toolchain-verify:
+    name: "Toolchain identity (candidate, manual)"
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: arc-s4-framework
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 校验实际 runner 工具链身份（fail-closed，显式绑定本仓 lock）
+        # 复检 checkout 与本 job 的 runner image 是否同一工具链身份；F4 要求显式
+        # 传入本仓 docker/toolchain.lock，避免镜像内置旧 lock 冒充当前仓契约。
+        run: bash scripts/verify_toolchain.sh --in-image --lock "$GITHUB_WORKSPACE/docker/toolchain.lock"

@@ -1,61 +1,73 @@
-# bbtools-runner v1：coroutine CI 专用 runner 镜像
+# bbtools-runner v2：纯工具链 runner 镜像（Issue #37）
 #
-# 基座 = 官方 actions-runner（保证与 ARC 控制器兼容），叠加工具链：
-# - 编译器/cmake/ninja：apt 安装
-# - Boost 1.90：从 bbtools-common-image:v1 COPY（不重编）
-# - bbtools-core：构建时按 CORE_REF 编进 /usr/local（与 s3 口径一致）；
-#   core 有更新时重编本镜像即取最新
-# - 业务代码（coroutine/infra）仍在 Job 运行时 checkout，不烘进镜像
+# 基座 = 官方 actions-runner（保证与 ARC 控制器兼容），叠加：
+# - 编译器 / cmake / ninja / git / ccache / pkg-config：apt 安装；
+# - Boost 1.90：从 bbtools-common-image COPY（不重编）；
+# - 锁定 protobuf 3.21.12 隔离前缀 /opt/protobuf-3.21.12：
+#   复用 #30 的 scripts/prepare_protobuf.sh（不重写配方）。
 #
-# 构建（s3 上，经 mihomo）：
-#   docker build --network=host -t bbtools-runner:v1 \
-#     --build-arg RUNNER_BASE=ghcr.io/actions/actions-runner:<pin> -f Dockerfile .
+# 刻意不烘焙 bbtools-core / infra / coroutine / framework 业务库，也不写 /usr/local
+# （旧配方把 core@master 编进 /usr/local 会被运行时抢绑，与本工单 R4/S5 相悖）。
+# 业务与 bbt 库在 job 内按 deps.lock 固定 SHA 隔离构建，镜像只提供工具。
+#
+# 构建入口（仓库根为 context，--network=host 以经宿主机代理取包）：
+#   docker/build_toolchain.sh
+#
+# 固定输入（基础镜像 digest / Boost / protobuf）只认 docker/toolchain.lock，
+# 由构建入口传入；本文件不设默认值，缺参即失败（fail-closed）。
 
-ARG RUNNER_BASE=ghcr.io/actions/actions-runner:latest
-ARG COMMON_IMAGE=bbtools-common-image:v1
-ARG CORE_REF=master
-ARG HTTP_PROXY=http://127.0.0.1:7890
+# COMMON_IMAGE 由 build_toolchain.sh 传入**本次刚构建出的 common imageID**
+# （不是悬浮 tag）：见下方 AS common 阶段。
+ARG RUNNER_BASE
+ARG COMMON_IMAGE
+# 代理默认空（noProxy）：仅当调用方显式传入时才注入，不假定本机恒有代理。
+ARG HTTP_PROXY=
 
+# 把 common 作为命名阶段暴露 /opt/boost；COPY --from 用阶段名（常量，
+# 规避旧构建器不接受 ARG 直入 COPY --from 的限制），同时以 FROM ${COMMON_IMAGE}
+# 真正消费构建入口刚产出的精确 imageID —— 消除「build A、copy B」的悬浮路径。
+FROM ${COMMON_IMAGE} AS common
 FROM ${RUNNER_BASE}
 
 # 全局 ARG 在 FROM 后超出作用域，此处重新声明以继承构建参数
-ARG COMMON_IMAGE
-ARG CORE_REF
 ARG HTTP_PROXY
 
 USER root
 
+# 仅工具链：不加 libevent-dev（infra 已摘除该依赖），不加 core/git clone。
 RUN export http_proxy=${HTTP_PROXY} https_proxy=${HTTP_PROXY} && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        g++ cmake ninja-build make git python3 ccache pkg-config libevent-dev && \
+        g++ cmake ninja-build make git python3 ccache pkg-config \
+        ca-certificates curl xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # Boost：复用 common-image 成果，不重编
-# 注：s3 的 docker 不支持 COPY --from 中用 ARG 变量，此处硬编码镜像名
-COPY --from=bbtools-common-image:v1 /opt/boost /opt/boost
+COPY --from=common /opt/boost /opt/boost
 
-# common-image 的 Boost 不在默认路径，用编译器环境变量指过去，不改业务 CMakeLists
-# （必须放在 core 构建之前，core 的编译也要找 Boost 头文件）
-ENV CPLUS_INCLUDE_PATH=/opt/boost/include \
-    LIBRARY_PATH=/opt/boost/lib \
-    LD_LIBRARY_PATH=/opt/boost/lib:/usr/local/lib
-
-# bbtools-core：编进 /usr/local（复刻 s3 的 sudo make install 口径；
-# 上游 CMake 无 install target，故手动拷 .so + 头文件树）
+# 锁定 protobuf 3.21.12 隔离前缀：复用 scripts/prepare_protobuf.sh，不重写配方。
+COPY scripts/prepare_protobuf.sh /usr/local/share/bbt/prepare_protobuf.sh
+COPY docker/toolchain.lock /usr/local/share/bbt/toolchain.lock
 RUN export http_proxy=${HTTP_PROXY} https_proxy=${HTTP_PROXY} && \
-    git clone --depth 1 --branch ${CORE_REF} \
-        https://github.com/yqm-307/bbtools-core.git /tmp/core && \
-    cmake -S /tmp/core -B /tmp/core/build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DNEED_TEST=OFF -DENABLE_EXAMPLE=OFF && \
-    cmake --build /tmp/core/build -j$(nproc) && \
-    cp /tmp/core/build/lib/libbbt_core.so /usr/local/lib/ && \
-    cp -r /tmp/core/bbt /usr/local/include/bbt && \
-    ldconfig && \
-    ls /usr/local/lib/libbbt_core.so \
-       /usr/local/include/bbt/core/Attribute.hpp \
-       /opt/boost/lib/libboost_context.so && \
-    rm -rf /tmp/core
+    bash /usr/local/share/bbt/prepare_protobuf.sh /opt/protobuf-3.21.12 && \
+    echo /opt/protobuf-3.21.12/usr/lib/x86_64-linux-gnu > /etc/ld.so.conf.d/bbt-protobuf.conf && \
+    ldconfig
+
+# 工具链身份探针：可在镜像内独立运行（构建期与 CI 复用同一断言）
+COPY scripts/verify_toolchain.sh /usr/local/bin/verify-toolchain
+
+# Boost + protobuf 都不在默认路径，用环境变量指过去，不改业务 CMakeLists
+# （必须放在探针之前，探针与后续 job 都依赖这些变量）。
+ENV CPLUS_INCLUDE_PATH=/opt/boost/include:/opt/protobuf-3.21.12/usr/include \
+    LIBRARY_PATH=/opt/boost/lib:/opt/protobuf-3.21.12/usr/lib/x86_64-linux-gnu \
+    LD_LIBRARY_PATH=/opt/boost/lib:/opt/protobuf-3.21.12/usr/lib/x86_64-linux-gnu \
+    PATH=/opt/protobuf-3.21.12/usr/bin:$PATH \
+    BBT_TOOLCHAIN_PROTOBUF_PREFIX=/opt/protobuf-3.21.12
+
+# 构建期自检：protoc 版本 / libprotobuf.a checksum / Boost 成品与版本 /
+# 无 /usr/local bbt。探针自身会优先读镜像内 /usr/local/share/bbt/toolchain.lock
+# （构建上下文里就是本仓 lock），并以实际 version.hpp 内容核对 Boost 版本。
+RUN /usr/local/bin/verify-toolchain --in-image
 
 # 切回基座默认用户（以 docker inspect 基座 Config.User 为准，官方镜像为 runner）
 USER runner
