@@ -12,6 +12,9 @@
 #include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/framework/internal/ResourceClose.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+#include <bbt/framework/internal/RpcWireBridge.hpp>
+#endif
 
 namespace bbt::framework {
 
@@ -45,8 +48,23 @@ CoApp::CoApp(CoAppOptions options)
     m_default_host = std::make_shared<InfraHttpHost>(
         m_options.network_limits, m_options.listen);
     m_network_host = m_default_host;
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
+        InstallRpcWireBridge(*m_default_host, *this);
+    else
+        InstallRpcHttpBridge(*m_default_host, *this);
+#else
+    // 无 protobuf 前缀锁定时只有迁移期 header 桥；显式选择 ProtoWireV1 会在
+    // _ValidateConfig 被拒绝（不静默降级为另一协议）。
     InstallRpcHttpBridge(*m_default_host, *this);
-    m_default_egress = std::make_shared<HttpEgress>(m_default_host);
+#endif
+    // 出站 profile 与入站一致：选 ProtoWireV1 时出站走正式 body 信封（同一
+    // HttpClient 发送 root，只换编解码），不与入站协议分叉；LegacyHeaders 保留
+    // 迁移期 header 桥行为。
+    m_default_egress = std::make_shared<HttpEgress>(m_default_host,
+        m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1
+            ? RpcEgressProfile::ProtoWireV1
+            : RpcEgressProfile::LegacyHeaders);
     for (const auto& r : m_options.static_routes)
         m_routes.emplace(r.service_name, r.address);   // 重复名保先见，run 校验拒绝
 }
@@ -250,6 +268,12 @@ result<void> CoApp::_ValidateConfig() const {
         return FailInvalid("CoApp: listen host is empty");
     if (m_options.shutdown_step_budget <= std::chrono::milliseconds{0})
         return FailInvalid("CoApp: shutdown_step_budget must be > 0");
+#if !defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
+        return FailInvalid(
+            "CoApp: ProtoWireV1 inbound bridge requires bbt::infra_rpc "
+            "(protobuf prefix not configured); refusing to silently fall back");
+#endif
     for (const auto& r : m_options.static_routes) {
         if (r.service_name.empty())
             return FailInvalid("CoApp: static route with empty service_name");

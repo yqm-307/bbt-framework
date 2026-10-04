@@ -58,6 +58,35 @@ protected:
         const RouteFields& custom = {},
         const CallOptions& options = {});
 
+    // Issue #4：typed proto 出站调用（最小 typed seam，向后兼容）。
+    // request/response schema 取自生成物 descriptor::full_name()（.proto 唯一
+    // 真源），payload 经业务特化的 ProtoCodec<Req>/ProtoCodec<Resp> 编解码；
+    // 其余（envelope、deadline 适配、路由门、发送注入点）与 CoRpcReq 路径共用
+    // _CallSend 机器面，业务不接触 binder/envelope/发送注入。仅当 Req/Resp 有
+    // ProtoCodec 特化时可用；与既有 call(CoRpcReq) 重载互不影响。
+    template <class Req, class Resp>
+    [[nodiscard]] result<Resp> call(
+        std::string_view service_name,
+        std::string_view method_name,
+        const Req& request,
+        const RouteFields& custom = {},
+        const CallOptions& options = {}) {
+        static_assert(rpc_detail::is_proto_codec_v<Req> &&
+                      rpc_detail::is_proto_codec_v<Resp>,
+            "typed call requires ProtoCodec<Req>/ProtoCodec<Resp> "
+            "specializations");
+        auto encoded = rpc_detail::ProtoCodec<Req>::Encode(request);
+        if (!encoded)
+            return result<Resp>::err(std::move(encoded.error()));
+        auto reply = _CallSend(
+            service_name, method_name,
+            Req::descriptor()->full_name(), Resp::descriptor()->full_name(),
+            std::move(encoded.value()), custom, options);
+        if (!reply)
+            return result<Resp>::err(std::move(reply.error()));
+        return rpc_detail::ProtoCodec<Resp>::Decode(reply.value());
+    }
+
     // 服务上下文：请求字段只读 + 资源缝（见 ServiceContext.hpp）。
     ServiceContext&       context() noexcept { return m_context; }
     const ServiceContext& context() const noexcept { return m_context; }

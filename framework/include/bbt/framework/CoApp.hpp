@@ -63,12 +63,21 @@ struct CoAppSeam;
 std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
                                         CoAppSeam seam);
 void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
+void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app);
 
 // 显式静态路由项：service_name → 已配置的出站地址。
 struct StaticRoute {
     std::string              service_name;
     bbt::infra::RpcAddress   address;
 };
+
+// Issue #4：入站 RPC 协议选择。
+//  - LegacyHeaders：迁移期绑定，envelope 字段一对一映射 x-bbt-* header（既有
+//    默认，保留既有测试）。
+//  - ProtoWireV1：infra Issue #8 冻结的正式 body wire profile（POST /rpc +
+//    Content-Type: application/x-protobuf，body=RpcEnvelopeMsg）；须在 protobuf
+//    前缀锁定可用时选择，否则启动期显式失败。
+enum class RpcInboundBridge { LegacyHeaders, ProtoWireV1 };
 
 // 运行时配置（全部字段必须显式填写，与 ServiceOptions 同一约定）：
 //  - network_limits：透传给网络依赖组件的限额（ValidateNetworkLimits）；
@@ -81,6 +90,8 @@ struct CoAppOptions {
     bbt::infra::ListenAddress listen;
     std::vector<StaticRoute>  static_routes;
     std::chrono::milliseconds shutdown_step_budget;
+    // Issue #4：入站桥选择，默认保留既有 x-bbt-* header 绑定。
+    RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
 };
 
 class CoApp {
@@ -89,6 +100,7 @@ class CoApp {
     friend std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions,
                                                    CoAppSeam);
     friend void InstallRpcHttpBridge(InfraHttpHost&, CoApp&);
+    friend void InstallRpcWireBridge(InfraHttpHost&, CoApp&);
     // 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
     // dispatch_inbound，不新增业务可见面。
     friend result<bbt::infra::RpcEnvelope> DispatchInboundForTest(

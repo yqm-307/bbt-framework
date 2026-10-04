@@ -35,6 +35,14 @@ struct PositionalActorMethodDecl {
     const char* name;
 };
 
+// Issue #4：带 schema 类型的方法声明。请求/回复类型是 protobuf Message 类型，
+// 方法表在构建期从二者的 descriptor full_name 推导 request_schema /
+// response_schema——.proto 是唯一真源，业务不手写 schema 字符串。
+template <auto Ptr, class Req, class Resp>
+struct ProtoMethodDecl {
+    const char* name;
+};
+
 template <class... D>
 struct MethodList {
     std::tuple<D...> methods;
@@ -55,6 +63,19 @@ template <auto Ptr, class Key, std::size_t Index = 0>
 constexpr detail::PositionalActorMethodDecl<Ptr, Key, Index>
 ActorMethodAt(const char* name) {
     return detail::PositionalActorMethodDecl<Ptr, Key, Index>{name};
+}
+
+// Issue #4：proto schema 方法声明。
+//   fw::ProtoMethod<&Svc::GetValue,
+//                   bbt::example::v1::GetValueRequest,
+//                   bbt::example::v1::GetValueResponse>("GetValue")
+// handler 仍为 CoRpcResp(CoRpcReq)；负载 codec 由业务经公开
+// CoRpcReq::ParseProto / CoRpcResp::FromProto + rpc_detail::ProtoCodec<T>
+// 特化提供。schema 字符串由生成物的 descriptor 推导，不在此重复。
+template <auto Ptr, class Req, class Resp>
+constexpr detail::ProtoMethodDecl<Ptr, Req, Resp>
+ProtoMethod(const char* name) {
+    return detail::ProtoMethodDecl<Ptr, Req, Resp>{name};
 }
 
 template <class... D>
