@@ -174,6 +174,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare locked protobuf (ctest 用例工具前缀)
+        # build 树的 CTest 配置把 examples.getvalue.xlang 的 --protoc / --protoc-libdir
+        # 固化为绝对路径 $GITHUB_WORKSPACE/.deps/protobuf-3.21.12（= build job 的
+        # BBT_PROTOBUF_PREFIX）。test 是新 runner 新 checkout，checkout 的 git clean
+        # 已清掉未跟踪的 .deps，用例会 FileNotFoundError 指向该 protoc。这里复用
+        # build 侧同一 prepare_protobuf.sh，在相同绝对路径重建锁定前缀：只把 debs
+        # 解包进私有前缀，不安装系统包、不替换系统 protoc、不改 .deps 既有内容。
+        if: needs.changes.outputs.code == 'true'
+        run: bash scripts/prepare_protobuf.sh "$GITHUB_WORKSPACE/.deps/protobuf-3.21.12"
+
       - name: Download build tree
         if: needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v4
@@ -206,6 +216,19 @@ jobs:
           chmod +x "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null || true
           test -f "$BBT_BUILD_DIR/tests/rpc_xlang_server"
           chmod +x "$BBT_BUILD_DIR/tests/rpc_xlang_server"
+          # examples 下被 ctest COMMAND 直接 spawn 的产物同样经 artifact 往返丢 +x：
+          # examples.getvalue.{xlang,s2s} 会 Popen getvalue_server / getvalue_caller，
+          # 缺执行位即 PermissionError。与 tests/ 同口径显式恢复 + 存在性校验，
+          # 不做静默跳过（零命中即明确失败）。
+          for exe in getvalue_server getvalue_caller; do
+            bin="$BBT_BUILD_DIR/examples/getvalue/$exe"
+            if [ ! -f "$bin" ]; then
+              echo "FATAL: artifact 缺少 $bin" >&2
+              ls -la "$BBT_BUILD_DIR/examples/getvalue/" >&2 || true
+              exit 1
+            fi
+            chmod +x "$bin"
+          done
           ls -la "$BBT_BUILD_DIR"/tests/ | head -n 20
 
       - name: Verify test binaries resolve libs (fail-fast)
