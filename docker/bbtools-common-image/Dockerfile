@@ -2,7 +2,7 @@
 #
 # 决策（2026-09-18，用户确认）：
 # - Boost 1.90：trixie 官方源只有 1.83，必须源码构建；
-#   包地址 https://archives.boost.io/release/1.90.0/source/boost_1_90_0.tar.gz（已验证可达）
+#   包地址 https://archives.boost.io/release/1.90.0/source/boost_1_90_0.tar.gz
 # - libevent 已摘除依赖，不进镜像；bbtools-core 已拆解，不进镜像
 # - 基座对齐 s3 现役 runner：Debian 13 + g++14 + cmake 3.31 + ninja
 # - 只存算力节点本地 containerd（k3s ctr images import），无外部 registry；
@@ -10,12 +10,19 @@
 # - 自研单测框架零第三方依赖；Boost 只用 context 编译库 + 头文件部分，
 #   ci-guide 把 Boost.Test 列为新单测写法故把 test 编译库也烘进去
 # - 某仓新增依赖时在此追加并 bump TAG，重新 import 即可
+#
+# #37：基础镜像 digest / Boost 版本与归档 sha256 一律由 build_toolchain.sh
+# 从 docker/toolchain.lock 传入；本文件不设默认值，避免「lock 与 Dockerfile
+# 双重真源」。缺任一 build-arg 构建即失败（fail-closed），只能经构建入口构建。
 
-ARG BOOST_VERSION=1.90.0
+ARG COMMON_BASE
+ARG BOOST_VERSION
+ARG BOOST_SHA256
 
 # ---- 构建 Boost（只编需要的 6 个库，头文件全量保留） ----
-FROM debian:trixie-slim AS boost-builder
+FROM ${COMMON_BASE} AS boost-builder
 ARG BOOST_VERSION
+ARG BOOST_SHA256
 # 代理穿透：直连慢时用 --network=host + --build-arg http_proxy/https_proxy 注入
 ARG http_proxy=
 ARG https_proxy=
@@ -28,6 +35,8 @@ WORKDIR /src
 RUN set -e; \
     V_US=$(echo "$BOOST_VERSION" | tr '.' '_'); \
     wget -q "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${V_US}.tar.gz" -O boost.tar.gz; \
+    printf '%s  %s\n' "$BOOST_SHA256" boost.tar.gz | sha256sum --check --status \
+        || { echo "FATAL: boost 归档 sha256 不符" >&2; exit 3; }; \
     mkdir boost && tar xzf boost.tar.gz -C boost --strip-components=1; \
     cd boost; \
     ./bootstrap.sh --prefix=/opt/boost \
@@ -36,7 +45,7 @@ RUN set -e; \
     rm -rf /src/boost /src/boost.tar.gz
 
 # ---- 最终镜像：toolchain + 成品 Boost ----
-FROM debian:trixie-slim
+FROM ${COMMON_BASE}
 ENV DEBIAN_FRONTEND=noninteractive \
     CC=gcc \
     CXX=g++ \
