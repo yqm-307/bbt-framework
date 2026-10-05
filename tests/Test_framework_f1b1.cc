@@ -3,7 +3,9 @@
 // 拒绝。网络组件全部走 INetworkHost 桩（经 internal 测试缝注入）：断言
 // 真实调用序列、每步发生时 coroutine runtime 已初始化、超时与异常路径；
 // 无真实 socket、无 sleep 凑时序、无空断言。
-#define BOOST_TEST_MAIN
+// 自定义 main（BOOST_TEST_NO_MAIN）：若环境带 BBT_F1B1_DRAIN_CHILD 标志，则
+// 本进程作为「干净 exec 的自有子进程」运行永久排空失败探针；否则走 Boost 套件。
+#define BOOST_TEST_NO_MAIN
 #include <boost/test/included/unit_test.hpp>
 
 #include <algorithm>
@@ -11,14 +13,23 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <string>
 #include <string_view>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
+
+extern char** environ;
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
@@ -103,6 +114,7 @@ public:
     fw::result<void> start_rc  = fw::result<void>::ok();
     std::function<fw::result<void>(co::Deadline)> on_wait_handlers;
     std::function<void()> on_started;   // Start 成功后回调（控制线程）
+    std::function<void()> on_closed;    // Close() 调用时回调（控制线程）
     TestLatch start_seen{1};   // Start() 被调用（启动完成、开始接纳）时倒计时
 
     fw::result<void> Create() override {
@@ -122,7 +134,10 @@ public:
         if (on_wait_handlers) return on_wait_handlers(d);
         return fw::result<void>::ok();
     }
-    void Close() noexcept override { _Record("net.close"); }
+    void Close() noexcept override {
+        _Record("net.close");
+        if (on_closed) on_closed();
+    }
 
     std::vector<NetCall> Snapshot() const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -275,11 +290,329 @@ void JoinRun(const std::unique_ptr<RunHandle>& h) {
     if (h->th.joinable()) h->th.join();
 }
 
+// 早退安全：任何 BOOST_REQUIRE 失败都会展开栈，若 run 线程仍阻塞在闸门上
+// 则闸门/latch 对象被销毁（悬垂）或 run 线程未 join（terminate）。按「先放行
+// 闸门、再 join 线程」的析构顺序声明（后声明先析构）：先构造 join 守卫，再构造
+// 放行守卫。正常路径末尾的显式放行/join 与守卫幂等。
+struct RunJoinOnExit {
+    std::unique_ptr<RunHandle>* h;
+    ~RunJoinOnExit() { if (h != nullptr && *h) JoinRun(*h); }
+};
+struct GateOpenOnExit {
+    TestGate* g;
+    ~GateOpenOnExit() { if (g != nullptr) g->Open(); }
+};
+
 const std::vector<std::string> kCleanOrder{
     "net.create", "net.start", "net.stop_accepting", "net.wait_handlers",
     "net.close"};
 
+// ── 永久排空失败的子进程验证设施 ──────────────────────────────────────
+// fail-closed 语义下「永久排空失败」是设计上的永久 ShutdownIncomplete 保活：
+// Run 永不返回、绝不 Close/release（见 HostLifecycle.hpp 头部说明）。该状态
+// 无法在同进程内断言（run 不返回），故以「干净 exec」起本测试可执行文件的一个
+// 自有子进程运行场景：posix_spawn（不起 fork 已有 worker 线程的进程），由环境
+// 标志让子进程 main 直接走探针分支。证据只在「两次 WaitHandlersDone 均已返回
+// 并落定」后才写出；父进程读证据后只终止自有子进程并 waitpid，以 WIFSIGNALED
+// 证明 Run 确实未返回；若 Run 返回，子进程显式写 RETURNED 并以失败码退出，
+// 绝不以无限 pause 掩盖。
+
+enum class DrainFailure {
+    NonTimeoutError,   // 初次与续等都返回非超时错误 → 永久排空失败
+    TimeoutThenError,  // 初次 TimedOut、续等非超时错误 → 永久排空失败
+};
+
+std::string ModeName(DrainFailure m) {
+    return m == DrainFailure::NonTimeoutError ? "nontimeout" : "timeoutthen";
+}
+
+void WriteFd(int fd, const std::string& s) {
+    std::size_t off = 0;
+    while (off < s.size()) {
+        const ssize_t w = ::write(fd, s.data() + off, s.size() - off);
+        if (w <= 0) return;
+        off += static_cast<std::size_t>(w);
+    }
+}
+
+// 子进程探针：直接驱动 HostLifecycle（internal 缝），同时观察 ShutdownIncomplete
+// 状态、失败清单、未完成清理项，以及两个资源收束挂接点（on_handlers_drained =
+// 资源 Close 挂接点、on_release = 对象回收）与网络 Close。
+[[noreturn]] void RunDrainFailureChild(int fd, DrainFailure mode) {
+    auto wait_calls = std::make_shared<std::atomic<int>>(0);
+    auto host = std::make_shared<StubNetHost>();
+    host->on_closed = [fd] { WriteFd(fd, "NET_CLOSE\n"); };
+    host->on_wait_handlers =
+        [mode, wait_calls](co::Deadline) -> fw::result<void> {
+            const int n = wait_calls->fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (mode == DrainFailure::NonTimeoutError)
+                return fw::result<void>::err(fw::MakeError(
+                    fw::ErrorCode::InternalError, "permanent drain failure"));
+            if (n == 1)
+                return fw::result<void>::err(fw::MakeError(
+                    fw::ErrorCode::TimedOut, "handlers still running"));
+            return fw::result<void>::err(fw::MakeError(
+                fw::ErrorCode::InternalError, "drain failed after timeout"));
+        };
+
+    int nfds[2];   // 子进程内部：Run 返回时唤醒主线程（父进程不参与）
+    if (::pipe(nfds) != 0) { WriteFd(fd, "PIPE_FAIL\n"); ::_exit(2); }
+
+    fw::HostLifecycle::Hooks hooks;
+    hooks.on_handlers_drained = [fd] { WriteFd(fd, "RESOURCE_CLOSE\n"); };
+    hooks.on_release          = [fd] { WriteFd(fd, "RELEASE\n"); };
+
+    auto lc = std::make_shared<fw::HostLifecycle>(
+        host, std::chrono::milliseconds{2000}, nullptr);
+    std::atomic<bool> run_done{false};
+    std::thread run_th([lc, &hooks, &run_done, nfds] {
+        (void)lc->Run(hooks);
+        run_done.store(true, std::memory_order_release);
+        const ssize_t w = ::write(nfds[1], "R", 1);   // 唤醒主线程：Run 已返回
+        (void)w;
+    });
+    run_th.detach();
+
+    if (!host->start_seen.WaitFor(kWait)) {
+        WriteFd(fd, "START_TIMEOUT\n");
+        ::_exit(2);
+    }
+    lc->RequestShutdown();
+
+    const auto until = Clock::now() + kWait;
+    for (;;) {
+        const int waits = wait_calls->load(std::memory_order_acquire);
+        const auto fails = lc->Failures();
+        const auto pending = lc->IncompleteSteps();
+        auto count = [&fails](const char* needle) {
+            int c = 0;
+            for (const auto& f : fails)
+                if (f.find(needle) != std::string::npos) ++c;
+            return c;
+        };
+        // 「两次 Wait 均已返回并落定」的可证条件：两次调用都发生过；且「续等
+        // 返回之后」才写入的失败原文已出现（非超时错误在返回后记 failure；
+        // TimeoutThenError 的第二次非超时错误亦在返回后才记）。
+        const bool settled =
+            waits >= 2 &&
+            (mode == DrainFailure::NonTimeoutError
+                 ? count("permanent drain failure") >= 2
+                 : count("drain failed after timeout") >= 1);
+        if (settled && !pending.empty() && pending[0] == "WaitHandlersDone" &&
+            !run_done.load(std::memory_order_acquire)) {
+            std::string line = "PARKED waits=" + std::to_string(waits) +
+                               " pending=" + pending[0] + " failures=";
+            for (const auto& f : fails) line += "[" + f + "]";
+            WriteFd(fd, line + "\n");
+            break;
+        }
+        if (run_done.load(std::memory_order_acquire)) {
+            WriteFd(fd, "RETURNED\n");   // Run 返回 → 显式失败，绝不无限保活掩盖
+            ::_exit(4);
+        }
+        if (Clock::now() >= until) { WriteFd(fd, "NOT_PARKED\n"); ::_exit(2); }
+        std::this_thread::yield();
+    }
+
+    // 已落定于永久 ShutdownIncomplete：Run 若在落定后返回，会经 nfds 唤醒——
+    // 事件等待、不忙等、不 sleep 刷绿；父进程在本事件上阻塞期间终止本子进程。
+    pollfd p{nfds[0], POLLIN, 0};
+    const int pr = ::poll(&p, 1, -1);
+    WriteFd(fd, pr > 0 ? "RETURNED\n" : "POLL_ERR\n");
+    ::_exit(4);
+}
+
+struct DrainChildEvidence {
+    bool        parked{false};         // 子进程报告已落定于永久 ShutdownIncomplete
+    bool        signal_killed{false};  // 子进程被信号终止（Run 未返回）
+    std::string out;                   // 子进程写出的全部证据文本
+};
+
+// 从 environ 复制并追加/覆盖探针标志（不 setenv：不依赖全局环境可变性）。
+struct SpawnEnv {
+    std::vector<std::string> store;
+    std::vector<char*>       ptrs;
+    explicit SpawnEnv(const std::vector<std::string>& extra) {
+        for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
+            const std::string_view s{*e};
+            if (s.rfind("BBT_F1B1_DRAIN_", 0) == 0) continue;
+            store.emplace_back(s);
+        }
+        for (const auto& x : extra) store.push_back(x);
+        ptrs.reserve(store.size() + 1);
+        for (auto& s : store) ptrs.push_back(s.data());
+        ptrs.push_back(nullptr);
+    }
+    char* const* data() const { return ptrs.data(); }
+};
+
+// posix_spawn 本可执行文件 + 环境标志运行自有子进程；读到 PARKED 证据（含两次
+// Wait 落定与失败原文）后只 SIGKILL 并 waitpid 该自有子进程，排空残留证据。
+DrainChildEvidence ProbeDrainFailureChild(DrainFailure mode) {
+    DrainChildEvidence ev;
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return ev;
+    exe[n] = '\0';
+
+    int fds[2];
+    if (::pipe(fds) != 0) return ev;
+    const int ev_r = fds[0];
+    const int ev_w = fds[1];
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    // 顺序要紧：先关读端释放可能等于目标 3 的 fd，再把写端 dup 到固定 fd 3，
+    // 最后关掉写端原 fd（避免 addclose 关掉刚建立的 fd 3）。
+    posix_spawn_file_actions_addclose(&fa, ev_r);
+    posix_spawn_file_actions_adddup2(&fa, ev_w, 3);
+    if (ev_w != 3) posix_spawn_file_actions_addclose(&fa, ev_w);
+
+    SpawnEnv env({std::string("BBT_F1B1_DRAIN_CHILD=") + ModeName(mode),
+                  std::string("BBT_F1B1_DRAIN_EVFD=3")});
+    char* argv[] = {exe, nullptr};
+
+    pid_t pid = -1;
+    const int sp = ::posix_spawn(&pid, exe, &fa, nullptr, argv, env.data());
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(ev_w);
+    if (sp != 0) { ::close(ev_r); return ev; }   // 未能起子进程 → parked=false
+
+    char buf[512];
+    const auto deadline = Clock::now() + kWait;
+    bool stop = false;
+    while (!stop) {
+        const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()).count();
+        if (remain <= 0) break;
+        pollfd pfd{ev_r, POLLIN, 0};
+        if (::poll(&pfd, 1, static_cast<int>(remain)) <= 0) break;
+        const ssize_t r = ::read(ev_r, buf, sizeof(buf));
+        if (r <= 0) break;
+        ev.out.append(buf, static_cast<std::size_t>(r));
+        if (ev.out.find("PARKED") != std::string::npos) {
+            const auto pos = ev.out.find("PARKED");
+            if (ev.out.find('\n', pos) != std::string::npos) {
+                ev.parked = true;   // 完整 PARKED 行（含 waits/pending/failures）已读全
+                stop = true;
+            }
+        } else if (ev.out.find("NOT_PARKED") != std::string::npos ||
+                   ev.out.find("RETURNED") != std::string::npos ||
+                   ev.out.find("START_TIMEOUT") != std::string::npos ||
+                   ev.out.find("PIPE_FAIL") != std::string::npos) {
+            stop = true;
+        }
+    }
+    (void)::kill(pid, SIGKILL);   // 只终止自有子进程；不触碰他人进程
+    int status = 0;
+    (void)::waitpid(pid, &status, 0);
+    ev.signal_killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+    for (;;) {   // 排空子进程可能残留的证据（含任何 NET_CLOSE/RESOURCE_CLOSE/RELEASE）
+        const ssize_t r = ::read(ev_r, buf, sizeof(buf));
+        if (r <= 0) break;
+        ev.out.append(buf, static_cast<std::size_t>(r));
+    }
+    ::close(ev_r);
+    return ev;
+}
+
 BOOST_AUTO_TEST_SUITE(framework_f1b1)
+
+// 用例 0：永久排空失败 → fail-closed 保活。WaitHandlersDone 初次/续等返回错误
+// （排空未被证实）时，状态机绝不进入资源 Close 挂接点、绝不网络 Close、绝不
+// 释放 owner，Run 永不返回（保持 ShutdownIncomplete）；原始排空错误保留可观察。
+// 场景在「干净 exec 的自有子进程」中运行（posix_spawn，不在已有多线程的父进程
+// 内 fork），因此不依赖套件声明顺序；证据在两次 Wait 均已返回落定后才写出。
+BOOST_AUTO_TEST_CASE(drain_failure_fails_closed_never_closes_child) {
+    for (const DrainFailure mode :
+         {DrainFailure::NonTimeoutError, DrainFailure::TimeoutThenError}) {
+        const DrainChildEvidence ev = ProbeDrainFailureChild(mode);
+        BOOST_TEST_MESSAGE("drain child evidence(mode="
+            << static_cast<int>(mode) << "): [" << ev.out << "]");
+        BOOST_CHECK_MESSAGE(ev.parked,
+            "子进程未落定于永久 ShutdownIncomplete 保活态: [" << ev.out << "]");
+        // Run 从未返回：子进程落定后阻塞在事件上，被父进程信号终止。
+        BOOST_CHECK_MESSAGE(ev.signal_killed,
+            "子进程不是被信号终止，Run 可能已返回（fail-closed 破坏）");
+        // 两次 WaitHandlersDone 均已返回并落定（waits=2 + 返回后才写入的失败原文）。
+        BOOST_CHECK_MESSAGE(ev.out.find("waits=2") != std::string::npos,
+            "未证实两次 WaitHandlersDone 均已返回: [" << ev.out << "]");
+        // 未完成清理项仍在（ShutdownIncomplete 未收束）。
+        BOOST_CHECK_MESSAGE(ev.out.find("pending=WaitHandlersDone") !=
+                            std::string::npos,
+            "未完成清理项未保留可观察: [" << ev.out << "]");
+        // 排空未证实 → 资源 Close 挂接点/网络 Close/对象回收三者均不得触发。
+        for (const char* marker : {"NET_CLOSE", "RESOURCE_CLOSE", "RELEASE"}) {
+            BOOST_CHECK_MESSAGE(ev.out.find(marker) == std::string::npos,
+                "排空未证实却触发了收束挂接点 " << marker << ": ["
+                << ev.out << "]");
+        }
+        BOOST_CHECK_MESSAGE(ev.out.find("RETURNED") == std::string::npos,
+            "Run 返回（fail-closed 破坏）: [" << ev.out << "]");
+        // 原始排空错误保留可观察（第二路径确为「先 TimedOut 后非超时错误」）。
+        const char* expect = (mode == DrainFailure::NonTimeoutError)
+            ? "permanent drain failure" : "drain failed after timeout";
+        BOOST_CHECK_MESSAGE(ev.out.find(expect) != std::string::npos,
+            "永久排空失败的原始错误未保留可观察: [" << ev.out << "]");
+    }
+}
+
+// 用例 0b：非超时排空错误 + 迟到收尾恢复——初次返回非超时错误（未证实排空）
+// 不得当作已排空：进入 ShutdownIncomplete、保留 owner、不 Close；续等迟到排空
+// 完成后才收束，因存在硬性失败项返回 kExitShutdownFailed。原错误保留可观察。
+BOOST_AUTO_TEST_CASE(drain_error_enters_incomplete_then_recovers) {
+    auto host = std::make_shared<StubNetHost>();
+    TestLatch persist_entered{1};   // 已进入无界续等
+    TestGate  allow_drain;          // 迟到收尾放行
+    std::atomic<int> calls{0};
+    host->on_wait_handlers =
+        [&](co::Deadline) -> fw::result<void> {
+            if (calls.fetch_add(1, std::memory_order_acq_rel) == 0)
+                return fw::result<void>::err(fw::MakeError(
+                    fw::ErrorCode::InternalError, "drain probe failed"));
+            persist_entered.CountDown();
+            allow_drain.Wait();
+            return fw::result<void>::ok();
+        };
+    auto app = MakeApp(AppOpts(), host);
+    BOOST_REQUIRE(app->add_service<EchoSvc>(ConcurrentOpts()));
+
+    auto h = RunApp(*app);
+    // 早退安全：任何 BOOST_REQUIRE 失败都先放行闸门、再 join run 线程（具体顺序
+    // 见 RunJoinOnExit/GateOpenOnExit 说明），避免断言展开使闸门栈悬垂或线程死锁。
+    RunJoinOnExit  join_guard{&h};
+    GateOpenOnExit release_guard{&allow_drain};
+    BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
+    app->request_shutdown();
+    BOOST_REQUIRE(persist_entered.WaitFor(kWait));
+
+    // 未证实排空：ShutdownIncomplete、pending=WaitHandlersDone、run 不返回。
+    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::ShutdownIncomplete);
+    const auto pending = app->pending_cleanup();
+    BOOST_REQUIRE(pending.size() == 1);
+    BOOST_TEST(pending[0] == "WaitHandlersDone");
+    BOOST_TEST(!h->done.load());
+    const auto failures = app->lifecycle_failures();
+    BOOST_REQUIRE(!failures.empty());
+    BOOST_CHECK_MESSAGE(
+        failures[0].find("drain probe failed") != std::string::npos,
+        "非超时排空错误未保留可观察: " << failures[0]);
+    {   // 未提前网络 Close（资源 Close/on_release 亦未发生）
+        const auto names = host->Names();
+        BOOST_CHECK(std::find(names.begin(), names.end(), "net.close") ==
+                    names.end());
+    }
+
+    // 迟到排空完成 → 走完收束；存在硬性失败项 → kExitShutdownFailed。
+    allow_drain.Open();
+    JoinRun(h);
+    BOOST_TEST(h->rc == fw::HostLifecycle::kExitShutdownFailed);
+    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closed);
+    BOOST_TEST(app->pending_cleanup().empty());
+    const auto after = host->Names();
+    BOOST_CHECK(std::find(after.begin(), after.end(), "net.close") !=
+                after.end());
+}
 
 // 用例 1：add_service 注册成功；同服务名重复注册被明确拒绝；服务身份在
 // 启动期经 _bind_runtime 绑定（id/generation != 0）；资源缝在受管实例上
@@ -522,6 +855,9 @@ BOOST_AUTO_TEST_CASE(shutdown_timeout_reports_incomplete_not_success) {
     BOOST_REQUIRE(app->add_service<EchoSvc>(ConcurrentOpts()));
 
     auto h = RunApp(*app);
+    // 早退安全：任何 BOOST_REQUIRE 失败都先放行闸门、再 join run 线程。
+    RunJoinOnExit  join_guard{&h};
+    GateOpenOnExit release_guard{&allow_drain};
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
     app->request_shutdown();
 
@@ -603,3 +939,19 @@ BOOST_AUTO_TEST_CASE(shutdown_requested_before_run_closes_immediately) {
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace
+
+// 自定义入口（BOOST_TEST_NO_MAIN）：探针标志存在时本进程作为排空失败子进程，
+// 否则交 Boost 运行套件。探针在 exec 出的干净进程中运行，不与父进程共享线程状态。
+boost::unit_test::test_suite* init_unit_test(int, char**) { return nullptr; }
+
+int main(int argc, char* argv[]) {
+    const char* mode = std::getenv("BBT_F1B1_DRAIN_CHILD");
+    const char* evfd = std::getenv("BBT_F1B1_DRAIN_EVFD");
+    if (mode != nullptr && evfd != nullptr) {
+        RunDrainFailureChild(std::atoi(evfd),
+            std::string(mode) == "nontimeout"
+                ? DrainFailure::NonTimeoutError
+                : DrainFailure::TimeoutThenError);
+    }
+    return ::boost::unit_test::unit_test_main(&init_unit_test, argc, argv);
+}

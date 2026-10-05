@@ -6,9 +6,17 @@
 //   → 资源 Close（同步）→ 网络 Close（同步收口）→ 释放网络/业务对象
 //   → run 返回。
 // 每个等待步先使用有限预算；当前关闭等待步为 WaitHandlersDone。预算耗尽
-// 进入 ShutdownIncomplete——控制线程仍在 Run 内继续等待迟到收尾，不提前走
-// 「关闭/释放/返回」三步，不假装成功，不 _Exit/abort、不强杀线程。迟到收尾最终完成后照常走完整收束，
-// Run 返回非零（kExitShutdownLate）。
+// （TimedOut）或排空返回**非超时错误**都表示「排空未被证实」：一律进入
+// ShutdownIncomplete——控制线程仍在 Run 内继续等待迟到收尾，不提前走
+// 「关闭/释放/返回」三步，不假装成功，不 _Exit/abort、不强杀线程。
+// 未证实排空复用同一条「无界期限（Deadline::max）续等一次」路径：续等成功
+// 即证明迟到收尾完成，照常走完整收束（预算耗尽的迟到完成 → Run 返回
+// kExitShutdownLate；非超时错误的迟到完成 → kExitShutdownFailed）。
+// 若续等仍失败（永久排空失败），则 fail-closed：保持 ShutdownIncomplete、
+// 保留 owner 与资源、run 返回前**绝不** Close/release、Run 永不返回；不
+// busy retry、不提供公共恢复 API，结束由外部终止进程负责。资源收束
+// （on_handlers_drained → 网络 Close → on_release）只在「排空被证实」
+// （WaitHandlersDone 返回 ok）之后发生。
 //
 // coroutine runtime 是进程寿命单例：没有 Stop/restart，也不改代际；本
 // 状态机只在未初始化时 Start 一次，已初始化（他人启动或上一次 run 复用）
@@ -44,7 +52,8 @@ namespace bbt::framework {
 //    WaitHandlersDone → Close）必须安全可调（未启动部分视为空操作）；
 //  - WaitHandlersDone 在 deadline 耗尽时必须返回超时（TimedOut），
 //    不得无限阻塞；宿主在预算耗尽后会以 Deadline::max() 再次调用同一
-//    入口等待迟到收尾；
+//    入口等待迟到收尾；非预算性错误按 err(其它 code) 如实返回，宿主
+//    不得把任何错误当作「已排空」；
 //  - StopAccepting/Close 幂等、noexcept。Close 同步完成物理释放
 //    （对应 infra ICoCloseable::Close：返回即资源已释放、后端不再访问）。
 class INetworkHost {
@@ -130,7 +139,12 @@ private:
     result<void> _StartUp(const Hooks& hooks);
     void         _WaitShutdownRequest();
     int          _ShutDown(const Hooks& hooks);   // 返回 kExit*，固定顺序收束
-    void         _WaitHandlersDone();             // 预算 + 迟到续等
+    // 预算内等待 + 一次无界续等；返回 true 表示排空已被证实（此时才允许
+    // Close/release），false 表示排空未被证实（调用方须 fail-closed）。
+    bool         _WaitHandlersDone();
+    // 排空未被证实时的 fail-closed 保活：不 Close/release、Run 永不返回，
+    // 保持 ShutdownIncomplete 与 owner/资源；无公共恢复 API、不 busy retry。
+    void         _ParkUndrained();
     void         _OnHandlersDrained(const Hooks& hooks);  // 资源同步关闭挂接点
     bbt::coroutine::Deadline _StepDeadline() const;
     void         _EnterIncomplete(const char* step);

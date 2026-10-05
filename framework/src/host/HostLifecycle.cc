@@ -94,9 +94,11 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
 
     if (m_host_created.load(std::memory_order_acquire)) {
         // 顺序：StopAccepting → 等 handler 结束 → 资源同步 Close 挂接点 →
-        // 网络同步 Close。任何一步超时都不跳过、不提前释放。
+        // 网络同步 Close。排空未被证实（预算耗尽后的无界续等仍失败，或排空
+        // 返回非超时错误）时绝不进入后三步——保留 owner/资源、不释放、不返回。
         m_host->StopAccepting();
-        _WaitHandlersDone();
+        if (!_WaitHandlersDone())
+            _ParkUndrained();  // 永不返回：fail-closed 保活 ShutdownIncomplete
         _OnHandlersDrained(hooks);
         m_host->Close();   // noexcept：同步返回即物理资源已释放
     }
@@ -119,23 +121,40 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
                : kExitOk;
 }
 
-void HostLifecycle::_WaitHandlersDone() {
+bool HostLifecycle::_WaitHandlersDone() {
     auto r = m_host->WaitHandlersDone(_StepDeadline());
     if (r)
-        return;
-    if (r.error().code == ErrorCode::TimedOut) {
-        // 预算耗尽：标记 ShutdownIncomplete 后以无界期限续等——期限约束的
-        // 是优雅关闭是否成功，不是进程退出的硬时限；不得跳过释放仍在被
-        // 回调访问的资源。
-        _EnterIncomplete("WaitHandlersDone");
-        r = m_host->WaitHandlersDone(bbt::coroutine::Deadline::max());
+        return true;   // 排空已被证实
+    // 非预算性排空错误同样是「排空未被证实」：保留原始错误可观察，绝不当作
+    // 已排空（不得据此 Close/release）。预算耗尽（TimedOut）不算失败项。
+    const bool timed_out = (r.error().code == ErrorCode::TimedOut);
+    if (!timed_out)
+        _AddFailure("WaitHandlersDone: " + r.error().message);
+    // 未证实排空：复用既有的「无界期限续等一次」路径等待迟到收尾，不新增
+    // busy retry。此期间进入 ShutdownIncomplete（保留 owner、不 Close）。
+    _EnterIncomplete("WaitHandlersDone");
+    r = m_host->WaitHandlersDone(bbt::coroutine::Deadline::max());
+    if (r) {
         _LeaveIncomplete("WaitHandlersDone");
-        if (r) {
+        if (timed_out)
             m_exceeded_budget.store(true, std::memory_order_release);
-            return;
-        }
+        return true;   // 迟到收尾完成 → 排空已证实，允许收束
     }
+    // 续等仍失败：永久性排空失败。保持 ShutdownIncomplete（保留 owner/资源），
+    // 返回 false 由调用方 fail-closed；不再次调用形成忙循环。
     _AddFailure("WaitHandlersDone: " + r.error().message);
+    return false;
+}
+
+void HostLifecycle::_ParkUndrained() {
+    // 排空未被证实：控制线程保活、Run 永不返回，保持 ShutdownIncomplete 与
+    // owner/资源不被释放（绝不 Close/release）。谓词恒假——无外部恢复入口
+    // （不新增公共恢复 API），结束由外部终止进程负责；不 busy retry、
+    // 不 _Exit/abort、不强杀线程。等待期间释放 m_mtx：State/IncompleteSteps/
+    // Failures 仍可被监督线程观察。
+    std::unique_lock<std::mutex> lk(m_mtx);
+    for (;;)
+        m_cv.wait(lk, [] { return false; });
 }
 
 void HostLifecycle::_OnHandlersDrained(const Hooks& hooks) {

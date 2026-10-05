@@ -82,6 +82,25 @@ target_compile_options(Test_framework_resource PRIVATE -Wall -Wextra)
 add_test(NAME Test_framework_resource COMMAND Test_framework_resource)
 set_tests_properties(Test_framework_resource PROPERTIES TIMEOUT 30)
 
+# issue #8 强制 live 验收开关（默认 OFF）：live runner/CI 显式
+# -DBBT_REQUIRE_RESOURCE_LIVE_TESTS=ON 时，Redis/Mongo 任一 infra 模块未注册即
+# configure 阶段 FATAL——不允许静默缺模块导致验收证据缺口（与 framework.rpc_xlang
+# 对 bbt_infra_rpc 的 fail-closed 同一口径）。OFF 时维持可选 target：缺模块走
+# 下面的 STATUS 提示，环境缺后端时进程 77 退出配合 SKIP_RETURN_CODE 标 Skipped，
+# 均不宣称 live 通过。
+option(BBT_REQUIRE_RESOURCE_LIVE_TESTS
+    "issue #8: 强制真实 Redis+Mongo live 验收（缺模块即 configure 失败）" OFF)
+if(BBT_REQUIRE_RESOURCE_LIVE_TESTS)
+    if(NOT TARGET bbt::infra_redis OR NOT TARGET bbt::infra_mongo)
+        message(FATAL_ERROR
+            "BBT_REQUIRE_RESOURCE_LIVE_TESTS=ON 但 bbt::infra_redis/"
+            "bbt::infra_mongo 未全部注册：issue #8 live 验收为强制项，不允许"
+            "静默缺模块。请提供 -DBBT_HIREDIS_PREFIX=<hiredis 前缀> 与 "
+            "-DBBT_MONGOC_PREFIX=/-DBBT_MONGOCXX_PREFIX=<mongoc/mongocxx 前缀>"
+            " 使两个目标注册后重新配置。")
+    endif()
+endif()
+
 # issue #8 live 验收：真实 Redis/MongoDB 容器经工厂装配 + service 资源缝
 # 消费 + 关闭收束到 IsClosed。Redis 与 Mongo 是两个独立 target/CTest 用例，
 # 各自显式要求对应 infra 模块已构建（缺 target → 编译期失败而不是静默

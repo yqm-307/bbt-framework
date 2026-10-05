@@ -21,10 +21,13 @@
 //     前返回 TimedOut，且后端无副作用（键未写入，可观察），连接保持健康。
 //  C3 关闭中在途请求：真实 HTTP handler 停在宿主注入的闸门上 → request_shutdown
 //     预算耗尽 → ShutdownIncomplete + pending=WaitHandlersDone、资源尚未 Close
-//     → 放行后同步等客户端明确结果 → 完整排空 → kExitShutdownLate。客户端结果按
+//     → 放行后 handler 在 ShutdownIncomplete 期间经 ServiceContext 取 Redis/Mongo
+//     执行真实操作成功（owner 仍活跃）→ 同步等客户端明确结果 → 完整排空 →
+//     kExitShutdownLate；最终 Close/release 后 Service 弱指针过期。客户端结果按
 //     InfraHttpHost.hpp:9-11 契约判定：Close 开始后尚未交给传输层的回复不承诺
 //     送达，因此只接受「完整 HELD」或「TransportError(code=8)」，不接受空结果/
-//     未知错误（未过期不等于 Close 后必达）。
+//     未知错误（未过期不等于 Close 后必达）。观察者由外部 RunState 独立持有，
+//     不持 Service shared_ptr 制造保活。
 //  C4a 后端 I/O 在途（服务端停顿）：同一自有实例 CLIENT PAUSE 1500 ALL 后，
 //     业务 Get 在 cache 命中路径上被服务端**真实扣住**约 1500ms 才返回正确值
 //     ——命令确已发出并被服务端执行（在途证据，非派发前过期）。
@@ -632,25 +635,51 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
 }
 
 // C3：关闭中在途请求——真实 HTTP handler 未排空 → ShutdownIncomplete（资源尚未
-// Close）→ 放行后同步等客户端明确回包 → 完整排空 → kExitShutdownLate。
+// Close）→ 放行后 handler 在 ShutdownIncomplete 期间经 ServiceContext 取
+// Redis/Mongo 执行真实操作成功（Service owner 仍活跃）→ 同步等客户端明确回包
+// → 完整排空 → kExitShutdownLate；最终 Close/release 后 Service 弱指针过期。
+// 观察者由外部 RunState 独立持有（Service 钩子捕获其 shared_ptr，lambda 寿命
+// 安全）；测试不持 Service shared_ptr 制造保活。
 BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     auto box = StartCombined(/*incoming*/std::chrono::milliseconds{10000},
                              /*shutdown*/std::chrono::milliseconds{300});
+
+    // 独立观察者：测试持有 RunState；Service 的两个钩子各捕获其 shared_ptr
+    // （即使 Run 结束、Service 释放，lambda 拷贝仍安全），断言只读 RunState，
+    // 不与关闭释放竞争。
+    struct RunState {
+        std::shared_ptr<CoGate> gate = std::make_shared<CoGate>();
+        TestLatch               arrived{1};
+        TestLatch               released{1};
+        TestLatch               op_done{1};
+        std::atomic<bool>       op_ok{false};
+    };
+    auto st = std::make_shared<RunState>();
+
+    // Service 弱观察口：不持 shared_ptr 制造保活；运行期用非 owner 裸指针。
+    std::weak_ptr<fw::ICoService> svc_weak;
+    {
+        auto svc_ref = box.app->find_service("kv");
+        BOOST_REQUIRE(svc_ref);
+        svc_weak = svc_ref.value();
+    }   // svc_ref 出作用域释放：此后只留弱引用
     auto* svc = SvcOf(*box.app);
-    auto gate     = std::make_shared<CoGate>();
-    auto arrived  = std::make_shared<TestLatch>(1);
-    auto released = std::make_shared<TestLatch>(1);
-    // 显式测试钩子：闸门由宿主测试装配持有/放行（业务实现不持全局测试状态）。
-    svc->hold_gate = [gate, arrived, released] {
-        arrived->CountDown();                     // handler 已到闸门（在途）
-        gate->Wait(Clock::now() + std::chrono::milliseconds{15000});
-        released->CountDown();                    // 放行后 handler 继续产出回复
+
+    // 显式测试钩子：闸门与「放行后真实资源操作完成」报告由宿主测试装配注入。
+    svc->hold_gate = [st] {
+        st->arrived.CountDown();                  // handler 已到闸门（在途）
+        st->gate->Wait(Clock::now() + std::chrono::milliseconds{15000});
+        st->released.CountDown();                 // 放行后 handler 继续产出回复
+    };
+    svc->hold_op_report = [st](bool ok) {
+        st->op_ok.store(ok, std::memory_order_release);
+        st->op_done.CountDown();                  // 放行后资源操作已落定
     };
     // RAII：任何早退/断言失败都先放行闸门，避免排空窗口上悬挂。
     struct ReleaseGuard {
-        std::shared_ptr<CoGate> gate;
-        ~ReleaseGuard() { if (gate) gate->Open(); }
-    } release{gate};
+        std::shared_ptr<RunState> st;
+        ~ReleaseGuard() { if (st) st->gate->Open(); }
+    } release{st};
 
     // 在途响应 sink：显式等待并断言客户端得到**明确结果**（完整回包或契约允许
     // 的传输错误）——删掉发送/响应即失败，不能只发不等仍绿。
@@ -658,7 +687,8 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     auto sink_done = std::make_shared<TestLatch>(1);
     auto client    = box.client;
     auto endpoint  = box.endpoint;
-    auto hold_env  = MakeEnv("kv", "hold", "c3-h", Req1("h"));
+    // hold 请求 id 每次运行唯一：Mongo 文档键不跨运行冲突（InsertOne 否则重复键）。
+    auto hold_env  = MakeEnv("kv", "hold", "c3-h", Req1(RunPrefix() + "hold"));
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [client, endpoint, sink, sink_done, hold_env] {
@@ -671,7 +701,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
         },
         succ);
     BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(arrived->WaitFor(kWait));   // handler 已在闸门上（真实 HTTP 在途）
+    BOOST_REQUIRE(st->arrived.WaitFor(kWait));   // handler 已在闸门上（真实 HTTP 在途）
 
     auto cache = svc->Cache();
     auto docs  = svc->Docs();
@@ -690,13 +720,20 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     BOOST_REQUIRE_EQUAL(pending.size(), std::size_t{1});
     BOOST_CHECK_EQUAL(pending[0], "WaitHandlersDone");
     BOOST_CHECK(!box.run->done.load());
-    // ShutdownIncomplete（handler 未排空）期间资源尚未 Close。
+    // ShutdownIncomplete（handler 未排空）期间：资源尚未 Close、Service owner 活跃。
     BOOST_CHECK(!cache->IsClosed());
     BOOST_CHECK(!docs->IsClosed());
+    BOOST_CHECK_MESSAGE(!svc_weak.expired(),
+        "ShutdownIncomplete 期间 Service owner 不应被释放");
 
-    gate->Open();                              // 迟到排空
-    BOOST_REQUIRE(released->WaitFor(kWait));   // 放行后 handler 真实继续执行
+    st->gate->Open();                             // 迟到排空
+    BOOST_REQUIRE(st->released.WaitFor(kWait));   // 放行后 handler 真实继续执行
     const auto released_at = Clock::now();
+    // 放行后（仍在 ShutdownIncomplete、资源未收束）handler 经 ServiceContext 取
+    // Redis/Mongo 执行真实操作成功——由独立 RunState 观察，不读可能被释放的 Service。
+    BOOST_REQUIRE(st->op_done.WaitFor(kWait));
+    BOOST_CHECK_MESSAGE(st->op_ok.load(),
+        "ShutdownIncomplete 期间经 ServiceContext 的真实 Redis/Mongo 操作未成功");
     BOOST_REQUIRE(sink_done->WaitFor(kWait));  // 同步等客户端明确结果（不悬挂）
     BOOST_REQUIRE(sink->has_value());          // 必须有明确回包/错误，不接受“无结果”静默
 
@@ -716,6 +753,10 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     BOOST_CHECK(box.app->pending_cleanup().empty());
     BOOST_CHECK(cache->IsClosed());
     BOOST_CHECK(docs->IsClosed());
+    // 完整 Close/release 后 Service owner 释放：弱指针过期（测试全程未持
+    // Service shared_ptr，故过期只能来自框架释放）。
+    BOOST_CHECK_MESSAGE(svc_weak.expired(),
+        "run 结束（Close/release）后 Service owner 应已释放");
 
     // ── 客户端可见结果门禁（按契约，不按“允许任意错误”放宽）──
     // 该请求 incoming 预算 10000ms、关闭步预算 300ms：放行发生在 incoming 到期
