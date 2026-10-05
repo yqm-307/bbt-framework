@@ -17,10 +17,33 @@ trap 'rm -rf "$staging"' EXIT
 mkdir -p "$staging/debs"
 
 # Exact Ubuntu package SHA256 values from infra's protobuf-3.21.12.provenance.md.
+# archive.ubuntu.com has intermittently failed TLS handshakes on ARC runners.
+# Keep it first, then use independent Ubuntu mirrors; the package SHA below
+# remains the trust gate for every successful download.
+ubuntu_mirrors=(
+    'https://archive.ubuntu.com/ubuntu'
+    'https://security.ubuntu.com/ubuntu'
+    'https://mirror.math.princeton.edu/pub/ubuntu'
+    'https://mirror.kumi.systems/ubuntu'
+)
+download_package() {
+    local component="$1" package="$2" file="$3" mirror url
+    for mirror in "${ubuntu_mirrors[@]}"; do
+        url="$mirror/pool/$component/p/protobuf/$package"
+        echo "[protobuf] downloading $package from $mirror"
+        rm -f "$file"
+        if curl --fail --location --retry 2 --retry-all-errors \
+            --silent --show-error "$url" -o "$file"; then
+            return 0
+        fi
+        echo "[protobuf] mirror failed for $package: $mirror" >&2
+    done
+    echo "[protobuf] FATAL: all Ubuntu mirrors failed: $package" >&2
+    return 1
+}
 while read -r component package sha; do
     file="$staging/debs/$package"
-    curl --fail --location --retry 2 --silent --show-error \
-        "https://archive.ubuntu.com/ubuntu/pool/$component/p/protobuf/$package" -o "$file"
+    download_package "$component" "$package" "$file" || exit 3
     printf '%s  %s\n' "$sha" "$file" | sha256sum --check --status || {
         echo "[protobuf] FATAL: package checksum mismatch: $package" >&2
         exit 3
