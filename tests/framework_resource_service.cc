@@ -251,7 +251,9 @@ fw::CoRpcResp KvSvc::ExpiredSet(fw::CoRpcReq req) {
     return _Reply(0, "SET");
 }
 
-// 关闭中在途：停在宿主注入的闸门上直到放行（真实 HTTP handler 在途）。
+// 关闭中在途：停在宿主注入的闸门上直到放行（真实 HTTP handler 在途）；放行后
+// 在关闭序列 ShutdownIncomplete 期间（资源尚未收束）经 ServiceContext 取
+// Redis/Mongo 执行真实操作，证明 owner 与资源在排空完成前仍活跃可用。
 fw::CoRpcResp KvSvc::Hold(fw::CoRpcReq req) {
     auto id = req.Parse<std::string>();
     if (!id) return fw::CoRpcResp::Error(id.error());
@@ -260,6 +262,37 @@ fw::CoRpcResp KvSvc::Hold(fw::CoRpcReq req) {
     if (!hold_gate) return fw::CoRpcResp::Error(fw::MakeError(
         fw::ErrorCode::RuntimeUnavailable, "kv: hold gate absent"));
     hold_gate();
+    // 放行后（ShutdownIncomplete 期间）：真实 Redis 写-读回环 + Mongo 落库。
+    // 失败路径原样回传底层错误（不泛化），并如实向观察者报告 false。
+    auto cache = context().resource<inf::CoRedisCli>("cache");
+    auto docs  = context().resource<inf::CoMongoCli>("docs");
+    if (!cache) return _Missing("cache");
+    if (!docs)  return _Missing("docs");
+    inf::CallOptions o;
+    o.deadline = ctx.value()->deadline;
+    const std::string key = "kv:" + id.value();
+    auto s = cache->Set(key, "held", o);
+    if (!s) {
+        if (hold_op_report) hold_op_report(false);
+        return fw::CoRpcResp::Error(s.error());
+    }
+    auto g = cache->Get(key, o);
+    if (!g) {
+        if (hold_op_report) hold_op_report(false);
+        return fw::CoRpcResp::Error(g.error());
+    }
+    if (!g.value().has_value() || *g.value() != "held") {
+        if (hold_op_report) hold_op_report(false);
+        return fw::CoRpcResp::Error(fw::MakeError(
+            fw::ErrorCode::ProtocolError,
+            "kv: hold readback mismatch during shutdown"));
+    }
+    auto ins = docs->InsertOne(DocIdV("c3-held-" + id.value(), "held"), o);
+    if (!ins) {
+        if (hold_op_report) hold_op_report(false);
+        return fw::CoRpcResp::Error(ins.error());
+    }
+    if (hold_op_report) hold_op_report(true);
     return _Reply(0, "HELD");
 }
 

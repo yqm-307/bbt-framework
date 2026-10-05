@@ -59,10 +59,15 @@ public:
     // 经 Service 侧真实调用计数，让「cache hit 未再查 Mongo」可观察而非猜测。
     std::atomic<int> mongo_reads{0};
 
-    // 显式测试钩子：关闭中在途用例的闸门由宿主测试装配注入/放行。
-    // 业务实现不持有全局测试状态、不管理线程或连接（HostLifecycle 排空语义
-    // 由框架保证）。为空表示该钩子未装配。
-    std::function<void()> hold_gate;
+    // 显式测试钩子：关闭中在途用例的闸门与「放行后真实资源操作完成」通知由
+    // 宿主测试装配注入/放行。业务实现不持有全局测试状态、不管理线程或连接
+    // （HostLifecycle 排空语义由框架保证）。为空表示该钩子未装配。
+    //  - hold_gate：Hold 进入后调用（阻塞在宿主闸门上，真实 HTTP handler 在途）；
+    //  - hold_op_report：Hold 放行后经 ServiceContext 取 Redis/Mongo 执行真实
+    //    操作，操作结果（true=成功）经此回调报告给独立持有的观察者，而不经
+    //    Service 实例本身——避免测试持 Service 指针与关闭释放竞争。
+    std::function<void()>     hold_gate;
+    std::function<void(bool)> hold_op_report;
 
     fw::CoRpcResp Get(fw::CoRpcReq req);
     fw::CoRpcResp Insert(fw::CoRpcReq req);
