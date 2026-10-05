@@ -127,6 +127,34 @@ else()
         "(BBT_MONGOC_PREFIX+BBT_MONGOCXX_PREFIX)，本配置无 Mongo live 门禁")
 endif()
 
+# issue #8 F8-T3 联合验收：真实 HTTP loopback → 框架入站 → 业务 Service →
+# 真实 Redis + Mongo 联合消费。要求两个 infra 资源模块都在场（任一缺失
+# 即不注册本 target——单资源 live 不能替代联合验收），缺环境时进程 77
+# 退出配合 SKIP_RETURN_CODE 标 Skipped。
+if(TARGET bbt::infra_redis AND TARGET bbt::infra_mongo)
+    # 业务 Service 在独立 TU framework_resource_service.cc 中实现（只 include
+    # framework/infra/coroutine 公开头），与测试宿主分属不同编译单元——这是
+    # 「干净消费者 Service 只公共头即可按名称使用资源」的真实编译证据。
+    add_executable(Test_framework_resource_combined
+        Test_framework_resource_combined.cc
+        framework_resource_service.cc)
+    target_link_libraries(Test_framework_resource_combined PRIVATE
+        bbt::framework bbt::infra_redis bbt::infra_mongo)
+    target_compile_options(Test_framework_resource_combined PRIVATE
+        -Wall -Wextra)
+    target_compile_definitions(Test_framework_resource_combined PRIVATE
+        BBT_LIVE_HAS_REDIS=1 BBT_LIVE_HAS_MONGO=1)
+    add_test(NAME framework.resource.live.combined
+        COMMAND Test_framework_resource_combined)
+    set_tests_properties(framework.resource.live.combined PROPERTIES
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77)
+else()
+    message(STATUS
+        "framework.resource.live.combined: 需要 bbt::infra_redis 与 "
+        "bbt::infra_mongo 同时在场，本配置无联合 live 门禁")
+endif()
+
 # framework #4：G5 RpcEnvelope wire profile 的跨语言互通验证。
 # C++ 服务端消费 bbt::infra_rpc + bbt::infra_http；Python 客户端经
 # http.client 真实 POST /rpc 收发 protobuf body。
