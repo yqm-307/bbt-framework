@@ -1,0 +1,44 @@
+# bbt-framework 双服务资源 runner 候选镜像固定输入（resource-job）
+#
+# 每行 key=value；docker/build_resource_runner.sh 与
+# docker/bbtools-resource-runner/Dockerfile 只认本文件。基础镜像禁止浮动
+# latest/tag：正式输入区分 **imageID** 与 **registry ref** 两种身份。
+#
+# 身份语义：现役基座 bbtools-runner:v1 由离线 OCI 导入产生，
+# RepoDigests 是导入时合成的 `bbtools-runner@<imageID>`（等于 config imageID），
+# **不是** registry manifest digest。因此本 lock 用 imageID 作为唯一可信身份，
+# registry ref 槽位显式记 unavailable，禁止拿 imageID 冒充 registry ref、也禁止
+# 猜测 registry 地址或凭据。
+
+# ---- 基座（本机候选：离线导入的现役工具链 runner） ----
+# 唯一可信身份 = daemon 实读 imageID；构建入口会 docker image inspect 核对后作为
+# FROM 输入（本地构建器对纯 imageID 可用）。
+RESOURCE_RUNNER_BASE_IMAGE_ID=sha256:f97a4a66b686e62e5ffa8de970196b368ac0bdd4ed8d52bb55874f819dd704a0
+# registry ref 槽位：未从 registry 拉取，显式记 unavailable（见上）。
+RESOURCE_RUNNER_BASE_REGISTRY_REF=unavailable
+# 人类可读 tag 提示；构建入口只把它当「同 imageID 的别名」核对，不作身份来源。
+RESOURCE_RUNNER_BASE_TAG_HINT=bbtools-runner:v1
+
+# ---- 第三方资源 recipe（唯一实现归 bbtools-infra，固定 commit） ----
+INFRA_REPO=https://github.com/yqm-307/bbtools-infra.git
+INFRA_COMMIT=1543bbd0aca4defa1be701b45aea5ba2cc2d0d86
+INFRA_RECIPE_PATH=scripts/prepare_resource_deps.sh
+INFRA_VERIFY_PATH=scripts/resource_prefix_verify
+
+# ---- 资源前缀（builder 与 final 同路径；manifest install_root 须与之相同） ----
+RESOURCE_PREFIX_ROOT=/opt/bbt-resource-deps
+RESOURCE_JOBS=3
+
+# ---- 三份依赖锁定值（须与 recipe 内锁定常量一致，构建入口交叉核对 cache_key） ----
+HIREDIS_COMMIT=616f2286ba5503f74ae96e720623fa11dbc690af
+MONGOC_COMMIT=ad87ab88907a0105823469fb5d393ed717bed9ba
+MONGOCXX_COMMIT=5cfce9d754a91d47e996394e2cdc9f2e60403542
+HIREDIS_VERSION=1.4.0
+MONGOC_VERSION=2.5.4
+MONGOCXX_VERSION=4.6.0
+RESOURCE_DEPS_CACHE_KEY=bbt-resource-deps-hiredis-616f2286-mongoc-ad87ab88-mongocxx-5cfce9d7
+
+# ---- 基座既有 protobuf（本仓既有 recipe 产出；final 只复核版本 + 归档 hash） ----
+# 来源：docker/toolchain.lock 的适用两项；不代表该 lock 整体满足。
+PROTOC_VERSION=3.21.12
+LIBPROTOBUF_A_SHA256=3e3e4ae1f24b2dd52e8104e7af229918a2d504274a08f7d660aaff59bae7a2de
