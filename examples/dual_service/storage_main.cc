@@ -16,6 +16,10 @@
 //   sleep_ms(ms)      挂起至多 ms 毫秒（等待一个永不完成的信号，deadline
 //                     取自入站上下文——调用方预算到期时如实 TimedOut）。
 //
+// 资源预算：put/get/del 的 Redis/Mongo 出站 deadline 取本请求入站上下文
+// deadline（ProtoWireV1 已按 min(传输硬看门, now+budget) 收敛），不使用无限
+// deadline——调用方预算耗尽时后端调用随之受限，不悬挂在无界等待上。
+//
 // 优雅关闭：SIGINT/SIGTERM → watcher 线程调用 request_shutdown →
 // CoApp::run 返回生命周期返回码（0 = kExitOk 按期收束）；关闭序列经
 // _CloseResources 把两个后端客户端收束到 IsClosed 终态。
@@ -25,13 +29,14 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <bbt/coroutine/coroutine.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/infra/CoRedisCli.hpp>
 #include <bbt/infra/CoMongoCli.hpp>
@@ -77,19 +82,6 @@ void BsonElemString(std::vector<std::uint8_t>& b,
     BsonPutI32(b, static_cast<std::int32_t>(val.size() + 1));
     BsonPutCStr(b, val);
 }
-inf::MongoDocument DocKV(std::string_view key, std::string_view val) {
-    std::vector<std::uint8_t> body;
-    BsonElemString(body, "_id", key);
-    BsonElemString(body, "v",   val);
-    inf::MongoDocument doc;
-    const std::int32_t total =
-        static_cast<std::int32_t>(body.size() + 5);
-    doc.bytes.reserve(static_cast<std::size_t>(total));
-    BsonPutI32(doc.bytes, total);
-    doc.bytes.insert(doc.bytes.end(), body.begin(), body.end());
-    doc.bytes.push_back(0x00);
-    return doc;
-}
 inf::MongoDocument DocKey(std::string_view key) {
     std::vector<std::uint8_t> body;
     BsonElemString(body, "_id", key);
@@ -123,9 +115,23 @@ inf::MongoDocument DocSet(std::string_view val) {
     return doc;
 }
 
+// 资源调用统一取入站预算：Redis/Mongo 出站不得用无限 deadline——本请求从
+// wire 继承来的 deadline（上游已按 min(传输硬看门, now+budget) 收敛）就是
+// 后端调用的上限；无受管请求上下文即如实失败，不退化为无限等待。
 class StorageSvc final : public fw::CoService<StorageSvc> {
 public:
     static constexpr std::string_view kServiceName = "storage";
+
+    fw::result<inf::CallOptions> ResourceBudget() {
+        auto ctx = context().request();
+        if (!ctx)
+            return fw::result<inf::CallOptions>::err(fw::MakeError(
+                fw::ErrorCode::InvalidContext,
+                "storage: no managed request context for resource budget"));
+        inf::CallOptions o;
+        o.deadline = ctx.value()->deadline;
+        return fw::result<inf::CallOptions>::ok(o);
+    }
 
     fw::CoRpcResp Put(fw::CoRpcReq req) {
         auto args = req.Parse<std::string, std::string>();
@@ -136,8 +142,9 @@ public:
         auto docs  = context().resource<inf::CoMongoCli>("docs");
         if (!cache) return ResErr("cache");
         if (!docs)  return ResErr("docs");
-        inf::CallOptions o;
-        o.deadline = co::Deadline::max();
+        auto budget = ResourceBudget();
+        if (!budget) return fw::CoRpcResp::Error(budget.error());
+        const inf::CallOptions& o = budget.value();
         // 真实双写：Redis SET 与 Mongo upsert 都成功才回写好的值。
         if (auto r = cache->Set(key, value, o); !r)
             return fw::CoRpcResp::Error(r.error());
@@ -155,8 +162,9 @@ public:
         auto docs  = context().resource<inf::CoMongoCli>("docs");
         if (!cache) return ResErr("cache");
         if (!docs)  return ResErr("docs");
-        inf::CallOptions o;
-        o.deadline = co::Deadline::max();
+        auto budget = ResourceBudget();
+        if (!budget) return fw::CoRpcResp::Error(budget.error());
+        const inf::CallOptions& o = budget.value();
         // 真实读路径：Redis GET 命中即回；miss 回退 Mongo FindOne。
         auto hit = cache->Get(args.value(), o);
         if (!hit) return fw::CoRpcResp::Error(hit.error());
@@ -182,8 +190,9 @@ public:
         auto docs  = context().resource<inf::CoMongoCli>("docs");
         if (!cache) return ResErr("cache");
         if (!docs)  return ResErr("docs");
-        inf::CallOptions o;
-        o.deadline = co::Deadline::max();
+        auto budget = ResourceBudget();
+        if (!budget) return fw::CoRpcResp::Error(budget.error());
+        const inf::CallOptions& o = budget.value();
         auto rn = cache->Delete({args.value()}, o);
         if (!rn) return fw::CoRpcResp::Error(rn.error());
         auto mn = docs->DeleteOne(DocKey(args.value()), o);
@@ -198,11 +207,13 @@ public:
         if (args.value() < 0) return ArgErr("storage.sleep_ms: negative ms");
         auto ctx = context().request();
         if (!ctx) return fw::CoRpcResp::Error(ctx.error());
-        // 在永不完成的信号上带预算等待：等价于协作式 sleep，入站
-        // deadline/cancel 到期时以 TimedOut/Cancelled 如实返回。
-        co::CompletionSignal gate;
-        const auto st = gate.Wait({ctx.value()->deadline,
-                                   ctx.value()->cancel});
+        // 在永不通知的 CoWaiter 上带预算等待：等价于协作式 sleep，入站
+        // deadline 到期以 TimedOut 如实返回，协程级 RequestCancel 到达则
+        // 返回 Cancelled（deadline 取入站预算，本示例不另叠 ms 上限）。
+        auto gate = co::sync::CoWaiter::Create();
+        co::WaitOptions wo;
+        wo.deadline = ctx.value()->deadline;
+        const auto st = gate->Wait(wo);
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(fw::MakeError(
                 st == co::WaitStatus::TimedOut
@@ -228,14 +239,42 @@ void InstallSignals() {
     std::signal(SIGTERM, [](int) { g_stop.store(true); });
 }
 
-// "host:port" → (host, port)；port 段缺失/非法 → port=0 交由
-// ValidateRedisClientConfig 拒绝（不静默猜测）。
+// 十进制端口解析：只接受 1..65535 的数字串。刻意不走 std::stoi——异常未捕获
+// 会让进程 terminate，而非法端口是普通用法错误，应给诊断后正常退出。
+bool ParsePort(const char* text, std::uint16_t* out) {
+    if (text == nullptr || *text == '\0') return false;
+    unsigned long value = 0;
+    for (const char* p = text; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        value = value * 10 + static_cast<unsigned long>(*p - '0');
+        if (value > 65535) return false;
+    }
+    if (value == 0) return false;
+    *out = static_cast<std::uint16_t>(value);
+    return true;
+}
+
+// "host:port" → (host, port)；port 段缺失/非法 → port=0（调用方据此给诊断退出，
+// infra 的 ValidateRedisClientConfig 仍是同一个 0 值的后端兜底）。不静默猜测、
+// 不抛异常。
 std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     const auto pos = addr.rfind(':');
     if (pos == std::string::npos) return {addr, 0};
-    return {addr.substr(0, pos),
-            static_cast<std::uint16_t>(std::stoi(addr.substr(pos + 1)))};
+    std::uint16_t port = 0;
+    if (!ParsePort(addr.c_str() + pos + 1, &port))
+        return {addr.substr(0, pos), 0};
+    return {addr.substr(0, pos), port};
 }
+
+// Redis 建连预算与工厂等待窗口：预算给 Connect 本身，窗口 = 预算 + 1s 宽限。
+// 两者等宽时「拨号在预算内刚成功」与「等待窗口到期」会同刻判定，把成功建连
+// 误判成超时（协程落定 promise 还要再被调度线程推进一格）。失败/超时路径的
+// 收尾按 ICoCloseable + CoRedisCli 契约：Close() 幂等、任意线程可调、返回即
+// 物理释放，并**同步等待在途 Dial 收口**（该等待本身无超时，故只在控制线程
+// 调用，且进程保留 2 个 static 调度线程推进 dial）；被投递的协程按值持有
+// shared_ptr，故 Close 后迟到的 Connect 回调不会踩到已释放对象。
+constexpr auto kRedisConnectBudget = std::chrono::milliseconds{5000};
+constexpr auto kRedisConnectWait   = std::chrono::milliseconds{6000};
 
 } // namespace
 
@@ -246,8 +285,20 @@ int main(int argc, char** argv) {
             "usage: svc_a <listen_port> <redis_addr host:port> <mongo_uri>\n");
         return 64;   // EX_USAGE
     }
-    const auto port = static_cast<std::uint16_t>(std::stoi(argv[1]));
+    std::uint16_t port = 0;
+    if (!ParsePort(argv[1], &port)) {
+        std::fprintf(stderr,
+            "[svc_a] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
+            argv[1]);
+        return 64;   // EX_USAGE
+    }
     const auto [rhost, rport] = SplitAddr(argv[2]);
+    if (rhost.empty() || rport == 0) {
+        std::fprintf(stderr,
+            "[svc_a] FATAL: 非法 redis_addr \"%s\"（需要 host:port，端口 1..65535）\n",
+            argv[2]);
+        return 64;   // EX_USAGE
+    }
     const std::string mongo_uri = argv[3];
 
     // 嵌套出站链的协程栈需求见 tests/F1-b2 实测记录：默认 12KB 触底，
@@ -263,6 +314,9 @@ int main(int argc, char** argv) {
         /*max_body_bytes*/  65536,
         /*incoming_timeout*/std::chrono::milliseconds{30000}};
     opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
+    // 正式 body wire（与 examples/getvalue 同口径）：入站预算经 wire 的
+    // remaining_budget_ms 收敛后才对 handler 可见，资源调用据此获得有限预算。
+    opts.inbound_bridge = fw::RpcInboundBridge::ProtoWireV1;
     opts.static_routes = {};                    // 纯被调方：无出站 RPC 路由
     opts.shutdown_step_budget = std::chrono::milliseconds{2000};
 
@@ -284,9 +338,53 @@ int main(int argc, char** argv) {
     rcfg.port         = rport;
     rcfg.max_inflight = 256;
     rcfg.max_queue    = 256;
+    // Redis 工厂：Create 只建对象；命令要求 ConnectStatus()==Connected，
+    // 而 Connect 只允许在协程上下文调用。故工厂投递一个显式 Connect 到
+    // Scheduler，并在控制线程等它结束（与 tests live 验收同口径）——只有
+    // Connected 实例才交框架绑定 Service，使 ready 先于入站接纳；交付前任何
+    // 失败路径都同步 Close，不留半装配句柄。（否则 handler 首次命令会得到
+    // RuntimeUnavailable "redis client not connected"。）
     if (auto r = app.add_resource<inf::CoRedisCli>("cache",
-            [rcfg] { return inf::CoRedisCli::Create(rcfg); });
-        !r) {
+            [rcfg]() -> inf::result<std::shared_ptr<inf::CoRedisCli>> {
+            auto created = inf::CoRedisCli::Create(rcfg);
+            if (!created)
+                return created;
+            auto client = created.value();
+            bool delivered = false;
+            struct CloseUnlessDelivered {
+                std::shared_ptr<inf::CoRedisCli> client;
+                const bool*                      released;
+                ~CloseUnlessDelivered() { if (!*released) client->Close(); }
+            } guard{client, &delivered};
+            auto promise = std::make_shared<std::promise<inf::result<void>>>();
+            auto done    = promise->get_future();
+            const inf::CallOptions call_options{
+                std::chrono::steady_clock::now() + kRedisConnectBudget};
+            bool submitted = false;
+            g_scheduler->RegistCoroutineTask(
+                [client, promise, call_options] {
+                    try {
+                        promise->set_value(client->Connect(call_options));
+                    } catch (...) {
+                        promise->set_exception(std::current_exception());
+                    }
+                }, submitted);
+            if (!submitted)
+                return inf::result<std::shared_ptr<inf::CoRedisCli>>::err(
+                    fw::MakeError(fw::ErrorCode::Unavailable,
+                        "redis connect task registration failed"));
+            if (done.wait_for(kRedisConnectWait) !=
+                std::future_status::ready)
+                return inf::result<std::shared_ptr<inf::CoRedisCli>>::err(
+                    fw::MakeError(fw::ErrorCode::TimedOut,
+                        "redis connect wait timed out"));
+            auto connected = done.get();
+            if (!connected)
+                return inf::result<std::shared_ptr<inf::CoRedisCli>>::err(
+                    connected.error());
+            delivered = true;
+            return created;
+        }); !r) {
         std::fprintf(stderr, "[svc_a] add_resource(cache) failed: %s\n",
                      r.error().message.c_str());
         return 65;

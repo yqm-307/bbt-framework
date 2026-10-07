@@ -1,8 +1,12 @@
 #pragma once
 // co-service-actor/v1 F1-a：请求上下文值类型（契约第 139 行）。
-// 入站适配器从 infra::IncomingCallContext 接收已换算的 deadline、cancel
-// 与已验证的 peer_principal，并从 RpcEnvelope 取得 request_id；本类型是
-// 这些已验证字段在框架层的受管形态，字段不得由业务侧自行伪造。
+// 入站适配器从 infra::IncomingCallContext 接收已换算的 deadline 与已验证的
+// peer_principal，并从 RpcEnvelope 取得 request_id；本类型是这些已验证字段
+// 在框架层的受管形态，字段不得由业务侧自行伪造。
+//
+// 取消不由本上下文字段表达：协程等待结果按 coroutine 自身契约处理，
+// 业务级取消由业务流程按 CoXxx 协程返回值自行决定（if/return/继续下一调用），
+// 框架不提供单操作业务取消令牌。
 //
 // 绑定语义：随逻辑请求/协程绑定（登记/取出见 RequestScope）。禁止用普通
 // thread_local 跨挂起缓存本类型或其字段——协程恢复可能换 worker，缓存
@@ -14,6 +18,7 @@
 #include <string>
 
 #include <bbt/infra/ICoObject.hpp>
+#include <bbt/coroutine/sync/WaitTypes.hpp>
 
 #include <bbt/framework/Result.hpp>
 
@@ -27,7 +32,6 @@ struct RequestContext {
     // infra deadline（契约第 141/143 行）。
     bbt::coroutine::Deadline           deadline =
         bbt::coroutine::Deadline::max();
-    bbt::coroutine::CancellationToken  cancel;
     std::string                        peer_principal; // 权限上下文：已验证对端身份
     std::optional<std::string>         trace_id;       // 追踪关联字段
 };

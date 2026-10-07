@@ -1,27 +1,28 @@
 // service-actor/v2 #8 切片验证：命名资源 Registry 的工厂装配、
-// Create/Start 相位、失败回滚与 shutdown budget 下的 RequestClose/
-// WaitClosed 收束。全部经 INetworkHost 桩驱动生命周期（与 F1-b1 同一
-// 形态：无真实 socket、无 sleep 凑时序、真实断言调用序与代际）。
+// Create/Start 相位、失败回滚与关闭序列下的同步 Close 收束（infra 关闭
+// 是同步契约：Close() 返回即物理释放，无 RequestClose/WaitClosed 等待）。
+// 全部经 INetworkHost 桩驱动生命周期（与 F1-b1 同一形态：无真实 socket、
+// 无 sleep 凑时序、真实断言调用序与运行时就绪）。
 //
 // 覆盖（issue #8 验收的资源生命周期切片）：
 //  T1 factory_named_resources_start_after_scheduler
 //      两个同名类型不同名工厂资源在 Scheduler 启动后创建并各 Start 一次；
 //      两个 Service 取同名资源得到同一实例、不同名隔离；关闭序列对资源
-//      RequestClose+WaitClosed 且发生在 handler 排空后、网络 RequestClose 前。
+//      同步 Close 且发生在 handler 排空后、网络 Close 前。
 //  T2 factory_create_failure_rolls_back
 //      工厂 Create 返回 err → run 返回 kExitStartFailed、service 不绑定、
-//      已先启动的资源被 RequestClose+WaitClosed 收束（不留半装配活跃资源）。
+//      已先启动的资源被同步 Close 收束（不留半装配活跃资源）。
 //  T3 factory_start_failure_rolls_back
-//      第二个资源 Start 失败 → 半装配资源本身也被 RequestClose/WaitClosed
-//      收束且不进入 service 可见实例视图。
+//      第二个资源 Start 失败 → 半装配资源本身也被同步 Close 收束且不进入
+//      service 可见实例视图。
 //  T4 duplicate_and_invalid_registration
 //      (类型,名) 重复登记失败；工厂资源与预创建共享同一键空间；空工厂失败；
 //      run 开始后登记返回 Closed。
-//  T5 resource_close_within_budget
-//      资源 WaitClosed 在预算内完成 → kExitOk，顺序在 WaitHandlersDone 后。
-//  T6 resource_close_budget_exhaustion
-//      资源 WaitClosed 首调超时 → ShutdownIncomplete（run 不返回、未完成项
-//      含 resource:*、资源仍强持有）→ 迟到续等完成 → kExitShutdownLate。
+//  T5 resource_close_after_handler_drain
+//      资源同步 Close 晚于 handler 排空、早于网络 Close；run 返回 kExitOk。
+//  T6 resource_close_synchronous_and_idempotent
+//      一次关闭序列里每个资源只 Close 一次（on_handlers_drained 与
+//      on_release 兜底共享 spec.closed 幂等标记），无未完成资源步。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -41,8 +42,6 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
-#include <bbt/coroutine/sync/Cancellation.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
 
 #include <bbt/infra/ICoCloseable.hpp>
 
@@ -99,10 +98,10 @@ private:
 
 constexpr std::chrono::milliseconds kWait{5000};
 
-// ── INetworkHost 桩（与 F1-b1 同形态）：记录调用名与调度器代际。──
+// ── INetworkHost 桩（与 F1-b1 同形态）：记录调用名与调用时运行时就绪态。──
 struct NetCall {
-    std::string   name;
-    std::uint64_t sched_gen;
+    std::string name;
+    bool        sched_ready;   // 调用发生时 coroutine runtime 已初始化
 };
 
 class StubNetHost final : public fw::INetworkHost {
@@ -115,17 +114,11 @@ public:
     fw::result<void> Start() override {
         _Record("net.start"); start_seen.CountDown(); return start_rc; }
     void StopAccepting() noexcept override { _Record("net.stop_accepting"); }
-    fw::result<void> WaitHandlersDone(co::Deadline,
-                                    co::CancellationToken) override {
+    fw::result<void> WaitHandlersDone(co::Deadline) override {
         _Record("net.wait_handlers");
         return fw::result<void>::ok();
     }
-    void RequestClose() noexcept override { _Record("net.request_close"); }
-    inf::CloseStatus WaitClosed(co::Deadline, co::CancellationToken) override {
-        _Record("net.wait_closed");
-        return inf::CloseStatus::Closed;
-    }
-    void ReleaseClosed() noexcept override { _Record("net.release"); }
+    void Close() noexcept override { _Record("net.close"); }
 
     std::vector<NetCall> Snapshot() const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -144,28 +137,26 @@ public:
 private:
     void _Record(const char* name) {
         std::lock_guard<std::mutex> lk(m_mtx);
-        m_calls.push_back(NetCall{name, g_scheduler->GetRunGeneration()});
+        m_calls.push_back(NetCall{name, g_scheduler->IsInitialized()});
     }
     mutable std::mutex   m_mtx;
     std::vector<NetCall> m_calls;
 };
 
-// ── 桩资源：模拟 infra CoRedisCli 的资源形态——静态 Create 要求 Scheduler
-//    已启动、实例 Start() -> result<void>、实现 ICoCloseable。──
+// ── 桩资源：模拟 infra CoRedisCli 的资源形态——静态 Create 要求运行时
+//    已初始化、实例 Start() -> result<void>、实现 ICoCloseable（同步
+//    Close()）。──
 class StubResource : public inf::ICoCloseable {
 public:
     struct Shared {
         std::atomic<int> create_calls{0};
         std::atomic<int> start_calls{0};
-        std::atomic<int> request_close_calls{0};
-        std::atomic<int> wait_closed_calls{0};
-        // 创建/启动时记录调度器代际（证明在 Scheduler::Start 之后）。
-        std::atomic<std::uint64_t> create_gen{0};
-        // WaitClosed 行为控制：首轮超时/挂起由测试编排。
-        std::function<inf::CloseStatus(co::Deadline, co::CancellationToken)>
-            on_wait_closed;
+        std::atomic<int> close_calls{0};
+        // 创建时记录「运行时就绪」（证明在 scheduler Start 之后）。
+        std::atomic<bool> created_after_scheduler{false};
+        // Close() 观测钩子（顺序证据：在 Close 时读 host 调用序）。
+        std::function<void()> on_close;
         std::atomic<bool> closed{false};
-        std::atomic<bool> close_requested{false};
         std::atomic<bool> started{false};
         // 失败注入：下一次 Create/Start 返回 err（consume-once 语义）。
         std::atomic<bool> fail_create{false};
@@ -177,17 +168,16 @@ public:
     static fw::result<std::shared_ptr<StubResource>> Create(
         std::shared_ptr<Shared> s) {
         s->create_calls.fetch_add(1);
-        s->create_gen.store(g_scheduler->GetRunGeneration(),
-                            std::memory_order_release);
         if (s->fail_create.exchange(false)) {
             return fw::result<std::shared_ptr<StubResource>>::err(
                 fw::MakeError(fw::ErrorCode::Unavailable, "create boom"));
         }
-        // Create 要求 Scheduler 已启动（运行时代际非零），否则如实失败。
-        if (co::CurrentRuntimeGeneration() == 0)
+        // Create 要求运行时已初始化，否则如实失败。
+        if (!g_scheduler->IsInitialized())
             return fw::result<std::shared_ptr<StubResource>>::err(
                 fw::MakeError(fw::ErrorCode::RuntimeUnavailable,
                     "scheduler not started"));
+        s->created_after_scheduler.store(true, std::memory_order_release);
         return fw::result<std::shared_ptr<StubResource>>::ok(
             std::make_shared<StubResource>(std::move(s)));
     }
@@ -201,21 +191,13 @@ public:
         return fw::result<void>::ok();
     }
 
-    void RequestClose() noexcept override {
-        // 如实语义：RequestClose 只发起关闭意图，不即置 Closed——真正
-        // 收束由 WaitClosed 报告（与 infra 连接池/客户端的真实形态一致：
-        // 在途回调未排空时 IsClosed 保持 false）。
-        m_s->request_close_calls.fetch_add(1);
-        m_s->close_requested.store(true);
+    // infra 关闭是同步契约：Close() 返回即物理释放、幂等、noexcept。
+    void Close() noexcept override {
+        m_s->close_calls.fetch_add(1);
+        if (m_s->on_close) m_s->on_close();
+        m_s->closed.store(true);
     }
     bool IsClosed() const noexcept override { return m_s->closed.load(); }
-    inf::CloseStatus WaitClosed(co::Deadline d,
-                                co::CancellationToken c) override {
-        m_s->wait_closed_calls.fetch_add(1);
-        if (m_s->on_wait_closed) return m_s->on_wait_closed(d, std::move(c));
-        m_s->closed.store(true);
-        return inf::CloseStatus::Closed;
-    }
 
 private:
     std::shared_ptr<Shared> m_s;
@@ -307,9 +289,9 @@ std::size_t PosOf(const std::vector<std::string>& names,
 
 BOOST_AUTO_TEST_SUITE(framework_resource)
 
-// T1：两个命名工厂资源在 Scheduler 启动后 Create/Start 各一次；两个服务
-// 共享同名实例、不同名隔离；关闭序列对资源 RequestClose+WaitClosed 且
-// 位于 handler 排空后、网络 RequestClose 前。
+// T1：两个命名工厂资源在运行时就绪后 Create/Start 各一次；两个服务共享
+// 同名实例、不同名隔离；关闭序列对资源同步 Close 且位于 handler 排空后、
+// 网络 Close 前。
 BOOST_AUTO_TEST_CASE(factory_resources_start_and_close_in_order) {
     auto host = std::make_shared<StubNetHost>();
     auto app  = MakeApp(AppOpts(), host);
@@ -330,10 +312,10 @@ BOOST_AUTO_TEST_CASE(factory_resources_start_and_close_in_order) {
     auto h = RunApp(*app);
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
 
-    // Create/Start 各一次，且在调度器运行代际内（Scheduler 已启动）。
+    // Create/Start 各一次，且发生在运行时就绪之后。
     BOOST_TEST(cache_s->create_calls.load() == 1);
     BOOST_TEST(cache_s->start_calls.load() == 1);
-    BOOST_TEST(cache_s->create_gen.load() != 0);
+    BOOST_TEST(cache_s->created_after_scheduler.load());
     BOOST_TEST(session_s->create_calls.load() == 1);
     BOOST_TEST(session_s->start_calls.load() == 1);
 
@@ -360,22 +342,19 @@ BOOST_AUTO_TEST_CASE(factory_resources_start_and_close_in_order) {
     JoinRun(h);
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
 
-    // 资源关闭在 handler 排空后、网络 RequestClose 前。
-    BOOST_TEST(cache_s->request_close_calls.load() >= 1);
-    BOOST_TEST(cache_s->wait_closed_calls.load() >= 1);
-    BOOST_TEST(session_s->request_close_calls.load() >= 1);
-    // 顺序证据：net.wait_handlers < resource close < net.request_close。
-    // 资源步骤不进 host 的 NetCall 序列——用调度器代际 + 桩序断言
-    // host 侧不变量，资源收束发生时机经 budget/状态断言覆盖（T6）。
+    // 资源同步 Close 各一次；顺序证据：net.wait_handlers < net.close
+    // （资源 Close 发生在 handler 排空之后、网络 Close 之前）。
+    BOOST_TEST(cache_s->close_calls.load() == 1);
+    BOOST_TEST(session_s->close_calls.load() == 1);
+    BOOST_TEST(cache_s->closed.load());
     const auto names = host->Names();
-    BOOST_TEST(PosOf(names, "net.wait_handlers") <
-               PosOf(names, "net.request_close"));
+    BOOST_TEST(PosOf(names, "net.wait_handlers") < PosOf(names, "net.close"));
 }
 
 // T2：资源 Create 失败 → 启动失败回退；凡已被创建并启动的资源必须被
-// RequestClose/WaitClosed 收束（不留半装配活跃资源）；service 不绑定、
-// 网络组件未立起、Scheduler 完整 Stop。（两个资源的处理序按登记表迭代
-// 序，不固定——断言写成「凡被启动者必被收束」，顺序无关。）
+// 同步 Close 收束（不留半装配活跃资源）；service 不绑定、网络组件未立起。
+// （两个资源的处理序按登记表迭代序，不固定——断言写成「凡被启动者必被
+// 收束」，顺序无关。）
 BOOST_AUTO_TEST_CASE(factory_create_failure_rolls_back) {
     auto host = std::make_shared<StubNetHost>();
     auto app  = MakeApp(AppOpts(), host);
@@ -390,11 +369,10 @@ BOOST_AUTO_TEST_CASE(factory_create_failure_rolls_back) {
         [fail_s] { return StubResource::Create(fail_s); }));
 
     BOOST_TEST(app->run() == fw::HostLifecycle::kExitStartFailed);
-    // 凡被启动的资源必被收束（RequestClose + WaitClosed 各至少一次，
-    // 且最终 IsClosed）；未创建的不要求（无对象可收束）。
+    // 凡被启动的资源必被同步 Close 收束（Close 恰一次，最终 IsClosed）；
+    // 未创建的不要求（无对象可收束）。
     if (ok_s->create_calls.load() > 0) {
-        BOOST_TEST(ok_s->request_close_calls.load() >= 1);
-        BOOST_TEST(ok_s->wait_closed_calls.load() >= 1);
+        BOOST_TEST(ok_s->close_calls.load() >= 1);
         BOOST_TEST(ok_s->closed.load());
     }
     if (fail_s->create_calls.load() > 0) {
@@ -408,11 +386,10 @@ BOOST_AUTO_TEST_CASE(factory_create_failure_rolls_back) {
     BOOST_REQUIRE(!svc_r);
     BOOST_CHECK(svc_r.error().code == fw::ErrorCode::RuntimeUnavailable);
     BOOST_TEST(!app->lifecycle_failures().empty());
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 
-// T3：资源 Start 失败 → 半装配资源本身被收束（RequestClose/WaitClosed）
-// 且不进入 service 可见实例视图。
+// T3：资源 Start 失败 → 半装配资源本身被同步 Close 收束且不进入 service
+// 可见实例视图。
 BOOST_AUTO_TEST_CASE(factory_start_failure_rolls_back) {
     auto host = std::make_shared<StubNetHost>();
     auto app  = MakeApp(AppOpts(), host);
@@ -424,13 +401,10 @@ BOOST_AUTO_TEST_CASE(factory_start_failure_rolls_back) {
         [fail_s] { return StubResource::Create(fail_s); }));
 
     BOOST_TEST(app->run() == fw::HostLifecycle::kExitStartFailed);
-    // 半装配资源被收束——Create 已成功的对象也走 RequestClose/WaitClosed
-    // 到 IsClosed 终态。
-    BOOST_TEST(fail_s->request_close_calls.load() >= 1);
-    BOOST_TEST(fail_s->wait_closed_calls.load() >= 1);
+    // 半装配资源被收束——Create 已成功的对象也走 Close 到 IsClosed 终态。
+    BOOST_TEST(fail_s->close_calls.load() >= 1);
     BOOST_TEST(fail_s->closed.load());
     BOOST_TEST(host->TotalCalls() == std::size_t{0});
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 
 // T4：登记校验——(类型,名) 重复（工厂↔预创建共享键空间）、空工厂、
@@ -471,26 +445,24 @@ BOOST_AUTO_TEST_CASE(resource_registration_validation) {
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
 }
 
-// T5：资源 WaitClosed 在预算内完成 → kExitOk；资源收束晚于 handler 排空。
-BOOST_AUTO_TEST_CASE(resource_close_within_budget) {
+// T5：资源 Close 是同步契约——Close 返回即物理释放；资源收束晚于 handler
+//     排空、早于网络 Close。
+BOOST_AUTO_TEST_CASE(resource_close_after_handler_drain) {
     auto host = std::make_shared<StubNetHost>();
     auto app  = MakeApp(AppOpts(), host);
     BOOST_REQUIRE(app->add_service<CacheSvc>(ConcurrentOpts()));
 
     auto s = std::make_shared<StubResource::Shared>();
     std::atomic<bool> drained{false};
-    // 资源 WaitClosed 时记录「handler 已排空」这一真实前提（经由 host
-    // 桩的调用名序佐证 on_handlers_drained 挂接点位置）。
-    s->on_wait_closed =
-        [host, &drained](co::Deadline, co::CancellationToken) {
-            const auto names = host->Names();
-            drained.store(
-                std::find(names.begin(), names.end(),
-                          "net.wait_handlers") != names.end() &&
-                std::find(names.begin(), names.end(),
-                          "net.request_close") == names.end());
-            return inf::CloseStatus::Closed;
-        };
+    // 资源 Close 时记录「handler 已排空、网络尚未 Close」这一真实前提。
+    s->on_close = [host, &drained]() {
+        const auto names = host->Names();
+        drained.store(
+            std::find(names.begin(), names.end(), "net.wait_handlers") !=
+                names.end() &&
+            std::find(names.begin(), names.end(), "net.close") ==
+                names.end());
+    };
     BOOST_REQUIRE(app->add_resource<StubResource>("r",
         [s] { return StubResource::Create(s); }));
 
@@ -500,55 +472,29 @@ BOOST_AUTO_TEST_CASE(resource_close_within_budget) {
     JoinRun(h);
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
     BOOST_TEST(drained.load());   // 资源收束发生在 handler 排空之后
+    BOOST_TEST(s->closed.load());
 }
 
-// T6：资源 WaitClosed 首调超时 → ShutdownIncomplete（run 不返回、未完成
-// 项含 resource:*、资源仍强持有）→ 迟到续等完成 → kExitShutdownLate。
-BOOST_AUTO_TEST_CASE(resource_close_budget_exhaustion) {
+// T6：资源 Close 同步、幂等——一次关闭序列里每个资源只 Close 一次
+//     （on_handlers_drained 与 on_release 兜底共享 spec.closed 幂等标记）；
+//     不再有资源等待步，不会因资源进入 ShutdownIncomplete。
+BOOST_AUTO_TEST_CASE(resource_close_synchronous_and_idempotent) {
     auto host = std::make_shared<StubNetHost>();
     auto app  = MakeApp(AppOpts(), host);
     BOOST_REQUIRE(app->add_service<CacheSvc>(ConcurrentOpts()));
 
     auto s = std::make_shared<StubResource::Shared>();
-    TestLatch waiting_unbounded{1};
-    TestGate  allow_close;
-    std::atomic<int> calls{0};
-    s->on_wait_closed =
-        [&](co::Deadline, co::CancellationToken) -> inf::CloseStatus {
-            if (calls.fetch_add(1) == 0)
-                return inf::CloseStatus::TimedOut;   // 预算内不收束
-            waiting_unbounded.CountDown();
-            allow_close.Wait();
-            return inf::CloseStatus::Closed;
-        };
-    BOOST_REQUIRE(app->add_resource<StubResource>("slow",
+    BOOST_REQUIRE(app->add_resource<StubResource>("r",
         [s] { return StubResource::Create(s); }));
 
     auto h = RunApp(*app);
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
     app->request_shutdown();
-
-    // 等状态机进入资源的无界续等：ShutdownIncomplete 可观察、run 不返回、
-    // 资源强持有（spec.instance 未释放——由 host 未 release 间接证明）。
-    BOOST_REQUIRE(waiting_unbounded.WaitFor(kWait));
-    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::ShutdownIncomplete);
-    const auto pending = app->pending_cleanup();
-    BOOST_REQUIRE(!pending.empty());
-    bool saw_resource_step = false;
-    for (const auto& p : pending)
-        if (p.rfind("resource:", 0) == 0) saw_resource_step = true;
-    BOOST_CHECK(saw_resource_step);
-    BOOST_TEST(!h->done.load());   // run 不返回
-    const auto names = host->Names();
-    BOOST_CHECK(std::find(names.begin(), names.end(),
-                          "net.release") == names.end());   // 未提前释放
-
-    allow_close.Open();
     JoinRun(h);
-    BOOST_TEST(h->rc == fw::HostLifecycle::kExitShutdownLate);
-    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_TEST(app->pending_cleanup().empty());
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
+    BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
+    BOOST_TEST(s->close_calls.load() == 1);       // 恰好一次（幂等）
+    BOOST_TEST(s->closed.load());
+    BOOST_TEST(app->pending_cleanup().empty());   // 无未完成资源步
 }
 
 // ── 异常路径：资源工厂抛异常（修复 review finding 1 的回归测试）──
@@ -576,7 +522,7 @@ BOOST_AUTO_TEST_CASE(factory_throw_rolls_back_via_exception_boundary) {
     BOOST_TEST(app->run() == fw::HostLifecycle::kExitStartFailed);
     // 已创建并启动的资源被收束；抛异常的工厂未产生对象不要求收束。
     if (ok_s->create_calls.load() > 0) {
-        BOOST_TEST(ok_s->request_close_calls.load() >= 1);
+        BOOST_TEST(ok_s->close_calls.load() >= 1);
         BOOST_TEST(ok_s->closed.load());
     }
     BOOST_TEST(host->TotalCalls() == std::size_t{0});
@@ -588,21 +534,20 @@ BOOST_AUTO_TEST_CASE(factory_throw_rolls_back_via_exception_boundary) {
             f.find("InternalError") != std::string::npos)
             saw_threw = true;
     BOOST_TEST(saw_threw);
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 
-// T8：Start() 抛异常 → 同样收口为 err，半装配资源被收束。
+// T8：Start() 抛异常 → 同样收口为 err，半装配资源被同步 Close 收束。
 class ThrowingStartResource : public inf::ICoCloseable {
 public:
     struct Shared {
         std::atomic<bool> closed{false};
-        std::atomic<int>  request_close_calls{0};
+        std::atomic<int>  close_calls{0};
     };
     explicit ThrowingStartResource(std::shared_ptr<Shared> s)
         : m_s(std::move(s)) {}
     static fw::result<std::shared_ptr<ThrowingStartResource>> Create(
         std::shared_ptr<Shared> s) {
-        if (co::CurrentRuntimeGeneration() == 0)
+        if (!g_scheduler->IsInitialized())
             return fw::result<
                 std::shared_ptr<ThrowingStartResource>>::err(
                     fw::MakeError(fw::ErrorCode::RuntimeUnavailable,
@@ -613,15 +558,11 @@ public:
     fw::result<void> Start() {
         throw std::runtime_error("start threw");
     }
-    void RequestClose() noexcept override {
-        m_s->request_close_calls.fetch_add(1);
+    void Close() noexcept override {
+        m_s->close_calls.fetch_add(1);
+        m_s->closed.store(true);
     }
     bool IsClosed() const noexcept override { return m_s->closed.load(); }
-    inf::CloseStatus WaitClosed(co::Deadline,
-                                co::CancellationToken) override {
-        m_s->closed.store(true);
-        return inf::CloseStatus::Closed;
-    }
 private:
     std::shared_ptr<Shared> m_s;
 };
@@ -636,11 +577,10 @@ BOOST_AUTO_TEST_CASE(resource_start_throw_rolls_back_via_exception_boundary) {
         [s] { return ThrowingStartResource::Create(s); }));
 
     BOOST_TEST(app->run() == fw::HostLifecycle::kExitStartFailed);
-    // 半装配资源被收束（RequestClose 至少一次，IsClosed 终态）。
-    BOOST_TEST(s->request_close_calls.load() >= 1);
+    // 半装配资源被同步收束（Close 至少一次，IsClosed 终态）。
+    BOOST_TEST(s->close_calls.load() >= 1);
     BOOST_TEST(s->closed.load());
     BOOST_TEST(host->TotalCalls() == std::size_t{0});
-    BOOST_TEST(g_scheduler->GetRunGeneration() == 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

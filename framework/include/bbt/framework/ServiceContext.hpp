@@ -4,7 +4,7 @@
 // ServiceContext 是框架注入到每个服务实例的上下文对象：
 //  - request()：当前受管请求上下文（同一逻辑请求随协程绑定；非受管
 //    调用返回 err(InvalidContext)）。handler 用它读 request_id、
-//    deadline、cancel、actor_key、peer_principal、trace_id；
+//    deadline、actor_key、peer_principal、trace_id；
 //  - resource<R>()：框架/扩展装配的资源客户端缝（如未来的
 //    CoRedisCli/CoMysqlCli/CoMongoCli 等 infra client mixin）。资源
 //    由 CoApp::add_resource<R> 按类型登记，服务在受管生命周期内取用；

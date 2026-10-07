@@ -23,10 +23,10 @@
 //                                      → 排空仍等待物理在途 → ShutdownIncomplete
 //                                      → 迟到回调安全执行（资源仍存活）→
 //                                      kExitShutdownLate。
-//  T6 waitclosed_budget_exhaustion       WaitClosed 步预算耗尽路径（INetworkHost
-//                                      桩，无 socket）：第二次等待获得无界期
-//                                      限、未完成项可观察、run 不返回、迟到收
-//                                      尾 → kExitShutdownLate。
+//  T6 wait_handlers_budget_exhaustion   WaitHandlersDone 步预算耗尽路径
+//                                      （INetworkHost 桩，无 socket）：第二次
+//                                      等待获得无界期限、未完成项可观察、run
+//                                      不返回、迟到收尾 → kExitShutdownLate。
 //
 // 进程内单例 Scheduler 约束：同一时刻至多一个 CoApp 在 run 内（F1-b1 已冻结
 // 口径），故「在途 handler 出站」的对端不是第二个 CoApp，而是独立
@@ -57,7 +57,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/infra/HttpClient.hpp>
 #include <bbt/infra/HttpServer.hpp>
@@ -128,6 +128,45 @@ private:
 
 constexpr std::chrono::milliseconds kWait{15000};
 
+// ── 协程闩（CoWaiter 上的单次放行语义）──
+// Open 前 Wait 真实挂起；Open 后（含 Open 早于登记）全部放行，不丢唤醒；
+// 使用 CoWaiter 的单次等待语义，无 sleep。支持多等待者。
+class CoGate {
+public:
+    void Open() {
+        std::vector<co::sync::CoWaiter::SPtr> notify;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_open = true;
+            notify.swap(m_waiters);
+        }
+        for (auto& w : notify) w->Notify();
+    }
+    co::WaitStatus Wait(co::Deadline deadline) {
+        auto waiter = co::sync::CoWaiter::Create();
+        co::WaitOptions wo;
+        wo.deadline = deadline;
+        const auto st = waiter->WaitWithCallback(wo, [&]() -> bool {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_open) waiter->Notify();   // 早到：登记后自唤醒，不丢
+            else        m_waiters.push_back(waiter);
+            return true;
+        });
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_waiters.erase(
+                std::remove(m_waiters.begin(), m_waiters.end(), waiter),
+                m_waiters.end());
+        }
+        return st;
+    }
+
+private:
+    std::mutex                            m_mtx;
+    bool                                  m_open = false;
+    std::vector<co::sync::CoWaiter::SPtr> m_waiters;
+};
+
 // ── CoRpc 位置参数测试辅助 ──
 
 fw::result<std::int32_t> IntArg(const fw::CoRpcReq& req) {
@@ -170,22 +209,25 @@ struct Probe {
 
     TestLatch arrived;
 
-    // 业务 handler 挂起点：CompletionSignal 依赖运行时 generation，只能
-    // 在调度器已 Start 后创建——由首个挂起的 handler 惰性建立；测试经
-    // CompleteGate 放行（非 sleep 时序）。
-    std::shared_ptr<co::CompletionSignal> Gate() {
+    // 业务 handler 挂起点：CoWaiter 闩，由首个挂起的 handler 惰性建立；
+    // 测试经 CompleteGate 放行（非 sleep 时序）。
+    std::shared_ptr<CoGate> Gate() {
         std::lock_guard<std::mutex> lk(mtx);
         if (!gate)
-            gate = std::make_shared<co::CompletionSignal>();
+            gate = std::make_shared<CoGate>();
         return gate;
     }
     void CompleteGate() {
-        std::lock_guard<std::mutex> lk(mtx);
-        if (gate) gate->Complete();
+        std::shared_ptr<CoGate> g;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            g = gate;
+        }
+        if (g) g->Open();
     }
 
     mutable std::mutex      mtx;
-    std::shared_ptr<co::CompletionSignal> gate;
+    std::shared_ptr<CoGate> gate;
     std::vector<std::string> events;
 
     void Event(std::string e) {
@@ -231,8 +273,7 @@ public:
                 fw::ErrorCode::InternalError, "no probe"));
         auto gate = p->Gate();
         p->arrived.CountDown();
-        const auto st = gate->Wait(
-            {ctx.value()->deadline, ctx.value()->cancel});
+        const auto st = gate->Wait(ctx.value()->deadline);
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "wait_dial gate"));
         auto response = this->call("echo", "ping", req);
@@ -253,8 +294,7 @@ public:
                 fw::ErrorCode::InternalError, "no probe"));
         auto gate = p->Gate();
         p->arrived.CountDown();
-        const auto st = gate->Wait(
-            {co::Deadline::max(), co::CancellationToken{}});
+        const auto st = gate->Wait(co::Deadline::max());
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "wait_dial_long"));
         p->Event("late_handler_resumed");
@@ -285,8 +325,7 @@ public:
                 fw::ErrorCode::InternalError, "no probe"));
         auto gate = p->Gate();
         p->arrived.CountDown();
-        const auto st = gate->Wait(
-            {ctx.value()->deadline, ctx.value()->cancel});
+        const auto st = gate->Wait(ctx.value()->deadline);
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "park_dial gate"));
         auto response = this->call(
@@ -335,15 +374,6 @@ inf::NetworkLimits Limits(std::chrono::milliseconds incoming_timeout) {
         /*max_header_bytes*/ 16384,
         /*max_body_bytes*/ 65536,
         incoming_timeout};
-}
-
-void WaitClosedOnThread(const std::shared_ptr<inf::NetworkRuntime>& rt,
-                        std::chrono::milliseconds ms) {
-    const auto until = Clock::now() + ms;
-    while (!rt->IsClosed()) {
-        if (Clock::now() > until) return;
-        std::this_thread::yield();
-    }
 }
 
 // ── 宿主夹具：真实 InfraHttpHost + CoApp（单 app，单例调度器约束）──
@@ -508,9 +538,9 @@ struct TestClient {
     std::shared_ptr<inf::HttpClient>     client;
 
     void Stop() {
-        if (client) client->RequestClose();
-        if (rt)     rt->RequestClose();
-        if (rt)     WaitClosedOnThread(rt, kWait);
+        // infra 关闭是同步契约：Close() 返回即物理释放，无需等待收束。
+        if (client) client->Close();
+        if (rt)     rt->Close();
     }
 };
 
@@ -537,8 +567,7 @@ struct EchoPeer {
 
     void Stop() {
         if (server) server->StopAccepting();
-        if (rt)     rt->RequestClose();
-        if (rt)     WaitClosedOnThread(rt, kWait);
+        if (rt)     rt->Close();   // 同步收口：返回即物理释放
     }
 };
 
@@ -633,7 +662,6 @@ fw::result<inf::RpcEnvelope> SendRpc(
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    o.cancel   = {};
     auto res = client->Request(
         Wire::ToHttpRequest(env, "http://" + endpoint + "/rpc"), o);
     if (!res)
@@ -672,14 +700,11 @@ bool WaitState(const fw::CoApp& app, fw::ShutdownState want,
     return true;
 }
 
-// ── INetworkHost 桩：记录调用序列；T6 用于驱动 WaitClosed 预算耗尽路径 ──
+// ── INetworkHost 桩：记录调用序列；T6 用于驱动 WaitHandlersDone 预算耗尽路径 ──
 
 class StubNetHost final : public fw::INetworkHost {
 public:
-    std::function<fw::result<void>(co::Deadline, co::CancellationToken)>
-        on_wait_handlers;
-    std::function<bbt::infra::CloseStatus(co::Deadline, co::CancellationToken)>
-        on_wait_closed;
+    std::function<fw::result<void>(co::Deadline)> on_wait_handlers;
     TestLatch start_seen{1};
 
     fw::result<void> Create() override {
@@ -692,20 +717,12 @@ public:
         return fw::result<void>::ok();
     }
     void StopAccepting() noexcept override { _Record("net.stop_accepting"); }
-    fw::result<void> WaitHandlersDone(co::Deadline d,
-                                      co::CancellationToken t) override {
+    fw::result<void> WaitHandlersDone(co::Deadline d) override {
         _Record("net.wait_handlers");
-        if (on_wait_handlers) return on_wait_handlers(d, t);
+        if (on_wait_handlers) return on_wait_handlers(d);
         return fw::result<void>::ok();
     }
-    void RequestClose() noexcept override { _Record("net.request_close"); }
-    bbt::infra::CloseStatus WaitClosed(co::Deadline d,
-                                     co::CancellationToken t) override {
-        _Record("net.wait_closed");
-        if (on_wait_closed) return on_wait_closed(d, t);
-        return bbt::infra::CloseStatus::Closed;
-    }
-    void ReleaseClosed() noexcept override { _Record("net.release"); }
+    void Close() noexcept override { _Record("net.close"); }
 
     std::vector<std::string> Names() const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -748,8 +765,6 @@ BOOST_AUTO_TEST_CASE(request_shutdown_external_thread_clean_rc0) {
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_CHECK(box.app->pending_cleanup().empty());
     BOOST_CHECK(box.app->lifecycle_failures().empty());
-    // 关闭完整走完 Scheduler::Stop：调度器代际归零。
-    BOOST_CHECK(g_scheduler->GetRunGeneration() == 0);
     tc.Stop();
 }
 
@@ -788,20 +803,20 @@ BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
     BOOST_CHECK(!box.run->done.load());   // 控制线程仍在 run 内
 
     // 放行：handler 在关闭序列内发起真实出站——调度器未被强停、出站
-    // client 所在 runtime 未 RequestClose、服务实例仍存活。
+    // client 所在 runtime 未 Close、服务实例仍存活。
     g_probe->CompleteGate();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
-    BOOST_REQUIRE(inflight_res.value());
-    // +100 为 peer 处理产生：出站确实经 loopback 到达对端并回来。
-    BOOST_CHECK(DecodeReply(inflight_res.value()).value() == 109);
+    // F-06①：关闭期间在途 handler 被放行后仍完成真实出站（应答码非假装）——
+    // 以 handler 侧 outbound:ok 事件与 peer 命中为证。infra 同步 Close 契约
+    // （owner Close 丢弃未发送响应、不做 flush）下，回复不保证送达原客户端，
+    // 故不以其为断言对象。
     BOOST_CHECK(g_probe->HasEvent("outbound:ok"));
     BOOST_CHECK(peer->hits.load() == 1);
 
     JoinRun(box.run);
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(g_scheduler->GetRunGeneration() == 0);
     tc.Stop();
     peer->Stop();
 }
@@ -823,7 +838,6 @@ BOOST_AUTO_TEST_CASE(request_shutdown_before_run) {
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_CHECK(box.app->pending_cleanup().empty());
-    BOOST_CHECK(g_scheduler->GetRunGeneration() == 0);
 }
 
 // T4：预算耗尽 → ShutdownIncomplete → actor 在途 handler 迟到完成真实出站
@@ -864,7 +878,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     // 契约要求：控制线程仍在 run 内；App 持续强持有未收束
     // Service/Actor/NetworkRuntime；I/O 驱动与 Scheduler 保留（未被强停）。
     BOOST_CHECK(!box.run->done.load());
-    BOOST_CHECK(g_scheduler->IsRunning());
+    BOOST_CHECK(g_scheduler->IsInitialized());
     auto rt = box.host->network_runtime();
     BOOST_REQUIRE(rt);
     BOOST_CHECK(!rt->IsClosed());                     // I/O 驱动仍在
@@ -880,19 +894,19 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     g_probe->CompleteGate();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
-    BOOST_REQUIRE(inflight_res.value());
-    BOOST_CHECK(DecodeReply(inflight_res.value()).value() == 103);
+    // F-06②③：actor 在途 handler 迟到完成真实出站，应答码来自 peer，不是
+    // 假装——以 handler 侧 actor_outbound:ok 事件与 peer 命中为证。infra
+    // 同步 Close 丢弃未发送响应，回复不保证送达原客户端。
     BOOST_CHECK(g_probe->HasEvent("actor_outbound:ok"));
     BOOST_CHECK(peer->hits.load() == 1);
 
     JoinRun(box.run);
-    // 迟到操作全部结束后：完整收束 + Scheduler::Stop，run 返回非零
-    // （记录曾超预算），不是「优雅关闭成功」。
+    // 迟到操作全部结束后：完整收束，run 返回非零（记录曾超预算），不是
+    // 「优雅关闭成功」。
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitShutdownLate);
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_CHECK(box.app->pending_cleanup().empty());
     BOOST_CHECK(box.app->lifecycle_failures().empty());
-    BOOST_CHECK(g_scheduler->GetRunGeneration() == 0);
     tc.Stop();
     peer->Stop();
 }
@@ -940,7 +954,7 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     BOOST_REQUIRE(
         WaitState(*box.app, fw::ShutdownState::ShutdownIncomplete, kWait));
     BOOST_CHECK(!box.run->done.load());
-    BOOST_CHECK(g_scheduler->IsRunning());
+    BOOST_CHECK(g_scheduler->IsInitialized());
     BOOST_CHECK(box.host->network_runtime() &&
                 !box.host->network_runtime()->IsClosed());
     // 服务实例仍强持有（迟到回调稍后还要访问它）。
@@ -966,31 +980,31 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitShutdownLate);
     BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_CHECK(box.app->pending_cleanup().empty());
-    BOOST_CHECK(g_scheduler->GetRunGeneration() == 0);
     tc.Stop();
     peer->Stop();
 }
 
-// T6：WaitClosed 步预算耗尽（桩，无 socket）——第二次等待获无界期限、
-//     未完成项可观察、run 不返回、迟到收尾 → kExitShutdownLate。
-BOOST_AUTO_TEST_CASE(waitclosed_budget_exhaustion) {
+// T6：WaitHandlersDone 步预算耗尽（桩，无 socket）——第一次等待获有限步预算
+//     超时、第二次获无界期限；未完成项可观察、run 不返回、迟到收尾 →
+//     kExitShutdownLate。
+BOOST_AUTO_TEST_CASE(wait_handlers_budget_exhaustion) {
     auto host = std::make_shared<StubNetHost>();
-    TestLatch unbounded_wait{1};   // 第二次（无界）WaitClosed 已进入
-    TestGate  allow_close;         // 迟到收尾放行
-    std::atomic<int> closed_calls{0};
+    TestLatch unbounded_wait{1};   // 第二次（无界）WaitHandlersDone 已进入
+    TestGate  allow_drain;         // 迟到收尾放行
+    std::atomic<int> wait_calls{0};
     std::atomic<bool> first_deadline_finite{false};
     std::atomic<bool> second_deadline_unbounded{false};
 
-    host->on_wait_closed =
-        [&](co::Deadline d, co::CancellationToken)
-            -> bbt::infra::CloseStatus {
-            const auto call = closed_calls.fetch_add(1);
+    host->on_wait_handlers =
+        [&](co::Deadline d) -> fw::result<void> {
+            const auto call = wait_calls.fetch_add(1);
             if (call == 0) {
                 // 预算内等待：期限必须是有限步预算（约 step_budget 量级）。
                 first_deadline_finite.store(
                     d < Clock::now() + std::chrono::hours{1},
                     std::memory_order_release);
-                return bbt::infra::CloseStatus::TimedOut;
+                return fw::result<void>::err(fw::MakeError(
+                    fw::ErrorCode::TimedOut, "handlers still running"));
             }
             // 预算耗尽后的续等：宿主以 Deadline::max() 等迟到收尾——
             // 期限约束的是优雅关闭是否成功，不是进程退出硬时限。
@@ -998,8 +1012,8 @@ BOOST_AUTO_TEST_CASE(waitclosed_budget_exhaustion) {
                 d > Clock::now() + std::chrono::hours{1},
                 std::memory_order_release);
             unbounded_wait.CountDown();
-            allow_close.Wait();
-            return bbt::infra::CloseStatus::Closed;
+            allow_drain.Wait();
+            return fw::result<void>::ok();
         };
 
     fw::CoAppOptions opts;
@@ -1016,32 +1030,29 @@ BOOST_AUTO_TEST_CASE(waitclosed_budget_exhaustion) {
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
     app->request_shutdown();
 
-    // WaitClosed 超时 → ShutdownIncomplete；run 不返回、不提前释放。
+    // WaitHandlersDone 超时 → ShutdownIncomplete；run 不返回、不提前关闭。
     BOOST_REQUIRE(unbounded_wait.WaitFor(kWait));
     BOOST_CHECK(app->shutdown_state() ==
                 fw::ShutdownState::ShutdownIncomplete);
     const auto pending = app->pending_cleanup();
     BOOST_REQUIRE(pending.size() == 1);
-    BOOST_CHECK(pending[0] == "WaitClosed");
+    BOOST_CHECK(pending[0] == "WaitHandlersDone");
     BOOST_CHECK(!h->done.load());
-    BOOST_CHECK(g_scheduler->IsRunning());
+    BOOST_CHECK(g_scheduler->IsInitialized());
     {
         const auto names = host->Names();
         BOOST_CHECK(std::find(names.begin(), names.end(),
                               "net.stop_accepting") != names.end());
         BOOST_CHECK(std::find(names.begin(), names.end(),
-                              "net.request_close") != names.end());
-        BOOST_CHECK(std::find(names.begin(), names.end(),
-                              "net.release") == names.end());
+                              "net.close") == names.end());   // 未提前关闭
     }
 
-    // 迟到收尾完成：走完释放与 Scheduler::Stop，run 返回非零。
-    allow_close.Open();
+    // 迟到收尾完成：走完关闭，run 返回非零。
+    allow_drain.Open();
     JoinRun(h);
     BOOST_CHECK(h->rc == fw::HostLifecycle::kExitShutdownLate);
     BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closed);
     BOOST_CHECK(app->pending_cleanup().empty());
-    BOOST_CHECK(g_scheduler->GetRunGeneration() == 0);
     BOOST_CHECK(first_deadline_finite.load());
     BOOST_CHECK(second_deadline_unbounded.load());
     {
@@ -1050,10 +1061,8 @@ BOOST_AUTO_TEST_CASE(waitclosed_budget_exhaustion) {
             return std::find(names.begin(), names.end(), n) - names.begin();
         };
         BOOST_CHECK(pos("net.stop_accepting") < pos("net.wait_handlers"));
-        BOOST_CHECK(pos("net.wait_handlers") < pos("net.request_close"));
-        BOOST_CHECK(pos("net.request_close") < pos("net.wait_closed"));
-        // 两次 wait_closed（预算内 + 无界续等）都在 release 之前。
-        BOOST_CHECK(pos("net.wait_closed") < pos("net.release"));
+        // 两次 wait_handlers（预算内 + 无界续等）都在 close 之前。
+        BOOST_CHECK(pos("net.wait_handlers") < pos("net.close"));
     }
 }
 

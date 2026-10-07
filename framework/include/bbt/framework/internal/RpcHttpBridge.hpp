@@ -55,11 +55,19 @@ void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 
 // 默认出站：HttpClient 懒建（首个发送时在协程内创建，协程约束与
 // infra 一致）；runtime 不可得 → RuntimeUnavailable。
+// Issue #4：出站协议 profile 与入站一致——LegacyHeaders 走 x-bbt-* header
+// 迁移期桥；ProtoWireV1 走 infra 正式 body 信封（POST /rpc +
+// application/x-protobuf）。两者共享同一 HttpClient 懒建与发送 root，只换
+// 编解码 profile；不做 header/body 混用。
+enum class RpcEgressProfile { LegacyHeaders, ProtoWireV1 };
+
 class HttpEgress {
 public:
-    // host 弱持有：宿主对象本身可空（纯出站宿主）或由 ReleaseClosed
-    // 释放；两者都以 RuntimeUnavailable 如实返回。
-    explicit HttpEgress(std::weak_ptr<InfraHttpHost> host);
+    // host 弱持有：宿主对象本身可空（纯出站宿主）或经 Close() 释放；
+    // 两者都以 RuntimeUnavailable 如实返回。
+    explicit HttpEgress(std::weak_ptr<InfraHttpHost> host,
+                        RpcEgressProfile profile =
+                            RpcEgressProfile::LegacyHeaders);
 
     // 协程内调用。addr.transport 仅支持 "http"（其余 → InvalidArgument）。
     result<bbt::infra::RpcEnvelope> Send(
@@ -68,7 +76,16 @@ public:
         const bbt::infra::CallOptions& opt);
 
 private:
+    // ProtoWireV1 分支：本地 deadline → remaining_budget_ms（clamp），
+    // 正式 wire 请求/响应编解码。仅 BBT_FRAMEWORK_HAS_RPC_WIRE 时可用。
+    result<bbt::infra::RpcEnvelope> _SendWireProfile(
+        const bbt::infra::RpcAddress& addr,
+        const bbt::infra::RpcEnvelope& env,
+        const bbt::infra::CallOptions& opt,
+        const std::shared_ptr<bbt::infra::HttpClient>& client);
+
     std::weak_ptr<InfraHttpHost>            m_host;
+    RpcEgressProfile                        m_profile;
     std::mutex                              m_mtx;
     std::shared_ptr<bbt::infra::HttpClient> m_client;
 };

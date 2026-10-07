@@ -63,12 +63,21 @@ struct CoAppSeam;
 std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
                                         CoAppSeam seam);
 void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
+void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app);
 
 // 显式静态路由项：service_name → 已配置的出站地址。
 struct StaticRoute {
     std::string              service_name;
     bbt::infra::RpcAddress   address;
 };
+
+// Issue #4：入站 RPC 协议选择。
+//  - LegacyHeaders：迁移期绑定，envelope 字段一对一映射 x-bbt-* header（既有
+//    默认，保留既有测试）。
+//  - ProtoWireV1：infra Issue #8 冻结的正式 body wire profile（POST /rpc +
+//    Content-Type: application/x-protobuf，body=RpcEnvelopeMsg）；须在 protobuf
+//    前缀锁定可用时选择，否则启动期显式失败。
+enum class RpcInboundBridge { LegacyHeaders, ProtoWireV1 };
 
 // 运行时配置（全部字段必须显式填写，与 ServiceOptions 同一约定）：
 //  - network_limits：透传给网络依赖组件的限额（ValidateNetworkLimits）；
@@ -81,6 +90,8 @@ struct CoAppOptions {
     bbt::infra::ListenAddress listen;
     std::vector<StaticRoute>  static_routes;
     std::chrono::milliseconds shutdown_step_budget;
+    // Issue #4：入站桥选择，默认保留既有 x-bbt-* header 绑定。
+    RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
 };
 
 class CoApp {
@@ -89,6 +100,7 @@ class CoApp {
     friend std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions,
                                                    CoAppSeam);
     friend void InstallRpcHttpBridge(InfraHttpHost&, CoApp&);
+    friend void InstallRpcWireBridge(InfraHttpHost&, CoApp&);
     // 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
     // dispatch_inbound，不新增业务可见面。
     friend result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
@@ -179,7 +191,7 @@ public:
     // 已启动」的资源形态（如 infra CoRedisCli/CoMongoCli）。factory 须返回
     // result<std::shared_ptr<R>>；创建出的实例若暴露 Start() 且该返回
     // result<void> 则由框架在登记后调用一次，若实现
-    // bbt::infra::ICoCloseable 则由关闭序列统一 RequestClose/WaitClosed。
+    // bbt::infra::ICoCloseable 则由关闭序列统一 Close()（同步收口）。
     // 任一资源创建/启动失败 → 启动失败回退，不留半装配资源。
     // name 约束与 add_resource(ptr) 相同；重复键/空工厂 → InvalidArgument。
     template <class R, class F,
@@ -360,9 +372,9 @@ private:
     // 资源生命周期（#8）：on_scheduler_started 相位内先 _StartResources
     // （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
     // handler 排空后（on_handlers_drained）与回退路径（on_release）统一
-    // 经 _CloseResources 收束。两者幂等（ResourceSpec::closed）。
+    // 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。
     result<void> _StartResources();
-    void         _CloseResources(HostLifecycle& lifecycle) noexcept;
+    void         _CloseResources() noexcept;
     void         _ReleaseServices() noexcept;
     // find_route 路由门 + 出站实现（ICoService::RpcSendFn 是
     // ICoService 的私有别名；CoApp 经友元命名）。

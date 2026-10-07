@@ -14,9 +14,9 @@
 //  - g_scheduler->RegistCoroutineTask：仅提供「把 drain 闭包交给某个 worker
 //    协程执行」，不承诺同一闭包不被并发执行。唯一消费者由本类自保证：
 //    m_draining 占位标志与队列共用 m_mtx，空转→活跃边沿至多注册一个 drain。
-//  - 销毁竞争：drain 闭包按值捕获本对象 shared_ptr，协程存活期间邮箱不死；
-//    邮箱析构不发生在 drain 运行中途。Scheduler::Stop 遗弃未跑完的协程时
-//    随闭包一起释放引用，不解引用。
+//  - 销毁竞争：drain 闭包按值捕获邮箱、方法描述与 actor 实例，协程存活
+//    期间这些执行所需对象不悬空；邮箱析构不发生在 drain 运行中途。运行时
+//    无 Stop/restart；进程结束前不销毁挂起协程，故这里不依赖停机时的栈展开。
 //  - 队列与容量用 std::deque + std::mutex 自建：coroutine 的 Chan<T,Max>
 //    容量是模板常量，放不下运行期 mailbox_capacity；且其读端挂起语义
 //    （m_is_reading 单读者）虽同形，本类需要在持锁临界区内完成「满则拒绝

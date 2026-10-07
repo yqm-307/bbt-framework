@@ -3,7 +3,6 @@
 #include <utility>
 
 #include <bbt/coroutine/coroutine.hpp>
-#include <bbt/coroutine/object/CoObject.hpp>
 
 namespace bbt::framework {
 
@@ -30,21 +29,17 @@ int HostLifecycle::Run(const Hooks& hooks) {
 
     _SetPhase(Phase::Starting);
 
-    // 固定顺序第 1 步：Scheduler::Start。宿主以单例调度器为运行时；
-    // 已由他人启动（generation != 0）时所有权不明，拒绝而不是叠加 Start。
-    if (bbt::coroutine::CurrentRuntimeGeneration() != 0) {
-        _AddFailure("scheduler already running: ownership ambiguous");
-        _SetPhase(Phase::Failed);
-        return kExitRejected;
-    }
-    g_scheduler->Start();
-
     result<void> startup = result<void>::ok();
     try {
+        // 固定顺序第 1 步：coroutine runtime 初始化。运行时是进程寿命单例，
+        // 没有 Stop/restart、不改代际；未初始化才 Start 一次，已初始化（他人
+        // 启动或上一次 run 复用）直接复用，不叠加 Start。
+        if (!g_scheduler->IsInitialized())
+            g_scheduler->Start();
         startup = _StartUp(hooks);
     } catch (const std::exception& e) {
-        // on_scheduler_started / host Create/Start 抛出的异常一律收口为
-        // 启动失败：异常不得越过 Run 逃逸，固定回退序列仍须执行。
+        // Start、on_scheduler_started 或 host Create/Start 抛出的异常一律收口为
+        // 启动失败：异常不得越过 Run，固定回退序列仍须执行。
         startup = result<void>::err(MakeError(ErrorCode::InternalError,
             std::string("startup threw: ") + e.what()));
     } catch (...) {
@@ -98,25 +93,23 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
     _SetPhase(Phase::Closing);
 
     if (m_host_created.load(std::memory_order_acquire)) {
-        // 顺序：StopAccepting → 等 handler 结束 → 资源收束挂接点 →
-        // RequestClose/WaitClosed → 释放已关闭网络对象。任何一步超时都不
-        // 跳过、不提前释放。
+        // 顺序：StopAccepting → 等 handler 结束 → 资源同步 Close 挂接点 →
+        // 网络同步 Close。排空未被证实（预算耗尽后的无界续等仍失败，或排空
+        // 返回非超时错误）时绝不进入后三步——保留 owner/资源、不释放、不返回。
         m_host->StopAccepting();
-        _WaitHandlersDone();
+        if (!_WaitHandlersDone())
+            _ParkUndrained();  // 永不返回：fail-closed 保活 ShutdownIncomplete
         _OnHandlersDrained(hooks);
-        m_host->RequestClose();
-        _WaitClosed();
-        m_host->ReleaseClosed();
+        m_host->Close();   // noexcept：同步返回即物理资源已释放
     }
-    // 业务对象回收与「释放已关闭网络对象」同组，均在 Scheduler::Stop 前。
+    // 业务对象回收在网络 Close 之后、run 返回之前。
     if (hooks.on_release) {
         try {
-            hooks.on_release(*this);
+            hooks.on_release();
         } catch (...) {
             _AddFailure("on_release hook threw");
         }
     }
-    g_scheduler->Stop();
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -128,81 +121,52 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
                : kExitOk;
 }
 
-void HostLifecycle::_WaitHandlersDone() {
-    auto r = m_host->WaitHandlersDone(_StepDeadline(), m_close_cancel.Token());
+bool HostLifecycle::_WaitHandlersDone() {
+    auto r = m_host->WaitHandlersDone(_StepDeadline());
     if (r)
-        return;
-    if (r.error().code == ErrorCode::TimedOut) {
-        // 预算耗尽：标记 ShutdownIncomplete 后以无界期限续等——期限约束的
-        // 是优雅关闭是否成功，不是进程退出的硬时限；不得跳过释放仍在被
-        // 回调访问的资源。
-        _EnterIncomplete("WaitHandlersDone");
-        r = m_host->WaitHandlersDone(bbt::coroutine::Deadline::max(),
-                                     m_close_cancel.Token());
+        return true;   // 排空已被证实
+    // 非预算性排空错误同样是「排空未被证实」：保留原始错误可观察，绝不当作
+    // 已排空（不得据此 Close/release）。预算耗尽（TimedOut）不算失败项。
+    const bool timed_out = (r.error().code == ErrorCode::TimedOut);
+    if (!timed_out)
+        _AddFailure("WaitHandlersDone: " + r.error().message);
+    // 未证实排空：复用既有的「无界期限续等一次」路径等待迟到收尾，不新增
+    // busy retry。此期间进入 ShutdownIncomplete（保留 owner、不 Close）。
+    _EnterIncomplete("WaitHandlersDone");
+    r = m_host->WaitHandlersDone(bbt::coroutine::Deadline::max());
+    if (r) {
         _LeaveIncomplete("WaitHandlersDone");
-        if (r) {
+        if (timed_out)
             m_exceeded_budget.store(true, std::memory_order_release);
-            return;
-        }
+        return true;   // 迟到收尾完成 → 排空已证实，允许收束
     }
+    // 续等仍失败：永久性排空失败。保持 ShutdownIncomplete（保留 owner/资源），
+    // 返回 false 由调用方 fail-closed；不再次调用形成忙循环。
     _AddFailure("WaitHandlersDone: " + r.error().message);
+    return false;
 }
 
-void HostLifecycle::_WaitClosed() {
-    auto st = m_host->WaitClosed(_StepDeadline(), m_close_cancel.Token());
-    if (st == bbt::infra::CloseStatus::Closed)
-        return;
-    if (st == bbt::infra::CloseStatus::TimedOut) {
-        _EnterIncomplete("WaitClosed");
-        st = m_host->WaitClosed(bbt::coroutine::Deadline::max(),
-                                m_close_cancel.Token());
-        _LeaveIncomplete("WaitClosed");
-        if (st == bbt::infra::CloseStatus::Closed) {
-            m_exceeded_budget.store(true, std::memory_order_release);
-            return;
-        }
-    }
-    _AddFailure("WaitClosed: status " + std::to_string(static_cast<int>(st)));
+void HostLifecycle::_ParkUndrained() {
+    // 排空未被证实：控制线程保活、Run 永不返回，保持 ShutdownIncomplete 与
+    // owner/资源不被释放（绝不 Close/release）。谓词恒假——无外部恢复入口
+    // （不新增公共恢复 API），结束由外部终止进程负责；不 busy retry、
+    // 不 _Exit/abort、不强杀线程。等待期间释放 m_mtx：State/IncompleteSteps/
+    // Failures 仍可被监督线程观察。
+    std::unique_lock<std::mutex> lk(m_mtx);
+    for (;;)
+        m_cv.wait(lk, [] { return false; });
 }
 
 void HostLifecycle::_OnHandlersDrained(const Hooks& hooks) {
     if (!hooks.on_handlers_drained)
         return;
     try {
-        hooks.on_handlers_drained(*this);
+        hooks.on_handlers_drained();
     } catch (const std::exception& e) {
         _AddFailure(std::string("on_handlers_drained: ") + e.what());
     } catch (...) {
         _AddFailure("on_handlers_drained threw");
     }
-}
-
-void HostLifecycle::RunCloseStep(
-    const std::string& name,
-    const std::function<bbt::infra::CloseStatus(
-        bbt::coroutine::Deadline,
-        bbt::coroutine::CancellationToken)>& wait_fn) {
-    auto st = wait_fn(_StepDeadline(), m_close_cancel.Token());
-    if (st == bbt::infra::CloseStatus::Closed)
-        return;
-    if (st == bbt::infra::CloseStatus::TimedOut) {
-        _EnterIncomplete(name.c_str());
-        st = wait_fn(bbt::coroutine::Deadline::max(), m_close_cancel.Token());
-        _LeaveIncomplete(name.c_str());
-        if (st == bbt::infra::CloseStatus::Closed) {
-            m_exceeded_budget.store(true, std::memory_order_release);
-            return;
-        }
-    }
-    _AddFailure(name + ": status " + std::to_string(static_cast<int>(st)));
-}
-
-bbt::coroutine::Deadline HostLifecycle::StepDeadline() const {
-    return _StepDeadline();
-}
-
-bbt::coroutine::CancellationToken HostLifecycle::CloseToken() const noexcept {
-    return m_close_cancel.Token();
 }
 
 bbt::coroutine::Deadline HostLifecycle::_StepDeadline() const {

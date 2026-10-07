@@ -8,6 +8,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(NEED_TEST "编译本仓 unit test 文件" OFF)
 option(NEED_EXAMPLE "编译 examples/ 下的可运行示例（Issue #5）" ON)
 
+# Issue #5：双服务资源示例的显式能力开关（默认 OFF）。语义固定为：
+#   OFF（默认）：普通 framework 构建不加入 examples/dual_service，不要求
+#                hiredis/mongo-cxx-driver，也不要求真实 Redis/Mongo 后端；
+#   ON：显式选择该能力后 fail-closed——下面列出的前置条件任一缺失即在
+#       configure 阶段 FATAL_ERROR，不允许静默跳过（跳过会让 storage_main.cc
+#       等核心示例代码永不进入构建，形成「CI 绿灯但没有覆盖」的假通过）。
+option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE
+    "构建依赖真实 Redis/Mongo 的 examples/dual_service 示例（Issue #5）" OFF)
+
 # 框架库目标：F0 为 header-only INTERFACE；F2-a 起含编译产物，
 # 目标在 framework/src/CMakeLists.txt 定义（需先接入 bbt::infra_common，
 # 见下方依赖块后的 add_subdirectory）。
@@ -94,6 +103,11 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/RpcHttpBridge.hpp
     internal/CoAppSeam.hpp
     internal/ResourceClose.hpp)
+# Issue #4：正式 wire 桥头只在 protobuf 前缀锁定（infra 注册 bbt_infra_rpc）时
+# 进入自给自检；未配置时该头不参与（其 include 的上游头不可得）。
+if(TARGET bbt_infra_rpc)
+    list(APPEND BBT_FRAMEWORK_INTERNAL_HEADERS internal/RpcWireBridge.hpp)
+endif()
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")
 set(_selfcheck_srcs "")
@@ -109,11 +123,48 @@ target_link_libraries(bbt_framework_header_selfcheck PRIVATE bbt::framework)
 target_compile_options(bbt_framework_header_selfcheck PRIVATE -Wall -Wextra)
 set_target_properties(bbt_framework_header_selfcheck PROPERTIES LINKER_LANGUAGE CXX)
 
-if(NEED_EXAMPLE)
-    add_subdirectory(examples)
+# Issue #5：显式开启 dual_service 的 fail-closed 门禁（只增判定，不改默认路径）。
+# 示例挂在 examples 入口（NEED_TEST=ON 且 bbt_infra_rpc 可用）之下，svc_a 又
+# 需要真实 Redis/Mongo 两个 infra 模块；四项前置条件任一缺失都必须在这里
+# configure 失败，不能变成「开关说 ON、实际被静默跳过」。
+if(BBT_ENABLE_DUAL_SERVICE_EXAMPLE)
+    set(_bbt_ds_missing "")
+    if(NOT NEED_TEST)
+        list(APPEND _bbt_ds_missing "NEED_TEST=ON（examples 入口由它开启）")
+    endif()
+    if(NOT TARGET bbt_infra_rpc)
+        list(APPEND _bbt_ds_missing
+            "-DBBT_PROTOBUF_PREFIX=<protobuf 前缀>（使 bbt_infra_rpc 注册，examples 入口前置）")
+    endif()
+    if(NOT TARGET bbt::infra_redis)
+        list(APPEND _bbt_ds_missing
+            "-DBBT_HIREDIS_PREFIX=<hiredis 前缀>（使 bbt::infra_redis 注册，svc_a 必需）")
+    endif()
+    if(NOT TARGET bbt::infra_mongo)
+        list(APPEND _bbt_ds_missing
+            "-DBBT_MONGOC_PREFIX=<mongo-c-driver 前缀> 与 -DBBT_MONGOCXX_PREFIX=<mongo-cxx-driver 前缀>（使 bbt::infra_mongo 注册，svc_a 必需）")
+    endif()
+    if(_bbt_ds_missing)
+        string(REPLACE ";" "\n  - " _bbt_ds_msg "${_bbt_ds_missing}")
+        message(FATAL_ERROR
+            "BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 缺少前置条件"
+            "（fail-closed，禁止降级为跳过）：\n  - ${_bbt_ds_msg}")
+    endif()
+    unset(_bbt_ds_missing)
+    unset(_bbt_ds_msg)
 endif()
 
+# Issue #4（P0-A）：GetValue 业务切片示例（唯一业务 .proto 真源 + C++ 服务端 +
+# Python 标准库客户端）。仅在测试构建（NEED_TEST=ON）且 protobuf 前缀锁定、
+# bbt_infra_rpc 目标可用时构建/注册；仓库约定 `-DNEED_TEST=ON` 才开启本仓
+# tests 与示例 ctest，不给只想链接 bbt::framework 的库消费者强加 Python3/Boost
+# 示例工具链依赖，也不在非测试构建跑示例用例。未配置前缀时不注册（示例不静默
+# 降级为 echo/header 旁路）。
 if(NEED_TEST)
+    # add_test 需要先 enable_testing；示例与 tests 都在此块内。
     enable_testing()
+    if(NEED_EXAMPLE AND TARGET bbt_infra_rpc)
+        add_subdirectory(examples)
+    endif()
     add_subdirectory(tests)
 endif()

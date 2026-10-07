@@ -10,6 +10,12 @@
 #   4) 独立构建目录 /tmp/bbt-ci-work/<run_id>（按 run_id 隔离，避同机并发互踩）；
 #   5) ccache 可用则挂入（优雅降级）+ BBT_JOBS=3（12c 机 3 槽之一）+ flock 串行全量；
 #   6) ctest -j1 --timeout 300 保留（镜像 scripts/run_ctest.sh 的 SKIP 门禁并加 --timeout）。
+#
+# Issue #5：dual_service 示例默认不构建（根 CMake 开关
+# BBT_ENABLE_DUAL_SERVICE_EXAMPLE 默认 OFF），因此本 workflow 的绿灯**不**覆盖
+# 该示例；这里只增加一个负向门禁步（显式 ON 且缺前缀必须 configure 失败），
+# 防止开关语义被改回「静默跳过」。真实资源验收 job（固定前缀 + Redis/Mongo +
+# run_demo.sh）尚未接线，见 examples/dual_service/README.md「覆盖边界」。
 name: ci
 
 on:
@@ -17,6 +23,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Issue #37：工具链身份校验候选。仅手动触发，不进 PR/push 的 required checks，
+  # 直到运维把 arc-s4 runner 切到 docker/toolchain.lock 固定的镜像
+  # （未切换时该 job 在旧 runner 上会 fail-closed，属预期 —— 见 docker/README.md）。
+  workflow_dispatch:
 
 concurrency:
   # 排队语义：不设 cancel-in-progress，同 ref 的后续运行排队等待而非取消在跑
@@ -110,9 +120,14 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: bash scripts/fetch_deps.sh
 
+      - name: Prepare locked protobuf
+        if: needs.changes.outputs.code == 'true'
+        run: bash scripts/prepare_protobuf.sh "$GITHUB_WORKSPACE/.deps/protobuf-3.21.12"
+
       - name: Build (flock 串行全量)
         if: needs.changes.outputs.code == 'true'
         run: |
+          export BBT_CMAKE_ARGS="-DBBT_PROTOBUF_PREFIX=$GITHUB_WORKSPACE/.deps/protobuf-3.21.12 ${BBT_CMAKE_ARGS:-}"
           # ccache 可用则经 launcher 挂入（优雅降级，不作为硬依赖；
           # BBT_CMAKE_ARGS 由 build_stack.sh:114-122 透传给 cmake 配置）。
           if command -v ccache >/dev/null 2>&1; then
@@ -140,6 +155,46 @@ jobs:
           fi
           if command -v ccache >/dev/null 2>&1; then ccache -s || true; fi
 
+      - name: Dual-service switch gate (fail-closed，负向)
+        # Issue #5：默认构建树必须保持开关 OFF 且不含 dual_service 产物；显式
+        # ON 而缺前置条件（此处刻意不传任何第三方前缀）必须 configure 失败。
+        # 断言失败即 job 失败——不允许把「静默跳过示例」当绿灯。
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          grep -q '^BBT_ENABLE_DUAL_SERVICE_EXAMPLE:BOOL=OFF$' \
+            "$BBT_BUILD_DIR/CMakeCache.txt" || {
+            echo "FATAL: 默认构建树未保持 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=OFF" >&2
+            exit 1
+          }
+          if [ -e "$BBT_BUILD_DIR/examples/dual_service" ]; then
+            echo "FATAL: 默认构建生成了 examples/dual_service（应默认不构建）" >&2
+            exit 1
+          fi
+          set +e
+          cmake -S "$GITHUB_WORKSPACE" -B "$BBT_WORK_DIR/ds-gate-negative" -G Ninja \
+            -DNEED_TEST=ON \
+            -DBBT_INFRA_SOURCE_DIR="$BBT_DEPS_DIR/infra-main" \
+            -DBBT_COROUTINE_SOURCE_DIR="$BBT_DEPS_DIR/coroutine-main" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON \
+            >"$BBT_WORK_DIR/ds-gate-negative.log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "FATAL: 缺前缀时 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 仍 configure 成功" >&2
+            exit 1
+          fi
+          # CMake 会把 message 折行，按稳定短串断言失败来自本门禁（而不是
+          # tests/ 的 bbt_infra_rpc 门禁）。
+          if ! grep -q '缺少前置条件' "$BBT_WORK_DIR/ds-gate-negative.log" ||
+             ! grep -q -- '-DBBT_HIREDIS_PREFIX' "$BBT_WORK_DIR/ds-gate-negative.log"; then
+            echo "FATAL: configure 失败原因不是 dual_service 前置条件门禁" >&2
+            tail -40 "$BBT_WORK_DIR/ds-gate-negative.log" >&2
+            exit 1
+          fi
+          echo "dual-service gate: OFF 默认生效；缺前缀时 ON fail-closed (rc=$rc)"
+          rm -rf "$BBT_WORK_DIR/ds-gate-negative"
+
       - name: Upload build tree
         if: needs.changes.outputs.code == 'true'
         uses: actions/upload-artifact@v4
@@ -163,6 +218,22 @@ jobs:
         if: needs.changes.outputs.code == 'false'
         run: echo "docs-only change, skipping test; check reports success."
 
+      - name: Checkout test sources
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare locked protobuf (ctest 用例工具前缀)
+        # build 树的 CTest 配置把 examples.getvalue.xlang 的 --protoc / --protoc-libdir
+        # 固化为绝对路径 $GITHUB_WORKSPACE/.deps/protobuf-3.21.12（= build job 的
+        # BBT_PROTOBUF_PREFIX）。test 是新 runner 新 checkout，checkout 的 git clean
+        # 已清掉未跟踪的 .deps，用例会 FileNotFoundError 指向该 protoc。这里复用
+        # build 侧同一 prepare_protobuf.sh，在相同绝对路径重建锁定前缀：只把 debs
+        # 解包进私有前缀，不安装系统包、不替换系统 protoc、不改 .deps 既有内容。
+        if: needs.changes.outputs.code == 'true'
+        run: bash scripts/prepare_protobuf.sh "$GITHUB_WORKSPACE/.deps/protobuf-3.21.12"
+
       - name: Download build tree
         if: needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v4
@@ -174,9 +245,40 @@ jobs:
         # 首轮真实 run 实证：Verify 循环零输出（[ -x ] 全跳过），而 ldd 直读同路径
         # 却命中 /usr/local —— upload/download-artifact 往返丢了执行位。这里显式恢复，
         # 并列出目录证据；Verify 另有 found 计数，零命中时明确失败，不再静默。
+        # 部分 runner/action 组合会在下载后多包一层 artifact 根目录；先按唯一测试
+        # 二进制反查真实 build root，并通过 GITHUB_ENV 让后续步骤使用同一路径。
         if: needs.changes.outputs.code == 'true'
         run: |
+          rpc_candidates=$(find "$BBT_WORK_DIR" -type f -name rpc_xlang_server -print)
+          rpc_count=$(printf '%s\n' "$rpc_candidates" | sed '/^$/d' | wc -l)
+          if [ "$rpc_count" -ne 1 ]; then
+            echo "FATAL: artifact 中 rpc_xlang_server 候选数=$rpc_count" >&2
+            find "$BBT_WORK_DIR" -maxdepth 6 -type f \( -name 'Test_framework_*' -o -name 'rpc_xlang_server' \) >&2 || true
+            exit 1
+          fi
+          actual_build_dir="${rpc_candidates%/tests/rpc_xlang_server}"
+          if [ ! -d "$actual_build_dir/tests" ]; then
+            echo "FATAL: 无效 build root: $actual_build_dir" >&2
+            exit 1
+          fi
+          echo "BBT_BUILD_DIR=$actual_build_dir" >> "$GITHUB_ENV"
+          export BBT_BUILD_DIR="$actual_build_dir"
           chmod +x "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null || true
+          test -f "$BBT_BUILD_DIR/tests/rpc_xlang_server"
+          chmod +x "$BBT_BUILD_DIR/tests/rpc_xlang_server"
+          # examples 下被 ctest COMMAND 直接 spawn 的产物同样经 artifact 往返丢 +x：
+          # examples.getvalue.{xlang,s2s} 会 Popen getvalue_server / getvalue_caller，
+          # 缺执行位即 PermissionError。与 tests/ 同口径显式恢复 + 存在性校验，
+          # 不做静默跳过（零命中即明确失败）。
+          for exe in getvalue_server getvalue_caller; do
+            bin="$BBT_BUILD_DIR/examples/getvalue/$exe"
+            if [ ! -f "$bin" ]; then
+              echo "FATAL: artifact 缺少 $bin" >&2
+              ls -la "$BBT_BUILD_DIR/examples/getvalue/" >&2 || true
+              exit 1
+            fi
+            chmod +x "$bin"
+          done
           ls -la "$BBT_BUILD_DIR"/tests/ | head -n 20
 
       - name: Verify test binaries resolve libs (fail-fast)
@@ -210,6 +312,10 @@ jobs:
             echo "FATAL: 未找到可执行测试二进制 ($BBT_BUILD_DIR/tests/Test_framework_*)" >&2
             ls -la "$BBT_BUILD_DIR"/tests/ >&2 || true
             exit 9
+          fi
+          if ldd "$BBT_BUILD_DIR/tests/rpc_xlang_server" | grep -q 'not found'; then
+            echo "FATAL: rpc_xlang_server 有未解析依赖" >&2
+            missing=1
           fi
           echo "verified binaries: $found"
           # bbt 必须解析到 build 树内（干净 runner 不许吃 /usr/local 旧产物）
@@ -260,3 +366,23 @@ jobs:
       - name: Cleanup build dir
         if: always()
         run: rm -rf "$BBT_WORK_DIR"
+
+  # Issue #37 候选接线：证明"实际 runner 用的工具链"满足 docker/toolchain.lock，
+  # 而不只是 Dockerfile 可构建。仅 workflow_dispatch 触发，不属 required checks。
+  # 未部署固定镜像前在旧 runner 上预期失败（fail-closed，不绿色 skipped）。
+  # 运维切换镜像后把它并入 build job 才成为 P0-A 的强制前置（CI-T3/R4/S4）。
+  toolchain-verify:
+    name: "Toolchain identity (candidate, manual)"
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: arc-s4-framework
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 校验实际 runner 工具链身份（fail-closed，显式绑定本仓 lock）
+        # 复检 checkout 与本 job 的 runner image 是否同一工具链身份；F4 要求显式
+        # 传入本仓 docker/toolchain.lock，避免镜像内置旧 lock 冒充当前仓契约。
+        run: bash scripts/verify_toolchain.sh --in-image --lock "$GITHUB_WORKSPACE/docker/toolchain.lock"

@@ -3,7 +3,7 @@
 // 公共头的 call<Reply> 模板只做编译期 codec 选择与请求编码；本文件
 // 承接类型擦除后的发送路径：受管校验、隐式请求上下文、envelope 组装、
 // 有序票据系统元数据（fw.* 只由本可信路径写入，不从业务 custom 读）、
-// deadline/cancel 经 CallOptionsAdapter 适配、宿主注入点发送与回复
+// deadline 经 CallOptionsAdapter 适配、宿主注入点发送与回复
 // 封包校验。成功返回回复 payload 字节，解码回公共头完成。
 
 #include <bbt/framework/ICoService.hpp>
@@ -72,8 +72,8 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
             "fw.sequence", std::to_string(options.ordered->sequence()));
     }
 
-    // deadline/cancel 经适配器换算（min 规则、过期 TimedOut、Combine
-    // 原样下发）；发送动作经宿主注入点完成，回复回填 slot。
+    // deadline 经适配器换算（min 规则、过期 TimedOut，infra 只收期限）；
+    // 发送动作经宿主注入点完成，回复回填 slot。
     std::optional<bbt::infra::RpcEnvelope> reply_env;
     CallEgressHooks hooks;
     if (m_send) {

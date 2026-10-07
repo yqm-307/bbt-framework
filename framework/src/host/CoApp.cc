@@ -12,6 +12,9 @@
 #include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/framework/internal/ResourceClose.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+#include <bbt/framework/internal/RpcWireBridge.hpp>
+#endif
 
 namespace bbt::framework {
 
@@ -45,8 +48,23 @@ CoApp::CoApp(CoAppOptions options)
     m_default_host = std::make_shared<InfraHttpHost>(
         m_options.network_limits, m_options.listen);
     m_network_host = m_default_host;
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
+        InstallRpcWireBridge(*m_default_host, *this);
+    else
+        InstallRpcHttpBridge(*m_default_host, *this);
+#else
+    // 无 protobuf 前缀锁定时只有迁移期 header 桥；显式选择 ProtoWireV1 会在
+    // _ValidateConfig 被拒绝（不静默降级为另一协议）。
     InstallRpcHttpBridge(*m_default_host, *this);
-    m_default_egress = std::make_shared<HttpEgress>(m_default_host);
+#endif
+    // 出站 profile 与入站一致：选 ProtoWireV1 时出站走正式 body 信封（同一
+    // HttpClient 发送 root，只换编解码），不与入站协议分叉；LegacyHeaders 保留
+    // 迁移期 header 桥行为。
+    m_default_egress = std::make_shared<HttpEgress>(m_default_host,
+        m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1
+            ? RpcEgressProfile::ProtoWireV1
+            : RpcEgressProfile::LegacyHeaders);
     for (const auto& r : m_options.static_routes)
         m_routes.emplace(r.service_name, r.address);   // 重复名保先见，run 校验拒绝
 }
@@ -99,21 +117,19 @@ int CoApp::run() {
     m_lifecycle.store(&lifecycle, std::memory_order_release);
 
     HostLifecycle::Hooks hooks;
-    // 启动：Scheduler::Start 之后、网络 Create 之前先创建/启动资源，再
-    // 绑定 Service——满足资源「Create 要求 Scheduler 已启动」与「资源就绪
+    // 启动：runtime 初始化之后、网络 Create 之前先创建/启动资源，再
+    // 绑定 Service——满足资源「Create 要求 runtime 已初始化」与「资源就绪
     // 后再接纳」的装配顺序。
     hooks.on_scheduler_started = [this] {
         if (auto r = _StartResources(); !r)
             return r;
         return _BindServices();
     };
-    // 关闭：handler 排空后、网络 RequestClose 前收束资源（资源可能在途
+    // 关闭：handler 排空后、网络 Close 前同步收束资源（资源可能在途
     // handler 仍被引用；网络对象尚未关闭，资源可安全收尾）。
-    hooks.on_handlers_drained = [this](HostLifecycle& lc) {
-        _CloseResources(lc);
-    };
-    hooks.on_release           = [this](HostLifecycle& lc) {
-        _CloseResources(lc);   // 回退路径兜底（spec.closed 幂等）
+    hooks.on_handlers_drained = [this] { _CloseResources(); };
+    hooks.on_release           = [this] {
+        _CloseResources();   // 回退路径兜底（spec.closed 幂等）
         _ReleaseServices();
     };
 
@@ -252,6 +268,12 @@ result<void> CoApp::_ValidateConfig() const {
         return FailInvalid("CoApp: listen host is empty");
     if (m_options.shutdown_step_budget <= std::chrono::milliseconds{0})
         return FailInvalid("CoApp: shutdown_step_budget must be > 0");
+#if !defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
+        return FailInvalid(
+            "CoApp: ProtoWireV1 inbound bridge requires bbt::infra_rpc "
+            "(protobuf prefix not configured); refusing to silently fall back");
+#endif
     for (const auto& r : m_options.static_routes) {
         if (r.service_name.empty())
             return FailInvalid("CoApp: static route with empty service_name");
@@ -266,7 +288,7 @@ result<void> CoApp::_ValidateConfig() const {
 }
 
 result<void> CoApp::_BindServices() {
-    // Scheduler::Start 之后调用（generation 已就位）。Concurrent → 单实例
+    // runtime 初始化之后调用（runtime 已就绪）。Concurrent → 单实例
     // 绑定；ActorSerial → 注册表工厂在激活时绑定身份，actor key 由注册表
     // 经 _bind_actor_key 绑定。所有实例共享同一出站注入点（经路由门）
     // 与同一应用级资源表（context().resource<R>() 的数据源）。
@@ -335,7 +357,7 @@ result<void> CoApp::_BindServices() {
 }
 
 result<void> CoApp::_StartResources() {
-    // Scheduler::Start 之后（on_scheduler_started）、绑定 Service 之前：
+    // runtime 初始化之后（on_scheduler_started）、绑定 Service 之前：
     // 逐个执行工厂资源的 Create→Start→登记实例视图。m_resource_specs 是
     // unordered_map（ResourceKeyHash），本处无跨资源依赖约定，顺序不敏感；
     // 如需登记序请改存有序容器，不在注释中宣称确定性。任一失败即返回，
@@ -391,38 +413,25 @@ result<void> CoApp::_StartResources() {
     return result<void>::ok();
 }
 
-void CoApp::_CloseResources(HostLifecycle& lifecycle) noexcept {
-    // 收集需收束的资源（持锁拷贝句柄，避免在锁内做可能阻塞的等待）。
-    struct Item {
-        std::string                                name;
-        std::shared_ptr<bbt::infra::ICoCloseable>  closeable;
-        ResourceSpec*                              spec;
-    };
-    std::vector<Item> items;
+void CoApp::_CloseResources() noexcept {
+    // 收集需收束的资源（持锁拷贝句柄，避免在锁内执行 Close）。
+    std::vector<std::shared_ptr<bbt::infra::ICoCloseable>> closeables;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        for (auto& [key, spec] : m_resource_specs) {
+        for (auto& kv : m_resource_specs) {
+            ResourceSpec& spec = kv.second;
             if (spec.closed || !spec.instance || !spec.as_closeable)
                 continue;
             if (auto c = spec.as_closeable(spec.instance)) {
-                items.push_back(Item{key.name, std::move(c), &spec});
+                closeables.push_back(std::move(c));
                 spec.closed = true;   // 幂等：回退路径不重复收束
             }
         }
     }
-    for (auto& item : items) {
-        // RequestClose 幂等、任意线程可调；WaitClosed 桥接到协程等待，
-        // 预算与 ShutdownIncomplete 记账由 RunCloseStep 统一处理。
-        item.closeable->RequestClose();
-        auto closeable = item.closeable;
-        lifecycle.RunCloseStep(
-            "resource:" + item.name,
-            [closeable](bbt::coroutine::Deadline d,
-                        bbt::coroutine::CancellationToken c) {
-                return internal::WaitClosedOnControlThread(
-                    closeable, d, std::move(c));
-            });
-    }
+    // infra 关闭是同步契约：Close() 返回即物理释放、幂等、noexcept，
+    // 无控制线程等待预算/迟到收尾（资源不再有独立等待步）。
+    for (auto& closeable : closeables)
+        internal::CloseResource(closeable);
 }
 
 void CoApp::_ReleaseServices() noexcept {

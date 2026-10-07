@@ -2,20 +2,21 @@
 // co-service-actor/v1 F1-b2：INetworkHost 的真实实现——infra
 // NetworkRuntime + HttpServer（已验收的真实 HTTP loopback 传输）。
 //
-// 口径差异桥接（本类的核心职责，契约 F1/F3 与 infra N0 的已知差异）：
-//  - INetworkHost::WaitClosed 是「控制线程」语义；infra
-//    ICoCloseable::WaitClosed 只在协程内可用。本类在内部完成桥接：
-//    向 Scheduler 注册一次性等待协程执行真实 WaitClosed，控制线程在
-//    条件变量上收结果。deadline/cancel 原样传入 infra，不放宽语义；
-//    上层不感知两套约束。
-//  - WaitHandlersDone 同样是控制线程语义：infra 不暴露「已接纳 handler
-//    排空」入口，本类对已安装的 HttpHandler 做在途记账，由自身
-//    std::condition_variable 等待排空，不走协程等待。
+// 口径差异（契约 F1/F3 与 infra N0）：
+//  - infra 关闭是同步契约（ICoCloseable::Close 返回即物理释放）；本类
+//    Close 在控制线程直接调用 NetworkRuntime::Close，与 infra 同一语义，
+//    不做协程等待桥接。
+//  - handler 在 Close 前完成的出站回复按 infra 的正常发送语义处理；Close
+//    开始后仍在途且尚未交给传输层的回复不承诺送达原客户端，测试应断言
+//    handler/owner 侧收口证据而不是伪造 flush 保证。
+//  - WaitHandlersDone 是控制线程语义：infra 不暴露「已接纳 handler 排空」
+//    入口，本类对已安装的 HttpHandler 做在途记账，由自身
+//    std::condition_variable 在给定期限内等待排空，不走协程等待。
 //
 // 生命周期：Create（NetworkRuntime::Create）→ Start（runtime Start +
-// 按需 ListenHttp）→ StopAccepting → WaitHandlersDone → RequestClose →
-// WaitClosed → ReleaseClosed。关闭序列的每一步在宿主控制线程调用；
-// 未安装 handler 时 Start 跳过监听（纯出站宿主），其余步骤语义不变。
+// 按需 ListenHttp）→ StopAccepting → WaitHandlersDone → Close（同步）。
+// 关闭序列的每一步在宿主控制线程调用；未安装 handler 时 Start 跳过监听
+// （纯出站宿主），其余步骤语义不变。
 
 #include <condition_variable>
 #include <cstddef>
@@ -50,13 +51,8 @@ public:
     result<void> Start() override;
     void         StopAccepting() noexcept override;
     result<void> WaitHandlersDone(
-        bbt::coroutine::Deadline deadline,
-        bbt::coroutine::CancellationToken cancel) override;
-    void         RequestClose() noexcept override;
-    bbt::infra::CloseStatus WaitClosed(
-        bbt::coroutine::Deadline deadline,
-        bbt::coroutine::CancellationToken cancel) override;
-    void         ReleaseClosed() noexcept override;
+        bbt::coroutine::Deadline deadline) override;
+    void         Close() noexcept override;
 
     // Start 成功后的实际绑定地址；未监听返回 std::nullopt。
     std::optional<bbt::infra::ListenAddress> bound_address() const;
@@ -77,10 +73,10 @@ private:
     const bbt::infra::ListenAddress m_listen;
 
     bbt::infra::HttpHandler                 m_handler;
-    // m_runtime/m_server/m_bound 经 m_mtx 发布：Create/Start/ReleaseClosed
-    // 在宿主控制线程写，bound_*/http_server/network_runtime/RequestClose/
-    // WaitClosed/StopAccepting 允许从任意线程读——m_server 与 m_bound 必须
-    // 在同一临界区成对可见，否则轮询方能读到半成品就绪状态。
+    // m_runtime/m_server/m_bound 经 m_mtx 发布：Create/Start/Close
+    // 在宿主控制线程写，bound_*/http_server/network_runtime/StopAccepting
+    // 允许从任意线程读——m_server 与 m_bound 必须在
+    // 同一临界区成对可见，否则轮询方能读到半成品就绪状态。
     std::shared_ptr<bbt::infra::NetworkRuntime> m_runtime;
     std::shared_ptr<bbt::infra::HttpServer>     m_server;
     bbt::infra::ListenAddress                 m_bound{};

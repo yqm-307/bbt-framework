@@ -111,15 +111,13 @@ struct OrderRecorder {
     std::vector<int>   values;
 };
 
-// 全局 fixture：调度器只起一次，4 个静态 worker 保证跨 Actor 用例有
-// 真实并行度；Stop 在所有用例之后（各用例已通过 latch 确认任务跑完）。
+// 全局 fixture：调度器是进程寿命单例，只 Start 一次、无 Stop；4 个静态
+// worker 保证跨 Actor 用例有真实并行度（各用例已通过 latch 确认任务跑完）。
 struct SchedulerFixture {
     SchedulerFixture() {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
-        g_scheduler->Start();
-    }
-    ~SchedulerFixture() {
-        g_scheduler->Stop();
+        if (!g_scheduler->IsInitialized())
+            g_scheduler->Start();
     }
 };
 
