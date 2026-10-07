@@ -27,6 +27,11 @@ on:
   # 直到运维把 arc-s4 runner 切到 docker/toolchain.lock 固定的镜像
   # （未切换时该 job 在旧 runner 上会 fail-closed，属预期 —— 见 docker/README.md）。
   workflow_dispatch:
+    inputs:
+      resource_acceptance:
+        description: "运行固定资源 recipe + Redis/Mongo 双服务真实验收（非 required）"
+        type: boolean
+        default: false
 
 concurrency:
   # 排队语义：不设 cancel-in-progress，同 ref 的后续运行排队等待而非取消在跑
@@ -386,3 +391,78 @@ jobs:
         # 复检 checkout 与本 job 的 runner image 是否同一工具链身份；F4 要求显式
         # 传入本仓 docker/toolchain.lock，避免镜像内置旧 lock 冒充当前仓契约。
         run: bash scripts/verify_toolchain.sh --in-image --lock "$GITHUB_WORKSPACE/docker/toolchain.lock"
+
+  # Issue #5 真实资源验收：手动触发、非 required，不依赖共享 runner 已切镜像。
+  # 资源仍由 infra 唯一 recipe 生成；本 job 只消费固定 SHA 的 recipe，禁止复制
+  # hiredis/mongo 构建逻辑。runner 镜像完成运维切换并单独验收后，再评估是否提升为
+  # PR required check。
+  resource-acceptance:
+    name: "Dual-service resource acceptance (manual)"
+    if: github.event_name == 'workflow_dispatch' && inputs.resource_acceptance == true
+    runs-on: arc-s4-framework
+    timeout-minutes: 45
+    env:
+      BBT_JOBS: "3"
+      BBT_DEPS_DIR: ${{ github.workspace }}/.deps
+      BBT_RESOURCE_ROOT: ${{ github.workspace }}/.resource-deps
+      # infra recipe 的不可变候选 SHA；更新时必须重跑 recipe + 验收。
+      RESOURCE_RECIPE_SHA: "1543bbd0aca4defa1be701b45aea5ba2cc2d0d86"
+      BBT_DEMO_REDIS_IMAGE: "redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+      BBT_DEMO_MONGO_IMAGE: "mongo@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2"
+    steps:
+      - name: Checkout framework
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Print acceptance inputs
+        run: |
+          set -euo pipefail
+          echo "framework_sha=$(git rev-parse HEAD)"
+          echo "resource_recipe_sha=$RESOURCE_RECIPE_SHA"
+          echo "redis_image=$BBT_DEMO_REDIS_IMAGE"
+          echo "mongo_image=$BBT_DEMO_MONGO_IMAGE"
+          command -v docker
+          docker version --format '{{.Server.Version}}'
+
+      - name: Fetch framework pinned source dependencies
+        run: bash scripts/fetch_deps.sh
+
+      - name: Checkout pinned resource recipe
+        uses: actions/checkout@v4
+        with:
+          repository: yqm-307/bbtools-infra
+          ref: ${{ env.RESOURCE_RECIPE_SHA }}
+          path: .resource-recipe
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare locked protobuf prefix
+        run: bash scripts/prepare_protobuf.sh "$GITHUB_WORKSPACE/.deps/protobuf-3.21.12"
+
+      - name: Prepare pinned resource dependency prefix
+        run: |
+          set -euo pipefail
+          test "$(git -C .resource-recipe rev-parse HEAD)" = "$RESOURCE_RECIPE_SHA"
+          bash .resource-recipe/scripts/prepare_resource_deps.sh "$BBT_RESOURCE_ROOT" --jobs "$BBT_JOBS"
+          test -f "$BBT_RESOURCE_ROOT/resource-deps.manifest.json"
+          python3 -m json.tool "$BBT_RESOURCE_ROOT/resource-deps.manifest.json" >/dev/null
+          echo "BBT_DEMO_EXPECT_CACHE_KEY=$(bash .resource-recipe/scripts/prepare_resource_deps.sh --print-cache-key)" >> "$GITHUB_ENV"
+
+      - name: Build dual-service example with explicit resources
+        run: |
+          set -euo pipefail
+          export BBT_CMAKE_ARGS="-DBBT_PROTOBUF_PREFIX=$GITHUB_WORKSPACE/.deps/protobuf-3.21.12 -DBBT_HIREDIS_PREFIX=$BBT_RESOURCE_ROOT/hiredis -DBBT_MONGOC_PREFIX=$BBT_RESOURCE_ROOT/mongoc -DBBT_MONGOCXX_PREFIX=$BBT_RESOURCE_ROOT/mongocxx -DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON"
+          export BBT_WORK_DIR="$GITHUB_WORKSPACE/.dual-resource-work"
+          export BBT_BUILD_DIR="$BBT_WORK_DIR/project-build"
+          bash scripts/build_stack.sh
+          cmake --build "$BBT_BUILD_DIR" --parallel "$BBT_JOBS" --target svc_a svc_b driver
+
+      - name: Run real Redis/Mongo multi-process acceptance
+        run: |
+          set -euo pipefail
+          bash examples/dual_service/run_acceptance.sh "$GITHUB_WORKSPACE/.dual-resource-work/project-build"
+
+      - name: Cleanup acceptance workspace
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/.dual-resource-work" "$GITHUB_WORKSPACE/.resource-deps" "$GITHUB_WORKSPACE/.resource-recipe" "$GITHUB_WORKSPACE/.deps"

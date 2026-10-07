@@ -191,17 +191,17 @@ kill -TERM %1 %2   # 两进程各自优雅关闭，exit code 0
 - 默认 CI 另有一个负向门禁步骤：显式传
   `-DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON` 而缺上述前置条件时必须 configure
   失败（断言失败即 job 失败），保证开关语义不会被改回「静默跳过」。
-- **真实资源验收的 CI job 尚未接线**：本轮**不**新增 `ubuntu-latest`/新
-  runner 架构，也不发布/切换 runner。当前运行证据来自本地/受控环境
-  （`run_acceptance.sh`），状态对默认 CI 为 `UNVERIFIED`——不得用默认 CI
-  绿灯代替。
-- 推荐接线方向（待父级/拥有者决定）：在既有 runner 体系上派生一个预装
-  hiredis/mongoc/mongocxx **固定前缀**的镜像，配由 infra 侧提供的
-  Redis/Mongo 固定 recipe（镜像 digest）。届时复用的入口就是本目录的
-  `run_demo.sh`（`--prefix` 经 CMake 传入）与 `run_acceptance.sh`
-  （recipe 经 `BBT_DEMO_*_IMAGE` 传入）。**未发布文件不当可用依赖**：
-  recipe 落地并冻结 SHA 后才接线，在此之前不加必然失败或假绿的 job。
-  「本机当前没有该镜像」只是现状，不代表不可搭建。
+- **真实资源验收的 CI job 已接线，但暂为手动、非 required**：`.github/workflows/ci.yml` 的
+  `resource-acceptance` 只在 `workflow_dispatch` 勾选 `resource_acceptance` 时运行；它
+  固定消费 `bbtools-infra` recipe SHA，复用 `scripts/prepare_resource_deps.sh` 生成
+  前缀，并用 Redis/Mongo 镜像 digest 跑 `run_acceptance.sh`。普通 PR/push 仍不构建本示例，
+  所以默认 CI 绿灯**不能**作为本示例的验收证据；手动 job 未执行时状态仍为 `UNVERIFIED`。
+- 该 job 是镜像切换前的真实 CI 验收路径，不替代固定 runner 镜像。镜像候选完成构建、发布
+  和 ARC 运维切换并单独验收后，再评估把资源 job 提升为 required；本轮不自动发布或切换 runner。
+- 固定后端镜像 digest 当前由 workflow 显式传入；若上游镜像更新，必须先重新核对 digest，
+  再更新 workflow 并重跑验收，不得恢复浮动 tag。
+- **资源验收的剩余边界**：当前 job 每次从 infra recipe 构建资源前缀，尚未改为消费已部署
+  的资源 runner 镜像；固定镜像的构建与 ARC 切换需单独运维门禁。
 
 ### 本示例真实需要的 runtime 与路径（记录，供派生镜像）
 

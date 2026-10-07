@@ -56,3 +56,40 @@ scripts/verify_toolchain.sh --image <docker-ref>        # 宿主机对镜像 doc
   `BLOCKED`，不报通过、不绿色 skipped。
 - `.github/workflows/ci.yml` 里 `toolchain-verify` job 仅 `workflow_dispatch` 触发，
   不进 required checks；运维切换后可把它并入 build job 成为 P0-A 强制前置。
+
+## 双服务资源 runner 候选镜像（resource-job）
+
+`bbtools-resource-runner/` 在**现役工具链基座之上增量叠加 Redis/Mongo 私有依赖前缀**，
+让 `dual_service` 资源验收 job 不必每 job 从浮动上游重编驱动。它不改上面的 P0-A 工具链
+配方，也不替代它。
+
+```bash
+# 唯一固定输入 docker/resource-runner.lock；只构建，不部署/不 publish/不切 runner
+docker/build_resource_runner.sh
+# 默认产物 tag bbt-dual-resource:20261007-candidate；镜像身份、资源前缀 manifest、
+# ABI/hash/ldd 证据写到 build-resource/（.gitignore 的 build-*/ 已忽略）：
+#   resource-runner-build-manifest.txt / final-runtime-evidence.txt /
+#   verify-toolchain-applicable.txt / resource-runner-build.log
+```
+
+- **第三方资源 recipe 的唯一实现归 `bbtools-infra`**：本目录不复制下载/构建逻辑，
+  只 `git archive` 其固定 commit（`INFRA_COMMIT`，见 lock）的
+  `scripts/prepare_resource_deps.sh` 与 `scripts/resource_prefix_verify` 落到构建上下文，
+  在 builder 阶段运行。lock 与 recipe 的 `--print-cache-key` 不一致即 fail-closed。
+- **多阶段同基座 builder->final**：两段 `FROM` 同一基座（同 OS/ABI，避免
+  `GLIBC_2.xx not found`）。final 只从 builder 拷 `/opt/bbt-resource-deps`；不带入
+  git 源码、服务端、私密配置或 bbt 业务库。前缀 builder/final 同路径，manifest 的
+  `install_root` 与最终 `/opt` 前缀一致，不 relocate；产物 RUNPATH 指向前缀，自定位。
+- **基座身份区分 imageID / registry ref**：现役 `bbtools-runner:v1` 为离线 OCI 导入，
+  `RepoDigests` 是导入合成的 `bbtools-runner@<imageID>`（**不是** registry manifest
+  digest），故 lock 以 imageID 为唯一可信身份、registry 槽位记 `unavailable`。构建入口
+  实读 daemon imageID 核对后作为本地 `FROM` 输入。
+- **protobuf 不重写**：基座已含既有 recipe 产出的 `/opt/protobuf-3.21.12`，final 直接
+  继承并只复核 `protoc` 版本 + `libprotobuf.a` checksum；**不代表**
+  `docker/toolchain.lock`（v2，`COMMON_BASE=debian:trixie-slim`）整体满足。
+- **验证**：builder 与 final（final 以基座 `runner` 用户）各跑一次 infra 消费者自检
+  （imported target + 运行版本 1.4.0/2.5.4/4.6.0 + 真实符号调用 + ldd 来源全在前缀内）；
+  缺 objdump、错链接、版本不符立即失败。资源 lib 目录**不**进全局 `LD_LIBRARY_PATH`，
+  只在 final 写显式 `BBT_HIREDIS_PREFIX` / `BBT_MONGOC_PREFIX` / `BBT_MONGOCXX_PREFIX`。
+- 基座 `CMD`/`USER` 与 `/opt/boost`、protobuf 等既有资产保持不变；本候选**未 publish
+  registry**、未切 runner。是否切换共享 runner 由运维另授权，本仓不证明。
