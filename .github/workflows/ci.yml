@@ -10,6 +10,12 @@
 #   4) 独立构建目录 /tmp/bbt-ci-work/<run_id>（按 run_id 隔离，避同机并发互踩）；
 #   5) ccache 可用则挂入（优雅降级）+ BBT_JOBS=3（12c 机 3 槽之一）+ flock 串行全量；
 #   6) ctest -j1 --timeout 300 保留（镜像 scripts/run_ctest.sh 的 SKIP 门禁并加 --timeout）。
+#
+# Issue #5：dual_service 示例默认不构建（根 CMake 开关
+# BBT_ENABLE_DUAL_SERVICE_EXAMPLE 默认 OFF），因此本 workflow 的绿灯**不**覆盖
+# 该示例；这里只增加一个负向门禁步（显式 ON 且缺前缀必须 configure 失败），
+# 防止开关语义被改回「静默跳过」。真实资源验收 job（固定前缀 + Redis/Mongo +
+# run_demo.sh）尚未接线，见 examples/dual_service/README.md「覆盖边界」。
 name: ci
 
 on:
@@ -148,6 +154,46 @@ jobs:
             exit 7
           fi
           if command -v ccache >/dev/null 2>&1; then ccache -s || true; fi
+
+      - name: Dual-service switch gate (fail-closed，负向)
+        # Issue #5：默认构建树必须保持开关 OFF 且不含 dual_service 产物；显式
+        # ON 而缺前置条件（此处刻意不传任何第三方前缀）必须 configure 失败。
+        # 断言失败即 job 失败——不允许把「静默跳过示例」当绿灯。
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          grep -q '^BBT_ENABLE_DUAL_SERVICE_EXAMPLE:BOOL=OFF$' \
+            "$BBT_BUILD_DIR/CMakeCache.txt" || {
+            echo "FATAL: 默认构建树未保持 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=OFF" >&2
+            exit 1
+          }
+          if [ -e "$BBT_BUILD_DIR/examples/dual_service" ]; then
+            echo "FATAL: 默认构建生成了 examples/dual_service（应默认不构建）" >&2
+            exit 1
+          fi
+          set +e
+          cmake -S "$GITHUB_WORKSPACE" -B "$BBT_WORK_DIR/ds-gate-negative" -G Ninja \
+            -DNEED_TEST=ON \
+            -DBBT_INFRA_SOURCE_DIR="$BBT_DEPS_DIR/infra-main" \
+            -DBBT_COROUTINE_SOURCE_DIR="$BBT_DEPS_DIR/coroutine-main" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON \
+            >"$BBT_WORK_DIR/ds-gate-negative.log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "FATAL: 缺前缀时 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 仍 configure 成功" >&2
+            exit 1
+          fi
+          # CMake 会把 message 折行，按稳定短串断言失败来自本门禁（而不是
+          # tests/ 的 bbt_infra_rpc 门禁）。
+          if ! grep -q '缺少前置条件' "$BBT_WORK_DIR/ds-gate-negative.log" ||
+             ! grep -q -- '-DBBT_HIREDIS_PREFIX' "$BBT_WORK_DIR/ds-gate-negative.log"; then
+            echo "FATAL: configure 失败原因不是 dual_service 前置条件门禁" >&2
+            tail -40 "$BBT_WORK_DIR/ds-gate-negative.log" >&2
+            exit 1
+          fi
+          echo "dual-service gate: OFF 默认生效；缺前缀时 ON fail-closed (rc=$rc)"
+          rm -rf "$BBT_WORK_DIR/ds-gate-negative"
 
       - name: Upload build tree
         if: needs.changes.outputs.code == 'true'

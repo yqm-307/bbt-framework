@@ -80,3 +80,36 @@ ctest --test-dir build -j1 --output-on-failure
 - 运行/验收（ctest 名 `examples.getvalue.xlang` 与 `framework.getvalue.codec`）；
   Python 客户端零依赖（手写 proto3 wire 编解码）。所有结构化结果带
   `auth_state=unauthenticated_loopback`。
+
+## 双服务资源示例：dual_service（Issue #5，默认不构建）
+
+`examples/dual_service/` 是三个真实进程的跨服务示例（`svc_a` storage /
+`svc_b` gateway / `driver` 客户端，`svc_a` 用真实 Redis + Mongo 资源），
+由根 CMake 的显式开关控制：
+
+```cmake
+option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
+```
+
+- 默认 OFF：普通 framework 构建与测试不加入该示例，不要求
+  hiredis / mongo-cxx-driver，也不要求真实 Redis/Mongo 后端。
+- 显式 ON：fail-closed。必须同时具备 `NEED_TEST=ON`、protobuf 前缀
+  （`bbt_infra_rpc`）、hiredis 前缀（`bbt::infra_redis`）、
+  `BBT_MONGOC_PREFIX`+`BBT_MONGOCXX_PREFIX`（`bbt::infra_mongo`）；
+  任一缺失都在 configure 阶段 `FATAL_ERROR`，不静默跳过。
+- 协议：三个进程统一 ProtoWireV1（infra 正式 body wire），只有它携带
+  `remaining_budget_ms`，服务端才能真正继承调用方预算（示例含可判定证据）。
+- 覆盖边界：默认 CI 不传该开关，所以它的绿灯**不**覆盖本示例；真实资源
+  验收入口是 `examples/dual_service/run_acceptance.sh`（临时 Redis/Mongo
+  容器 + 全场景 + 残留复核），当前仅本地/受控环境运行。资源验收 CI job
+  尚未接线——本轮不新增 `ubuntu-latest`/新 runner 架构，推荐方向是派生一个
+  预装 hiredis/mongoc/mongocxx 固定前缀的 runner 镜像 + infra 固定 recipe，
+  待其落地并冻结 SHA 后经 `run_acceptance.sh` 复用。默认 CI 另有一个负向
+  门禁步，断言「显式 ON 且缺前缀必须 configure 失败」。
+- 资源身份与清理都 fail-closed：`run_acceptance.sh` 拉容器前校验
+  recipe 身份（manifest 与 CMakeCache 前缀一致、组件 commit 与 `cache_key`
+  互绑、每个已记录 `.so` 的 `sha256`、`svc_a` 的 `ldd` 逐个解析到对应私有
+  前缀且无 `not found`），teardown 只删/只复核自己创建的对象，`docker`
+  查询失败同样计为未证实并让退出码非零。
+
+详见 [`examples/dual_service/README.md`](examples/dual_service/README.md)。
