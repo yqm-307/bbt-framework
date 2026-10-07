@@ -9,7 +9,7 @@
 //   Forward          —— 正常 typed call（预算继承父请求，不放大）
 //   ForwardExpired   —— 显式已过期 deadline；应在发起任何 I/O 前 TimedOut
 //   ForwardNoRoute   —— 目标无静态路由；find_route 门拒绝，不发起 I/O
-//   ForwardBlackhole —— 目标是「接受后立即断开」的真实端点（丢 reply）
+//   ForwardBlackhole —— 目标是「完整读下请求后断开（丢 reply）」的真实端点
 
 #include <chrono>
 #include <string_view>
@@ -39,7 +39,7 @@ public:
     // 故意不配置静态路由的目标：find_route 门拒绝。
     static constexpr std::string_view kNoRouteService =
         "bbt.example.v1.UnroutedService";
-    // 配置到「接受后立即断开」端点的目标：真实传输错误。
+    // 配置到「完整读下请求后断开（丢 reply）」端点的目标：真实传输错误。
     static constexpr std::string_view kBlackholeService =
         "bbt.example.v1.BlackholeService";
 

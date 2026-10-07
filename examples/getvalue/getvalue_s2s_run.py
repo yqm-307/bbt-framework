@@ -6,7 +6,7 @@
   - caller 进程（getvalue_caller）：宿主 GetValueCallerService，其 handler 内
     经 IWorkerService::call<Req,Resp>（typed seam）向 callee 发起真实正式 body
     出站（HTTP loopback + application/x-protobuf）
-外加一个「接受后立即断开」的真实 TCP 端点作为黑障目标（丢 reply）。
+外加一个「完整读下请求后断开（丢 reply）」的真实 TCP 端点作为黑障目标。
 
 本驱动器只用 Python 标准库手写 proto3 编解码（不依赖 google.protobuf），
 既做输入又做字节级断言。
@@ -15,7 +15,9 @@
   - s2s-known / s2s-miss / s2s-empty：出站 typed 调用成功 / miss / 业务错误透传
   - s2s-expired：发送前已过期 → caller 侧 TimedOut，callee journal 无新 handler
   - s2s-noroute：find_route 门拒绝，callee journal 无新 handler
-  - s2s-blackhole：真实传输断开 → caller 得到错误非成功，callee journal 无新 handler
+  - s2s-blackhole-unknown：请求已完整写出后对端丢 reply（读完整个请求再断开）
+    → caller 得到 OutcomeUnknown(14)，非未提交传输错误；对端只被连接一次（无 retry），
+    callee journal 无新 handler
 
 结果完整性（本轮修复）：总体结论（tail）只在自有 caller/callee/blackhole 全部
 清理、退出码检查完成后生成；异常/崩溃/非 0/超时强杀一律记 fail，且 exit 1，
@@ -51,6 +53,7 @@ RESPONSE_SCHEMA = "bbt.example.v1.GetValueResponse"
 INVALID_ARGUMENT = 1
 TIMED_OUT = 6
 NOT_FOUND = 11
+OUTCOME_UNKNOWN = 14   # RpcErrorCode.RPC_ERROR_CODE_OUTCOME_UNKNOWN
 
 WIRE_VARINT = 0
 WIRE_LEN = 2
@@ -279,7 +282,13 @@ def wait_port(path, proc, timeout):
 
 
 class Blackhole:
-    """真实 TCP「接受后立即断开」端点：收到请求后直接关闭连接（丢 reply）。"""
+    """真实 TCP「完整读完请求后不回复直接断开」端点（丢 reply）。
+
+    与「accept 后立即 close」不同：本端点先完整收下 HTTP 请求（头 + Content-Length
+    body）再断开，使客户端请求字节已完整写出（RequestCommitted）后才失去可信回复，
+    得到 OutcomeUnknown（wire 错误码 14），而不是未提交的确定传输错误。记录被连接
+    次数，供「一次终态、无 retry」断言。
+    """
 
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -288,8 +297,15 @@ class Blackhole:
         self.sock.listen(8)
         self.port = self.sock.getsockname()[1]
         self._stop = False
+        self._accepts = 0
+        self._lock = threading.Lock()
         self._t = threading.Thread(target=self._serve, daemon=True)
         self._t.start()
+
+    @property
+    def accepts(self):
+        with self._lock:
+            return self._accepts
 
     def _serve(self):
         self.sock.settimeout(0.2)
@@ -300,12 +316,43 @@ class Blackhole:
                 continue
             except OSError:
                 break
+            with self._lock:
+                self._accepts += 1
             try:
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                                b"\x01\x00\x00\x00\x00\x00\x00\x00")
-            except OSError:
-                pass
-            conn.close()   # 立即断开：客户端写出的请求不会得到任何 reply
+                self._read_full_request(conn)
+            finally:
+                try:
+                    conn.close()   # 已完整收下请求 → 不回复直接断开
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _read_full_request(conn):
+        """读到完整 HTTP 请求（头 + Content-Length body）为止；超时/中断即返回。"""
+        conn.settimeout(5)
+        buf = bytearray()
+        header_end = -1
+        content_length = -1
+        while True:
+            if header_end < 0:
+                header_end = buf.find(b"\r\n\r\n")
+                if header_end >= 0:
+                    head = bytes(buf[:header_end]).lower()
+                    cl = -1
+                    for line in head.split(b"\r\n"):
+                        if line.startswith(b"content-length:"):
+                            cl = int(line.split(b":", 1)[1].strip())
+                    content_length = cl if cl >= 0 else 0
+            if header_end >= 0 and content_length >= 0:
+                if len(buf) - (header_end + 4) >= content_length:
+                    return
+            try:
+                chunk = conn.recv(4096)
+            except (socket.timeout, OSError):
+                return
+            if not chunk:
+                return
+            buf.extend(chunk)
 
     def close(self):
         self._stop = True
@@ -466,23 +513,28 @@ def main():
                                   "auth_state": AUTH_STATE}
         finish("s2s-noroute", ok)
 
-        # 6) 真实传输断开（丢 reply）：caller 得到错误、非成功；不重试。
+        # 6) 请求已完整写出后丢 reply（真 OutcomeUnknown）：对端读完整个请求后
+        #    断开，客户端请求已提交；一次终态、无 retry（对端只被连接一次）。
+        accepts_before = blackhole.accepts
         st, env = call(caller_port, request_id="sc-blackhole",
                        method="ForwardBlackhole", key="alpha")
         code = env.get("error", {}).get("code")
         n_black = len(read_journal(callee_jrnl_f))
-        ok = ("error" in env and code is not None and code != 0
-              and code != INVALID_ARGUMENT and n_black == n_after_business)
-        check(ok, f"expected transport error (not business), got code={code} "
-                  f"env={env}", "s2s-blackhole")
-        RESULTS["s2s-blackhole"] = {"error_code": code,
-                                    "error_domain": env.get("error", {}).get(
-                                        "domain", ""),
-                                    "error_message": env.get("error", {}).get(
-                                        "message", ""),
-                                    "callee_handler_after": n_black,
-                                    "auth_state": AUTH_STATE}
-        finish("s2s-blackhole", ok)
+        black_accepts = blackhole.accepts - accepts_before
+        ok = ("error" in env and code == OUTCOME_UNKNOWN
+              and n_black == n_after_business and black_accepts == 1)
+        check(ok, f"expected OutcomeUnknown(14) after committed reply loss + "
+                  f"exactly one connection, got code={code} "
+                  f"blackhole_accepts={black_accepts} env={env}",
+              "s2s-blackhole-unknown")
+        finish("s2s-blackhole-unknown", ok)
+        # 指标在 finish() 之后写入（finish 会重置该场景条目），保留 status/auth_state。
+        RESULTS["s2s-blackhole-unknown"].update({
+            "error_code": code,
+            "error_domain": env.get("error", {}).get("domain", ""),
+            "error_message": env.get("error", {}).get("message", ""),
+            "blackhole_accepts": black_accepts,
+            "callee_handler_after": n_black})
 
         # 7) callee journal 终态：仅 3 条业务处理，principal 未被升级。
         entries = read_journal(callee_jrnl_f)

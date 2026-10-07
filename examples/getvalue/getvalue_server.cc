@@ -6,7 +6,7 @@
 //
 // argv: getvalue_server server <port_file> <meta_file> <journal_file>
 //
-// 版本/来源：链接 bbtools-infra locked 65a0a407… 的 bbt::infra_rpc（protobuf
+// 版本/来源：链接 bbtools-infra locked 162bb5fd… 的 bbt::infra_rpc（protobuf
 // 3.21.12），bbt::framework 经 BBT_FRAMEWORK_HAS_RPC_WIRE 启用正式桥。
 
 #include <chrono>
