@@ -97,7 +97,7 @@ app.run();
 
 ```bash
 cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DNEED_TEST=ON -DBBT_INFRA_SOURCE_DIR=<infra-65a0a40> \
+  -DNEED_TEST=ON -DBBT_INFRA_SOURCE_DIR=<infra-162bb5fd> \
   -DBBT_COROUTINE_SOURCE_DIR=<coroutine-7bcda3b> \
   -DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12> -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build-deps/project-build --target getvalue_server \
@@ -144,16 +144,18 @@ journal 断言：`budget0/budget1/schema/route/wire` 被拒请求**未进 handle
   profile**：`HttpEgress` 增加 `ProtoWireV1` 分支（同一 HttpClient 发送 root，
   只换 wire 编解码；`ToWireEnvelope`/`FromWireEnvelope` helper），egress 发起
   I/O 前再次按本地 deadline 换算 remaining_budget_ms（过期 → TimedOut 无 I/O），
-  回复校验 request_id/response_schema 并保留 Error（含 `OutcomeUnknown`）。固定
-  infra merge `65a0a407…` 的正式 C++ server + caller 双进程 driver 已连续 3 次
-  完成 7 个场景，caller/callee 均 rc=0；ASan/UBSan 构建下同样连续 3 次通过。
-  结果均带 `auth_state=unauthenticated_loopback`。
+  回复校验 request_id/response_schema 并保留 Error（含 `OutcomeUnknown`）。当前
+  候选固定 infra merge `162bb5fd…`，Release 构建下已验证 7 个耦合场景，
+  caller/callee 均 rc=0；本轮未在 ASan/UBSan 构建下重跑。结果均带
+  `auth_state=unauthenticated_loopback`。
 - **R2/R4 部分**：已覆盖接收端 local-min、0 预算与「可解码但过期」不进 handler、
   预算回显 clamp；driver 已覆盖发送前过期、非法路由和断连，但**跨 hop 预算不放大、
   排队耗预算的发送端观察**未在专门矩阵中重验。
-- **R5**：客户端断连→unknown 为真实观测；服务端 in-memory 无副作用，「已提交后
-  丢 reply → 远端 OutcomeUnknown」未在本切片产生（wire/Error 映射能力存在，缺
-  真实产生该 code 的链路）。
+- **R5**：客户端断连→unknown 为真实观测；「已提交后丢 reply → 远端
+  OutcomeUnknown」已在本切片产生，证据 = `framework.egress.phase` 的 T3
+  （完整写出后丢 reply → OutcomeUnknown、phase=RequestCommitted、对端只连接
+  一次）+ `examples.getvalue.s2s` 的 `s2s-blackhole-unknown`（code=14、
+  blackhole_accepts=1）。服务端 in-memory 无副作用。
 - **R6/R7/R8 并发/容量/关闭矩阵**：本轮只验证双进程正常退出和固定 infra 修复后的
   基础关闭路径；既有 `Test_framework_f1b2` 覆盖并发不串扰，非本切片新路径。容量耗尽
   Overloaded、超时后 inflight 强持有、ShutdownIncomplete、独立 supervisor 硬停机

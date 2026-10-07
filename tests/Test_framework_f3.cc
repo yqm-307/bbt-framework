@@ -19,7 +19,7 @@
 //                                      → 迟到收尾 → kExitShutdownLate。
 //  T5 late_callback_past_logical_end     诊断区分逻辑请求结束与物理清理：
 //                                      handler 物理挂起超过 incoming 看门
-//                                      （客户端见 TransportError 即逻辑结束）
+//                                      （客户端见 OutcomeUnknown 即逻辑结束）
 //                                      → 排空仍等待物理在途 → ShutdownIncomplete
 //                                      → 迟到回调安全执行（资源仍存活）→
 //                                      kExitShutdownLate。
@@ -912,7 +912,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
 }
 
 // T5：逻辑请求结束 ≠ 物理清理完成——handler 物理在途超过 incoming 看门，
-//     客户端已见 TransportError；排空仍等物理结束 → ShutdownIncomplete →
+//     客户端已见 OutcomeUnknown；排空仍等物理结束 → ShutdownIncomplete →
 //     迟到回调资源安全 → kExitShutdownLate。
 BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     g_probe = std::make_shared<Probe>(1);
@@ -929,8 +929,8 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     auto tc = StartClient(Limits(std::chrono::milliseconds{400}));
 
     // handler 以无界期限物理挂起：incoming 看门（400ms）先于 handler
-    // 结束到期 → infra 切断回复路径 → 客户端见到的是传输错误（逻辑结
-    // 束），但物理 handler 协程仍在途。
+    // 结束到期 → infra 切断回复路径；请求已完整写出但无可信回复，客户端
+    // 见 OutcomeUnknown（逻辑结束），但物理 handler 协程仍在途。
     TestLatch inflight_done{1};
     std::optional<fw::result<inf::RpcEnvelope>> inflight_res;
     bbtco [&]() {
@@ -945,8 +945,12 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
     BOOST_REQUIRE(!inflight_res.value());
-    BOOST_CHECK(inflight_res.value().error().code ==
-                fw::ErrorCode::TransportError);
+    const auto& error = inflight_res.value().error();
+    BOOST_CHECK_EQUAL(static_cast<int>(error.code),
+                      static_cast<int>(fw::ErrorCode::OutcomeUnknown));
+    BOOST_REQUIRE(error.request_phase.has_value());
+    BOOST_CHECK_EQUAL(static_cast<int>(*error.request_phase),
+                      static_cast<int>(inf::RequestPhase::RequestCommitted));
     BOOST_CHECK(!g_probe->HasEvent("late_handler_resumed"));  // 物理仍在途
 
     box.app->request_shutdown();

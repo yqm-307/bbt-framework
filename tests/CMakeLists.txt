@@ -207,6 +207,19 @@ add_test(
             --client-py "${CMAKE_CURRENT_SOURCE_DIR}/rpc_xlang_client.py")
 set_tests_properties(framework.rpc_xlang PROPERTIES TIMEOUT 60)
 
+# framework #4 下游 request-phase/OutcomeUnknown 消费验收：在真实 framework
+# ProtoWireV1 egress 上消费 bbtools-infra 已合入的公开 request-phase/
+# OutcomeUnknown 契约（RequestPhase / IsRequestCommitted / Error::request_phase）。
+# 覆盖：R5 committed→OutcomeUnknown；另覆盖发送前过期、未提交失败、remaining
+# budget 换算与 clamp。不覆盖 R6/R7/R8 并发/容量/关闭矩阵。
+# 需要 bbt::infra_rpc 与 protobuf 前缀——上方已 fail-closed 保证该目标在场。
+# 对端是测试自有裸 TCP loopback，不依赖实例。
+add_executable(Test_framework_egress_phase Test_framework_egress_phase.cc)
+target_link_libraries(Test_framework_egress_phase PRIVATE bbt::framework)
+target_compile_options(Test_framework_egress_phase PRIVATE -Wall -Wextra)
+add_test(NAME framework.egress.phase COMMAND Test_framework_egress_phase)
+set_tests_properties(framework.egress.phase PROPERTIES TIMEOUT 60)
+
 # framework #4 P0-A：GetValue 业务切片单测（唯一 .proto 真源 → descriptor/方法表
 # schema/typed codec golden vectors/handler 分支）。仅在示例目标构建时注册。
 if(TARGET getvalue_proto)
