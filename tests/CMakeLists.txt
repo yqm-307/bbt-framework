@@ -234,3 +234,24 @@ if(TARGET getvalue_proto)
         COMMAND Test_framework_getvalue_codec)
     set_tests_properties(framework.getvalue.codec PROPERTIES TIMEOUT 30)
 endif()
+
+# framework #4 RPC-T4（修偏轮）：并发隔离/容量/迟到寿命与关闭矩阵（R6/R7/R8）。
+# 服务端：公开 CoApp（inbound_bridge=ProtoWireV1）+ 真实 InfraHttpHost 监听
+# 127.0.0.1 动态端口；客户端：infra 公开 NetworkRuntime/HttpClient + rpc::RpcWire
+# 构造真实 POST /rpc protobuf body，走真实 socket loopback。不使用
+# MakeCoAppForTest / DispatchInboundForTest / INetworkHost 桩 / LegacyHeaders。
+# 不覆盖跨 hop 预算（R4/S4）与跨进程 supervisor 硬停（R8/S8）。
+if(TARGET getvalue_proto)
+    add_executable(Test_framework_matrix Test_framework_matrix.cc)
+    target_link_libraries(Test_framework_matrix PRIVATE
+        bbt::framework getvalue_proto Boost::boost Threads::Threads)
+    target_include_directories(Test_framework_matrix PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/getvalue")
+    target_compile_options(Test_framework_matrix PRIVATE -Wall -Wextra)
+    add_test(NAME framework.matrix COMMAND Test_framework_matrix)
+    set_tests_properties(framework.matrix PROPERTIES TIMEOUT 120)
+else()
+    message(STATUS
+        "framework.matrix: 未构建 getvalue_proto（需 -DNEED_TEST=ON 且 "
+        "BBT_PROTOBUF_PREFIX 可用），本配置无 RPC-T4 正式 wire 矩阵用例")
+endif()
