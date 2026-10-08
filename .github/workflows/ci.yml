@@ -95,6 +95,8 @@ jobs:
 
   build:
     name: Build (pinned deps)
+    outputs:
+      archive_sha256: ${{ steps.build_archive.outputs.sha256 }}
     needs: [changes]
     runs-on: arc-s4-framework
     timeout-minutes: 20
@@ -200,13 +202,28 @@ jobs:
           echo "dual-service gate: OFF 默认生效；缺前缀时 ON fail-closed (rc=$rc)"
           rm -rf "$BBT_WORK_DIR/ds-gate-negative"
 
+      - name: Pack build tree (保留权限，生成跨 job 校验值)
+        id: build_archive
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          archive="$BBT_WORK_DIR/build-tree.tar.gz"
+          tar -czf "$archive" -C "$BBT_WORK_DIR" \
+            project-build deps-manifest.txt link-sources.txt \
+            project-configure.log project-build.log
+          sha=$(sha256sum "$archive" | cut -d' ' -f1)
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          printf 'build archive sha256=%s bytes=%s\n' "$sha" "$(stat -c '%s' "$archive")"
+
       - name: Upload build tree
         if: needs.changes.outputs.code == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bbt-build-${{ github.run_id }}
-          path: ${{ env.BBT_WORK_DIR }}
+          path: ${{ env.BBT_WORK_DIR }}/build-tree.tar.gz
           retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
       - name: Cleanup build dir (build 侧，防跨 runner 留痕)
         # test job 跑在另一个 runner 上，清不到这里的 /tmp；上传完成后本地必清。
@@ -239,19 +256,31 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: bash scripts/prepare_protobuf.sh "$GITHUB_WORKSPACE/.deps/protobuf-3.21.12"
 
-      - name: Download build tree
+      - name: Download build archive
         if: needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v4
         with:
           name: bbt-build-${{ github.run_id }}
           path: ${{ env.BBT_WORK_DIR }}
 
+      - name: Verify and unpack build tree (fail-closed)
+        if: needs.changes.outputs.code == 'true'
+        env:
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "FATAL: 缺少或无效的 build job archive SHA256" >&2
+            exit 1
+          fi
+          archive="$BBT_WORK_DIR/build-tree.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$BBT_WORK_DIR"
+          rm "$archive"
+
       - name: Restore exec bits (artifact 往返丢 +x)
-        # 首轮真实 run 实证：Verify 循环零输出（[ -x ] 全跳过），而 ldd 直读同路径
-        # 却命中 /usr/local —— upload/download-artifact 往返丢了执行位。这里显式恢复，
-        # 并列出目录证据；Verify 另有 found 计数，零命中时明确失败，不再静默。
-        # 部分 runner/action 组合会在下载后多包一层 artifact 根目录；先按唯一测试
-        # 二进制反查真实 build root，并通过 GITHUB_ENV 让后续步骤使用同一路径。
+        # build job 先将整个构建树打成单一归档；本 job 先按 build job 输出的
+        # SHA256 校验归档，再解包，避免部分下载树进入 CTest。
         if: needs.changes.outputs.code == 'true'
         run: |
           rpc_candidates=$(find "$BBT_WORK_DIR" -type f -name rpc_xlang_server -print)
@@ -273,7 +302,7 @@ jobs:
           chmod +x "$BBT_BUILD_DIR/tests/rpc_xlang_server"
           # examples 的 Python 驱动器会 spawn 下列产物；artifact 往返丢 +x 后
           # 必须与 tests/ 同口径恢复执行位，缺任一产物即失败，不静默跳过。
-          for exe in getvalue/getvalue_server getvalue/getvalue_caller two_service/two_service; do
+          for exe in getvalue/getvalue_server getvalue/getvalue_caller two_service/two_service lifecycle_matrix/lifecycle_fixture; do
             bin="$BBT_BUILD_DIR/examples/$exe"
             if [ ! -f "$bin" ]; then
               echo "FATAL: artifact 缺少 $bin" >&2
