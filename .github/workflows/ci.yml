@@ -271,15 +271,12 @@ jobs:
           chmod +x "$BBT_BUILD_DIR"/tests/Test_framework_* 2>/dev/null || true
           test -f "$BBT_BUILD_DIR/tests/rpc_xlang_server"
           chmod +x "$BBT_BUILD_DIR/tests/rpc_xlang_server"
-          # examples 下被 ctest COMMAND 直接 spawn 的产物同样经 artifact 往返丢 +x：
-          # examples.getvalue.{xlang,s2s} 会 Popen getvalue_server / getvalue_caller，
-          # 缺执行位即 PermissionError。与 tests/ 同口径显式恢复 + 存在性校验，
-          # 不做静默跳过（零命中即明确失败）。
-          for exe in getvalue_server getvalue_caller; do
-            bin="$BBT_BUILD_DIR/examples/getvalue/$exe"
+          # examples 的 Python 驱动器会 spawn 下列产物；artifact 往返丢 +x 后
+          # 必须与 tests/ 同口径恢复执行位，缺任一产物即失败，不静默跳过。
+          for exe in getvalue/getvalue_server getvalue/getvalue_caller two_service/two_service; do
+            bin="$BBT_BUILD_DIR/examples/$exe"
             if [ ! -f "$bin" ]; then
               echo "FATAL: artifact 缺少 $bin" >&2
-              ls -la "$BBT_BUILD_DIR/examples/getvalue/" >&2 || true
               exit 1
             fi
             chmod +x "$bin"

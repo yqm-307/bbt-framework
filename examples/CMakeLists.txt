@@ -2,6 +2,11 @@
 # 仅当 bbt_infra_rpc 可用时被父级加入（见根 CMakeLists）。
 add_subdirectory(getvalue)
 
+# Issue #5（EX-T2）：单进程双 Service fixture。与 getvalue 同一前置（本目录被
+# 加入即代表 NEED_TEST=ON 且 bbt_infra_rpc 已注册），复用 getvalue_proto，无
+# Redis/Mongo/Compose 依赖。
+add_subdirectory(two_service)
+
 # Issue #5：双服务资源示例（svc_a/svc_b/driver）。只在显式
 # BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 时加入——默认 OFF 时本仓不引入
 # hiredis/mongo-cxx-driver。四项前置条件（NEED_TEST、bbt_infra_rpc、
