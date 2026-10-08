@@ -100,15 +100,18 @@ cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DNEED_TEST=ON -DBBT_INFRA_SOURCE_DIR=<infra-162bb5fd> \
   -DBBT_COROUTINE_SOURCE_DIR=<coroutine-7bcda3b> \
   -DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12> -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-cmake --build build-deps/project-build --target getvalue_server \
+cmake --build build-deps/project-build --target getvalue_server getvalue_caller \
   Test_framework_getvalue_codec --parallel 2
 ctest --test-dir build-deps/project-build -j1 --output-on-failure \
-  -R "examples.getvalue.xlang|framework.getvalue.codec"
+  -R "examples.getvalue.xlang|examples.getvalue.s2s|framework.getvalue.codec"
 ```
 
 - `examples.getvalue.xlang`：C++ server + Python 标准库 client 真实跨进程
   （driver 动态端口/readiness/有限等待/finally 清理，并做 protoc 重复生成无漂移
   与 journal 断言）。
+- `examples.getvalue.s2s`：`getvalue_server`（callee）+ `getvalue_caller`（caller）
+  两个独立 CoApp 进程 + 真实黑障端点的正式出站验收，并含 #5 EX-T3 的四类非法
+  静态路由启动拒绝负例（见 §5.1）。
 - `framework.getvalue.codec`：descriptor/字段号/类型、方法表 schema 推导、
   golden vectors、handler 分支（Boost.Test 内嵌）。
 
@@ -129,6 +132,60 @@ disconnect-unknown / unknown-error-code / schema-drift-guard / golden vectors。
 journal 断言：`budget0/budget1/schema/route/wire` 被拒请求**未进 handler**；
 `budgetlarge` 等真正处理的请求 `handler_entered` 存在（正反对照）；
 所有记录 `auth_state=unauthenticated_loopback`；`peer_principal` 未被 metadata 升级。
+
+## 5.1 跨进程 Service→Service 与 #5 EX-T3 静态路由负例（复用本路径）
+
+`examples/getvalue` 的跨进程路径同时承载 #4 的正式出站**与 #5 EX-T3 的「双进程
+静态路由」**——EX-T3 不另起一套 caller/server/driver（#5 禁止复制 #4 已有实现）：
+
+- **两个独立 CoApp 进程**：`getvalue_server`（callee，宿主 `GetValueService`）与
+  `getvalue_caller`（caller，宿主 `GetValueCallerService`，handler 内经公开
+  `service.call<Req,Resp>` 出站），各自 `CoApp`、各自 loopback **动态端口**
+  （`listen={"127.0.0.1",0}` + 轮询 `bound_endpoint()` 写 port 文件）。
+- **显式 `service_name→endpoint` 白名单静态路由**：caller 只登记 callee 与
+  blackhole 两条；出站必经 `find_route` 门，未配置目标一律 `NotFound`（无自动发现、
+  无同进程直连后门）。
+- **真实验收驱动器** `getvalue_s2s_run.py`（ctest `examples.getvalue.s2s`，TIMEOUT 120）：
+  两进程 + 真实黑障端点；结构化结果全部带 `auth_state=unauthenticated_loopback`。
+
+### 非法静态路由：公开入口，run 启动任何组件前拒绝
+
+`getvalue_caller` 增加一个公开验收子命令，构造四类**非法**静态路由后经公开
+`CoApp`/`add_service`/`add_resource`/`run` 装配（不使用任何测试缝）：
+
+```
+getvalue_caller badroute <kind> <result_file>
+  kind ∈ {empty-service, empty-transport, empty-endpoint, duplicate}
+```
+
+| kind | 非法输入 | `_ValidateConfig` 拒绝原因（`lifecycle_failures` 恰 1 条） |
+|---|---|---|
+| `empty-service` | 空 `service_name` | `CoApp: static route with empty service_name` |
+| `empty-transport` | 空 `transport`（`endpoint` 非空） | `CoApp: static route '<name>' has empty transport/endpoint` |
+| `empty-endpoint` | 空 `endpoint`（`transport` 非空） | 同上 |
+| `duplicate` | 两条相同 `service_name` | `CoApp: duplicate static route service_name` |
+
+机器可读观测（进程自写 `<result_file>` JSON；断言由驱动器独立核对，不信任自报
+`status`）：`rc==1`（`HostLifecycle::kExitRejected`，启动任何组件前返回）、
+`lifecycle_failures` 恰 1 条且含对应原因、`bound_endpoint==""`（未绑定任何 ready
+端口）、`resource_factory_calls==0`（经公开 `add_resource` 注册的延迟工厂未被调用，
+证明拒绝发生在资源/网络/服务启动之前）。四项均带
+`auth_state=unauthenticated_loopback`。`getvalue_s2s_run.py` 以四个**有界**子进程
+运行上述四例，并入 `RESULTS`/`_FAILURES` 与清理后的总判定（超时/异常/崩溃一律记
+fail 并回收自有进程）。
+
+**语义边界（勿混淆）**：
+
+- **空路由列表合法**：`static_routes` 为空表示「不允许任何出站目标」，配置本身合法；
+  此时**未配置目标**的出站调用在运行期由 `find_route` 门拒绝为 `NotFound`
+  （`s2s-noroute` 场景）——这是运行期路由未命中，**不是**启动期配置拒绝。
+- **空字段 / 重复 `service_name` 非法**：`service_name`/`transport`/`endpoint` 任一
+  为空，或两条路由同名，都在 `run()` 启动任何组件前被拒绝（本子命令四例）。
+- **端点格式检查未纳入该断言**：当前 `_ValidateConfig` 只判空，不做 endpoint 结构
+  （如缺端口）或 transport 白名单语义校验；本切片**不新增**这些语义，也不声称它们
+  被拒绝。
+- 未覆盖：EX-T4 容量/并发/迟到 lifecycle 矩阵、EX-T5 整体验收、认证/授权（#38）。
+  本切片不证明身份/授权完成。
 
 ## 6. 已知限制 / 未覆盖（不伪报）
 

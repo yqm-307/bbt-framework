@@ -86,8 +86,17 @@ journal 交叉对照：只有真正到达 callee handler 的 3 个请求（known
 
 ## 已知限制 / 未覆盖（不伪报）
 
-- **未覆盖跨进程**：本 fixture 是单进程「双 Service」，同一宿主的自环出站；
-  两个独立 `CoApp` 进程 + 静态路由（EX-T3）不在本切片。
+- **跨进程由 `examples/getvalue` 承载（#5 EX-T3 复用）**：本 fixture 是单进程
+  「双 Service」，同一宿主的自环出站。两个独立 `CoApp` 进程 + 显式
+  `service_name→endpoint` 白名单静态路由（EX-T3）由 **`examples/getvalue` 的
+  `getvalue_server` + `getvalue_caller` + `getvalue_s2s_run.py`（ctest
+  `examples.getvalue.s2s`）**承载，不在本切片；#5 不另起一套 caller/server/driver。
+  其中四类**非法**静态路由（空 `service_name` / 空 `transport` / 空 `endpoint` /
+  重复 `service_name`）的「run 启动任何组件前拒绝」由公开入口
+  `getvalue_caller badroute <kind> <result_file>` + s2s 驱动器断言（`rc=1`、
+  `lifecycle_failures` 恰 1 条且为对应原因、`bound_endpoint` 为空、资源工厂计数 0）。
+  注意区分：**空路由列表合法**（等于不允许任何出站目标，未配置目标在运行期
+  `NotFound`），与空字段/重复项的启动期拒绝不同；endpoint 格式校验未纳入该断言。
 - **未覆盖容量/并发/迟到 lifecycle 矩阵**：容量耗尽 `Overloaded`、超时后 inflight
   强持有、`ShutdownIncomplete` 迟到完成、supervisor 硬终止（EX-T4）不在本切片；
   本切片的关闭是「无在途 handler 的正常关闭」。
