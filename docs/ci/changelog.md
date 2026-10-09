@@ -83,6 +83,26 @@ fork 准入与宿主隔离均在 revision 4 前未在线实跑；revision 4 已�
 - **未覆盖**：跨仓 caller、在线 rerun 复用、fork 准入/宿主隔离、required checks、C++/perf、
   self-hosted、consumer 迁移（均不得声称已验证）。
 
+## v1（候选，revision 5 — 结果契约嵌套 plan 接线修复）
+
+- **真实缺陷**：`bbtools-classify-v1` 的 `classify` job 输出 `plan_json` 是 `cli.py` 的 CLI **外层信封**
+  `{ok,classification,plan,evaluation}`，而 `result` job 旧实现把该外层直接当内部 `plan` 传给
+  `cli.py evaluate`；`result_contract.evaluate_plan` 访问 `plan["required"]` 即 `KeyError`，导致
+  「全部 success 也整体失败」。线上 infra run 37876778191 / 37876766821（callee `5b04115…`）C++ build
+  成功、仅结果评估 job 因此失败（`KeyError: 'required'`，退出 1）。
+- **修复（最小）**：`result` job 的 evaluate 内联脚本改为从 CLI 信封中提取内部 `plan`；非「带内部 dict
+  `plan` 的信封」即 fail-closed（非零、不写 payload）。不新增抽象/配置依赖，不改 CLI 格式与已发布
+  输出 schema，不改权限/触发/checkout pin/身份来源。
+- **接线一致性**：`bbtools-verify-v1` 的 report 消费同一 `plan_json` 外层信封（读 `classification`），
+  与修复后的新口径一致，未改动。
+- **回归**：`scripts/ci/shared/tests/test_contracts.py` 新增真实接线用例——从真实 YAML 提取 evaluate 内联
+  脚本，串起真实 `cli.py classify` 输出 → 脚本 → 真实 `cli.py evaluate`（不绕过 workflow heredoc）；
+  覆盖全 success 判绿、required `failure`/`cancelled`/`skipped` 退出非零、docs-only 允许 optional
+  `skipped`、`code`/`unknown` optional `skipped` 失败、classification-only 保持成功、malformed
+  `plan_json` 不得伪绿。
+- **在线状态**：修复后的复用模板**尚未**在线重跑；须经 PR、独立审查与 exact-head CI 通过后合入 `main`
+  再发布，本记录不构成线上验证。
+
 ## 破坏性变更策略
 
 `v1` 内以下任一变化视为破坏性（需新 major 与保留旧 SHA + 文档）：

@@ -212,7 +212,13 @@ jobs:
 
           raw = json.loads(os.environ["BBT_WORKFLOW_INPUTS"]).get("results_json") or "{}"
           results = json.loads(raw) if isinstance(raw, str) else raw
-          plan = json.loads(os.environ["BBT_PLAN_JSON"])
+          # classify 的 plan_json 输出是 cli.py 的 CLI 外层信封 {ok,classification,plan,evaluation}；
+          # 结果契约只消费内部 plan。缺失/非法即 fail-closed，绝不写伪 payload 蒙混门禁。
+          envelope = json.loads(os.environ["BBT_PLAN_JSON"])
+          plan = envelope.get("plan") if isinstance(envelope, dict) else None
+          if not isinstance(plan, dict):
+              print("FATAL: classify plan_json is not a CLI envelope with an inner plan; refusing", file=sys.stderr)
+              sys.exit(1)
           with open(sys.argv[1], "w", encoding="utf-8") as handle:
               json.dump({"plan": plan, "results": results}, handle)
           PY

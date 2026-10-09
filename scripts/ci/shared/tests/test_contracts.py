@@ -462,5 +462,190 @@ class GithubShapedRoutingTests(unittest.TestCase):
                 self.assertIn("E_INPUT_REPO", proc.stdout)
 
 
+def _classify_eval_script():
+    """从真实 workflow YAML 提取 result job 的 evaluate 内联脚本（真实执行，不做静态断言）。"""
+    for body in extract_heredocs(CLASSIFY_YML):
+        if "BBT_PLAN_JSON" in body:
+            return body
+    raise AssertionError("classify workflow has no evaluate heredoc referencing BBT_PLAN_JSON")
+
+
+def _classify_detect_script():
+    for body in extract_heredocs(CLASSIFY_YML):
+        if "has_results" in body:
+            return body
+    raise AssertionError("classify workflow has no detect heredoc writing has_results")
+
+
+def _github_classify_inputs(changed_files, results_json, *, required=("changes", "plan"),
+                            optional=("build",), classifier_status="ok"):
+    """真实 caller toJSON(inputs) 形态：镜像线上 infra 运行（required=changes/plan, optional=build）。"""
+    inputs = dict(GITHUB_CLASSIFY_INPUTS)
+    inputs["changed_files_json"] = json.dumps(list(changed_files))
+    inputs["results_json"] = results_json
+    inputs["required_checks_json"] = json.dumps(list(required))
+    inputs["optional_checks_json"] = json.dumps(list(optional))
+    inputs["classifier_status"] = classifier_status
+    return inputs
+
+
+def _run_classify_job(inputs):
+    """真实重放 classify job：cli.py classify 写 GITHUB_OUTPUT，返回其 result_json 输出值（= plan_json）。"""
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    with tempfile.TemporaryDirectory() as tmp:
+        gh = os.path.join(tmp, "gh_output")
+        proc = subprocess.run(
+            [sys.executable, CLI, "classify", "--github-output", gh],
+            input=json.dumps(inputs), capture_output=True, text=True, env=env,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"cli classify failed: {proc.returncode}: {proc.stdout}{proc.stderr}")
+        with open(gh, encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("result_json="):
+                    return line[len("result_json="):].rstrip("\n")
+    raise AssertionError("cli classify produced no result_json github-output")
+
+
+def _run_detect_job(inputs):
+    """真实执行 result job 的 detect 内联脚本，返回其 GITHUB_OUTPUT 内容。"""
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["BBT_WORKFLOW_INPUTS"] = json.dumps(inputs)
+    with tempfile.TemporaryDirectory() as tmp:
+        gh = os.path.join(tmp, "gh_output")
+        with open(gh, "w", encoding="utf-8"):
+            pass
+        proc = subprocess.run(
+            [sys.executable, "-", gh], input=_classify_detect_script(),
+            capture_output=True, text=True, env=env,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"detect heredoc failed: {proc.stderr}")
+        with open(gh, encoding="utf-8") as handle:
+            return handle.read()
+
+
+def _evaluate_wiring(inputs, plan_json):
+    """真实接线重放：workflow evaluate 内联脚本 -> payload -> 真实 cli.py evaluate。
+
+    返回 (exit_code, verdict|None, payload_written)。内联脚本 fail-closed（不写 payload）时不跑 CLI。
+    """
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["BBT_WORKFLOW_INPUTS"] = json.dumps(inputs)
+    env["BBT_PLAN_JSON"] = plan_json
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = os.path.join(tmp, "bbtools-eval.json")
+        prep = subprocess.run(
+            [sys.executable, "-", payload], input=_classify_eval_script(),
+            capture_output=True, text=True, env=env,
+        )
+        if prep.returncode != 0 or not os.path.exists(payload):
+            return prep.returncode or 1, None, False
+        proc = subprocess.run(
+            [sys.executable, CLI, "evaluate", "--file", payload],
+            capture_output=True, text=True, env=env,
+        )
+        verdict = None
+        try:
+            verdict = json.loads(proc.stdout)["verdict"]
+        except (ValueError, KeyError, TypeError):
+            verdict = None
+        return proc.returncode, verdict, True
+
+
+class ClassifyResultConsumerWiringTests(unittest.TestCase):
+    """#50 结果契约接线回归：plan_json 是 cli classify 的 CLI 外层信封（{ok,classification,plan,evaluation}），
+    result job 必须先提取内部 plan 再门禁。
+
+    端到端重放：真实 cli.py classify 输出 -> 真实 YAML evaluate 内联脚本提取 plan -> 真实 cli.py evaluate。
+    旧实现把外层信封当 plan 传给 evaluate_plan，直接 KeyError('/'required')/伪失败，本类会红。
+    """
+
+    REQUIRED_OK = '{"changes":"success","plan":"success","build":"success"}'
+
+    def test_classify_job_output_is_cli_envelope_with_inner_plan(self):
+        # 固化根因：classify 的 result_json（即 plan_json 输出值）是 CLI 信封，plan 在内部。
+        inputs = _github_classify_inputs([".github/workflows/x.yml"], self.REQUIRED_OK)
+        envelope = json.loads(_run_classify_job(inputs))
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(envelope["classification"], "code")
+        self.assertIsInstance(envelope["plan"], dict)
+        self.assertIn("required", envelope["plan"])
+
+    def test_all_required_and_optional_success_is_green(self):
+        inputs = _github_classify_inputs([".github/workflows/x.yml"], self.REQUIRED_OK)
+        code, verdict, wrote = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertTrue(wrote, "evaluate payload must be written from the classify envelope")
+        self.assertEqual(code, 0)
+        self.assertEqual(verdict, "success")
+
+    def test_required_failure_is_red(self):
+        inputs = _github_classify_inputs(
+            [".github/workflows/x.yml"], '{"changes":"failure","plan":"success","build":"success"}')
+        code, verdict, _ = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(verdict, "failure")
+
+    def test_required_cancelled_is_red(self):
+        inputs = _github_classify_inputs(
+            [".github/workflows/x.yml"], '{"changes":"success","plan":"cancelled","build":"success"}')
+        code, verdict, _ = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(verdict, "failure")
+
+    def test_required_skipped_is_red(self):
+        inputs = _github_classify_inputs(
+            [".github/workflows/x.yml"], '{"changes":"success","plan":"skipped","build":"success"}')
+        code, verdict, _ = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(verdict, "failure")
+
+    def test_docs_only_optional_skipped_is_allowed_green(self):
+        inputs = _github_classify_inputs(
+            ["docs/ci/api.md"], '{"changes":"success","plan":"success","build":"skipped"}')
+        code, verdict, _ = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertEqual(code, 0)
+        self.assertEqual(verdict, "success")
+
+    def test_code_optional_skipped_is_red(self):
+        inputs = _github_classify_inputs(
+            [".github/workflows/x.yml"], '{"changes":"success","plan":"success","build":"skipped"}')
+        code, verdict, _ = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(verdict, "failure")
+
+    def test_unknown_optional_skipped_is_red(self):
+        # 空变更集 => unknown（保守执行），optional 跳过不判绿。
+        inputs = _github_classify_inputs(
+            [], '{"changes":"success","plan":"success","build":"skipped"}')
+        self.assertEqual(json.loads(_run_classify_job(inputs))["classification"], "unknown")
+        code, verdict, _ = _evaluate_wiring(inputs, _run_classify_job(inputs))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(verdict, "failure")
+
+    def test_classification_only_call_stays_green_without_evaluation(self):
+        # 无 results：detect 必须判 false -> workflow 不执行 evaluate step -> 成功；输出无 evaluation。
+        inputs = _github_classify_inputs([".github/workflows/x.yml"], "")
+        self.assertIn("has_results=false", _run_detect_job(inputs))
+        envelope = json.loads(_run_classify_job(inputs))
+        self.assertNotIn("evaluation", envelope)
+        self.assertIn("plan", envelope)
+        # 评估步骤确实被真实存在且以 has_results 为门（否则 classify-only 会被迫评估/失败）。
+        raw_yaml = open(CLASSIFY_YML, encoding="utf-8").read()
+        self.assertIn("steps.detect.outputs.has_results == 'true'", raw_yaml)
+
+    def test_malformed_plan_json_is_never_green(self):
+        # 任何非「带内部 plan 的 CLI 信封」都不得伪绿：内联脚本 fail-closed，绝不写 payload 蒙混评估。
+        inputs = _github_classify_inputs([".github/workflows/x.yml"], self.REQUIRED_OK)
+        for bad in ("{}", "[]", "not json", '{"plan":"nope"}', '{"ok":true}', ""):
+            with self.subTest(plan_json=bad):
+                code, _, wrote = _evaluate_wiring(inputs, bad)
+                self.assertNotEqual(code, 0)
+                self.assertFalse(wrote)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
