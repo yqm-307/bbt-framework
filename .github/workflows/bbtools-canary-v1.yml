@@ -1,0 +1,55 @@
+# bbtools-ci-foundation-v1 hosted-only canary caller —— 未发布（UNPUBLISHED）。
+#
+# 触发面有意最小：**仅** 本分支 push；不响应 pull_request / tag / main / schedule /
+# workflow_dispatch。只读；不执行 source/上游 C++ 与 artifact 内容；不改现役 ci.yml、
+# runner、required checks 或 release。
+#
+# 初版 callee 用同 commit 本地引用（./.github/workflows/...），保证文件在同一 commit 可读。
+# 父级发布首个 candidate commit 后，必须把两个 `uses:` 替换为「已发布完整 40-hex SHA」引用，
+# 见 docs/ci/caller-canary-publish-patch.md；本文件中的占位不构成已发布路径。
+name: bbtools-canary-v1
+
+on:
+  push:
+    branches: [ci/issue-50-hosted-canary]
+
+permissions: {}
+
+concurrency:
+  group: bbtools-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    name: "canary classify (default no-results must succeed)"
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
+    permissions:
+      contents: read
+    with:
+      repo: yqm-307/bbtools-coroutine
+      source_sha: 5c10c68603260e3204c337638b1e3bf10658661a
+      profile: hosted
+      concurrency: "1"
+      timeout_minutes: "10"
+      event_json: '{"name":"push","head_ref":"ci/issue-50-hosted-canary"}'
+      changed_files_json: '["docs/ci/api.md"]'
+      required_checks_json: '["canary-classify"]'
+      optional_checks_json: '[]'
+      classifier_status: ok
+
+  verify:
+    name: "canary verify (real payload produce + download + receipt validation)"
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-verify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
+    permissions:
+      contents: read
+    with:
+      repo: yqm-307/bbtools-coroutine
+      source_sha: 5c10c68603260e3204c337638b1e3bf10658661a
+      profile: hosted
+      concurrency: "1"
+      timeout_minutes: "20"
+      event_json: '{"name":"push","head_ref":"ci/issue-50-hosted-canary"}'
+      changed_files_json: '["docs/ci/api.md"]'
+      required_checks_json: '["canary-verify"]'
+      optional_checks_json: '[]'
+      classifier_status: ok

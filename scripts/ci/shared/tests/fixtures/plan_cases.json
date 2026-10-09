@@ -1,0 +1,86 @@
+{
+  "_comment": "分类/计划契约正反 fixtures。payload 为已 typed 的输入子集；expect_plan 为期望计划字段，code 为期望拒绝码。",
+  "cases": [
+    {
+      "name": "docs_only_skips_optional",
+      "payload": {
+        "changed_files": ["docs/ci/api.md", "README.md", "LICENSE"],
+        "required_checks": ["lint", "unit"],
+        "optional_checks": ["heavy", "perf"],
+        "classifier_status": "ok"
+      },
+      "expect_plan": {
+        "classification": "docs-only",
+        "run": ["lint", "unit"],
+        "skip": ["heavy", "perf"],
+        "allow_skip": true,
+        "allow_skip_reason": "docs-only"
+      }
+    },
+    {
+      "name": "code_runs_all",
+      "payload": {
+        "changed_files": ["framework/src/app.cpp", "docs/readme.md"],
+        "required_checks": ["lint"],
+        "optional_checks": ["heavy"],
+        "classifier_status": "ok"
+      },
+      "expect_plan": {
+        "classification": "code",
+        "run": ["lint", "heavy"],
+        "skip": [],
+        "allow_skip": false
+      }
+    },
+    {
+      "name": "classifier_failed_is_conservative_unknown",
+      "payload": {
+        "changed_files": ["docs/only.md"],
+        "required_checks": ["lint"],
+        "optional_checks": ["heavy"],
+        "classifier_status": "failed"
+      },
+      "expect_plan": {
+        "classification": "unknown",
+        "run": ["lint", "heavy"],
+        "skip": [],
+        "allow_skip": false
+      }
+    },
+    {
+      "name": "empty_change_is_unknown_conservative",
+      "payload": {
+        "changed_files": [],
+        "required_checks": ["lint"],
+        "optional_checks": ["heavy"],
+        "classifier_status": "ok"
+      },
+      "expect_plan": {
+        "classification": "unknown",
+        "run": ["lint", "heavy"],
+        "skip": [],
+        "allow_skip": false
+      }
+    },
+    {
+      "name": "empty_required_rejected",
+      "payload": {
+        "changed_files": ["docs/a.md"],
+        "required_checks": [],
+        "optional_checks": ["heavy"],
+        "classifier_status": "ok"
+      },
+      "code": "E_REQUIRED_EMPTY"
+    },
+    {
+      "name": "overlap_rejected",
+      "payload": {
+        "changed_files": ["docs/a.md"],
+        "required_checks": ["lint"],
+        "optional_checks": ["lint"],
+        "classifier_status": "ok"
+      },
+      "code": "E_CHECK_OVERLAP"
+    }
+  ]
+}

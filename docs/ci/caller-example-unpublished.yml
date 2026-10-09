@@ -1,0 +1,30 @@
+# bbtools-ci-foundation-v1 caller 形状示例（文件名保留历史 "unpublished" 标记）。
+#
+# 状态：#50 T3.1 的 callee 模板已发布到隔离分支 ci/issue-50-hosted-canary（模板 commit 完整 SHA
+# 5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8），并由在线 hosted canary 实跑成功（run 37870605859 /
+# 37870795091）；但**未合入 main**，也**未做 C++/perf 验收**，consumer 迁移（主目标）尚未开始。
+# 本文件是 caller 形状示例：正式 consumer 迁移时应引用合入目标分支后的发布版本完整 SHA。
+# 首选设计：consumer 保留事件/concurrency/required-check；模板只提供 job 主体。
+name: bbtools-caller-example
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: bbtools-${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  bbtools-verify:
+    # callee 已发布到隔离分支的完整 SHA（非 main 发布；consumer 迁移前应改用合入版本）。
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-verify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
+    with:
+      repo: ${{ github.repository }}
+      source_sha: ${{ github.event.pull_request.head.sha }}
+      profile: hosted
+      concurrency: "2"
+      timeout_minutes: "20"
+      event_json: '{"name":"pull_request","base_ref":"main"}'
+      required_checks_json: '["lint","unit"]'
+      optional_checks_json: '["heavy","perf"]'
+      classifier_status: ok
