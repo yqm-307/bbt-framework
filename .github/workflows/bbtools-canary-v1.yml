@@ -22,7 +22,7 @@ concurrency:
 jobs:
   classify:
     name: "canary classify (default no-results must succeed)"
-    uses: ./.github/workflows/bbtools-classify-v1.yml
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
     permissions:
       contents: read
     with:
@@ -39,7 +39,7 @@ jobs:
 
   verify:
     name: "canary verify (real payload produce + download + receipt validation)"
-    uses: ./.github/workflows/bbtools-verify-v1.yml
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-verify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
     permissions:
       contents: read
     with:
