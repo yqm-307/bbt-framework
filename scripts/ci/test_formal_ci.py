@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-"""ci-shadow-v1 离线冒烟与直接耦合测试（stdlib 为主，PyYAML 可选增强）。
+"""正式 `.github/workflows/ci.yml`（唯一权威普通入口）离线冒烟与直接耦合测试。
 
-本文件属新增影子候选的一部分，**不作为任何现役测试入口自动发现**：framework 现役
-`.github/workflows/ci.yml` 不跑 python 单测，因此需显式运行。本地只验证「CI 配方 /
-archive 接收侧门禁 / 分类路由 / 静态与结构契约」，**不跑 C++ 全量构建、不下载源码、不连网**
-（真实 build→test 走父级授权的 PR CI，在线未验）。
+本文件是现役普通 CI（由已独立审查的 hosted 影子候选升级而来，Issue #50/#53）的**直接
+测试**：只验证「CI 配方 / archive 接收侧门禁 / 分类路由 / 静态与结构契约 / 手动任务保留」，
+**不跑 C++ 全量构建、不下载源码、不连网**（真实 build→test 走父级授权的在线 CI，在线未验
+见 `docs/ci/formal-ci.md`）。stdlib 为主，PyYAML 可选增强。
 
 运行：
-  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v scripts/ci/test_shadow_ci.py
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v scripts/ci/test_formal_ci.py
   # 结构契约需 PyYAML（缺省显式 SKIP，不等于通过）；分类路由冒烟需指向已发布 callee：
   UV_OFFLINE=1 UV_CACHE_DIR=<cache> uv run --no-project --with pyyaml \\
-    python3 scripts/ci/test_shadow_ci.py
+    python3 scripts/ci/test_formal_ci.py
   PYTHONDONTWRITEBYTECODE=1 BBT_CI_SHARED_DIR=<framework>/scripts/ci/shared \\
-    python3 scripts/ci/test_shadow_ci.py
+    python3 scripts/ci/test_formal_ci.py
 
 覆盖：
 - 配方守卫：脚本 bash -n、python compile、prepare_boost --print-plan 固定值、fail-closed 拒绝；
 - archive 接收侧：sha256 校验 + 闭集成员/路径穿越/绝对路径/逃逸 symlink/设备成员拒绝
   （真实调用 scripts/ci/run_framework_gate.sh verify-archive，synthetic 归档非真实 C++ 产物）；
 - changed_files 路由：push/PR 真实 diff 归一、未知保守回退、超预算整集回退；
-- 影子 workflow 文本契约（stdlib，恒跑，直接读真实文件）；
-- 影子 workflow 结构契约（需 PyYAML，缺省显式 SKIP）；
-- 与现役 .github/workflows/ci.yml 及真实 scripts/ 的直接耦合（防漂移）；
-- 分类路由冒烟（需 BBT_CI_SHARED_DIR）：用**同一个真实 cli.py** 校验影子受限输入与
+- 正式 workflow 文本契约（stdlib，恒跑，直接读真实文件）：触发面/身份/权限/concurrency/
+  hosted 与手动 runner/固定 SHA pin/callee 复用/required-optional/docs-only/always result/
+  artifact 闭包/producer attempt/no-cache/判据命令/内联 bash -n/无影子双跑；
+- 正式 workflow 结构契约（需 PyYAML，缺省显式 SKIP）；
+- 手动任务保留契约：toolchain-verify / resource-acceptance 及其 inputs/资源边界不删不改；
+- producer→receipt 语义：执行真实 workflow heredoc + 真实 shared cli.py，复用原 producer attempt；
+- 分类路由冒烟（需 BBT_CI_SHARED_DIR）：用**同一个真实 cli.py** 校验正式受限输入与
   required/optional 判定，本仓不复制契约。
 """
 from __future__ import annotations
@@ -31,7 +34,6 @@ import io
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -40,7 +42,6 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKTREE = os.path.normpath(os.path.join(HERE, "..", ".."))
-SHADOW = os.path.join(WORKTREE, ".github", "workflows", "ci-shadow-v1.yml")
 CI_YML = os.path.join(WORKTREE, ".github", "workflows", "ci.yml")
 CLASSIFY_YML = os.path.join(WORKTREE, ".github", "workflows", "bbtools-classify-v1.yml")
 PREPARE_BOOST = os.path.join(HERE, "prepare_boost.sh")
@@ -51,6 +52,7 @@ PREPARE_PROTOBUF = os.path.join(WORKTREE, "scripts", "prepare_protobuf.sh")
 LOCAL_BUILD = os.path.join(WORKTREE, "scripts", "local_build.sh")
 BUILD_STACK = os.path.join(WORKTREE, "scripts", "build_stack.sh")
 RUN_CTEST = os.path.join(WORKTREE, "scripts", "run_ctest.sh")
+VERIFY_TOOLCHAIN = os.path.join(WORKTREE, "scripts", "verify_toolchain.sh")
 DEPS_LOCK = os.path.join(WORKTREE, "deps.lock")
 TOOLCHAIN_LOCK = os.path.join(WORKTREE, "docker", "toolchain.lock")
 
@@ -60,6 +62,8 @@ CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
 UPLOAD_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
 DOWNLOAD_SHA = "d3f86a106a0bac45b974a628896c90dbdf5c8093"
 SHA_PIN_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+HOSTED_RUNNER = "ubuntu-24.04"
+MANUAL_RUNNER = "arc-s4-framework"
 
 ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 
@@ -142,18 +146,18 @@ def _make_tar(path: str, entries):
 
 
 GOOD_ENTRIES = [
-    (".shadow-work", "dir", None),
-    (".shadow-work/project-build", "dir", None),
-    (".shadow-work/project-build/tests", "dir", None),
-    (".shadow-work/project-build/tests/rpc_xlang_server", "file", "elf"),
-    (".shadow-work/deps-manifest.txt", "file", "coroutine path=/x sha=deadbeef"),
+    (".ci-work", "dir", None),
+    (".ci-work/project-build", "dir", None),
+    (".ci-work/project-build/tests", "dir", None),
+    (".ci-work/project-build/tests/rpc_xlang_server", "file", "elf"),
+    (".ci-work/deps-manifest.txt", "file", "coroutine path=/x sha=deadbeef"),
     ("boost-prefix/lib", "dir", None),
     ("boost-prefix/lib/libboost_context.so.1.90.0", "file", "so"),
     ("boost-prefix/lib/libboost_context.so", "sym", "libboost_context.so.1.90.0"),
 ]
 
 
-def _verify_archive(archive, expected, dest, prefixes=(".shadow-work", "boost-prefix/lib")):
+def _verify_archive(archive, expected, dest, prefixes=(".ci-work", "boost-prefix/lib")):
     cmd = ["bash", GATE, "verify-archive", "--archive", archive,
            "--expected-sha256", expected, "--dest", dest]
     for p in prefixes:
@@ -167,7 +171,7 @@ def _verify_archive(archive, expected, dest, prefixes=(".shadow-work", "boost-pr
 class RecipeGuardTests(unittest.TestCase):
     def test_shell_recipes_parse(self):
         for path in (PREPARE_BOOST, GATE, FETCH_DEPS, PREPARE_PROTOBUF, LOCAL_BUILD,
-                     BUILD_STACK, RUN_CTEST):
+                     BUILD_STACK, RUN_CTEST, VERIFY_TOOLCHAIN):
             with self.subTest(path=os.path.basename(path)):
                 proc = run(["bash", "-n", path], env=ENV)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -196,7 +200,7 @@ class RecipeGuardTests(unittest.TestCase):
         )
 
     def test_prepare_boost_pins_match_toolchain_lock(self):
-        # 影子 Boost 固定值必须与本仓 docker/toolchain.lock 同源同值（防漂移）。
+        # 正式 Boost 固定值必须与本仓 docker/toolchain.lock 同源同值（防漂移）。
         lock = raw(TOOLCHAIN_LOCK)
         self.assertIn("BOOST_VERSION=1.90.0", lock)
         self.assertIn(
@@ -294,7 +298,7 @@ class VerifyArchiveTests(unittest.TestCase):
             proc = _verify_archive(archive, sha, dest)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertTrue(
-                os.path.isfile(os.path.join(dest, ".shadow-work/project-build/tests/rpc_xlang_server"))
+                os.path.isfile(os.path.join(dest, ".ci-work/project-build/tests/rpc_xlang_server"))
             )
             link = os.path.join(dest, "boost-prefix/lib/libboost_context.so")
             self.assertTrue(os.path.islink(link))
@@ -324,7 +328,7 @@ class VerifyArchiveTests(unittest.TestCase):
     def test_path_traversal_refused(self):
         with tempfile.TemporaryDirectory() as td:
             self._assert_refused(
-                td, [(".shadow-work/../../etc/pwn", "file", "x")], "非法成员名"
+                td, [(".ci-work/../../etc/pwn", "file", "x")], "非法成员名"
             )
 
     def test_absolute_member_refused(self):
@@ -338,13 +342,13 @@ class VerifyArchiveTests(unittest.TestCase):
     def test_escaping_symlink_refused(self):
         with tempfile.TemporaryDirectory() as td:
             self._assert_refused(
-                td, [(".shadow-work/link", "sym", "../../etc/passwd")], "symlink"
+                td, [(".ci-work/link", "sym", "../../etc/passwd")], "symlink"
             )
 
     def test_device_member_refused(self):
         with tempfile.TemporaryDirectory() as td:
             self._assert_refused(
-                td, [(".shadow-work/devnull", "chr", None)], "非闭集成员类型"
+                td, [(".ci-work/devnull", "chr", None)], "非闭集成员类型"
             )
 
     def test_empty_archive_refused(self):
@@ -364,8 +368,8 @@ def _git(repo, *args):
 
 def _init_repo(repo):
     _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "shadow@test")
-    _git(repo, "config", "user.name", "shadow")
+    _git(repo, "config", "user.email", "formal@test")
+    _git(repo, "config", "user.name", "formal")
     _git(repo, "config", "commit.gpgsign", "false")
 
 
@@ -380,7 +384,7 @@ def _commit(repo, relpath, content, message):
 
 
 def _changed_files(repo, env_extra):
-    out_path = os.path.join(repo, ".shadow-output")
+    out_path = os.path.join(repo, ".ci-output")
     env = dict(ENV, GITHUB_OUTPUT=out_path, **env_extra)
     proc = run([sys.executable, CHANGED], env=env, cwd=repo)
     with open(out_path, encoding="utf-8") as handle:
@@ -398,15 +402,14 @@ class ChangedFilesRoutingTests(unittest.TestCase):
             second = _commit(repo, "framework/src/x.cc", "x", "code")
             proc, values = _changed_files(
                 repo,
-                {"EVENT_NAME": "push", "BEFORE": first, "SHA": second,
-                 "REF_NAME": "ci/issue-50-framework-hosted-shadow"},
+                {"EVENT_NAME": "push", "BEFORE": first, "SHA": second, "REF_NAME": "main"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(values["classifier_status"], "ok")
             self.assertEqual(json.loads(values["changed_files_json"]), ["framework/src/x.cc"])
             self.assertEqual(
                 json.loads(values["event_json"]),
-                {"name": "push", "head_ref": "ci/issue-50-framework-hosted-shadow"},
+                {"name": "push", "head_ref": "main"},
             )
 
     def test_pull_request_three_dot(self):
@@ -415,14 +418,14 @@ class ChangedFilesRoutingTests(unittest.TestCase):
             base = _commit(repo, "docs/ci/a.md", "a", "base")
             _git(repo, "update-ref", "refs/remotes/origin/main", base)
             _git(repo, "checkout", "-q", "-b", "feat")
-            head = _commit(repo, "docs/ci/framework-shadow-v1.md", "n", "note")
+            head = _commit(repo, "docs/ci/formal-ci.md", "n", "note")
             proc, values = _changed_files(
                 repo,
                 {"EVENT_NAME": "pull_request", "BASE_REF": "main", "SHA": head},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(
-                json.loads(values["changed_files_json"]), ["docs/ci/framework-shadow-v1.md"]
+                json.loads(values["changed_files_json"]), ["docs/ci/formal-ci.md"]
             )
             self.assertEqual(
                 json.loads(values["event_json"]),
@@ -466,24 +469,29 @@ class ChangedFilesRoutingTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 影子 workflow 文本契约（stdlib，恒跑，直接读真实文件）
+# 正式 workflow 文本契约（stdlib，恒跑，直接读真实文件）
 # --------------------------------------------------------------------------- #
-class WorkflowTextContractTests(unittest.TestCase):
+class FormalWorkflowTextContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.text = raw(SHADOW)
-        cls.stripped = body(SHADOW)
+        cls.text = raw(CI_YML)
+        cls.stripped = body(CI_YML)
 
-    def test_name_and_independent_identity(self):
-        self.assertIn("\nname: ci-shadow-v1\n", self.text)
-        # 独立于现役 artifact 命名空间，不污染 bbt-build。
-        self.assertIn("bbt-shadow-build-${{ github.run_id }}", self.stripped)
-        self.assertNotIn("name: bbt-build-", self.stripped)
+    def test_name_and_single_authoritative_identity(self):
+        self.assertIn("\nname: ci\n", self.text)
+        # 正式 artifact 名（bbt-build-<run_id>），不再是影子名；无影子双跑残留。
+        self.assertIn("bbt-build-${{ github.run_id }}", self.stripped)
+        self.assertNotIn("bbt-shadow-build-", self.stripped)
+        self.assertNotIn("ci-shadow-v1", self.stripped)
 
-    def test_trigger_is_branch_push_and_main_pr_only(self):
-        self.assertIn("branches: [ci/issue-50-framework-hosted-shadow]", self.stripped)
+    def test_triggers_are_pr_push_main_and_manual(self):
+        self.assertIn("pull_request:", self.stripped)
+        self.assertIn("push:", self.stripped)
+        self.assertIn("workflow_dispatch:", self.stripped)
         self.assertIn("branches: [main]", self.stripped)
-        for forbidden in ("workflow_dispatch", "schedule", "merge_group"):
+        # 手动入口保留 resource_acceptance 布尔输入。
+        self.assertIn("resource_acceptance:", self.stripped)
+        for forbidden in ("schedule:", "merge_group"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.stripped)
 
@@ -495,17 +503,20 @@ class WorkflowTextContractTests(unittest.TestCase):
         self.assertNotIn("id-token", self.text)
         self.assertIn("persist-credentials: false", self.text)
 
-    def test_concurrency_is_independent_and_pr_only_cancel(self):
-        self.assertIn("ci-shadow-v1-${{", self.stripped)
+    def test_concurrency_main_no_cancel_and_pr_only_cancel(self):
+        # main/手动：group 含 run_id → 逐提交独立、互不取消；PR：只取消同一 PR。
+        self.assertIn("group: ci-${{", self.stripped)
         self.assertIn("github.run_id", self.stripped)
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
                       self.stripped)
-        self.assertNotIn("${{ github.workflow }}", self.stripped)
 
-    def test_local_jobs_are_hosted_ubuntu_24_04(self):
+    def test_runner_split_hosted_and_preserved_manual(self):
         runs_on = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self.stripped)
         self.assertTrue(runs_on, "应存在本地 job 的 runs-on")
-        self.assertEqual(set(runs_on), {"ubuntu-24.04"})
+        self.assertEqual(set(runs_on), {HOSTED_RUNNER, MANUAL_RUNNER})
+        # 普通重型 job 必须 hosted。
+        self.assertGreaterEqual(runs_on.count(HOSTED_RUNNER), 3)
+        self.assertEqual(runs_on.count(MANUAL_RUNNER), 2)
 
     def test_all_uses_are_full_sha_pinned_and_expected(self):
         uses = re.findall(r"(?m)^\s*uses:\s*(\S+)\s*$", self.stripped)
@@ -554,8 +565,8 @@ class WorkflowTextContractTests(unittest.TestCase):
         self.assertIn('format(\'{{"name":"{0}"}}\', github.event_name)', self.stripped)
 
     def test_artifact_cross_runner_closure_commands_present(self):
-        # same-run only：下载名含 run_id；artifact 命名独立。
-        self.assertIn("name: bbt-shadow-build-${{ github.run_id }}", self.stripped)
+        # same-run only：下载名含 run_id；artifact 命名正式。
+        self.assertIn("name: bbt-build-${{ github.run_id }}", self.stripped)
         self.assertIn("download-artifact@", self.stripped)
         self.assertIn("upload-artifact@", self.stripped)
         self.assertIn("retention-days: 1", self.stripped)
@@ -564,7 +575,7 @@ class WorkflowTextContractTests(unittest.TestCase):
         # 先校验 sha256 后解包（verify-archive），并做闭集成员约束。
         self.assertIn("run_framework_gate.sh verify-archive", self.stripped)
         self.assertIn("--expected-sha256 \"$EXPECTED_ARCHIVE_SHA256\"", self.stripped)
-        self.assertIn("--allow-prefix \".shadow-work\"", self.stripped)
+        self.assertIn("--allow-prefix \".ci-work\"", self.stripped)
         self.assertIn("--allow-prefix \"boost-prefix/lib\"", self.stripped)
         # provenance 复用已发布 shared 契约，不新增第二 public API：
         # build 侧 produce 在 gate 脚本，接收侧 verify-receipt 在 workflow。
@@ -671,6 +682,72 @@ class WorkflowTextContractTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, self.stripped)
 
+    def test_build_recipe_delegation_and_fixed_dependencies(self):
+        # 正式入口负责准备依赖；gate 负责调用唯一构建配方，不要求旧内联块重复存在。
+        for needle in ('bash scripts/fetch_deps.sh',
+                       'bash scripts/prepare_protobuf.sh "$BBT_PROTOBUF_PREFIX"',
+                       'bash scripts/ci/run_framework_gate.sh build'):
+            with self.subTest(workflow=needle):
+                self.assertIn(needle, self.stripped)
+        gate = body(GATE)
+        for needle in ('bash "$repo_dir/scripts/local_build.sh"',
+                       'export BBT_NEED_TEST=ON', 'export BBT_SKIP_CTEST=1',
+                       '-DBBT_PROTOBUF_PREFIX=$protobuf_prefix'):
+            with self.subTest(gate=needle):
+                self.assertIn(needle, gate)
+        for dependency in ('coroutine', 'infra'):
+            self.assertRegex(raw(DEPS_LOCK), rf'{dependency} repo=\S+ sha=[0-9a-f]{{40}}')
+
+    def test_delegated_dual_service_negative_gate_preserved(self):
+        self.assertIn('bash scripts/ci/run_framework_gate.sh build', self.stripped)
+        gate = body(GATE)
+        for needle in ('-DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON',
+                       "grep -q '^BBT_ENABLE_DUAL_SERVICE_EXAMPLE:BOOL=OFF$'",
+                       '缺少前置条件', '-DBBT_HIREDIS_PREFIX',
+                       'examples/dual_service', 'if [ "$rc" -eq 0 ]; then'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, gate)
+
+    def test_build_and_test_link_source_evidence_preserved(self):
+        for source in (self.stripped, body(GATE)):
+            for needle in ('deps-manifest.txt', 'link-sources.txt',
+                           'if grep -q /usr/local/', 'exit 7'):
+                with self.subTest(needle=needle, source='workflow' if source == self.stripped else 'gate'):
+                    self.assertIn(needle, source)
+
+    def test_example_exec_bits_and_actual_build_directory_preserved(self):
+        block = next(b for b in _extract_run_blocks(self.text) if 'rpc_candidates=' in b)
+        for needle in ('rpc_xlang_server', 'Test_framework_*',
+                       'getvalue/getvalue_server', 'getvalue/getvalue_caller',
+                       'two_service/two_service', 'lifecycle_matrix/lifecycle_fixture',
+                       'BBT_BUILD_DIR=$actual_build_dir', 'chmod +x "$bin"',
+                       'if [ ! -f "$bin" ]; then'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, block)
+
+    def test_ldd_missing_and_external_bbt_guards_preserved(self):
+        block = next(b for b in _extract_run_blocks(self.text) if 'boost_links=' in b)
+        for needle in ("grep -q 'not found'", '/usr/local/.*bbt',
+                       'missing=1', 'exit "$missing"'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, block)
+
+    def test_manual_jobs_preserved_with_inputs_and_resource_boundaries(self):
+        # 手动工具链验收与双服务资源验收任务、inputs/资源边界保留，不删除假完成。
+        self.assertIn("verify_toolchain.sh --in-image --lock \"$GITHUB_WORKSPACE/docker/toolchain.lock\"",
+                      self.stripped)
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", self.stripped)
+        self.assertIn("inputs.resource_acceptance == true", self.stripped)
+        for needle in (
+            'RESOURCE_RECIPE_SHA: "1543bbd0aca4defa1be701b45aea5ba2cc2d0d86"',
+            "redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+            "mongo@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2",
+            ".resource-recipe",
+            "run_acceptance.sh",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.stripped)
+
     def test_inline_run_blocks_pass_bash_n(self):
         blocks = _extract_run_blocks(self.text)
         self.assertTrue(blocks, "应提取到至少一个 run 块")
@@ -688,7 +765,7 @@ class WorkflowTextContractTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 影子 workflow 结构契约（需 PyYAML）
+# 正式 workflow 结构契约（需 PyYAML）
 # --------------------------------------------------------------------------- #
 try:
     import yaml
@@ -726,23 +803,27 @@ def _loader():
 
 
 @unittest.skipIf(yaml is None, "PyYAML 不可用：结构契约显式 SKIP（不等于通过）")
-class WorkflowStructureTests(unittest.TestCase):
+class FormalWorkflowStructureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert yaml is not None
-        cls.wf = yaml.load(raw(SHADOW), Loader=_loader())
-        cls.text = raw(SHADOW)
+        cls.wf = yaml.load(raw(CI_YML), Loader=_loader())
+        cls.text = raw(CI_YML)
 
     def test_toplevel_shape_and_jobs(self):
-        self.assertEqual(self.wf["name"], "ci-shadow-v1")
+        self.assertEqual(self.wf["name"], "ci")
         self.assertEqual(set(self.wf), {"name", "on", "permissions", "concurrency", "env", "jobs"})
-        self.assertEqual(set(self.wf["jobs"]), {"changes", "plan", "build", "test", "result"})
+        self.assertEqual(
+            set(self.wf["jobs"]),
+            {"changes", "plan", "build", "test", "result", "toolchain-verify", "resource-acceptance"},
+        )
 
     def test_triggers(self):
         on = self.wf["on"]
-        self.assertEqual(set(on), {"push", "pull_request"})
-        self.assertEqual(on["push"]["branches"], ["ci/issue-50-framework-hosted-shadow"])
+        self.assertEqual(set(on), {"push", "pull_request", "workflow_dispatch"})
+        self.assertEqual(on["push"]["branches"], ["main"])
         self.assertEqual(on["pull_request"]["branches"], ["main"])
+        self.assertIn("resource_acceptance", on["workflow_dispatch"]["inputs"])
 
     def test_permissions_minimal(self):
         self.assertEqual(self.wf["permissions"], {})
@@ -760,12 +841,14 @@ class WorkflowStructureTests(unittest.TestCase):
                 self.assertEqual(job["with"]["profile"], "hosted")
                 self.assertIn("github.sha", job["with"]["source_sha"])
 
-    def test_local_jobs_runs_on_hosted(self):
-        for name, job in self.wf["jobs"].items():
-            if "uses" in job:
-                continue
+    def test_hosted_and_manual_runner_split(self):
+        for name in ("changes", "build", "test"):
             with self.subTest(job=name):
-                self.assertEqual(job["runs-on"], "ubuntu-24.04")
+                self.assertEqual(self.wf["jobs"][name]["runs-on"], HOSTED_RUNNER)
+        for name in ("toolchain-verify", "resource-acceptance"):
+            with self.subTest(job=name):
+                self.assertEqual(self.wf["jobs"][name]["runs-on"], MANUAL_RUNNER)
+                self.assertIn("workflow_dispatch", str(self.wf["jobs"][name]["if"]))
 
     def test_build_test_chain_and_results(self):
         build = self.wf["jobs"]["build"]
@@ -782,123 +865,11 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertEqual(json.loads(result["with"]["required_checks_json"]), ["changes", "plan"])
         self.assertEqual(json.loads(result["with"]["optional_checks_json"]), ["build", "test"])
 
-
-# --------------------------------------------------------------------------- #
-# 与现役 ci.yml 及真实 scripts/ 的直接耦合（防漂移）
-# --------------------------------------------------------------------------- #
-class CiYmlCouplingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.ci = raw(CI_YML)
-        cls.shadow = body(SHADOW)
-        cls.gate = raw(GATE)
-
-    def _both(self, needle):
-        self.assertIn(needle, self.ci, "现役 ci.yml 缺该判据（可能漂移）")
-        self.assertIn(needle, self.shadow, "影子缺该判据（未对齐现役）")
-
-    def test_build_recipe_matches_ci_yml(self):
-        for needle in (
-            "scripts/fetch_deps.sh",
-            "scripts/prepare_protobuf.sh",
-            "local_build.sh",
-            "BBT_PROTOBUF_PREFIX",
-        ):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, self.ci)
-                self.assertIn(needle, self.gate)
-
-    def test_dual_service_negative_gate_preserved(self):
-        for needle in (
-            "BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON",
-            "BBT_ENABLE_DUAL_SERVICE_EXAMPLE:BOOL=OFF",
-            "缺少前置条件",
-            "-DBBT_HIREDIS_PREFIX",
-            "examples/dual_service",
-        ):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, self.ci)
-                self.assertIn(needle, self.gate)
-
-    def test_link_source_evidence_preserved(self):
-        for needle in ("deps-manifest.txt", "link-sources.txt", "/usr/local/"):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, self.ci)
-                self.assertIn(needle, self.gate)
-        # 影子 test 侧同样复核证据。
-        self.assertIn("link-sources.txt", self.shadow)
-
-    def test_ctest_criteria_match_ci_yml(self):
-        needle = 'ctest --test-dir "$BBT_BUILD_DIR" -j1 --timeout 300 --output-on-failure --no-tests=error'
-        self._both(needle)
-        self._both("100% tests passed, 0 tests failed")
-        # SKIP/Not Run 门禁的稳定判据串（两边都必须保留）。
-        self._both("(Skipped|Not Run)")
-
-    def test_exec_bits_and_binary_completeness_match(self):
-        for needle in (
-            "rpc_xlang_server",
-            "Test_framework_*",
-            "getvalue/getvalue_server",
-            "getvalue/getvalue_caller",
-            "two_service/two_service",
-            "lifecycle_matrix/lifecycle_fixture",
-            "BBT_BUILD_DIR=$actual_build_dir",
-        ):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, self.ci)
-                self.assertIn(needle, self.shadow)
-
-    def test_ldd_source_assertions_match(self):
-        for needle in ('grep -q \'not found\'', "/usr/local/.*bbt"):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, self.ci)
-                self.assertIn(needle, self.shadow)
-
-    def test_shadow_does_not_modify_ci_yml_or_add_perf_release(self):
-        # 现役 ci.yml 不得提到影子；影子不得提性能/发布/基线/内存检测。
-        self.assertNotIn("ci-shadow-v1", self.ci)
-        for forbidden in ("ci_perf", "baseline", "release", "memcheck", "sanitizer",
-                          "workflow_dispatch"):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, self.shadow)
-
-    def test_shadow_routes_through_real_gate_scripts(self):
-        # 影子必须经真实 scripts/local_build.sh（→ build_stack.sh）与 run_framework_gate.sh，
-        # 不自造第二套构建/依赖配方。
-        self.assertIn("scripts/local_build.sh", self.ci)
-        self.assertIn("scripts/local_build.sh", self.gate)
-        self.assertIn("scripts/ci/run_framework_gate.sh build", self.shadow)
-        # deps.lock 固定 SHA 仍是唯一依赖真源。
-        lock = raw(DEPS_LOCK)
-        self.assertRegex(lock, r"coroutine repo=\S+ sha=[0-9a-f]{40}")
-        self.assertRegex(lock, r"infra repo=\S+ sha=[0-9a-f]{40}")
-
-    def test_only_added_paths_and_no_second_public_api(self):
-        # 影子新增文件只落在约定清单内；不得触碰 scripts/ci/shared（公共契约）。
-        rel = os.path.relpath(WORKTREE, WORKTREE)
-        allowed = {
-            ".github/workflows/ci-shadow-v1.yml",
-            "scripts/ci/changed_files.py",
-            "scripts/ci/prepare_boost.sh",
-            "scripts/ci/run_framework_gate.sh",
-            "scripts/ci/test_shadow_ci.py",
-            "docs/ci/framework-shadow-v1.md",
-        }
-        proc = run(["git", "-C", WORKTREE, "status", "--porcelain", "--untracked-files=all"], env=ENV)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        changed = set()
-        for line in proc.stdout.splitlines():
-            path = line[3:].strip()
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            changed.add(path)
-        self.assertTrue(changed.issubset(allowed), f"出现清单外的改动: {sorted(changed - allowed)}")
-        self.assertFalse(
-            any(p.startswith("scripts/ci/shared/") for p in changed),
-            "不得修改 scripts/ci/shared 公共契约",
-        )
-        del rel
+    def test_required_check_job_names_preserved(self):
+        # job 名保持现役 required check 名，避免 required context 悬空。
+        self.assertEqual(self.wf["jobs"]["changes"]["name"], "变更类型检测")
+        self.assertEqual(self.wf["jobs"]["build"]["name"], "Build (pinned deps)")
+        self.assertEqual(self.wf["jobs"]["test"]["name"], "Test (ctest -j1)")
 
 
 # --------------------------------------------------------------------------- #
@@ -907,7 +878,7 @@ class CiYmlCouplingTests(unittest.TestCase):
 SHARED = os.environ.get("BBT_CI_SHARED_DIR", "")
 
 
-def _shadow_payload(changed_files_json, classifier_status="ok"):
+def _formal_payload(changed_files_json, classifier_status="ok"):
     return {
         "repo": "yqm-307/bbt-framework",
         "source_sha": "a" * 40,
@@ -933,7 +904,7 @@ class ClassificationRoutingTests(unittest.TestCase):
 
     def _classify(self, changed, status="ok"):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump(_shadow_payload(changed, status), handle)
+            json.dump(_formal_payload(changed, status), handle)
             path = handle.name
         proc = run([sys.executable, self.cli, "classify", "--file", path], env=ENV)
         os.unlink(path)
@@ -953,7 +924,7 @@ class ClassificationRoutingTests(unittest.TestCase):
         return json.loads(proc.stdout)["plan"]
 
     def test_docs_only_routing(self):
-        proc = self._classify('["docs/ci/framework-shadow-v1.md"]')
+        proc = self._classify('["docs/ci/formal-ci.md"]')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["classification"], "docs-only")
 
@@ -965,13 +936,13 @@ class ClassificationRoutingTests(unittest.TestCase):
 
     def test_classifier_failure_is_unknown_not_docs(self):
         self.assertEqual(
-            json.loads(self._classify('["docs/ci/framework-shadow-v1.md"]', status="failed").stdout)["classification"],
+            json.loads(self._classify('["docs/ci/formal-ci.md"]', status="failed").stdout)["classification"],
             "unknown",
         )
         self.assertEqual(json.loads(self._classify("[]").stdout)["classification"], "unknown")
 
     def test_docs_only_allows_build_test_skip_and_is_success(self):
-        plan = self._plan_for('["docs/ci/framework-shadow-v1.md"]')
+        plan = self._plan_for('["docs/ci/formal-ci.md"]')
         proc = self._evaluate(
             plan,
             {"changes": "success", "plan": "success", "build": "skipped", "test": "skipped"},
