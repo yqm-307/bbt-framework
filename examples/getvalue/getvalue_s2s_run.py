@@ -18,6 +18,10 @@
   - s2s-blackhole-unknown：请求已完整写出后对端丢 reply（读完整个请求再断开）
     → caller 得到 OutcomeUnknown(14)，非未提交传输错误；对端只被连接一次（无 retry），
     callee journal 无新 handler
+  - s2s-badroute-{empty-service,empty-transport,empty-endpoint,duplicate}（#5 EX-T3）：
+    caller 以公开入口载入四类非法静态路由 → run 启动任何组件前拒绝
+    （rc=1=kExitRejected），lifecycle_failures 恰 1 条且为对应原因，bound_endpoint
+    为空，资源工厂计数 0（拒绝断言由驱动器独立核对进程观测，不信任自报结论）
 
 结果完整性（本轮修复）：总体结论（tail）只在自有 caller/callee/blackhole 全部
 清理、退出码检查完成后生成；异常/崩溃/非 0/超时强杀一律记 fail，且 exit 1，
@@ -54,6 +58,15 @@ INVALID_ARGUMENT = 1
 TIMED_OUT = 6
 NOT_FOUND = 11
 OUTCOME_UNKNOWN = 14   # RpcErrorCode.RPC_ERROR_CODE_OUTCOME_UNKNOWN
+
+# #5 EX-T3：四类非法静态路由 → 公开入口 run 前拒绝。期望的 lifecycle_failures
+# 单条子串来自 CoApp::_ValidateConfig 的对应校验分支。
+BADROUTE_CASES = [
+    ("empty-service", "empty service_name"),
+    ("empty-transport", "has empty transport/endpoint"),
+    ("empty-endpoint", "has empty transport/endpoint"),
+    ("duplicate", "duplicate static route service_name"),
+]
 
 WIRE_VARINT = 0
 WIRE_LEN = 2
@@ -399,6 +412,63 @@ def _reap(name, proc, failures):
         failures.append(f"{name} pid={proc.pid} rc={rc}")
 
 
+def run_badroute(caller_bin, wd, kind, expect, timeout):
+    """#5 EX-T3：独立进程经公开入口验证非法静态路由 run 前拒绝。
+
+    只读该进程自己写的机器可读观测（rc/lifecycle_failures/bound_endpoint/
+    resource_factory_calls），断言由驱动器独立做出，不信任进程自报结论；
+    超时/异常/崩溃一律记 fail 并回收自有进程。"""
+    scenario = f"s2s-badroute-{kind}"
+    result_f = os.path.join(wd, f"badroute-{kind}.json")
+    rc = None
+    obs = {}
+    try:
+        try:
+            os.unlink(result_f)
+        except OSError:
+            pass
+        proc = subprocess.Popen(
+            [caller_bin, "badroute", kind, result_f],
+            stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr)
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            _FAILURES.append(
+                f"{scenario}: process did not exit within {timeout}s (killed)")
+        if os.path.exists(result_f):
+            with open(result_f) as fh:
+                obs = json.load(fh)
+    except Exception as exc:  # noqa: BLE001 - 任何驱动异常都要落到结构化结果
+        _FAILURES.append(f"{scenario}: driver-error {type(exc).__name__}: {exc}")
+
+    failures = obs.get("lifecycle_failures")
+    endpoint = obs.get("bound_endpoint")
+    calls = obs.get("resource_factory_calls")
+    ok = (
+        rc == 1                        # kExitRejected：校验失败，未启动组件
+        and obs.get("rc") == 1         # 进程内观测与退出码一致
+        and obs.get("kind") == kind
+        and isinstance(failures, list) and len(failures) == 1
+        and expect in failures[0]      # 精确对应本次非法输入的原因
+        and endpoint == ""             # 未绑定任何 ready 端口
+        and calls == 0                 # 资源工厂未被调用（无组件启动）
+        and obs.get("auth_state") == AUTH_STATE
+    )
+    check(ok, f"rc={rc} obs={obs}", scenario)
+    finish(scenario, ok)
+    # 指标在 finish() 之后写入（finish 会重置该场景条目），保留 status/auth_state。
+    RESULTS[scenario].update({
+        "rc": rc,
+        "kind": kind,
+        "expect_failure_substring": expect,
+        "lifecycle_failures": failures,
+        "bound_endpoint": endpoint,
+        "resource_factory_calls": calls,
+    })
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--callee-bin", required=True)
@@ -426,6 +496,10 @@ def main():
                 os.unlink(p)
             except OSError:
                 pass
+
+        # 0) #5 EX-T3：四类非法静态路由 → 公开入口 run 前拒绝（四个独立进程）。
+        for kind, expect in BADROUTE_CASES:
+            run_badroute(args.caller_bin, wd, kind, expect, args.timeout)
 
         blackhole = Blackhole()
 
