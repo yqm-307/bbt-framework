@@ -1,10 +1,12 @@
-# bbtools classify/verify v1 接口契约（本地候选，未发布）
+# bbtools classify/verify v1 接口契约（已发布隔离分支；未合入 main）
 
-> 状态：**本地隔离候选，未在任何远端发布**。本目录描述的是 `bbtools-ci-foundation-v1`
-> revision 1 的候选接口与离线判据；`ready` 只表示本地候选范围足以开工，不代表已获实现/
-> 发布授权，也不代表线上可调用。consumer 不得引用未替换为已发布版本的路径。
+> 状态：**模板已发布到隔离分支 `ci/issue-50-hosted-canary`（模板 commit 完整 SHA
+> `5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8`），并由在线 hosted canary 实跑成功（run 37870605859 /
+> 37870795091）**；**未合入 `main`、未做 C++/perf 验收、consumer 未迁移**。本目录描述
+> `bbtools-ci-foundation-v1` revision 1 的接口与判据；`ready` 只表示本地候选范围足以开工，
+> 不代表已获发布授权，也不代表线上通用可调用。
 
-唯一真源：`yqm-307/bbt-framework` 独立 CI 命名空间。本候选不改动现役
+唯一真源：`yqm-307/bbt-framework` 独立 CI 命名空间。本切片不改动现役
 `.github/workflows/ci.yml`、产品/依赖/发布流程与 required checks。
 
 ## 1. 组成
@@ -13,10 +15,10 @@
 |---|---|
 | `.github/workflows/bbtools-classify-v1.yml` | reusable callee：纯分类 + 结果契约 |
 | `.github/workflows/bbtools-verify-v1.yml` | reusable callee：source/automation 分离 checkout + 真实元数据 payload + 接收侧校验 |
-| `.github/workflows/bbtools-canary-v1.yml` | hosted-only canary caller：仅分支 push 触发，本地 callee 引用 |
+| `.github/workflows/bbtools-canary-v1.yml` | hosted-only canary caller：仅分支 push 触发，callee 已 pin 到已发布模板完整 SHA |
 | `scripts/ci/shared/` | 纯逻辑（无网络、无命令执行）、真实产物链路与离线测试 |
 | `scripts/ci/shared/tests/` | 表驱动正反 fixtures + CLI 冒烟 + 产物正负用例 |
-| `docs/ci/caller-canary-publish-patch.md` | canary 发布替换方案（占位模板，未执行） |
+| `docs/ci/caller-canary-publish-patch.md` | canary callee 引用发布说明（已在隔离分支执行） |
 
 未新增 composite：两个 callee 不共享可复用的重复步骤集合，套空 wrapper 反而违反“不新造
 通用执行器/空 wrapper”约束。
@@ -97,8 +99,8 @@ required_checks/optional_checks/classifier_status/results`。
 ## 3. 错误码（稳定契约）
 
 `E_INPUT_*`（类型/未知字段/repo/SHA/profile/并发/超时/事件/路径/检查 id/状态/凭据）、
-`E_PROFILE_NO_ADMISSION`、`E_REQUIRED_EMPTY`、`E_CHECK_OVERLAP`、`E_RESULT_*`、
-`E_ALL_SKIPPED`、`E_ENV_*`（类型/未知字段/缺失/repo/SHA/job/run id/attempt/digest/path/
+`E_PROFILE_NO_ADMISSION`、`E_REQUIRED_EMPTY`、`E_CHECK_OVERLAP`、`E_RESULT_*`、`E_ALL_SKIPPED`、
+`E_ENV_*`（类型/未知字段/缺失/repo/SHA/job/run id/attempt/digest/path/
 运行信息/凭据/身份不匹配/改绑）。完整定义见 `scripts/ci/shared/contract_errors.py`。
 
 ## 4. 权限与身份
@@ -136,19 +138,23 @@ CLI 退出码：`0` 成功（`evaluate` 仅 verdict=success）；`1` 契约通�
 （`evaluate` verdict=failure）；`3` 契约拒绝（含输入非 JSON/文件读取失败，稳定 `E_INPUT_JSON`；
 产物/manifest 拒绝为稳定 `E_ART_*`/`E_ENV_*`）。
 
-## 6. 未覆盖边界（不得声称已验证）
+## 6. 已确证 / 未覆盖边界
 
-- 离线逻辑**不能**证明 GitHub 真实 reusable 上下文、callee 身份可信、平台 runner 准入或
-  性能/资源；这些属于后续授权 canary/在线发布包。
-- `job.workflow_repository`/`job.workflow_sha` 的运行时取值属在线事实：本地只能按 GitHub
-  公开语义（reusable job 上下文标识 callee 自身）静态保证接线，未在线实跑。
-- **真实产物链路已接线但未在线实跑**：produce 的真实字节摘要、upload/download 固定 SHA 传输、
-  接收侧 fail-closed 校验与 16 项负向探针均在本地/离线真实执行；hosted runner 上的
-  `upload-artifact` 归档 digest（`artifact-digest` 输出）与 reusable 上下文仍属在线事实，
-  离线不造值、不冒充已验证。
-- **在线负向边界**：canary 只在 hosted 运行里执行负向探针；未覆盖「预期失败 job +
-  continue-on-error + 显式断言」形状，也未覆盖 required checks、perf、跨仓 caller 重跑或权限提升。
+- **已确证（在线，隔离分支 `ci/issue-50-hosted-canary`）**：hosted canary 两次运行均 success ——
+  run 37870605859（本地同 commit，caller==callee）与 run 37870795091（caller `d003182…` != callee
+  `5b04115…`，模板完整 SHA），每轮 6 个 hosted job；produce 真实字节摘要、固定 SHA upload/download
+  传输、接收侧 fail-closed 校验与 16 个负向探针 + 1 正向对照在 hosted runner 上真实执行（负向全部
+  被拒）。reusable callee 身份取自 callee 作用域 `job.workflow_repository`/`job.workflow_sha`，
+  **同仓** caller != callee 在线成立。
+- **未覆盖（不得声称已验证）**：**跨仓** caller（caller 与 callee 分属不同仓库）在线语义；在线
+  rerun/identity 复用；required checks / Actions policy / fork 准入与宿主隔离；性能/资源；
+  self-hosted 准入。
+- **非 C++ 验收**：本轮未运行任何 C++ 全量构建、真实 producer 资格或跨仓写入；canary 只验证 CI
+  模板的 metadata artifact 链路，不构成框架/产品验收。
+- **未迁移**：`main`、现役 `ci.yml`、runner、release、required checks 与 consumer 路径均未改动；
+  模板目前只存在于隔离分支，`main` 发布与 consumer 迁移属后续授权。
 - `self-hosted` 无行政准入证据即拒绝，是保守默认，非已实现准入机制。
-- 路径逃逸离线已用真实 symlink 用例覆盖（payload symlink 与目录 symlink 逃逸均拒绝）；
-  但真实 runner 上 `download-artifact` 的解压布局属在线事实。
-- 未运行任何 C++ 全量构建、真实 Actions 远程调用或跨仓写入。
+- 路径逃逸离线已用真实 symlink 用例覆盖（payload symlink 与目录 symlink 逃逸均拒绝）；在线 runner
+  上 `download-artifact` 的解压布局随本次 canary 真实执行，但未做独立断言。
+- 归档 digest（`upload-artifact` 的 `artifact-digest`）已随本次 canary 在线取得，但仅作运行证据，
+  绝不作为身份或比对依据（离线不造值）。

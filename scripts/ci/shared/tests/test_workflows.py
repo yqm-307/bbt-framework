@@ -22,6 +22,8 @@ VERIFY = os.path.join(WORKFLOW_DIR, "bbtools-verify-v1.yml")
 CANARY = os.path.join(WORKFLOW_DIR, "bbtools-canary-v1.yml")
 CALLER = os.path.join(WORKTREE, "docs", "ci", "caller-example-unpublished.yml")
 PUBLISH_PATCH_DOC = os.path.join(WORKTREE, "docs", "ci", "caller-canary-publish-patch.md")
+API_DOC = os.path.join(WORKTREE, "docs", "ci", "api.md")
+CHANGELOG_DOC = os.path.join(WORKTREE, "docs", "ci", "changelog.md")
 
 SHARED = os.path.normpath(os.path.join(HERE, ".."))
 sys.path.insert(0, SHARED)
@@ -37,6 +39,17 @@ LOCAL_REF_RE = re.compile(r"^\./\.github/workflows/[A-Za-z0-9._-]+\.yml$")
 ALLOWED_INPUT_TYPES = {"string", "boolean", "number"}
 REUSABLE = (CLASSIFY, VERIFY)
 CALLERS = (CALLER, CANARY)
+
+# #50 T3.1 已发布隔离分支（ci/issue-50-hosted-canary）上的真实模板 commit：canary 两处 callee
+# 引用已机械 pin 到该完整 40-hex SHA（在线 run 37870795091，caller d003182… != callee 5b04115…）。
+# 重新 pin 时同步更新此处与 docs/ci/（不引入配置/注册表）。
+PUBLISHED_CALLEE_SHA = "5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8"
+CALLEE_REPO = "yqm-307/bbt-framework"
+CANARY_CALLEES = {"classify": "bbtools-classify-v1.yml", "verify": "bbtools-verify-v1.yml"}
+PUBLISHED_REF_RE = re.compile(
+    r"^(?P<repo>[^/@\s]+/[^/@\s]+)/\.github/workflows/"
+    r"(?P<path>[A-Za-z0-9._-]+\.yml)@(?P<sha>[0-9a-f]{40})$"
+)
 
 
 class DuplicateKeyError(Exception):
@@ -76,10 +89,6 @@ def load_workflow(path):
         return yaml.load(handle, Loader=_make_loader())
 
 
-def load_text(text):
-    return yaml.load(text, Loader=_make_loader())
-
-
 def raw(path):
     with open(path, encoding="utf-8") as handle:
         return handle.read()
@@ -105,6 +114,25 @@ def iter_uses(workflow):
         for step in job.get("steps", []) or []:
             if "uses" in step:
                 yield step["uses"]
+
+
+def parse_published_ref(uses):
+    """解析「已发布 reusable 引用」：<owner>/<repo>/.github/workflows/<file>.yml@<40-hex>。"""
+    return PUBLISHED_REF_RE.match(uses)
+
+
+def is_canary_callee_ref(job_name, uses):
+    """严格判定 canary callee 引用：本仓 + 正确 callee 路径 + 当前已发布完整 40-hex SHA。
+
+    拒绝分支/tag/短 SHA/跨仓/错误路径/不同 callee SHA/本地 ./ 引用。
+    """
+    match = parse_published_ref(uses)
+    return bool(
+        match
+        and match.group("repo") == CALLEE_REPO
+        and match.group("path") == CANARY_CALLEES.get(job_name)
+        and match.group("sha") == PUBLISHED_CALLEE_SHA
+    )
 
 
 @unittest.skipIf(yaml is None, "PyYAML 不可用（用 uv 运行）")
@@ -182,19 +210,44 @@ class WorkflowStaticTests(unittest.TestCase):
             self.assertNotIn(forbidden, text, forbidden)
         self.assertEqual(wf.get("permissions"), {})
 
-    def test_canary_calls_local_callees_with_explicit_inputs(self):
+    def test_canary_calls_published_callees_with_explicit_inputs(self):
+        # #50 T3.1：canary 两处 uses 已 pin 到已发布隔离分支模板的完整 SHA（caller != callee）。
         wf = load_workflow(CANARY)
-        self.assertEqual(set(wf["jobs"]), {"classify", "verify"})
-        callers = {"classify": "bbtools-classify-v1.yml", "verify": "bbtools-verify-v1.yml"}
+        self.assertEqual(set(wf["jobs"]), set(CANARY_CALLEES))
+        shas = set()
         for name, job in wf["jobs"].items():
             with self.subTest(job=name):
-                self.assertEqual(job["uses"], f"./.github/workflows/{callers[name]}")
+                match = parse_published_ref(job["uses"])
+                self.assertIsNotNone(match, f"must be a published full-SHA ref: {job['uses']}")
+                self.assertTrue(is_canary_callee_ref(name, job["uses"]), job["uses"])
+                shas.add(match.group("sha"))
                 self.assertNotIn("secrets", job)
                 with_block = job["with"]
                 for key in ("repo", "source_sha", "profile", "required_checks_json"):
                     self.assertIn(key, with_block)
                 self.assertEqual(with_block["profile"], "hosted")
-                self.assertEqual(load_workflow(CANARY)["jobs"][name]["permissions"], {"contents": "read"})
+                self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(shas, {PUBLISHED_CALLEE_SHA}, "both callees must pin the same published commit")
+
+    def test_canary_callee_ref_rejects_bad_pins(self):
+        # 已发布形状的严格反例：分支/tag/短 SHA/跨仓/错误路径/不同 callee SHA/非本仓 workflows 路径/
+        # 本地 ./ 引用都必须被拒（正向对照一并校验）。
+        good = f"{CALLEE_REPO}/.github/workflows/bbtools-verify-v1.yml@{PUBLISHED_CALLEE_SHA}"
+        self.assertTrue(is_canary_callee_ref("verify", good))
+        bad = {
+            "branch": f"{CALLEE_REPO}/.github/workflows/bbtools-verify-v1.yml@main",
+            "tag": f"{CALLEE_REPO}/.github/workflows/bbtools-verify-v1.yml@v1",
+            "short_sha": f"{CALLEE_REPO}/.github/workflows/bbtools-verify-v1.yml@{PUBLISHED_CALLEE_SHA[:7]}",
+            "cross_repo": f"yqm-307/bbtools-infra/.github/workflows/bbtools-verify-v1.yml@{PUBLISHED_CALLEE_SHA}",
+            "wrong_path": f"{CALLEE_REPO}/.github/workflows/bbtools-classify-v1.yml@{PUBLISHED_CALLEE_SHA}",
+            "different_callee_sha": f"{CALLEE_REPO}/.github/workflows/bbtools-verify-v1.yml@{'a' * 40}",
+            "non_workflow_path": f"{CALLEE_REPO}/evil/bbtools-verify-v1.yml@{PUBLISHED_CALLEE_SHA}",
+            "path_traversal": f"{CALLEE_REPO}/.github/workflows/../bbtools-verify-v1.yml@{PUBLISHED_CALLEE_SHA}",
+            "local_ref": "./.github/workflows/bbtools-verify-v1.yml",
+        }
+        for label, uses in bad.items():
+            with self.subTest(case=label):
+                self.assertFalse(is_canary_callee_ref("verify", uses), uses)
 
     def test_verify_upload_download_are_pinned_and_scoped(self):
         text = raw(VERIFY)
@@ -280,13 +333,31 @@ class WorkflowStaticTests(unittest.TestCase):
                     finally:
                         os.unlink(tmp)
 
-    def test_caller_example_marked_unpublished(self):
+    def test_caller_example_references_published_callee(self):
+        # caller 示例引用已发布隔离分支模板的真实完整 SHA，并如实标注未合入 main / 非 C++ 验收。
         text = raw(CALLER)
-        self.assertTrue(("未发布" in text) or ("UNPUBLISHED" in text))
+        wf = load_workflow(CALLER)
+        uses = [j["uses"] for j in wf["jobs"].values() if "uses" in j]
+        self.assertTrue(uses, "caller example must show a reusable call")
+        for ref in uses:
+            match = parse_published_ref(ref)
+            self.assertIsNotNone(match, ref)
+            self.assertEqual(match.group("repo"), CALLEE_REPO)
+            self.assertIn(match.group("path"), set(CANARY_CALLEES.values()))
+            self.assertEqual(match.group("sha"), PUBLISHED_CALLEE_SHA)
+        for marker in ("隔离分支", "main", "C++"):
+            self.assertIn(marker, text, marker)
 
-    def test_canary_marked_unpublished(self):
-        text = raw(CANARY)
-        self.assertTrue(("未发布" in text) or ("UNPUBLISHED" in text))
+    def test_status_docs_distinguish_published_branch_from_unmerged_main(self):
+        # 真实状态（run 37870605859 本地同 commit success / 37870795091 caller != callee success）：
+        # 模板已发布到隔离分支 ci/issue-50-hosted-canary（完整 SHA 5b04115…）并被在线 hosted canary 实跑；
+        # 未合入 main、非 C++/perf 验收、consumer 未迁移。workflow 头部的候选期 UNPUBLISHED 标记是历史
+        # （本轮不改 workflow 文本），真实状态以 docs/ci 为准。
+        docs = "\n".join((raw(API_DOC), raw(CHANGELOG_DOC), raw(PUBLISH_PATCH_DOC)))
+        self.assertIn(PUBLISHED_CALLEE_SHA, docs)
+        self.assertIn("隔离分支", docs)
+        self.assertNotIn("未在任何远端发布", docs)
+        self.assertTrue(("UNPUBLISHED" in raw(CANARY)) or ("未发布" in raw(CANARY)))
 
     def test_identity_resolved_from_job_context(self):
         # C1：automation 身份必须取自 callee 作用域 job.workflow_*，不得解析 caller 关联变量。
@@ -345,27 +416,33 @@ class WorkflowStaticTests(unittest.TestCase):
         self.assertNotRegex(produce[0]["run"], r"sha256:[0-9a-f]{64}")
 
     def test_canary_publish_patch_template_applies(self):
-        # 为父级第二轮 caller != callee 准备：本地引用可机械替换为已发布完整 SHA 引用。
+        # 从真实已发布 canary 还原本地引用，再应用文档中的两行机械替换。
+        # 任一引用缺失/重复/改为坏 pin 都必须失败，其他字节必须保持不变。
         text = raw(CANARY)
-        local = re.findall(r"uses: (\./\.github/workflows/[A-Za-z0-9._-]+\.yml)", text)
-        self.assertEqual(sorted(local), [
-            "./.github/workflows/bbtools-classify-v1.yml",
-            "./.github/workflows/bbtools-verify-v1.yml",
-        ])
-        published = "a" * 40  # 仅用于验证替换形状；不构成任何已发布 SHA 声明。
-        patched = text
-        for ref in local:
-            patched = patched.replace(
-                f"uses: {ref}",
-                f"uses: yqm-307/bbt-framework/{ref[2:]}@{published}",
-            )
-        wf = load_text(patched)
-        for name, job in wf["jobs"].items():
-            with self.subTest(job=name):
-                self.assertRegex(job["uses"], SHA_PIN_RE)
-        body = raw(PUBLISH_PATCH_DOC)
-        self.assertIn("<PUBLISHED_COMMIT_SHA_40HEX>", body)
-        self.assertIn("bbtools-canary-v1.yml", body)
+        assert yaml is not None  # 本类在无 PyYAML 时整体 skip。
+        local_text = text
+        replacements = []
+        for name, ref in CANARY_CALLEES.items():
+            local = f"./.github/workflows/{ref}"
+            published = f"{CALLEE_REPO}/{local[2:]}@{PUBLISHED_CALLEE_SHA}"
+            before, after = f"uses: {local}", f"uses: {published}"
+            self.assertEqual(text.count(after), 1, name)
+            self.assertNotIn(before, text)
+            local_text = local_text.replace(after, before)
+            replacements.append((before, after))
+        local_wf = yaml.load(local_text, Loader=_make_loader())
+        self.assertEqual(set(local_wf["jobs"]), set(CANARY_CALLEES))
+        for name, ref in CANARY_CALLEES.items():
+            self.assertEqual(local_wf["jobs"][name]["uses"], f"./.github/workflows/{ref}")
+            self.assertRegex(local_wf["jobs"][name]["uses"], LOCAL_REF_RE)
+        patched = local_text
+        for before, after in replacements:
+            self.assertEqual(patched.count(before), 1)
+            patched = patched.replace(before, after)
+        self.assertEqual(patched, text)
+        doc = raw(PUBLISH_PATCH_DOC)
+        self.assertIn(PUBLISHED_CALLEE_SHA, doc)
+        self.assertIn("bbtools-canary-v1.yml", doc)
 
 
 if __name__ == "__main__":

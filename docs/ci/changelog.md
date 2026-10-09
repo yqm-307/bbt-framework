@@ -1,13 +1,16 @@
-# bbtools CI v1 版本与变更记录（本地候选，未发布）
+# bbtools CI v1 版本与变更记录（已发布隔离分支；未合入 main）
 
 ## 版本模型
 
 - 接口族：`bbtools-classify-v1`、`bbtools-verify-v1`（`workflow_call`）。
 - 唯一真源：`yqm-307/bbt-framework`，固定基线 `a60edfb4f7cd77e69926be475e2c45e324a3db2b`。
-- 发布状态：**v1 候选，未发布（UNPUBLISHED）**。本目录与候选文件仅存在于隔离 worktree
-  的本地候选，未 commit/push/建 PR/触发 CI/部署。
-- 引用方式：consumer 必须引用**已发布**的完整 commit SHA 路径；候选期的
-  `docs/ci/caller-example-unpublished.yml` 用占位 SHA 且明确标注未发布，禁止复制到真实 caller。
+- 发布状态：**已发布到隔离分支 `ci/issue-50-hosted-canary`**。模板 commit
+  `5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8`，固定的 canary caller commit
+  `d003182a574f1e42ce916eff34c3d9926445cb5d`；在线 hosted canary 实跑成功（run 37870605859 /
+  37870795091）。**未合入 `main`、未建 PR/未发布 release、未做 C++/perf 验收、consumer 未迁移**。
+- 引用方式：consumer 必须引用**完整 commit SHA** 路径（禁分支名/tag/短 SHA）；模板当前只在隔离分支
+  发布，`main` 发布与 consumer 迁移属后续授权。`docs/ci/caller-example-unpublished.yml` 为 caller
+  形状示例（文件名保留历史 `unpublished` 标记，不代表模板从未发布）。
 
 ## v1（候选，revision 1）
 
@@ -17,7 +20,7 @@
   完整 SHA pin 的 reusable callee 候选。
 - `scripts/ci/shared/`：纯分类/结果/输入/envelope 逻辑，标准库实现，无网络与命令执行。
 - `scripts/ci/shared/tests/`：表驱动正反 fixtures 与 CLI 冒烟。
-- `docs/ci/`：本 API、本变更记录、未发布 caller 形状示例。
+- `docs/ci/`：本 API、本变更记录、caller 形状示例。
 
 不包含（明确越界）：不改现役 `ci.yml`、产品代码、`deps.lock`/`toolchain.lock`、docker/runner/
 代理、发布流程、consumer required check 或 core；不新增通用调度器/动态任务 DSL/空 wrapper。
@@ -41,8 +44,8 @@
 - **C7 仓库坐标**：`REPO_RE` 收紧为合法 `owner/name`（拒绝 `.`/`..` 等 dot 段）。
 - **C8 CLI 输入错误**：非 JSON / 文件读取解析失败统一归一为稳定 `E_INPUT_JSON`（非零 JSON，无 traceback）。
 
-未覆盖（在线边界，见 `api.md` §6）：`job.workflow_*` 运行时取值、Actions 归档 digest/runner
-准入与宿主隔离、真实 reusable caller != callee 语义均未在线实跑。
+未覆盖（在线边界，见 `api.md` §6）：`job.workflow_*` 运行时取值、跨仓 caller 语义、required checks /
+fork 准入与宿主隔离均在 revision 4 前未在线实跑；revision 4 已在隔离分支实跑**同仓** caller != callee。
 
 ## v1（候选，revision 3 — T3.1 hosted artifact canary 有限切片）
 
@@ -63,10 +66,22 @@
   对真实产出执行，任一未拒或探针异常即失败。
 - **canary caller**：新增 `.github/workflows/bbtools-canary-v1.yml`，仅
   `push.branches: [ci/issue-50-hosted-canary]` 触发，不响应 PR/tag/main/schedule/workflow_dispatch；
-  顶层 `permissions: {}`，调用 job `contents: read`；初版本地 callee 引用，发布替换方案见
-  `docs/ci/caller-canary-publish-patch.md`。
+  顶层 `permissions: {}`，调用 job `contents: read`；初版本地 callee 引用，后经 revision 4 发布替换为
+  完整 SHA，说明见 `docs/ci/caller-canary-publish-patch.md`。
 - **report 聚合**：改用 `!cancelled()` + 显式 `needs.*.result` 断言失败，不再用 `always()` 吞失败；
   JSON 输出经 env 安全读取，不直接拼入 shell。
+
+## v1（候选，revision 4 — 隔离分支 hosted canary 发布并 pin）
+
+- **发布形态**：`.github/workflows/bbtools-canary-v1.yml` 两处 `uses:` 由本地引用机械替换为已发布
+  隔离分支模板 commit `5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8`（同一完整 40-hex SHA）；canary
+  caller commit `d003182a574f1e42ce916eff34c3d9926445cb5d`。
+- **在线证据**：初轮 run 37870605859（本地同 commit，caller==callee）与固定 SHA 轮 run 37870795091
+  （caller `d003182…` != callee `5b04115…`）均 success，每轮 6 个 hosted job；produce 真实字节摘要
+  （331B manifest）、固定 SHA upload/download 传输、接收侧 fail-closed 与 16 负向探针 + 1 正向对照
+  在 hosted runner 真实执行并全部符合预期。
+- **未覆盖**：跨仓 caller、在线 rerun 复用、fork 准入/宿主隔离、required checks、C++/perf、
+  self-hosted、consumer 迁移（均不得声称已验证）。
 
 ## 破坏性变更策略
 
@@ -91,5 +106,6 @@ major tag 为浮动 ref，**引用必须使用完整 SHA**。
 
 ## 未运行声明
 
-所有 F/M 场景**尚未在线执行**；本变更记录不证明线上 callee 身份、Actions policy、
-宿主隔离或性能资源。离线证据只覆盖新增纯逻辑与静态结构/耦合。
+本变更记录不证明**跨仓** caller、Actions policy、宿主隔离、required checks 或性能资源；C++ 全量
+构建未运行。当前在线证据仅为隔离分支 `ci/issue-50-hosted-canary` 上**同仓** hosted canary 的两次
+成功运行（见 revision 4）。
