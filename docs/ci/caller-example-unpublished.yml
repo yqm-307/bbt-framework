@@ -1,0 +1,29 @@
+# bbtools-ci-foundation-v1 本地候选调用形状示例 —— 未发布（UNPUBLISHED）。
+#
+# 本文件仅演示候选 reusable 的调用形状，**指向尚未在远端发布的版本**；
+# 下方 @ 后的 40 位 SHA 是占位符（非真实存在），发布前禁止复制到任何真实 caller。
+# 首选设计：consumer 保留事件/concurrency/required-check；模板只提供 job 主体。
+# TODO(发布后): 用 bbtools-verify-v1 实际发布 commit 的完整 SHA 替换占位符。
+name: bbtools-caller-example
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: bbtools-${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  bbtools-verify:
+    # 占位 SHA：候选未发布，此处不做真实引用。
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-verify-v1.yml@1111111111111111111111111111111111111111
+    with:
+      repo: ${{ github.repository }}
+      source_sha: ${{ github.event.pull_request.head.sha }}
+      profile: hosted
+      concurrency: "2"
+      timeout_minutes: "20"
+      event_json: '{"name":"pull_request","base_ref":"main"}'
+      required_checks_json: '["lint","unit"]'
+      optional_checks_json: '["heavy","perf"]'
+      classifier_status: ok

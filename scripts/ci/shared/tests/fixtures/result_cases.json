@@ -1,0 +1,96 @@
+{
+  "_comment": "结果契约正反 fixtures。plan 已校验；results 为调用方收集的 job->status 映射。",
+  "plans": {
+    "docs_only": {
+      "classification": "docs-only",
+      "required": ["lint", "unit"],
+      "optional": ["heavy", "perf"],
+      "run": ["lint", "unit"],
+      "skip": ["heavy", "perf"],
+      "allow_skip": true,
+      "allow_skip_reason": "docs-only"
+    },
+    "code": {
+      "classification": "code",
+      "required": ["lint"],
+      "optional": ["heavy"],
+      "run": ["lint", "heavy"],
+      "skip": [],
+      "allow_skip": false,
+      "allow_skip_reason": null
+    }
+  },
+  "cases": [
+    {
+      "name": "all_green",
+      "plan": "docs_only",
+      "results": {"lint": "success", "unit": "success", "heavy": "success", "perf": "success"},
+      "expect_verdict": "success"
+    },
+    {
+      "name": "docs_only_optional_skipped_ok",
+      "plan": "docs_only",
+      "results": {"lint": "success", "unit": "success", "heavy": "skipped", "perf": "skipped"},
+      "expect_verdict": "success"
+    },
+    {
+      "name": "required_failure_not_green",
+      "plan": "docs_only",
+      "results": {"lint": "success", "unit": "failure", "heavy": "success", "perf": "success"},
+      "expect_verdict": "failure",
+      "expect_failed": ["unit"]
+    },
+    {
+      "name": "required_cancelled_not_green",
+      "plan": "docs_only",
+      "results": {"lint": "success", "unit": "cancelled", "heavy": "success", "perf": "success"},
+      "expect_verdict": "failure",
+      "expect_failed": ["unit"]
+    },
+    {
+      "name": "required_unexpected_skipped_not_green",
+      "plan": "code",
+      "results": {"lint": "success", "heavy": "skipped"},
+      "expect_verdict": "failure",
+      "expect_failed": ["heavy"]
+    },
+    {
+      "name": "required_missing_empty_not_green",
+      "plan": "docs_only",
+      "results": {"lint": "success", "heavy": "success", "perf": "success"},
+      "expect_verdict": "failure",
+      "expect_failed": ["unit"]
+    },
+    {
+      "name": "all_skipped_never_green",
+      "plan": "docs_only",
+      "results": {"lint": "skipped", "unit": "skipped", "heavy": "skipped", "perf": "skipped"},
+      "expect_verdict": "failure"
+    },
+    {
+      "name": "optional_failure_not_green",
+      "plan": "code",
+      "results": {"lint": "success", "heavy": "failure"},
+      "expect_verdict": "failure",
+      "expect_failed": ["heavy"]
+    },
+    {
+      "name": "unknown_job_rejected",
+      "plan": "docs_only",
+      "results": {"lint": "success", "unit": "success", "ghost": "success"},
+      "code": "E_RESULT_UNKNOWN_JOB"
+    },
+    {
+      "name": "bad_status_rejected",
+      "plan": "docs_only",
+      "results": {"lint": "green", "unit": "success"},
+      "code": "E_RESULT_STATUS"
+    },
+    {
+      "name": "empty_results_rejected",
+      "plan": "docs_only",
+      "results": {},
+      "code": "E_RESULT_EMPTY"
+    }
+  ]
+}

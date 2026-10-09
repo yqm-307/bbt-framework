@@ -1,0 +1,236 @@
+# bbtools-ci-foundation-v1 本地候选 —— 未发布（UNPUBLISHED）。
+#
+# bbtools-classify-v1：纯分类/结果契约 reusable callee（workflow_call）。
+#   - hosted-only：runs-on 固定 ubuntu-latest，不接受调用方传入 runs-on；
+#   - 权限最小：顶层 permissions 为空，仅需要 checkout 的 job 授予 contents: read；
+#   - 无自定义 secret、无 secrets:inherit；远程 action 全部完整 SHA pin；
+#   - automation（callee 自身 job.workflow_sha）与 source（调用方被测 SHA）分离；
+#   - callee 身份取自 job 上下文（job.workflow_repository / job.workflow_sha），不解析
+#     关联 caller 的 GITHUB_WORKFLOW_REF/SHA；缺失或非法即 fail-closed，不回退 main；
+#   - 分类与结果评估解耦：调用方未提供 results 时只输出分类，不评估、不阻断；
+#     提供 results 时 result job 按 verdict 门禁，failure 使运行整体非零失败。
+# 纯逻辑来自 scripts/ci/shared（callee 自身固定版本），不来自调用方候选源码。
+name: bbtools-classify-v1
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "source repository owner/name (identity only, not executed)"
+        type: string
+        required: true
+      source_sha:
+        description: "full 40-hex source commit SHA"
+        type: string
+        required: true
+      profile:
+        description: "runner profile; v1 supports hosted only"
+        type: string
+        required: true
+      concurrency:
+        description: "positive integer concurrency budget"
+        type: string
+        required: false
+        default: "1"
+      timeout_minutes:
+        description: "positive integer timeout budget (minutes)"
+        type: string
+        required: false
+        default: "20"
+      event_json:
+        description: "bounded event object, e.g. {\"name\":\"pull_request\",\"base_ref\":\"main\"}"
+        type: string
+        required: false
+        default: "{\"name\":\"workflow_dispatch\"}"
+      changed_files_json:
+        description: "JSON array of bounded repo-relative changed paths"
+        type: string
+        required: false
+        default: "[]"
+      required_checks_json:
+        description: "JSON array of job ids the trusted caller declares must run"
+        type: string
+        required: true
+      optional_checks_json:
+        description: "JSON array of heavy jobs allowed to skip only on docs-only"
+        type: string
+        required: false
+        default: "[]"
+      classifier_status:
+        description: "classifier outcome: ok | failed | unknown"
+        type: string
+        required: false
+        default: "ok"
+      results_json:
+        description: "JSON object of job->status collected by the caller; empty means classification-only (no evaluation)"
+        type: string
+        required: false
+        default: ""
+    outputs:
+      classification:
+        description: "docs-only | code | unknown"
+        value: ${{ jobs.classify.outputs.classification }}
+      plan_json:
+        description: "validated execution plan (JSON)"
+        value: ${{ jobs.classify.outputs.plan_json }}
+      verdict:
+        description: "result-contract verdict: success | failure (empty when the caller supplied no results)"
+        value: ${{ jobs.result.outputs.verdict }}
+    secrets: {}
+
+permissions: {}
+
+jobs:
+  classify:
+    name: "classify (pure logic, automation checkout only)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      classification: ${{ steps.plan.outputs.classification }}
+      plan_json: ${{ steps.plan.outputs.result_json }}
+    steps:
+      - name: "Resolve reusable callee identity from job context (fail-closed, no main fallback)"
+        env:
+          BBT_CALLEE_REPO: ${{ job.workflow_repository }}
+          BBT_CALLEE_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          repo="${BBT_CALLEE_REPO:-}"
+          sha="${BBT_CALLEE_SHA:-}"
+          if [ -z "$repo" ] || [ -z "$sha" ]; then
+            echo "FATAL: reusable callee identity missing (job.workflow_repository/workflow_sha); refusing" >&2
+            exit 1
+          fi
+          case "$sha" in
+            *[!0-9a-f]*) echo "FATAL: callee workflow_sha is not a 40-hex commit; refusing" >&2; exit 1 ;;
+          esac
+          if [ "${#sha}" -ne 40 ]; then
+            echo "FATAL: callee workflow_sha is not a 40-hex commit; refusing" >&2
+            exit 1
+          fi
+          echo "BBT_AUTOMATION_REPO=$repo" >> "$GITHUB_ENV"
+          echo "BBT_AUTOMATION_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: "Checkout automation logic at pinned callee SHA (separate from source)"
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.BBT_AUTOMATION_REPO }}
+          ref: ${{ env.BBT_AUTOMATION_SHA }}
+          path: .bbt-automation
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "Validate inputs and compute run plan (fail-closed)"
+        id: plan
+        env:
+          BBT_WORKFLOW_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          payload_file="$RUNNER_TEMP/bbtools-inputs.json"
+          printf '%s' "$BBT_WORKFLOW_INPUTS" > "$payload_file"
+          python3 .bbt-automation/scripts/ci/shared/cli.py classify \
+            --file "$payload_file" \
+            --github-output "$GITHUB_OUTPUT"
+
+  result:
+    name: "result contract (pure logic)"
+    needs: classify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      - name: "Resolve reusable callee identity from job context (fail-closed)"
+        env:
+          BBT_CALLEE_REPO: ${{ job.workflow_repository }}
+          BBT_CALLEE_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          repo="${BBT_CALLEE_REPO:-}"
+          sha="${BBT_CALLEE_SHA:-}"
+          if [ -z "$repo" ] || [ -z "$sha" ]; then
+            echo "FATAL: reusable callee identity missing; refusing" >&2
+            exit 1
+          fi
+          echo "BBT_AUTOMATION_REPO=$repo" >> "$GITHUB_ENV"
+          echo "BBT_AUTOMATION_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: "Checkout automation logic at pinned callee SHA"
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.BBT_AUTOMATION_REPO }}
+          ref: ${{ env.BBT_AUTOMATION_SHA }}
+          path: .bbt-automation
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "Detect caller-supplied results (classification-only calls have none)"
+        id: detect
+        env:
+          BBT_WORKFLOW_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import sys
+
+          raw = json.loads(os.environ["BBT_WORKFLOW_INPUTS"]).get("results_json") or ""
+          if isinstance(raw, str):
+              text = raw.strip()
+              results = json.loads(text) if text else {}
+          else:
+              results = raw if isinstance(raw, dict) else {}
+          has = "true" if results else "false"
+          with open(sys.argv[1], "a", encoding="utf-8") as handle:
+              handle.write(f"has_results={has}\n")
+          PY
+
+      - name: "No results supplied: classification-only call, verdict stays empty"
+        if: steps.detect.outputs.has_results != 'true'
+        run: |
+          set -euo pipefail
+          echo "no results_json supplied; skipping result evaluation (verdict empty)"
+
+      - name: "Evaluate required/optional results (fail-closed; nonzero on any required failure)"
+        id: verdict
+        if: steps.detect.outputs.has_results == 'true'
+        env:
+          BBT_WORKFLOW_INPUTS: ${{ toJSON(inputs) }}
+          BBT_PLAN_JSON: ${{ needs.classify.outputs.plan_json }}
+        run: |
+          set -euo pipefail
+          payload_file="$RUNNER_TEMP/bbtools-eval.json"
+          python3 - "$payload_file" <<'PY'
+          import json
+          import os
+          import sys
+
+          raw = json.loads(os.environ["BBT_WORKFLOW_INPUTS"]).get("results_json") or "{}"
+          results = json.loads(raw) if isinstance(raw, str) else raw
+          plan = json.loads(os.environ["BBT_PLAN_JSON"])
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump({"plan": plan, "results": results}, handle)
+          PY
+          python3 .bbt-automation/scripts/ci/shared/cli.py evaluate \
+            --file "$payload_file" \
+            --github-output "$GITHUB_OUTPUT"
+
+  report:
+    name: "verdict aggregate (no checkout, no permissions)"
+    needs: [classify, result]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: "Report classification and verdict (read-only, no checkout)"
+        run: |
+          set -euo pipefail
+          echo "classification=${{ needs.classify.outputs.classification }}"
+          verdict="${{ needs.result.outputs.verdict }}"
+          echo "verdict=${verdict:-<none>}"

@@ -1,0 +1,231 @@
+{
+  "_comment": "产物 envelope 正反 fixtures：结构校验 / 身份绑定 / 下游重跑复用。expected 为模板/调用方真源身份。",
+  "valid_envelope": {
+    "producer_repo": "yqm-307/bbt-framework",
+    "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+    "producer_run_id": 123456,
+    "producer_run_attempt": 1,
+    "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+    "job": "verify",
+    "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "artifact_path": "out/manifest.json",
+    "toolchain": "hosted-ubuntu-24.04",
+    "tests": "unit",
+    "retry": 0,
+    "cache_id": "cache-1",
+    "artifact_id": "artifact-1"
+  },
+  "expected": {
+    "repo": "yqm-307/bbt-framework",
+    "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+    "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+    "job": "verify"
+  },
+  "envelope_cases": [
+    {"name": "valid_full", "envelope": "valid_envelope", "expect": "ok"},
+    {
+      "name": "runtime_missing_becomes_unknown",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 2,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_path": "out/manifest.json"
+      },
+      "expect": "ok",
+      "expect_runtime_unknown": ["toolchain", "tests", "retry", "cache_id", "artifact_id"]
+    },
+    {
+      "name": "missing_workflow_sha",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 1,
+        "job": "verify",
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_path": "out/manifest.json"
+      },
+      "expect": "reject",
+      "code": "E_ENV_MISSING"
+    },
+    {
+      "name": "bad_digest",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "deadbeef",
+        "artifact_path": "out/manifest.json"
+      },
+      "expect": "reject",
+      "code": "E_ENV_DIGEST"
+    },
+    {
+      "name": "path_escape",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_path": "../etc/passwd"
+      },
+      "expect": "reject",
+      "code": "E_ENV_PATH"
+    },
+    {
+      "name": "bad_run_attempt_zero",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 0,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_path": "out/manifest.json"
+      },
+      "expect": "reject",
+      "code": "E_ENV_RUN_ATTEMPT"
+    },
+    {
+      "name": "secret_canary_runtime",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_path": "out/manifest.json",
+        "toolchain": "token=ghp_0000000000000000000000000000000000"
+      },
+      "expect": "reject",
+      "code": "E_ENV_SECRET"
+    },
+    {
+      "name": "unknown_field",
+      "envelope": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 7,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_path": "out/manifest.json",
+        "trust_me": true
+      },
+      "expect": "reject",
+      "code": "E_ENV_UNKNOWN_FIELD"
+    }
+  ],
+  "binding_cases": [
+    {"name": "binding_ok", "envelope": "valid_envelope", "expected": "expected", "expect": "ok"},
+    {
+      "name": "binding_wrong_source",
+      "envelope": "valid_envelope",
+      "expected": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "0000000000000000000000000000000000000000",
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify"
+      },
+      "expect": "reject",
+      "code": "E_ENV_IDENTITY_MISMATCH"
+    },
+    {
+      "name": "binding_wrong_job",
+      "envelope": "valid_envelope",
+      "expected": {
+        "repo": "yqm-307/bbt-framework",
+        "source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "other"
+      },
+      "expect": "reject",
+      "code": "E_ENV_IDENTITY_MISMATCH"
+    }
+  ],
+  "rerun_cases": [
+    {"name": "rerun_reuses_producer_identity", "producer": "valid_envelope", "rerun": "valid_envelope", "expected": "expected", "expect": "ok"},
+    {
+      "name": "rerun_rebound_to_consumer_attempt",
+      "producer": "valid_envelope",
+      "rerun": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 999999,
+        "producer_run_attempt": 3,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_path": "out/manifest.json"
+      },
+      "expected": "expected",
+      "expect": "reject",
+      "code": "E_ENV_REBOUND"
+    },
+    {
+      "name": "rerun_wrong_digest_rebound",
+      "producer": "valid_envelope",
+      "rerun": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 123456,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "artifact_path": "out/manifest.json"
+      },
+      "expected": "expected",
+      "expect": "reject",
+      "code": "E_ENV_REBOUND"
+    },
+    {
+      "name": "rerun_wrong_source",
+      "producer": "valid_envelope",
+      "rerun": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "0000000000000000000000000000000000000000",
+        "producer_run_id": 123456,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_path": "out/manifest.json"
+      },
+      "expected": "expected",
+      "expect": "reject",
+      "code": "E_ENV_IDENTITY_MISMATCH"
+    },
+    {
+      "name": "rerun_path_escape",
+      "producer": "valid_envelope",
+      "rerun": {
+        "producer_repo": "yqm-307/bbt-framework",
+        "producer_source_sha": "a60edfb4f7cd77e69926be475e2c45e324a3db2b",
+        "producer_run_id": 123456,
+        "producer_run_attempt": 1,
+        "workflow_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "job": "verify",
+        "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_path": "../../root/.ssh/id_rsa"
+      },
+      "expected": "expected",
+      "expect": "reject",
+      "code": "E_ENV_PATH"
+    }
+  ]
+}
