@@ -266,6 +266,12 @@ std::atomic<int> g_budget_calls{0};
 std::atomic<int> g_inbound_entries{0};
 std::atomic<std::int64_t> g_inbound_pre_deadline_ns{0};
 std::atomic<int> g_inbound_error_code{0};
+// T7c 补充观测：进入 handler 的真实时刻（同钟）——handler 可见期限相对它的余量
+// 是「名义预算够不够」的实测证据，仅记录，不进入契约断言。
+std::atomic<std::int64_t> g_inbound_entry_ns{0};
+// T7c 受控耗尽：置位时入站 handler 在交付 framework **之前**等到接收端 local-min
+// 期限确实过去——用受控调度构造「名义预算 > 预留 仍被拒」，不靠 wall-clock 容差。
+std::atomic<bool> g_inbound_hold_until_deadline{false};
 
 fw::Error WaitErr(co::WaitStatus st, const char* what) {
     switch (st) {
@@ -835,22 +841,30 @@ fw::result<inf::HttpResponse> SendRawWire(const std::shared_ptr<inf::HttpClient>
     return std::move(*st->out);
 }
 
-// 在宿主上安装观测型 RpcHandler（T7）：真实 infra RpcServer 入站路径
+// 在宿主上安装观测型 RpcHandler（T7/T7c）：真实 infra RpcServer 入站路径
 // （HandleRpcRequest 的接收端 local-min、信封编码与五字段关联照常生效）
 // 进入本闭包时记录 IncomingCallContext.deadline（framework 扣减前、服务端
 // 同钟口径）与入口计数，再经既有测试缝 DispatchInboundForTest 走真实
 // InboundDispatcher/RequestScope 分发。只用于跨层预算观测，不改生产桥
 // InstallRpcWireBridge 的装配；不新增业务可见面（DispatchInboundForTest
 // 与 InstallRpcHandler 均为既有入口）。
+// T7c 受控耗尽：g_inbound_hold_until_deadline 置位时先等到接收端 local-min
+// 期限确实过去再交付 framework（睡过头只会更晚），用于在同一名义预算下确定地
+// 构造「调度已耗尽 → 拒绝」。
 void InstallBudgetProbeHandler(const std::shared_ptr<fw::InfraHttpHost>& host, fw::CoApp& app)
 {
     fw::CoApp* app_ptr = &app;
     host->InstallRpcHandler(
         [app_ptr](inf::IncomingCallContext ctx, inf::RpcEnvelope env) -> fw::result<inf::RpcEnvelope> {
+            g_inbound_entry_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(),
+                std::memory_order_release);
             g_inbound_pre_deadline_ns.store(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(ctx.deadline.time_since_epoch()).count(),
                 std::memory_order_release);
             g_inbound_entries.fetch_add(1, std::memory_order_acq_rel);
+            if (g_inbound_hold_until_deadline.load(std::memory_order_acquire))
+                std::this_thread::sleep_until(ctx.deadline + std::chrono::milliseconds{1});
             auto reply = fw::DispatchInboundForTest(*app_ptr, ctx, std::move(env));
             if (!reply) {
                 g_inbound_error_code.store(static_cast<int>(reply.error().code), std::memory_order_release);
@@ -1428,6 +1442,434 @@ BOOST_AUTO_TEST_CASE(wire_inbound_bridge_success_five_fields)
     BOOST_REQUIRE(rep);
     BOOST_CHECK(rep.value() == 21);
     BOOST_CHECK(g_budget_calls.load() == 1);
+
+    box.app->request_shutdown();
+    JoinRun(box.run);
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+}
+
+// ── 多 hop 预算（R4/S4）：同一进程同一 CoApp 的两个方法经 loopback socket 相扣 ──
+//
+// 口径（如实声明）：不是跨机器、不是跨进程、不涉及认证/授权。进程内单例
+// Scheduler 只允许一个 CoApp 处于 run 内（CoApp.cc 的活跃宿主登记），故「两跳」
+// 由同一 CoApp 的两个方法相扣，而不是三个 CoApp。两跳都真实经 infra
+// RpcServer/HandleRpcRequest（接收端 local-min）+ 真实 framework
+// InboundDispatcher（每跳恰扣一次 kReplyDeliveryReserve）；hop1 的出站用生产
+// HttpEgress(ProtoWireV1) → infra RpcClient::Call，只把逻辑 endpoint "self" 在
+// 发送时刻解析到本进程自身的监听地址（端口 0 只能 run 后得知；路由白名单仍由
+// find_route 按 service 名把关，解析只替换地址文本）。
+
+// 两跳链观测态：各跳串行完成，全部读写走锁；记录按角色（方法名）取用。
+struct HopProbe {
+    struct Ingress {
+        std::string service;
+        std::string method;
+        std::int64_t pre_ns{0}; // IncomingCallContext.deadline（infra local-min 结果）
+        std::int64_t at_ns{0};  // 记录时刻（同钟）
+    };
+
+    static std::int64_t Ns(Clock::time_point t)
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+    }
+    void Reset()
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        ingress.clear();
+        handler_deadline_ns.clear();
+        adapted_ns = 0;
+        widen_requested_ns = 0;
+        egress_start_ns = 0;
+        egress_ok = false;
+        handler_calls = 0;
+    }
+    void RecordIngress(std::string service, std::string method, co::Deadline pre, Clock::time_point at)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        ingress.push_back(Ingress{std::move(service), std::move(method), Ns(pre), Ns(at)});
+    }
+    Ingress At(const std::string& method) const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (const auto& i : ingress)
+            if (i.method == method)
+                return i;
+        return Ingress{};
+    }
+    void SetHandlerDeadline(const std::string& role, co::Deadline d)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        handler_deadline_ns[role] = Ns(d);
+        handler_calls += 1;
+    }
+    std::int64_t HandlerDeadline(const std::string& role) const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        const auto it = handler_deadline_ns.find(role);
+        return it != handler_deadline_ns.end() ? it->second : 0;
+    }
+    int HandlerCalls() const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        return handler_calls;
+    }
+    void SetAdapted(co::Deadline d)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        adapted_ns = Ns(d);
+    }
+    std::int64_t Adapted() const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        return adapted_ns;
+    }
+    void SetWidenRequested(co::Deadline d)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        widen_requested_ns = Ns(d);
+    }
+    std::int64_t WidenRequested() const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        return widen_requested_ns;
+    }
+    void MarkEgressStart(Clock::time_point t)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        egress_start_ns = Ns(t);
+    }
+    std::int64_t EgressStart() const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        return egress_start_ns;
+    }
+    void MarkEgressEnd(bool ok)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        egress_ok = ok;
+    }
+    bool EgressOk() const
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        return egress_ok;
+    }
+
+    mutable std::mutex mtx;
+    std::vector<Ingress> ingress;
+    std::map<std::string, std::int64_t> handler_deadline_ns;
+    std::int64_t adapted_ns{0};
+    std::int64_t widen_requested_ns{0};
+    std::int64_t egress_start_ns{0};
+    bool egress_ok{false};
+    int handler_calls{0};
+};
+
+std::shared_ptr<HopProbe> g_hop;
+
+std::int64_t MsNs(std::chrono::milliseconds d)
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+}
+
+// 两跳服务：leaf 为叶子（记录 handler 内可见期限后回值）；forward 记录父 ctx
+// 期限后做一次真实受管出站到 leaf。forward_widen 变体显式给出远大于父预算的
+// 子期限——适配器必须取 min，不得放大父预算（「去掉 min」变异的判别点）。
+class HopSvc final : public fw::CoService<HopSvc> {
+public:
+    static constexpr std::string_view kServiceName = "budget_hop";
+
+    fw::CoRpcResp Leaf(fw::CoRpcReq req)
+    {
+        auto v = IntArg(req);
+        if (!v)
+            return fw::CoRpcResp::Error(v.error());
+        auto ctx = fw::CurrentRequestContext();
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
+        if (g_hop)
+            g_hop->SetHandlerDeadline("leaf", ctx.value()->deadline);
+        return ReplyInt(v);
+    }
+
+    fw::CoRpcResp Forward(fw::CoRpcReq req)
+    {
+        return _Forward(req, false);
+    }
+    fw::CoRpcResp ForwardWiden(fw::CoRpcReq req)
+    {
+        return _Forward(req, true);
+    }
+
+    static constexpr auto kRpcMethods =
+        fw::RpcMethods(fw::Method<&HopSvc::Leaf>("leaf"), fw::Method<&HopSvc::Forward>("forward"),
+                       fw::Method<&HopSvc::ForwardWiden>("forward_widen"));
+
+private:
+    fw::CoRpcResp _Forward(fw::CoRpcReq req, bool widen)
+    {
+        auto v = IntArg(req);
+        if (!v)
+            return fw::CoRpcResp::Error(v.error());
+        auto ctx = fw::CurrentRequestContext();
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
+        const std::string role = widen ? "forward_widen" : "forward";
+        if (g_hop)
+            g_hop->SetHandlerDeadline(role, ctx.value()->deadline);
+        fw::CallOptions opt;
+        if (widen) {
+            opt.deadline = Clock::now() + std::chrono::seconds{30};
+            if (g_hop)
+                g_hop->SetWidenRequested(*opt.deadline);
+        }
+        if (g_hop)
+            g_hop->MarkEgressStart(Clock::now());
+        auto reply = this->call(kServiceName, "leaf", req, {}, opt);
+        if (g_hop)
+            g_hop->MarkEgressEnd(static_cast<bool>(reply));
+        if (!reply)
+            return fw::CoRpcResp::Error(reply.error());
+        return reply.value();
+    }
+};
+
+// 两跳观测入站：进入 framework 入站入口之前记录 IncomingCallContext.deadline 与
+// 该时刻（同钟），再走真实 DispatchInboundForTest→InboundDispatcher 分发。
+void InstallHopProbeHandler(const std::shared_ptr<fw::InfraHttpHost>& host, fw::CoApp& app)
+{
+    fw::CoApp* app_ptr = &app;
+    host->InstallRpcHandler(
+        [app_ptr](inf::IncomingCallContext ctx, inf::RpcEnvelope env) -> fw::result<inf::RpcEnvelope> {
+            if (g_hop)
+                g_hop->RecordIngress(env.service, env.method, ctx.deadline, Clock::now());
+            return fw::DispatchInboundForTest(*app_ptr, ctx, std::move(env));
+        });
+}
+
+// 两跳夹具：与 PrepareApp 同形（复用 AppBox/RunApp/Limits/EndpointSlot），差异
+// 只有「出站实现」与「endpoint 解析」两点，见上方口径声明。
+AppBox PrepareHopApp(std::chrono::milliseconds incoming_timeout, std::chrono::milliseconds step_budget,
+                     std::vector<fw::StaticRoute> routes, const std::function<void(fw::CoApp&)>& register_fn)
+{
+    AppBox box;
+    const auto limits = Limits(incoming_timeout);
+    box.host = std::make_shared<fw::InfraHttpHost>(limits, inf::ListenAddress{"127.0.0.1", 0});
+    box.egress_slot = std::make_shared<std::shared_ptr<inf::HttpClient>>();
+    box.peer_ep = std::make_shared<EndpointSlot>(); // 本夹具承载「自身 endpoint」
+
+    fw::CoAppOptions opts;
+    opts.network_limits = limits;
+    opts.listen = inf::ListenAddress{"127.0.0.1", 0};
+    opts.static_routes = std::move(routes);
+    opts.shutdown_step_budget = step_budget;
+
+    auto host = box.host;
+    auto eps = box.peer_ep;
+    auto egress = std::make_shared<fw::HttpEgress>(host, fw::RpcEgressProfile::ProtoWireV1);
+    fw::CoAppSeam seam;
+    seam.host = host;
+    seam.rpc_send = [egress, eps](const inf::RpcAddress& addr, const inf::RpcEnvelope& env,
+                                  const inf::CallOptions& o) -> fw::result<inf::RpcEnvelope> {
+        // 生产 AdaptCallOptions 之后、真正发起 I/O 之前收到的出站期限。
+        if (g_hop)
+            g_hop->SetAdapted(o.deadline);
+        const std::string ep = addr.endpoint == "self" ? eps->Get() : addr.endpoint;
+        if (ep.empty())
+            return fw::result<inf::RpcEnvelope>::err(
+                fw::MakeError(fw::ErrorCode::RuntimeUnavailable, "hop egress self endpoint not installed"));
+        return egress->Send(inf::RpcAddress{addr.transport, ep}, env, o);
+    };
+
+    box.app = fw::MakeCoAppForTest(opts, std::move(seam));
+    register_fn(*box.app);
+    InstallHopProbeHandler(box.host, *box.app);
+    return box;
+}
+
+// T9：真实两跳的预算不放大（R4/S4「跨 hop」）——A（测试侧真实框架出站）→
+// B（本进程 CoApp hop1 入站）→ B 的出站 → B（同一 CoApp hop2 入站）。
+// 断言全部落在同一 steady_clock 的绝对期限上：
+//  - 每跳 local-min 之后 framework 恰扣一次 20ms（同钟精确等值）；
+//  - 生产 AdaptCallOptions 后的出站期限 == 父 ctx 期限（无显式期限时继承，
+//    不延长、不放大）；
+//  - 到达 hop2 的预算相对父 ctx 期限只多出**实测**单程时延——出站放大（例如
+//    改用新预算、或去掉 min 让显式子期限生效）会远超该实测上界；
+//  - 逐跳只缩：d_hop2 < d_hop1；d_hop1 - d_hop2 的窗口是 20ms ± 实测单程，
+//    上界再含 wire 整数毫秒的 <1ms 向下取整余量（0/40ms 仍被排除）。
+// widen 变体显式把子期限设到 30s（远大于父预算 ~3s）：适配器取 min，仍不放大。
+BOOST_AUTO_TEST_CASE(wire_multihop_budget_never_amplified)
+{
+    using std::chrono::milliseconds;
+    g_hop = std::make_shared<HopProbe>();
+    auto box =
+        PrepareHopApp(milliseconds{30000}, milliseconds{5000},
+                      /*routes*/ {fw::StaticRoute{std::string(HopSvc::kServiceName), inf::RpcAddress{"http", "self"}}},
+                      [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<HopSvc>(ConcurrentOpts())); });
+    LaunchApp(box);
+    BOOST_REQUIRE(box.host->rpc_server() != nullptr); // 正式 ProtoWireV1 入站
+    BOOST_REQUIRE(!box.endpoint.empty());
+    box.peer_ep->Set(box.endpoint); // "self" → 本进程自身监听地址
+
+    // (a) 无显式子期限：子预算继承父预算。
+    auto r_a = SendWire(box.host, box.endpoint, MakeEnv(std::string(HopSvc::kServiceName), "forward", "mh-a", 11),
+                        milliseconds{3000});
+    if (!r_a)
+        BOOST_TEST_MESSAGE("mh-a error code=" << static_cast<int>(r_a.error().code) << " msg=" << r_a.error().message);
+    BOOST_REQUIRE(r_a);
+    auto rep_a = DecodeReply(r_a);
+    BOOST_REQUIRE(rep_a);
+    BOOST_CHECK(rep_a.value() == 11);
+
+    const auto ing_f = g_hop->At("forward");
+    const auto ing_l = g_hop->At("leaf");
+    const auto d_f = g_hop->HandlerDeadline("forward");
+    const auto d_l = g_hop->HandlerDeadline("leaf");
+    // 第 1 跳：真实 infra local-min → framework 恰扣一次 20ms。
+    BOOST_CHECK_NE(d_f, 0);
+    BOOST_CHECK(ing_f.pre_ns - d_f == MsNs(milliseconds{20}));
+    // 生产 AdaptCallOptions 后的出站期限 == 父 ctx 期限（继承，不延长）。
+    BOOST_CHECK(g_hop->Adapted() == d_f);
+    BOOST_CHECK(g_hop->HandlerCalls() == 2);
+    BOOST_CHECK(g_hop->EgressOk());
+    // 第 2 跳：同一 20ms 精确等值。
+    BOOST_CHECK_NE(d_l, 0);
+    BOOST_CHECK(ing_l.pre_ns - d_l == MsNs(milliseconds{20}));
+    // 实测单程（hop1 发起出站 → hop2 抵达入站包装）：本用例唯一的时延量。
+    const auto hop_latency = ing_l.at_ns - g_hop->EgressStart();
+    BOOST_CHECK_MESSAGE(hop_latency > 0, "hop latency not observed");
+    BOOST_CHECK_MESSAGE(hop_latency < MsNs(milliseconds{15}),
+                        "hop latency too large for discriminating power: " << hop_latency << "ns");
+    // 到达第 2 跳的预算相对父 ctx 期限只多出实测单程 → 出站未放大预算。
+    BOOST_TEST_MESSAGE("mh-a hop_latency=" << hop_latency << "ns arrival_excess_over_parent=" << (ing_l.pre_ns - d_f)
+                                           << "ns drop_d1_minus_d2=" << (d_f - d_l) << "ns");
+    BOOST_CHECK(ing_l.pre_ns - d_f <= hop_latency);
+    // wire 向下取整为整数毫秒：量化余量 <1ms 可使扣减量大于 20ms。
+    // 逐跳只缩；窗口包含实测单程及该量化项，0/40ms 仍在窗口外。
+    const auto wire_quantization = MsNs(milliseconds{1});
+    BOOST_CHECK(d_l < d_f);
+    BOOST_CHECK(d_f - d_l >= MsNs(milliseconds{20}) - hop_latency);
+    BOOST_CHECK(d_f - d_l <= MsNs(milliseconds{20}) + hop_latency + wire_quantization);
+
+    // (b) 显式子期限 = now + 30s（远大于父预算 ~3s）：父预算仍不可放大。
+    g_hop->Reset();
+    auto r_b = SendWire(box.host, box.endpoint, MakeEnv(std::string(HopSvc::kServiceName), "forward_widen", "mh-b", 12),
+                        milliseconds{3000});
+    if (!r_b)
+        BOOST_TEST_MESSAGE("mh-b error code=" << static_cast<int>(r_b.error().code) << " msg=" << r_b.error().message);
+    BOOST_REQUIRE(r_b);
+    auto rep_b = DecodeReply(r_b);
+    BOOST_REQUIRE(rep_b);
+    BOOST_CHECK(rep_b.value() == 12);
+
+    const auto ing_fb = g_hop->At("forward_widen");
+    const auto ing_lb = g_hop->At("leaf");
+    const auto d_fb = g_hop->HandlerDeadline("forward_widen");
+    const auto d_lb = g_hop->HandlerDeadline("leaf");
+    // 显式请求确实远大于父预算（否则本变体不具判别力）。
+    BOOST_CHECK(g_hop->WidenRequested() - d_fb > MsNs(milliseconds{5000}));
+    // 适配器取 min：出站期限仍是父预算，不是显式 30s。
+    BOOST_CHECK(g_hop->Adapted() == d_fb);
+    BOOST_CHECK(ing_fb.pre_ns - d_fb == MsNs(milliseconds{20}));
+    BOOST_CHECK(ing_lb.pre_ns - d_lb == MsNs(milliseconds{20}));
+    const auto hop_latency_b = ing_lb.at_ns - g_hop->EgressStart();
+    BOOST_CHECK_MESSAGE(hop_latency_b < MsNs(milliseconds{15}),
+                        "hop latency too large for discriminating power: " << hop_latency_b << "ns");
+    BOOST_TEST_MESSAGE("mh-b hop_latency=" << hop_latency_b
+                                           << "ns arrival_excess_over_parent=" << (ing_lb.pre_ns - d_fb)
+                                           << "ns drop_d1_minus_d2=" << (d_fb - d_lb) << "ns");
+    BOOST_CHECK(ing_lb.pre_ns - d_fb <= hop_latency_b);
+    BOOST_CHECK(d_lb < d_fb);
+
+    box.app->request_shutdown();
+    JoinRun(box.run);
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+}
+
+// T7c：20ms 预留的**真实链**边界（正式 ProtoWireV1 入站 + 真实 RpcServer）。
+// 契约（infra HandleRpcRequest + framework InboundDispatcher）：
+//   pre = min(服务端本地期限, now_s + wire.remaining_budget_ms)；
+//   ctx.deadline = pre - kReplyDeliveryReserve(20ms)；ctx.deadline <= now() → 拒绝。
+// 故 wire 预算恰 ==20ms 时 ctx.deadline == now_s，一律在 handler 之前拒绝（「==20ms
+// 应执行」的推断不成立）；名义 >20ms 也不充分——(b)/(c) 用同一个 45ms 预算、只改
+// 受控调度，证明判定用的是检查时刻的剩余时间。
+BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_boundary_20ms)
+{
+    using std::chrono::milliseconds;
+    g_probe = std::make_shared<Probe>(0);
+    g_budget_calls.store(0);
+    g_budget_deadline_ns.store(0);
+    g_inbound_entries.store(0);
+    g_inbound_pre_deadline_ns.store(0);
+    g_inbound_entry_ns.store(0);
+    g_inbound_error_code.store(0);
+    g_inbound_hold_until_deadline.store(false);
+
+    auto box =
+        PrepareApp(milliseconds{30000}, milliseconds{5000},
+                   /*routes*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<BudgetSvc>(ConcurrentOpts())); });
+    InstallBudgetProbeHandler(box.host, *box.app);
+    LaunchApp(box);
+    BOOST_REQUIRE(box.host->rpc_server() != nullptr);
+
+    // (a) wire 预算恰 ==20ms（客户端整段等待取 5s，确保请求必达服务端入口）：
+    //     接收端 local-min 取 20ms → 扣预留后期限即请求到达时刻 → 拒绝。
+    const auto before_a = Clock::now();
+    auto wire_a = inf::rpc::ToWireEnvelope(MakeEnv("budget", "probe", "t7c-eq", 11), 20);
+    BOOST_REQUIRE(wire_a);
+    auto r_a = SendRawWire(*box.egress_slot, box.endpoint, wire_a.value(), milliseconds{5000});
+    if (!r_a)
+        BOOST_TEST_MESSAGE("t7c-eq transport error code=" << static_cast<int>(r_a.error().code));
+    BOOST_REQUIRE(r_a);
+    BOOST_CHECK(r_a.value().status == 200);
+    auto reply_a = inf::rpc::ParseRpcWireHttpResponse(r_a.value());
+    BOOST_REQUIRE(reply_a);
+    BOOST_CHECK(!reply_a.value().success);
+    BOOST_CHECK(static_cast<int>(reply_a.value().error.code) == static_cast<int>(fw::ErrorCode::TimedOut));
+    BOOST_CHECK(g_inbound_entries.load() == 1); // 已抵真实入站入口（拒绝在预留门）
+    BOOST_CHECK(g_inbound_error_code.load() == static_cast<int>(fw::ErrorCode::TimedOut));
+    BOOST_CHECK(g_budget_calls.load() == 0); // 业务 handler 未执行
+    // 接收端 local-min 确实采用 wire 预算（20ms 量级），不是服务端 30s 本地期限。
+    const auto pre_a = std::chrono::nanoseconds{g_inbound_pre_deadline_ns.load()};
+    const auto pre_a_after = pre_a - std::chrono::duration_cast<std::chrono::nanoseconds>(before_a.time_since_epoch());
+    BOOST_CHECK(pre_a_after > milliseconds{0});
+    BOOST_CHECK(pre_a_after < milliseconds{500});
+
+    // (b) wire 预算 45ms（= 20ms 预留 + 25ms），无受控耗尽：取期限与检查点之间只剩
+    //     入站 prologue（纯 CPU）→ handler 执行，且恰扣一次 20ms。
+    auto wire_b = inf::rpc::ToWireEnvelope(MakeEnv("budget", "probe", "t7c-above-ok", 12), 45);
+    BOOST_REQUIRE(wire_b);
+    auto r_b = SendRawWire(*box.egress_slot, box.endpoint, wire_b.value(), milliseconds{5000});
+    BOOST_REQUIRE(r_b);
+    BOOST_CHECK(r_b.value().status == 200);
+    auto reply_b = inf::rpc::ParseRpcWireHttpResponse(r_b.value());
+    BOOST_REQUIRE(reply_b);
+    BOOST_CHECK(reply_b.value().success);
+    auto rep_b = fw::CoRpcReq(reply_b.value().payload).Parse<std::int32_t>();
+    BOOST_REQUIRE(rep_b);
+    BOOST_CHECK(rep_b.value() == 12);
+    BOOST_CHECK(g_inbound_entries.load() == 2);
+    BOOST_CHECK(g_budget_calls.load() == 1);
+    const auto pre_b = std::chrono::nanoseconds{g_inbound_pre_deadline_ns.load()};
+    const auto post_b = std::chrono::nanoseconds{g_budget_deadline_ns.load()};
+    BOOST_CHECK(pre_b - post_b == milliseconds{20});
+    BOOST_TEST_MESSAGE("t7c-above-ok handler headroom="
+                       << (post_b - std::chrono::nanoseconds{g_inbound_entry_ns.load()}).count() << "ns");
+
+    // (c) 同一 45ms 预算 + 受控耗尽（入站 handler 等到接收端 local-min 期限确实过去
+    //     再交付 framework）：同一名义预算下结果相反——判定用的是剩余时间。
+    g_inbound_hold_until_deadline.store(true);
+    auto wire_c = inf::rpc::ToWireEnvelope(MakeEnv("budget", "probe", "t7c-above-rejected", 13), 45);
+    BOOST_REQUIRE(wire_c);
+    auto r_c = SendRawWire(*box.egress_slot, box.endpoint, wire_c.value(), milliseconds{5000});
+    g_inbound_hold_until_deadline.store(false);
+    BOOST_REQUIRE(r_c);
+    BOOST_CHECK(r_c.value().status == 200);
+    auto reply_c = inf::rpc::ParseRpcWireHttpResponse(r_c.value());
+    BOOST_REQUIRE(reply_c);
+    BOOST_CHECK(!reply_c.value().success);
+    BOOST_CHECK(static_cast<int>(reply_c.value().error.code) == static_cast<int>(fw::ErrorCode::TimedOut));
+    BOOST_CHECK(g_inbound_entries.load() == 3);
+    BOOST_CHECK(g_budget_calls.load() == 1); // 仍未执行
 
     box.app->request_shutdown();
     JoinRun(box.run);
