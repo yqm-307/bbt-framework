@@ -256,10 +256,16 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
                     }
                     return result<RpcEnvelope>::err(*rep);
                 }
+                // 回复五个关联字段全部从这里回填（含 request_schema）：
+                // infra HandleRpcRequest 对 handler 回复做五字段校验，缺
+                // request_schema 会被判 changed association fields。回填
+                // 属关联事实搬运，与 response_schema 同源（method 表项已
+                // 在步骤 3 与请求 request_schema 对齐）。
                 RpcEnvelope reply;
-                reply.service         = request.service;
-                reply.method          = request.method;
-                reply.request_id      = request.request_id;
+                reply.service = request.service;
+                reply.method = request.method;
+                reply.request_id = request.request_id;
+                reply.request_schema = method->request_schema;
                 reply.response_schema = method->response_schema;
                 reply.payload.assign(replay.payload.begin(), replay.payload.end());
                 return result<RpcEnvelope>::ok(std::move(reply));
@@ -386,12 +392,18 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         reply_payload = std::move(r.value());
     }
 
+    // 回复五个关联字段（含 request_schema）全由本组件回填，与
+    // response_schema 同源（method 表项已在步骤 3 与请求 request_schema
+    // 对齐）。infra HandleRpcRequest 对 handler 回复做五字段校验：缺
+    // request_schema 的入站回复被判 changed association fields，因此回填
+    // 必须发生在源头（此处），任何消费 InboundDispatcher 的路径都满足关联。
     RpcEnvelope reply;
-    reply.service         = request.service;
-    reply.method          = request.method;
-    reply.request_id      = request.request_id;
+    reply.service = request.service;
+    reply.method = request.method;
+    reply.request_id = request.request_id;
+    reply.request_schema = method->request_schema;
     reply.response_schema = method->response_schema;
-    reply.payload         = std::move(reply_payload);
+    reply.payload = std::move(reply_payload);
     return result<RpcEnvelope>::ok(std::move(reply));
 }
 

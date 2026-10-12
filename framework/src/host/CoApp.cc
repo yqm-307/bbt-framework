@@ -1,5 +1,7 @@
 #include <bbt/framework/CoApp.hpp>
 
+#include <boost/scope/scope_exit.hpp>
+
 #include <exception>
 
 #include <bbt/coroutine/object/CoObject.hpp>
@@ -12,6 +14,7 @@
 #include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/framework/internal/ResourceClose.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
+#include <bbt/framework/RpcPolicy.hpp>
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
 #include <bbt/framework/internal/RpcWireBridge.hpp>
 #endif
@@ -42,9 +45,9 @@ result<void> FailInvalid(std::string what) {
 
 CoApp::CoApp(CoAppOptions options)
     : m_options(std::move(options)) {
-    // 默认装配：真实 HTTP 宿主 + envelope↔HTTP 线桥 + 默认出站。
-    // InstallHandler 只存 handler（Start 在 run 内），此处安装是安全的；
-    // handler 闭包持有 this，只在 run 存活期内被调用。
+    // 默认装配：真实网络宿主 + 入站线桥 + 默认出站。InstallHandler/
+    // InstallRpcHandler 只存 handler（Start 在 run 内），此处安装是安全的；
+    // handler 闭包自持状态、不按裸指针捕获宿主（见 InfraHttpHost 文件头寿命边界）。
     m_default_host = std::make_shared<InfraHttpHost>(
         m_options.network_limits, m_options.listen);
     m_network_host = m_default_host;
@@ -114,7 +117,18 @@ int CoApp::run() {
     HostLifecycle lifecycle(m_network_host,
                             m_options.shutdown_step_budget,
                             &m_shutdown_req);
-    m_lifecycle.store(&lifecycle, std::memory_order_release);
+    // guard 在发布前构造、在 lifecycle 前析构；正常退出或异常回卷都撤销发布。
+    // 同一把锁保证在途读者完成访问后才清空，后续读者不再访问局部对象。
+    auto revoke_publish = boost::scope::make_scope_exit([this]() noexcept {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        m_lifecycle = nullptr;
+    });
+    {
+        // 发布局部对象地址（全函数唯一写入点）：读取者在 m_lifecycle_mtx 内
+        // 取指针并完成成员访问，清空由上面的 guard 在同一把锁内完成。
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        m_lifecycle = &lifecycle;
+    }
 
     HostLifecycle::Hooks hooks;
     // 启动：runtime 初始化之后、网络 Create 之前先创建/启动资源，再
@@ -145,14 +159,16 @@ int CoApp::run() {
                                 std::make_move_iterator(f.end()));
     }
     m_parked_state.store(lifecycle.State(), std::memory_order_release);
-    m_lifecycle.store(nullptr, std::memory_order_release);
+    // 撤销发布统一由 revoke_publish 在退出时完成（正常 return 与异常回卷同一
+    // 规则；析构次序保证 guard 先于局部 lifecycle 运行），此处不再单独清空。
     return rc;
 }
 
 void CoApp::request_shutdown() noexcept {
     m_shutdown_req.store(true, std::memory_order_release);
-    if (auto* lc = m_lifecycle.load(std::memory_order_acquire))
-        lc->RequestShutdown();
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    if (m_lifecycle != nullptr)
+        m_lifecycle->RequestShutdown();
     else {
         // run 尚未开始：对外表达「已进入关闭意图」；已结束则保持 Closed。
         auto expected = ShutdownState::Running;
@@ -162,21 +178,25 @@ void CoApp::request_shutdown() noexcept {
 }
 
 ShutdownState CoApp::shutdown_state() const noexcept {
-    if (auto* lc = m_lifecycle.load(std::memory_order_acquire))
-        return lc->State();
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    if (m_lifecycle != nullptr)
+        return m_lifecycle->State();
     return m_parked_state.load(std::memory_order_acquire);
 }
 
 std::vector<std::string> CoApp::pending_cleanup() const {
-    if (auto* lc = m_lifecycle.load(std::memory_order_acquire))
-        return lc->IncompleteSteps();
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    if (m_lifecycle != nullptr)
+        return m_lifecycle->IncompleteSteps();
     return {};
 }
 
 std::vector<std::string> CoApp::lifecycle_failures() const {
-    if (auto* lc = m_lifecycle.load(std::memory_order_acquire))
-        return lc->Failures();
-    std::lock_guard<std::mutex> lk(m_mtx);
+    // 嵌套次序固定为 m_lifecycle_mtx → m_mtx（无反向获取），不构成死锁环。
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    if (m_lifecycle != nullptr)
+        return m_lifecycle->Failures();
+    std::lock_guard<std::mutex> lk_early(m_mtx);
     return m_early_failures;
 }
 
@@ -452,13 +472,39 @@ ICoService::RpcSendFn CoApp::_MakeEgress() {
         auto addr = find_route(env.service);
         if (!addr)
             return result<bbt::infra::RpcEnvelope>::err(addr.error());
+
+        // R8（3-5）：公开出站策略在路由授权之后、发送之前调用一次。策略只见
+        // 只读事实（已解析目标 + 不可改写 envelope + 已适配绝对期限），只能
+        // Allow/Reject 或收紧期限；无策略（nullptr）时逐字保持今天的行为。
+        bbt::infra::CallOptions opt = options;
+        if (m_options.rpc_policy) {
+            RpcPolicyDecision decision;
+            auto d = m_options.rpc_policy->Preflight(RpcCallView{addr.value(), env, opt.deadline});
+            if (!d)
+                return result<bbt::infra::RpcEnvelope>::err(d.error());
+            decision = d.value();
+
+            if (decision.kind == RpcPolicyDecision::Kind::Reject)
+                return result<bbt::infra::RpcEnvelope>::err(decision.reject_error);
+
+            // 只收紧：框架取 min(原期限, 收紧值)，绝不放大的策略结果。
+            if (decision.tightened_deadline.has_value() && *decision.tightened_deadline < opt.deadline)
+                opt.deadline = *decision.tightened_deadline;
+
+            // 收紧到已过期（或不晚于 now）→ 发起任何 I/O 之前按 TimedOut 拒绝，
+            // 与 AdaptCallOptions 的过期门同语义。
+            if (opt.deadline <= std::chrono::steady_clock::now())
+                return result<bbt::infra::RpcEnvelope>::err(
+                    MakeError(ErrorCode::TimedOut, "rpc policy tightened deadline already expired"));
+        }
+
         if (m_default_egress)
-            return m_default_egress->Send(addr.value(), env, options);
+            return m_default_egress->Send(addr.value(), env, opt);
         if (!m_seam_send)
             return result<bbt::infra::RpcEnvelope>::err(MakeError(
                 ErrorCode::RuntimeUnavailable,
                 "CoApp: rpc_send egress not configured"));
-        return m_seam_send(addr.value(), env, options);
+        return m_seam_send(addr.value(), env, opt);
     };
 }
 

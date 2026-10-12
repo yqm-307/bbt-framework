@@ -2,12 +2,14 @@
 // service-actor/v3：位置参数 RPC 公共面。
 //
 // CoRpcReq/CoRpcResp 只拥有 payload 与错误结果；线格式不暴露给业务。
-// 默认位置参数 codec 对应逻辑 field 1..N；ProtoCodec<T> 是未来
-// protobuf Message/MessageLite 的独立适配 seam，不引入 protobuf 头。
+// 通用位置参数 codec（字节规则/schema/错误码）的唯一实现下沉到
+// bbt::infra::rpc（bbt/infra/rpc/RpcPayload.hpp）；本头 rpc_detail 只保留
+// 兼容薄层转发，不复制第二套字节规则。ProtoCodec<T> 继承 infra 默认
+// trait seam，既有 `bbt::framework::rpc_detail::ProtoCodec<X>` 特化继续
+// 有效，仍不引入 protobuf 头。
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,240 +19,47 @@
 #include <vector>
 
 #include <bbt/framework/Result.hpp>
+#include <bbt/infra/rpc/RpcPayload.hpp>
 
 namespace bbt::framework {
 
 namespace rpc_detail {
 
-enum class WireType : std::uint8_t {
-    Bool = 1, Int = 2, Uint = 3, Float = 4, String = 5, Bytes = 6,
-};
+// 通用位置参数 codec 的唯一实现在 bbt::infra::rpc::*；下面只做名字转发，
+// 保持旧 rpc_detail 调用点（本仓 MethodTable/ICoService 及未来消费方）不变，
+// 不引入第二套字节规则。result/Error 与 infra 同一类型（framework/Result.hpp
+// 即 infra 的别名），转发不产生类型转换。
 
-template <class T>
-struct ProtoCodec {
-    static constexpr bool kDefined = false;
-};
+using bbt::infra::rpc::WireType;
 
-template <class T>
-inline constexpr bool is_proto_codec_v = ProtoCodec<T>::kDefined;
+template <class T> using Decay = bbt::infra::rpc::Decay<T>;
 
-template <class T>
-using Decay = std::decay_t<T>;
+template <class T> inline constexpr bool is_bytes_v = bbt::infra::rpc::is_bytes_v<T>;
 
-template <class T>
-inline constexpr bool is_bytes_v =
-    std::is_same_v<Decay<T>, std::vector<std::uint8_t>>;
+template <class T> inline constexpr WireType wire_type_v = bbt::infra::rpc::wire_type_v<T>;
 
-template <class T>
-inline constexpr WireType wire_type_v = [] {
-    using D = Decay<T>;
-    if constexpr (std::is_same_v<D, bool>) return WireType::Bool;
-    else if constexpr (std::is_integral_v<D> && std::is_signed_v<D>)
-        return WireType::Int;
-    else if constexpr (std::is_integral_v<D> && std::is_unsigned_v<D>)
-        return WireType::Uint;
-    else if constexpr (std::is_floating_point_v<D>) return WireType::Float;
-    else if constexpr (std::is_same_v<D, std::string>) return WireType::String;
-    else if constexpr (is_bytes_v<D>) return WireType::Bytes;
-    else return WireType::String;
-}();
+template <class T> inline constexpr bool scalar_supported_v = bbt::infra::rpc::scalar_supported_v<T>;
 
-template <class T>
-inline constexpr bool scalar_supported_v =
-    std::is_same_v<Decay<T>, bool> ||
-    (std::is_integral_v<Decay<T>> && !std::is_same_v<Decay<T>, bool>) ||
-    std::is_floating_point_v<Decay<T>> ||
-    std::is_same_v<Decay<T>, std::string> || is_bytes_v<T>;
+using bbt::infra::rpc::PutU32;
+using bbt::infra::rpc::TakeU32;
+using bbt::infra::rpc::EncodeOne;
+using bbt::infra::rpc::DecodeOne;
+using bbt::infra::rpc::DecodeAt;
+using bbt::infra::rpc::DecodeTuple;
+using bbt::infra::rpc::EncodeTuple;
 
-inline void PutU32(std::vector<std::uint8_t>& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i)
-        out.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
-}
+// protobuf codec 兼容 trait seam：继承 infra 默认 seam，令既有显式特化
+// `template<> struct bbt::framework::rpc_detail::ProtoCodec<X> { ... }` 继续
+// 生效——用户特化仍是 framework 层的自由度，infra 不认识业务 proto 类型，
+// 也不新增第二 registry。
+template <class T> struct ProtoCodec : bbt::infra::rpc::ProtoCodec<T> {};
 
-inline bool TakeU32(const std::vector<std::uint8_t>& in, std::size_t& pos,
-                   std::uint32_t& v) {
-    if (pos > in.size() || in.size() - pos < 4) return false;
-    v = static_cast<std::uint32_t>(in[pos]) |
-        (static_cast<std::uint32_t>(in[pos + 1]) << 8) |
-        (static_cast<std::uint32_t>(in[pos + 2]) << 16) |
-        (static_cast<std::uint32_t>(in[pos + 3]) << 24);
-    pos += 4;
-    return true;
-}
-
-inline Error Bad(const char* what) {
-    return MakeError(ErrorCode::ProtocolError,
-                     std::string("rpc payload: ") + what);
-}
-
-template <class T>
-result<std::vector<std::uint8_t>> EncodeOne(const T& value) {
-    using D = Decay<T>;
-    static_assert(scalar_supported_v<D>,
-                  "CoRpc positional argument has no scalar codec");
-    std::vector<std::uint8_t> out;
-    constexpr auto wt = wire_type_v<D>;
-    if constexpr (wt == WireType::Bool) {
-        out.push_back(value ? 1 : 0);
-    } else if constexpr (wt == WireType::Int || wt == WireType::Uint) {
-        const std::uint64_t u = static_cast<std::uint64_t>(value);
-        for (std::size_t i = 0; i < sizeof(D); ++i)
-            out.push_back(static_cast<std::uint8_t>(u >> (8 * i)));
-    } else if constexpr (wt == WireType::Float) {
-        if constexpr (sizeof(D) == 4) {
-            std::uint32_t u = 0;
-            std::memcpy(&u, &value, sizeof(u));
-            for (int i = 0; i < 4; ++i)
-                out.push_back(static_cast<std::uint8_t>(u >> (8 * i)));
-        } else {
-            std::uint64_t u = 0;
-            std::memcpy(&u, &value, sizeof(u));
-            for (int i = 0; i < 8; ++i)
-                out.push_back(static_cast<std::uint8_t>(u >> (8 * i)));
-        }
-    } else if constexpr (wt == WireType::String) {
-        out.insert(out.end(), value.begin(), value.end());
-    } else {
-        out.insert(out.end(), value.begin(), value.end());
-    }
-    return result<std::vector<std::uint8_t>>::ok(std::move(out));
-}
-
-template <class T>
-result<T> DecodeOne(std::uint8_t type, const std::uint8_t* data,
-                   std::size_t len) {
-    using D = Decay<T>;
-    static_assert(scalar_supported_v<D>,
-                  "CoRpc positional argument has no scalar codec");
-    if (type != static_cast<std::uint8_t>(wire_type_v<D>))
-        return result<T>::err(MakeError(ErrorCode::TypeMismatch,
-                                        "rpc payload argument type mismatch"));
-    if constexpr (std::is_same_v<D, bool>) {
-        if (len != 1 || data[0] > 1)
-            return result<T>::err(Bad("invalid bool"));
-        return result<T>::ok(data[0] != 0);
-    } else if constexpr (std::is_integral_v<D> && !std::is_same_v<D, bool>) {
-        if (len != sizeof(D)) return result<T>::err(Bad("invalid integer length"));
-        std::uint64_t u = 0;
-        for (std::size_t i = 0; i < len; ++i)
-            u |= static_cast<std::uint64_t>(data[i]) << (8 * i);
-        if constexpr (std::is_signed_v<D>) {
-            if (len < 8 && (u & (std::uint64_t{1} << (len * 8 - 1))))
-                u |= ~std::uint64_t{0} << (len * 8);
-            return result<T>::ok(static_cast<D>(static_cast<std::int64_t>(u)));
-        } else {
-            return result<T>::ok(static_cast<D>(u));
-        }
-    } else if constexpr (std::is_floating_point_v<D>) {
-        if (len != sizeof(D)) return result<T>::err(Bad("invalid float length"));
-        D out{};
-        if constexpr (sizeof(D) == 4) {
-            std::uint32_t u = 0;
-            for (int i = 0; i < 4; ++i) u |= static_cast<std::uint32_t>(data[i]) << (8 * i);
-            std::memcpy(&out, &u, sizeof(out));
-        } else {
-            std::uint64_t u = 0;
-            for (int i = 0; i < 8; ++i) u |= static_cast<std::uint64_t>(data[i]) << (8 * i);
-            std::memcpy(&out, &u, sizeof(out));
-        }
-        return result<T>::ok(out);
-    } else if constexpr (std::is_same_v<D, std::string>) {
-        return result<T>::ok(std::string(reinterpret_cast<const char*>(data), len));
-    } else {
-        return result<T>::ok(std::vector<std::uint8_t>(data, data + len));
-    }
-}
-
-template <class T>
-result<T> DecodeAt(const std::vector<std::uint8_t>& in, std::size_t wanted) {
-    std::size_t pos = 0;
-    std::uint32_t count = 0;
-    if (!TakeU32(in, pos, count))
-        return result<T>::err(Bad("header truncated"));
-    if (wanted >= count)
-        return result<T>::err(MakeError(
-            ErrorCode::InvalidArgument, "rpc payload argument index out of range"));
-
-    std::optional<T> value;
-    for (std::size_t index = 0; index < count; ++index) {
-        if (pos >= in.size())
-            return result<T>::err(Bad("missing argument"));
-        const std::uint8_t type = in[pos++];
-        std::uint32_t len = 0;
-        if (!TakeU32(in, pos, len) || len > in.size() - pos)
-            return result<T>::err(Bad("truncated argument"));
-        if (index == wanted) {
-            auto decoded = DecodeOne<T>(type, in.data() + pos, len);
-            if (!decoded)
-                return result<T>::err(std::move(decoded.error()));
-            value = std::move(decoded.value());
-        }
-        pos += len;
-    }
-    if (pos != in.size())
-        return result<T>::err(Bad("trailing garbage"));
-    if (!value.has_value())
-        return result<T>::err(Bad("missing argument"));
-    return result<T>::ok(std::move(*value));
-}
-
-template <class... Ts, std::size_t... I>
-result<std::tuple<Ts...>> DecodeTuple(const std::vector<std::uint8_t>& in,
-                                      std::index_sequence<I...>) {
-    std::size_t pos = 0;
-    std::uint32_t count = 0;
-    if (!TakeU32(in, pos, count))
-        return result<std::tuple<Ts...>>::err(Bad("header truncated"));
-    if (count != sizeof...(Ts))
-        return result<std::tuple<Ts...>>::err(MakeError(
-            ErrorCode::InvalidArgument, "rpc payload argument count mismatch"));
-    std::tuple<Ts...> out;
-    result<void> status = result<void>::ok();
-    auto one = [&](auto index) {
-        constexpr std::size_t N = decltype(index)::value;
-        using T = std::tuple_element_t<N, std::tuple<Ts...>>;
-        if (!status) return;
-        if (pos >= in.size()) { status = result<void>::err(Bad("missing argument")); return; }
-        const std::uint8_t type = in[pos++];
-        std::uint32_t len = 0;
-        if (!TakeU32(in, pos, len) || len > in.size() - pos) {
-            status = result<void>::err(Bad("truncated argument"));
-            return;
-        }
-        auto v = DecodeOne<T>(type, in.data() + pos, len);
-        pos += len;
-        if (!v) { status = result<void>::err(std::move(v.error())); return; }
-        std::get<N>(out) = std::move(v.value());
-    };
-    (one(std::integral_constant<std::size_t, I>{}), ...);
-    if (!status) return result<std::tuple<Ts...>>::err(std::move(status.error()));
-    if (pos != in.size()) return result<std::tuple<Ts...>>::err(Bad("trailing garbage"));
-    return result<std::tuple<Ts...>>::ok(std::move(out));
-}
-
-template <class Tuple, std::size_t... I>
-result<std::vector<std::uint8_t>> EncodeTuple(const Tuple& values,
-                                              std::index_sequence<I...>) {
-    std::vector<std::uint8_t> out;
-    PutU32(out, sizeof...(I));
-    result<void> status = result<void>::ok();
-    auto one = [&](auto index) {
-        constexpr std::size_t N = decltype(index)::value;
-        if (!status) return;
-        auto encoded = EncodeOne(std::get<N>(values));
-        if (!encoded) { status = result<void>::err(std::move(encoded.error())); return; }
-        out.push_back(static_cast<std::uint8_t>(wire_type_v<std::tuple_element_t<N, Tuple>>));
-        PutU32(out, static_cast<std::uint32_t>(encoded.value().size()));
-        out.insert(out.end(), encoded.value().begin(), encoded.value().end());
-    };
-    (one(std::integral_constant<std::size_t, I>{}), ...);
-    if (!status) return result<std::vector<std::uint8_t>>::err(std::move(status.error()));
-    return result<std::vector<std::uint8_t>>::ok(std::move(out));
-}
+template <class T> inline constexpr bool is_proto_codec_v = ProtoCodec<T>::kDefined;
 
 } // namespace rpc_detail
 
-inline constexpr std::string_view kCoRpcPositionalSchema = "bbt.rpc.positional/v1";
+// schema 常量从 infra 唯一来源映射，避免出现第二个字面量副本。
+inline constexpr std::string_view kCoRpcPositionalSchema = bbt::infra::rpc::kRpcPositionalSchema;
 
 class CoRpcReq {
 public:

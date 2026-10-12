@@ -24,6 +24,38 @@
 //  T7 actor_serial_remote_wait        同一 actor 在远端等待期间不重入
 //      _no_reenter                    （mailbox 持执行资格），不同 actor
 //                                    并发推进；邮箱容量上限 → Overloaded。
+//  T8 inbound_deadline_reply          入站回包送达预留（kReplyDeliveryReserve=
+//      _reserve_exact                 20ms）的精确扣减：已知绝对
+//                                     incoming.deadline 经真实 Dispatcher →
+//                                     方法表 → RequestScope 落到 handler 可见
+//                                     ctx.deadline 恰减一次（绝对相等，不用
+//                                     ±差值）；<=20ms 紧预算在进 handler 前
+//                                     TimedOut 且目标 handler 计数不增。
+//                                     驱动经 DispatchInboundForTest（CoApp::
+//                                     dispatch_inbound 的测试转发口）——HTTP
+//                                     loopback 的 incoming.deadline 由 infra
+//                                     在 accept 时刻换算，测试侧取不到已知
+//                                     绝对值，故本用例不复用 loopback 路径。
+//  T9 dispatch_direct_timeout_late    DispatchDirect 超预算失败路径的 CoApp
+//      _task_keeps_app_alive          所有权：注册任务停在调用 CoApp 之前，
+//                                     外部超时返回 InternalError；停 run 并
+//                                     放弃调用方强引用后 weak_ptr 证在途任务
+//                                     仍强持有 app；放行后任务真实执行，对已
+//                                     停止的 app 安全返回 RuntimeUnavailable
+//                                     并最终释放对 app 的强引用。
+//  T10 lifecycle_readers_survive_run_teardown
+//                                    CoApp 生命周期对象共享寿命：run 收束期间
+//                                    并发读取关闭状态/待收尾/失败清单与请求关闭
+//                                    不得触到已析构的 HostLifecycle。
+//  T11 callrpc_late_completion_after_timeout
+//                                    CallRpc 超预算返回后任务迟到完成：结果与
+//                                    完成信号在调用者/任务共享的堆状态上，不
+//                                    借用调用者栈对象。
+//  T12 lifecycle_publish_revoked_on_run_exception
+//                                    run 发布 m_lifecycle 后异常退出（宿主
+//                                    WaitHandlersDone 抛出，越过 Run）也必须
+//                                    撤销发布：读口不得触到已析构的 run 局部
+//                                    HostLifecycle。
 //
 // 线桥用框架默认 RpcHttpBridge（internal/）：x-bbt-* header ↔ envelope，
 // 业务负载使用 CoRpcReq/CoRpcResp 位置参数 codec。静态路由的 endpoint 值
@@ -33,6 +65,7 @@
 // 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
+#include <boost/scope/scope_exit.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -83,10 +116,13 @@ class TestLatch {
 public:
     explicit TestLatch(int n) : m_count(n) {}
     void CountDown() {
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            if (--m_count > 0) return;
-        }
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (--m_count > 0)
+            return;
+        // 锁内通知：等待者只能在通知返回、锁被释放后才可能因计数归零返回，
+        // 于是「等待者返回后析构 latch」不可能仍与通知并发（通知在锁内的
+        // 最后一次 CV 使用先于任何返回者退出）。超时返回仍由调用方按值持有
+        // 的堆状态保活 latch（见 CallState），不靠本排序兜底。
         m_cv.notify_all();
     }
     bool WaitFor(std::chrono::milliseconds ms) {
@@ -141,6 +177,30 @@ private:
     std::mutex                            m_mtx;
     bool                                  m_open = false;
     std::vector<co::sync::CoWaiter::SPtr> m_waiters;
+};
+
+// ── 预派发门（仅 T9 超时寿命用例使用）──
+// 让经 DispatchDirect 注册的派发任务在调用 CoApp 之前停住：Park() 先发布
+// 「已停在调用前」信号，再协作挂起（有界期限）到 Open()——不永久占用
+// worker、不阻塞操作系统线程。全部状态经 shared_ptr 共享在堆上，不捕获
+// 栈对象，也不接触裸 app。
+struct PreDispatchGate {
+    bool Park(co::Deadline deadline = Clock::now() + kWait)
+    {
+        arrived.CountDown();
+        return m_gate.Wait(deadline) == co::WaitStatus::Completed;
+    }
+    bool Arrived(std::chrono::milliseconds ms)
+    {
+        return arrived.WaitFor(ms);
+    }
+    void Open()
+    {
+        m_gate.Open();
+    }
+
+    TestLatch arrived{1};
+    CoGate m_gate;
 };
 
 // ── CoRpc 位置参数测试辅助 ──
@@ -204,6 +264,8 @@ struct ProbeState {
     co::Deadline                     last_egress_deadline{};
     std::atomic<int>                 egress_calls{0};
     std::atomic<int>                 expired_sends_before{-1};
+    // 目标 handler 真实进入次数（T8 用：拒绝路径必须不增）。
+    std::atomic<int> inspect_calls{0};
 
     std::shared_ptr<CoGate> GateFor(const std::string& rid) {
         std::lock_guard<std::mutex> lk(mtx);
@@ -302,6 +364,7 @@ public:
         if (!p)
             return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::InternalError, "no probe"));
+        p->inspect_calls.fetch_add(1, std::memory_order_acq_rel);
         p->Snapshot(p->before, ctx.value()->request_id,
                     SnapCtx(*ctx.value()));
         return fw::CoRpcResp::From(value.value());
@@ -582,8 +645,10 @@ struct AppBox {
     std::shared_ptr<inf::NetworkRuntime>        client_rt;
     std::shared_ptr<inf::HttpClient>            client;
     std::string                                 endpoint;
-    std::unique_ptr<fw::CoApp>                  app;
-    std::unique_ptr<RunHandle>                  run;
+    // CoApp 由夹具与在途派发任务共享强持有：DispatchDirect 超预算返回后
+    // 任务仍可能迟到，app 由任务的 shared_ptr 保活，窗口内不悬垂。
+    std::shared_ptr<fw::CoApp> app;
+    std::unique_ptr<RunHandle> run;
 
     AppBox()                         = default;
     ~AppBox() { Stop(); }
@@ -707,23 +772,98 @@ fw::result<inf::RpcEnvelope> SendRpc(
     return Wire::EnvelopeFromResponse(res.value());
 }
 
-// 控制线程发起一次 RPC 并限时等待结果（失败返回 err(InternalError)）。
-fw::result<inf::RpcEnvelope> CallRpc(
-    const AppBox& box, const inf::RpcEnvelope& env,
-    std::chrono::milliseconds budget = kWait) {
+// 一次 RPC 调用/派发的共享完成状态：结果与完成信号按值放在堆上，由调用方
+// 与在途协程共同强持有。调用方超预算返回（或放弃自己的引用）后，迟到任务
+// 仍写入同一块状态并通知同一个 latch——不存在指向调用者栈对象的引用，
+// latch 的寿命也与任务同生共死（配合 TestLatch 锁内通知，成功等待路径同样
+// 不与通知交叠）。
+struct CallState {
     std::optional<fw::result<inf::RpcEnvelope>> out;
     TestLatch done{1};
+};
+
+// 控制线程发起一次 RPC 并限时等待结果（失败返回 err(InternalError)）。
+//  - budget：请求自身的发送期限（与生产出站路径同形）；
+//  - state：调用方持有的完成状态（可选；给出后可在超预算返回后观察迟到结果）；
+//  - wait_budget：调用者等待上限，默认与 budget 相同。两者分开才能真实构造
+//    「调用者已超时返回、任务仍在途」的寿命窗口。
+// client/endpoint/请求/期限全部按值捕获，结果写在共享堆状态上：等待超限或
+// 注册失败都只返回错误，不会让在途任务引用调用者栈对象。
+fw::result<inf::RpcEnvelope> CallRpc(const AppBox& box, const inf::RpcEnvelope& env,
+                                     std::chrono::milliseconds budget = kWait,
+                                     std::shared_ptr<CallState> state = nullptr,
+                                     std::optional<std::chrono::milliseconds> wait_budget = std::nullopt)
+{
+    if (!state)
+        state = std::make_shared<CallState>();
+    const auto wait = wait_budget.value_or(budget);
+    auto client = box.client;
+    auto endpoint = box.endpoint;
+    auto request = env;
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(SendRpc(box.client, box.endpoint, env, budget));
-            done.CountDown();
+        [state, client, endpoint, request, budget] {
+            state->out.emplace(SendRpc(client, endpoint, request, budget));
+            state->done.CountDown();
         },
         succ);
-    if (!succ || !done.WaitFor(budget))
+    // 注册失败必须显式失败：不静默空过（否则调用方会把它误读成任务结果）。
+    if (!succ)
+        return fw::result<inf::RpcEnvelope>::err(
+            fw::MakeError(fw::ErrorCode::InternalError, "CallRpc registration failed"));
+    if (!state->done.WaitFor(wait))
         return fw::result<inf::RpcEnvelope>::err(fw::MakeError(
             fw::ErrorCode::InternalError, "CallRpc did not complete"));
-    return std::move(*out);
+    return std::move(*state->out);
+}
+
+// 经 DispatchInboundForTest（internal/CoAppSeam.hpp）在受管协程内直接分发：
+// envelope → InboundDispatcher → 方法表 → RequestScope → handler 全链真实，
+// 且 IncomingCallContext 由测试显式给出（可用已知绝对 deadline）。结果与完成
+// 信号按值放进共享的 CallState：派发协程超预算仍在途时不留下指向栈对象的
+// 悬垂引用。
+
+// 可选测试控制块（默认空 → 与生产同形：无前置门、内部自建状态）：
+//  - state：调用方持有的完成状态；超预算返回后仍可观察迟到任务的结果；
+//  - before_dispatch：任务在调用 CoApp 之前的门（仅测试用，默认空）。
+struct DispatchControl {
+    std::shared_ptr<CallState> state;
+    std::function<bool()> before_dispatch;
+};
+
+// app 以共享强持有交给派发任务：DispatchDirect 超预算返回（或调用方放弃
+// 自己的引用）后，在途任务仍使 CoApp 本体存活，故迟到任务对 app 的调用
+// 不会触到已析构对象（dispatcher 已释放则如实 RuntimeUnavailable）。
+fw::result<inf::RpcEnvelope> DispatchDirect(const std::shared_ptr<fw::CoApp>& app,
+                                            const inf::IncomingCallContext& incoming, const inf::RpcEnvelope& env,
+                                            std::chrono::milliseconds budget = kWait, DispatchControl control = {})
+{
+    if (!control.state)
+        control.state = std::make_shared<CallState>();
+    auto state = control.state;
+    auto request = env; // 副本随协程存活
+    auto ctx = incoming;
+    auto hook = std::move(control.before_dispatch);
+    bool succ = false;
+    g_scheduler->RegistCoroutineTask(
+        [state, app, request, ctx, hook] {
+            if (hook && !hook()) {
+                state->out.emplace(fw::result<inf::RpcEnvelope>::err(
+                    fw::MakeError(fw::ErrorCode::InternalError, "DispatchDirect gate did not open")));
+            } else {
+                state->out.emplace(fw::DispatchInboundForTest(*app, ctx, request));
+            }
+            state->done.CountDown();
+        },
+        succ);
+    // 注册失败必须显式失败：不静默空过（否则会与「门未开」路径混为一谈）。
+    if (!succ)
+        return fw::result<inf::RpcEnvelope>::err(
+            fw::MakeError(fw::ErrorCode::InternalError, "DispatchDirect registration failed"));
+    if (!state->done.WaitFor(budget))
+        return fw::result<inf::RpcEnvelope>::err(
+            fw::MakeError(fw::ErrorCode::InternalError, "DispatchDirect did not complete"));
+    return std::move(*state->out);
 }
 
 inf::RpcEnvelope MakeEnv(std::string service, std::string method,
@@ -1221,6 +1361,336 @@ BOOST_AUTO_TEST_CASE(actor_serial_remote_wait_no_reenter) {
 
     StopApp(box);
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+}
+
+// T8：入站回包送达预留（20ms）的 framework 局部精确扣减。
+//
+// 只覆盖 framework 内这段语义：IncomingCallContext.deadline 经真实
+// InboundDispatcher / 方法表 / RequestScope 落到 handler 可见的
+// ctx.deadline 时恰好减去 kReplyDeliveryReserve(20ms) 一次；预算不足以
+// 覆盖该预留（<=20ms）的请求在进入 handler 之前一律 TimedOut，目标
+// handler 计数不增。不涉及跨层（infra local-min → framework）顺序声明。
+//
+// 断言口径：对已知绝对 incoming.deadline 做「减 20ms 后精确相等」——
+// 不用 send_at ± 容差窗口（易 flaky），也不用「B 与 B+20 相差 20ms」
+// 的相对差（该差值对「完全未扣」与「重复扣两次」同样成立，无法识别）。
+BOOST_AUTO_TEST_CASE(inbound_deadline_reply_reserve_exact)
+{
+    using std::chrono::milliseconds;
+    g_probe = std::make_shared<ProbeState>(0);
+    auto box =
+        StartApp(milliseconds{30000}, milliseconds{2000},
+                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+
+    // (a) 充裕预算：handler 真实进入，ctx.deadline == 输入绝对值 - 20ms（恰一次）。
+    const auto budget_a = Clock::now() + milliseconds{5000};
+    inf::IncomingCallContext in_a;
+    in_a.deadline = budget_a;
+    const int calls_a = g_probe->inspect_calls.load();
+    auto r_a = DispatchDirect(box.app, in_a, MakeEnv("probe", "inspect", "t8-a", 11));
+    BOOST_REQUIRE(r_a);
+    BOOST_CHECK(r_a.value().request_id == "t8-a");
+    // I2 回源头：直接经 DispatchInboundForTest→InboundDispatcher 的回复必须
+    // 五字段关联自洽——入站 request_schema 也由 dispatcher 回填，不依赖入站
+    // 桥回显（缺它 infra HandleRpcRequest 会判 changed association fields）。
+    BOOST_CHECK(r_a.value().service == "probe");
+    BOOST_CHECK(r_a.value().method == "inspect");
+    BOOST_CHECK(r_a.value().request_schema == std::string(fw::kCoRpcPositionalSchema));
+    BOOST_CHECK(r_a.value().response_schema == std::string(fw::kCoRpcPositionalSchema));
+    auto rep_a = DecodeReply(r_a);
+    BOOST_REQUIRE(rep_a);
+    BOOST_CHECK(rep_a.value() == 11);
+    BOOST_CHECK(g_probe->inspect_calls.load() == calls_a + 1);
+
+    const auto snap_a = g_probe->At(g_probe->before, "t8-a");
+    BOOST_CHECK(snap_a.request_id == "t8-a"); // 确为本请求的 handler 内快照
+    BOOST_CHECK(snap_a.co_id != 0);
+    BOOST_CHECK(snap_a.deadline == budget_a - milliseconds{20});
+
+    // (b) 紧预算 10ms（< 20ms 预留）：扣除预留后 handler 可见期限已过期，
+    //     在进 handler 之前 TimedOut；handler 计数不增、无上下文快照。
+    inf::IncomingCallContext in_b;
+    in_b.deadline = Clock::now() + milliseconds{10};
+    const int calls_b = g_probe->inspect_calls.load();
+    auto r_b = DispatchDirect(box.app, in_b, MakeEnv("probe", "inspect", "t8-b", 12));
+    BOOST_REQUIRE(!r_b);
+    BOOST_CHECK(r_b.error().code == fw::ErrorCode::TimedOut);
+    BOOST_CHECK(g_probe->inspect_calls.load() == calls_b);
+    const auto snap_b = g_probe->At(g_probe->before, "t8-b");
+    BOOST_CHECK(snap_b.co_id == 0);
+    BOOST_CHECK(snap_b.request_id.empty());
+
+    StopApp(box);
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+}
+
+// T9：DispatchDirect 超预算失败路径的 CoApp 所有权（免 UAF）。
+//
+// 注册到进程寿命 scheduler 的派发任务不属于宿主 drain（InfraHttpHost 的
+// m_inflight 只记 HTTP handler），故 helper 必须自己在超预算返回后仍保活
+// CoApp。本用例把这条失败路径真实走一遍：
+//   (a) 预派发门令任务停在调用 CoApp 之前；外部紧预算等待超时 →
+//       InternalError（任务仍在途，未被等待掩盖）；
+//   (b) 停 run（on_release 释放 dispatcher）后放弃调用方强引用，weak_ptr
+//       证明在途任务仍强持有 app；
+//   (c) 放行门：任务真实执行，对已停止的 app 安全返回 RuntimeUnavailable、
+//       不进 handler，且在结束时释放对 app 的强引用（weak 过期）。
+BOOST_AUTO_TEST_CASE(dispatch_direct_timeout_late_task_keeps_app_alive)
+{
+    using std::chrono::milliseconds;
+    auto probe = std::make_shared<ProbeState>(0);
+    g_probe = probe;
+
+    // 门与早退放行器先于 box 声明：断言早退时也由后析构的 Releaser 在 app
+    // 完全停止后放行任务，迟到任务落到空 dispatcher 上，路径仍安全。
+    auto gate = std::make_shared<PreDispatchGate>();
+    struct Releaser {
+        std::shared_ptr<PreDispatchGate> g;
+        ~Releaser()
+        {
+            if (g)
+                g->Open();
+        }
+    } releaser{gate};
+
+    auto box =
+        StartApp(milliseconds{30000}, milliseconds{2000},
+                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+    std::weak_ptr<fw::CoApp> app_weak = box.app;
+
+    DispatchControl control;
+    control.state = std::make_shared<CallState>();
+    control.before_dispatch = [gate] {
+        return gate->Park();
+    };
+
+    inf::IncomingCallContext in;
+    in.deadline = Clock::now() + milliseconds{5000};
+
+    // 门到期而非显式放行：失败必须在调用 CoApp 前终止。
+    auto expired_gate = std::make_shared<PreDispatchGate>();
+    DispatchControl expired_control;
+    const auto expired_at = Clock::now();
+    expired_control.before_dispatch = [expired_gate, expired_at] {
+        return expired_gate->Park(expired_at);
+    };
+    auto rejected = DispatchDirect(box.app, in, MakeEnv("probe", "inspect", "t9-expired", 5), kWait, expired_control);
+    BOOST_REQUIRE(!rejected);
+    BOOST_CHECK(rejected.error().code == fw::ErrorCode::InternalError);
+    // 任务确已到门：本路径的失败来自「门未开」，不是注册失败空过
+    // （注册失败时不会有任务执行，arrived 永远不会被置位）。
+    BOOST_REQUIRE(expired_gate->Arrived(kWait));
+    BOOST_CHECK(probe->inspect_calls.load() == 0);
+
+    // (a) 任务停在门处、预算内不完结 → 外部超时返回 InternalError。
+    auto r = DispatchDirect(box.app, in, MakeEnv("probe", "inspect", "t9-a", 5), milliseconds{300}, control);
+    BOOST_REQUIRE(!r);
+    BOOST_CHECK(r.error().code == fw::ErrorCode::InternalError);
+    BOOST_REQUIRE(gate->Arrived(kWait)); // 确已停在调用 CoApp 之前
+    BOOST_CHECK(!app_weak.expired());    // 在途任务已强持有 app
+
+    // (b) 停止 run（收束路径释放 dispatcher）；放弃调用方与全局探针的引用。
+    StopApp(box);
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    box.app.reset();
+    g_probe.reset();
+    BOOST_REQUIRE(!app_weak.expired()); // 仍由在途任务强持有
+
+    // (c) 放行：任务真实执行到已停止的 app → RuntimeUnavailable，不进 handler。
+    gate->Open();
+    // 结果读写经 mutex/CV 完成信号同步；weak_ptr 只观测对象寿命。
+    BOOST_REQUIRE(control.state->done.WaitFor(kWait));
+    const auto until = Clock::now() + kWait;
+    while (!app_weak.expired()) {
+        BOOST_REQUIRE(Clock::now() < until);
+        std::this_thread::yield();
+    }
+    BOOST_REQUIRE(control.state->out.has_value());
+    BOOST_REQUIRE(!control.state->out.value());
+    BOOST_CHECK(control.state->out.value().error().code == fw::ErrorCode::RuntimeUnavailable);
+    BOOST_CHECK(probe->inspect_calls.load() == 0); // 未进入目标 handler
+}
+
+// T10：CoApp 生命周期对象的共享寿命（run 收束期间并发读取）。
+//
+// m_lifecycle 发布的是 run 局部 HostLifecycle 的地址：run 收束时清空指针并
+// 析构局部对象。若读取者取到指针后与「清空 + 析构」并发，就会进入已析构对象
+// （CondVar destroy vs broadcast：TSan 在 T9 报告过同一对操作）。本用例让
+// 读线程在收束全程持续走完四个读取入口（状态/待收尾/失败清单/请求关闭），
+// 断言收束正常完成、run 结束后各读口仍安全。修复前该窗口是真实 UAF。
+BOOST_AUTO_TEST_CASE(lifecycle_readers_survive_run_teardown)
+{
+    g_probe = std::make_shared<ProbeState>(0);
+    auto box =
+        StartApp(std::chrono::milliseconds{30000}, std::chrono::milliseconds{2000},
+                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0};
+    TestLatch reader_ran{1};
+    std::thread reader([&] {
+        bool first = true;
+        while (!stop.load(std::memory_order_acquire)) {
+            // 四个读取入口全部走一遍：它们都经 m_lifecycle 取用 run 的局部
+            // 生命周期对象，收束窗口内不得触到已析构对象。
+            (void)box.app->shutdown_state();
+            (void)box.app->pending_cleanup();
+            (void)box.app->lifecycle_failures();
+            box.app->request_shutdown();
+            if (first) {
+                reader_ran.CountDown();
+                first = false;
+            }
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    // 受控屏障：读线程至少完整走完一轮四个入口，收束才被启动。
+    BOOST_REQUIRE(reader_ran.WaitFor(kWait));
+
+    StopApp(box); // 与读线程并发：请求关闭 → join run（清空发布指针并析构
+                  // 局部生命周期对象），读线程仍在窗口内活动。
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(reads.load(std::memory_order_relaxed) > 0);
+
+    stop.store(true, std::memory_order_release);
+    reader.join();
+
+    // run 结束后各读口仍安全：报停驻状态，不再触碰已析构的生命周期对象。
+    BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
+    BOOST_CHECK(box.app->pending_cleanup().empty());
+    BOOST_CHECK(box.app->lifecycle_failures().empty());
+}
+
+// T11：CallRpc 超预算返回后任务迟到完成（无栈借用）。
+//
+// 构造：请求的发送期限（5s）远长于调用者等待上限（150ms），handler 停在
+// per-rid 门上（ctx 预算 30s）。调用者必然先超限返回（任务不可能在门放行前
+// 完成），随后放行 handler：迟到任务在 CallRpc 返回之后把结果写进共享堆状态
+// 并通知 latch——修复前该写入落在调用者已析构的栈 optional/latch 上。
+BOOST_AUTO_TEST_CASE(callrpc_late_completion_after_timeout)
+{
+    using std::chrono::milliseconds;
+    g_probe = std::make_shared<ProbeState>(1);
+    auto box =
+        StartApp(milliseconds{30000}, milliseconds{2000},
+                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+
+    auto state = std::make_shared<CallState>();
+    auto r = CallRpc(box, MakeEnv("probe", "wait_echo", "t11-late", 21),
+                     /*budget*/ milliseconds{5000}, state,
+                     /*wait_budget*/ milliseconds{150});
+    BOOST_REQUIRE(!r);
+    BOOST_CHECK(r.error().code == fw::ErrorCode::InternalError);
+    // 请求已真实进 handler 并停在门上：任务确在途（不是尚未被调度）。
+    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));
+    BOOST_CHECK(!box.run->done.load());
+
+    // 放行 handler：迟到任务完成并写入共享状态。
+    g_probe->CompleteAll();
+    BOOST_REQUIRE(state->done.WaitFor(kWait));
+    BOOST_REQUIRE(state->out.has_value());
+    BOOST_REQUIRE(state->out.value());
+    BOOST_CHECK(state->out.value().value().request_id == "t11-late");
+    auto rep = DecodeReply(state->out.value());
+    BOOST_REQUIRE(rep);
+    BOOST_CHECK(rep.value() == 21);
+
+    // 迟到任务收束后应用仍正常服务（未因栈借用/悬垂写入受损）。
+    auto again = CallRpc(box, MakeEnv("probe", "inspect", "t11-after", 3));
+    BOOST_REQUIRE(again);
+    auto rep2 = DecodeReply(again);
+    BOOST_REQUIRE(rep2);
+    BOOST_CHECK(rep2.value() == 3);
+
+    StopApp(box);
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+}
+
+// T12：run 的异常退出（发布点之后、清空点之前抛出）也必须撤销发布。
+//
+// 窗口：run() 发布 m_lifecycle 后，其后的任何抛出（Hooks 构造、lifecycle.Run、
+// early_failures 分配等 bad_alloc）都会栈回卷析构 run 的局部 HostLifecycle，而
+// 旧代码的 m_lifecycle 仍指向该已析构栈对象。修复 = 发布前装无分配 scope guard，
+// 任何退出（return/throw）都在局部 lifecycle 析构前、于 m_lifecycle_mtx 内清空。
+//
+// 触发经既有测试缝（MakeCoAppForTest 注入 INetworkHost）：桩的 WaitHandlersDone
+// 主动抛出；该点在 HostLifecycle::_ShutDown 未被 try/catch 包裹，异常越过 Run 与
+// run()。注意 HostLifecycle 的三个 Hook（on_scheduler_started/on_handlers_drained/
+// on_release）的异常在 Run 内被 catch 收口为失败项、**不**越过 Run——它们不能覆盖
+// 本窗口，故本用例不以 Hook 冒充覆盖。
+//
+// 关闭请求在 Start() 回调之后才发出：此时 run 已发布 m_lifecycle，request_shutdown
+// 走「指针非空」分支、不写停驻状态，故 m_parked_state 保持初始 Running——这正是
+// 能判别修复的读数（无 guard 的旧码此处进入悬垂对象，shutdown_state() 读到 Closing）。
+class ThrowingDrainHost final : public fw::INetworkHost {
+public:
+    TestLatch started{1};
+    fw::result<void> Create() override
+    {
+        return fw::result<void>::ok();
+    }
+    fw::result<void> Start() override
+    {
+        started.CountDown();
+        return fw::result<void>::ok();
+    }
+    void StopAccepting() noexcept override
+    {
+    }
+    fw::result<void> WaitHandlersDone(co::Deadline) override
+    {
+        throw std::runtime_error("injected WaitHandlersDone throw");
+    }
+    void Close() noexcept override
+    {
+    }
+};
+
+BOOST_AUTO_TEST_CASE(lifecycle_publish_revoked_on_run_exception)
+{
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+
+    fw::CoAppOptions opts{inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
+                                             /*max_header_bytes*/ 8192, /*max_body_bytes*/ 65536,
+                                             /*incoming_timeout*/ std::chrono::milliseconds{30000}},
+                          inf::ListenAddress{"127.0.0.1", 0},
+                          /*static_routes*/ {},
+                          /*shutdown_step_budget*/ std::chrono::milliseconds{2000}};
+    auto host = std::make_shared<ThrowingDrainHost>();
+    auto app = fw::MakeCoAppForTest(opts, fw::CoAppSeam{host, {}});
+    BOOST_REQUIRE(app);
+
+    std::atomic<bool> threw{false};
+    std::thread runner([&] {
+        try {
+            (void)app->run();
+        } catch (const std::runtime_error&) {
+            threw.store(true, std::memory_order_release);
+        }
+    });
+
+    auto finish_runner = boost::scope::make_scope_exit([&]() noexcept {
+        app->request_shutdown();
+        if (runner.joinable()) {
+            runner.join();
+        }
+    });
+
+    // run 已发布 m_lifecycle 并进入服务（Start 回调）后才请求关闭。
+    BOOST_REQUIRE(host->started.WaitFor(kWait));
+    app->request_shutdown();
+    runner.join();
+    BOOST_REQUIRE_MESSAGE(threw.load(std::memory_order_acquire), "host WaitHandlersDone throw must reach out of run()");
+
+    // run 已返回（栈回卷，局部 HostLifecycle 已析构）。修复后 m_lifecycle 已被
+    // guard 清空，读口走「未发布」分支、返回明确的停驻值，绝不解引用已析构对象
+    // （修复前此处进入悬垂对象：shutdown_state() 会读到 Closing，本断言即失败）。
+    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Running);
+    BOOST_CHECK(app->pending_cleanup().empty());
+    BOOST_CHECK(app->lifecycle_failures().empty());
+    app->request_shutdown(); // 指针已空 → 停驻状态 CAS Running→Closing
+    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closing);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -14,6 +14,7 @@
 #include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/ShutdownState.hpp>
 #include <bbt/framework/RpcMethods.hpp>
+#include <bbt/framework/RpcPolicy.hpp>
 #include <bbt/framework/ICoService.hpp>
 #include <bbt/framework/CoRpc.hpp>
 #include <bbt/framework/CoService.hpp>

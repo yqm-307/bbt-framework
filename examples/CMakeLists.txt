@@ -7,6 +7,10 @@ add_subdirectory(getvalue)
 # Redis/Mongo/Compose 依赖。
 add_subdirectory(two_service)
 
+# R8（3-5）：公开出站策略 fixture。与 getvalue/two_service 同一前置；复用
+# getvalue 业务，不引入 internal seam，无额外依赖。
+add_subdirectory(rpc_policy)
+
 # Issue #5（EX-T4）：容量 / 并发上下文 / 关闭生命周期验收 fixture + driver。
 # 与 getvalue/two_service 同一前置（NEED_TEST=ON 且 bbt_infra_rpc 已注册）。
 add_subdirectory(lifecycle_matrix)
