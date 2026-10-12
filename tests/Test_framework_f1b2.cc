@@ -825,10 +825,15 @@ fw::result<inf::RpcEnvelope> CallRpc(const AppBox& box, const inf::RpcEnvelope& 
 
 // 可选测试控制块（默认空 → 与生产同形：无前置门、内部自建状态）：
 //  - state：调用方持有的完成状态；超预算返回后仍可观察迟到任务的结果；
-//  - before_dispatch：任务在调用 CoApp 之前的门（仅测试用，默认空）。
+//  - before_dispatch：任务在调用 CoApp 之前的门（仅测试用，默认空）；
+//  - deadline_at_dispatch：在派发协程内、紧邻 DispatchInboundForTest 之前取
+//    「入站可见绝对期限」（覆盖 incoming.deadline）。近 20ms 边界的接受侧只与
+//    派发 prologue（纯 CPU）竞速，注册/调度耗时不再进入判别式——判别靠同钟
+//    绝对期限等值，不靠 wall-clock 容差。
 struct DispatchControl {
     std::shared_ptr<CallState> state;
     std::function<bool()> before_dispatch;
+    std::function<co::Deadline()> deadline_at_dispatch;
 };
 
 // app 以共享强持有交给派发任务：DispatchDirect 超预算返回（或调用方放弃
@@ -844,9 +849,13 @@ fw::result<inf::RpcEnvelope> DispatchDirect(const std::shared_ptr<fw::CoApp>& ap
     auto request = env; // 副本随协程存活
     auto ctx = incoming;
     auto hook = std::move(control.before_dispatch);
+    auto deadline_hook = std::move(control.deadline_at_dispatch);
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
-        [state, app, request, ctx, hook] {
+        [state, app, request, ctx, hook, deadline_hook]() mutable {
+            // 期限先取（同钟绝对），门其后；两者顺序固定，受控耗尽才落在期限之后。
+            if (deadline_hook)
+                ctx.deadline = deadline_hook();
             if (hook && !hook()) {
                 state->out.emplace(fw::result<inf::RpcEnvelope>::err(
                     fw::MakeError(fw::ErrorCode::InternalError, "DispatchDirect gate did not open")));
@@ -1419,6 +1428,91 @@ BOOST_AUTO_TEST_CASE(inbound_deadline_reply_reserve_exact)
     const auto snap_b = g_probe->At(g_probe->before, "t8-b");
     BOOST_CHECK(snap_b.co_id == 0);
     BOOST_CHECK(snap_b.request_id.empty());
+
+    StopApp(box);
+    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+}
+
+// T8b：20ms 预留的**边界**（internal 确定性 seam，同 T8/T9 的 DispatchDirect 入口）。
+//
+// 代码契约（src/host/InboundDispatcher.cc）：ctx.deadline = incoming.deadline -
+// kReplyDeliveryReserve(20ms)；其后 ctx.deadline <= now() → 进 handler 之前 TimedOut。
+// 判别式因此是「扣除预留后的绝对期限是否已到」，**不是**名义预算大不大于 20ms：
+//  - 恰 ==20ms：扣除后期限即「取期限那一刻」→ 恒拒绝，handler 不执行；
+//  - 名义 +25ms 但派发被推到该期限之后（受控调度）→ 同样拒绝；
+//  - 名义 +25ms 且取期限后仍有余量（剩余只有派发 prologue，纯 CPU）→ 执行，
+//    且期限恰减一次 20ms（同钟精确等值）。
+// 口径：期限在派发协程内、紧邻 DispatchInboundForTest 之前取（deadline_at_dispatch），
+// 注册/调度耗时不再进入判别式；两侧都不使用 wall-clock 容差。本用例不涉及跨层
+// （infra local-min → framework）顺序声明；跨层等值见 f3 T7 与 T7c。
+BOOST_AUTO_TEST_CASE(inbound_deadline_reply_reserve_boundary)
+{
+    using std::chrono::milliseconds;
+    g_probe = std::make_shared<ProbeState>(0);
+    auto box =
+        StartApp(milliseconds{30000}, milliseconds{2000},
+                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+
+    // (a) 恰 ==20ms（边界值本身）：ctx.deadline == 取期限那一刻 → TimedOut，不进 handler。
+    inf::IncomingCallContext in_eq;
+    in_eq.deadline = Clock::now() + milliseconds{20};
+    const int calls_eq = g_probe->inspect_calls.load();
+    auto r_eq = DispatchDirect(box.app, in_eq, MakeEnv("probe", "inspect", "t8b-eq", 11));
+    BOOST_REQUIRE(!r_eq);
+    BOOST_CHECK(r_eq.error().code == fw::ErrorCode::TimedOut);
+    BOOST_CHECK(g_probe->inspect_calls.load() == calls_eq);
+    const auto snap_eq = g_probe->At(g_probe->before, "t8b-eq");
+    BOOST_CHECK(snap_eq.co_id == 0);
+    BOOST_CHECK(snap_eq.request_id.empty());
+
+    // (b) 名义 +25ms（> 20ms 预留），但派发被受控推到「扣除预留后的期限已过」之后：
+    //     仍然拒绝——名义预算大于预留不是进入 handler 的充分条件。
+    auto armed_b = std::make_shared<std::atomic<std::int64_t>>(0);
+    DispatchControl ctl_b;
+    ctl_b.deadline_at_dispatch = [armed_b] {
+        const auto d = Clock::now() + milliseconds{25};
+        armed_b->store(std::chrono::duration_cast<std::chrono::nanoseconds>(d.time_since_epoch()).count(),
+                       std::memory_order_release);
+        return d;
+    };
+    ctl_b.before_dispatch = [armed_b] {
+        // 受控耗尽：等到该期限本身已过（睡过头只会更晚，不影响判定）。
+        const auto seen = co::Deadline{std::chrono::nanoseconds{armed_b->load(std::memory_order_acquire)}};
+        std::this_thread::sleep_until(seen + milliseconds{1});
+        return true;
+    };
+    const int calls_above = g_probe->inspect_calls.load();
+    auto r_above = DispatchDirect(box.app, inf::IncomingCallContext{},
+                                  MakeEnv("probe", "inspect", "t8b-above-rejected", 12), kWait, ctl_b);
+    BOOST_REQUIRE(!r_above);
+    BOOST_CHECK(r_above.error().code == fw::ErrorCode::TimedOut);
+    BOOST_CHECK(g_probe->inspect_calls.load() == calls_above);
+    const auto snap_above = g_probe->At(g_probe->before, "t8b-above-rejected");
+    BOOST_CHECK(snap_above.co_id == 0);
+
+    // (c) 同一名义 +25ms、无受控耗尽：只剩派发 prologue 与它竞速 → handler 执行，
+    //     且期限恰减一次 20ms（同钟精确等值：未扣得 +20ms、双扣得 -20ms，均被排除）。
+    auto armed_c = std::make_shared<std::atomic<std::int64_t>>(0);
+    DispatchControl ctl_c;
+    ctl_c.deadline_at_dispatch = [armed_c] {
+        const auto d = Clock::now() + milliseconds{25};
+        armed_c->store(std::chrono::duration_cast<std::chrono::nanoseconds>(d.time_since_epoch()).count(),
+                       std::memory_order_release);
+        return d;
+    };
+    const int calls_ok = g_probe->inspect_calls.load();
+    auto r_ok = DispatchDirect(box.app, inf::IncomingCallContext{},
+                               MakeEnv("probe", "inspect", "t8b-above-accepted", 13), kWait, ctl_c);
+    if (!r_ok)
+        BOOST_TEST_MESSAGE("t8b-above-accepted error code=" << static_cast<int>(r_ok.error().code)
+                                                            << " msg=" << r_ok.error().message);
+    BOOST_REQUIRE(r_ok);
+    BOOST_CHECK(r_ok.value().request_id == "t8b-above-accepted");
+    BOOST_CHECK(g_probe->inspect_calls.load() == calls_ok + 1);
+    const auto snap_ok = g_probe->At(g_probe->before, "t8b-above-accepted");
+    BOOST_CHECK(snap_ok.request_id == "t8b-above-accepted");
+    BOOST_CHECK(snap_ok.deadline
+                == co::Deadline{std::chrono::nanoseconds{armed_c->load(std::memory_order_acquire)}} - milliseconds{20});
 
     StopApp(box);
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
