@@ -53,12 +53,16 @@ result<bbt::infra::RpcEnvelope> EnvelopeFromResponse(
 // app.dispatch_inbound → ToHttpResponse。测试缝与业务默认路径共用。
 void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 
-// 默认出站：HttpClient 懒建（首个发送时在协程内创建，协程约束与
-// infra 一致）；runtime 不可得 → RuntimeUnavailable。
-// Issue #4：出站协议 profile 与入站一致——LegacyHeaders 走 x-bbt-* header
-// 迁移期桥；ProtoWireV1 走 infra 正式 body 信封（POST /rpc +
-// application/x-protobuf）。两者共享同一 HttpClient 懒建与发送 root，只换
-// 编解码 profile；不做 header/body 混用。
+// 默认出站：client 懒建（首个发送时在协程内创建，协程约束与 infra 一致）；
+// runtime 不可得 → RuntimeUnavailable。
+// Issue #4：出站协议 profile 与入站一致：
+//  - LegacyHeaders 走 x-bbt-* header 迁移期桥（HttpClient；
+//    http_bridge::ToHttpRequest/EnvelopeFromResponse）。
+//  - ProtoWireV1 走 infra 正式 body 信封，**唯一**发送方式 =
+//    NetworkRuntime::CreateRpcClient() + RpcClient::Call(addr, env, opt)：
+//    wire 编解码/本地期限→remaining_budget_ms/五字段关联/结构化错误全部由
+//    infra 承担，framework 不再自组 wire/HTTP。两者各自独立懒建缓存
+//    （RpcClient 内部自持 HttpClient，不再与 Legacy 分支共享同一发送 root）。
 enum class RpcEgressProfile { LegacyHeaders, ProtoWireV1 };
 
 class HttpEgress {
@@ -76,18 +80,18 @@ public:
         const bbt::infra::CallOptions& opt);
 
 private:
-    // ProtoWireV1 分支：本地 deadline → remaining_budget_ms（clamp），
-    // 正式 wire 请求/响应编解码。仅 BBT_FRAMEWORK_HAS_RPC_WIRE 时可用。
-    result<bbt::infra::RpcEnvelope> _SendWireProfile(
-        const bbt::infra::RpcAddress& addr,
-        const bbt::infra::RpcEnvelope& env,
-        const bbt::infra::CallOptions& opt,
-        const std::shared_ptr<bbt::infra::HttpClient>& client);
+    // ProtoWireV1 分支：懒建 RpcClient 一次并缓存，调用 infra Call；不在
+    // 调用期间持缓存锁（Call 是协程阻塞调用）。仅
+    // BBT_FRAMEWORK_HAS_RPC_WIRE 时可用。
+    result<bbt::infra::RpcEnvelope> _SendWireProfile(const bbt::infra::RpcAddress& addr,
+                                                     const bbt::infra::RpcEnvelope& env,
+                                                     const bbt::infra::CallOptions& opt);
 
-    std::weak_ptr<InfraHttpHost>            m_host;
-    RpcEgressProfile                        m_profile;
-    std::mutex                              m_mtx;
-    std::shared_ptr<bbt::infra::HttpClient> m_client;
+    std::weak_ptr<InfraHttpHost> m_host;
+    RpcEgressProfile m_profile;
+    std::mutex m_mtx;
+    std::shared_ptr<bbt::infra::HttpClient> m_client;    // LegacyHeaders
+    std::shared_ptr<bbt::infra::RpcClient> m_rpc_client; // ProtoWireV1
 };
 
 } // namespace bbt::framework

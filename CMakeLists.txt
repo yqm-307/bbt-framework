@@ -82,6 +82,7 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     ExecutionPolicy.hpp
     ShutdownState.hpp
     RpcMethods.hpp
+    RpcPolicy.hpp
     ICoService.hpp
     CoService.hpp
     CoRpc.hpp

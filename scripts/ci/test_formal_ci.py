@@ -717,11 +717,18 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
 
     def test_example_exec_bits_and_actual_build_directory_preserved(self):
         block = next(b for b in _extract_run_blocks(self.text) if 'rpc_candidates=' in b)
-        for needle in ('rpc_xlang_server', 'Test_framework_*',
-                       'getvalue/getvalue_server', 'getvalue/getvalue_caller',
-                       'two_service/two_service', 'lifecycle_matrix/lifecycle_fixture',
-                       'BBT_BUILD_DIR=$actual_build_dir', 'chmod +x "$bin"',
-                       'if [ ! -f "$bin" ]; then'):
+        for needle in (
+            "rpc_xlang_server",
+            "Test_framework_*",
+            "getvalue/getvalue_server",
+            "getvalue/getvalue_caller",
+            "two_service/two_service",
+            "lifecycle_matrix/lifecycle_fixture",
+            "rpc_policy/rpc_policy",
+            "BBT_BUILD_DIR=$actual_build_dir",
+            'chmod +x "$bin"',
+            'if [ ! -f "$bin" ]; then',
+        ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, block)
 

@@ -277,7 +277,7 @@ jobs:
           chmod +x "$BBT_BUILD_DIR/tests/rpc_xlang_server"
           # examples 的 Python 驱动器会 spawn 下列产物；artifact 往返丢 +x 后必须与 tests/
           # 同口径恢复执行位，缺任一产物即失败，不静默跳过。
-          for exe in getvalue/getvalue_server getvalue/getvalue_caller two_service/two_service lifecycle_matrix/lifecycle_fixture; do
+          for exe in getvalue/getvalue_server getvalue/getvalue_caller two_service/two_service lifecycle_matrix/lifecycle_fixture rpc_policy/rpc_policy; do
             bin="$BBT_BUILD_DIR/examples/$exe"
             if [ ! -f "$bin" ]; then
               echo "FATAL: artifact 缺少 $bin" >&2

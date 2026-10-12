@@ -56,6 +56,7 @@ class InboundDispatcher;
 class InfraHttpHost;
 class OrderedIngress;
 class INetworkHost;
+class RpcPolicy;
 struct CoAppOptions;
 struct CoAppSeam;
 
@@ -92,6 +93,10 @@ struct CoAppOptions {
     std::chrono::milliseconds shutdown_step_budget;
     // Issue #4：入站桥选择，默认保留既有 x-bbt-* header 绑定。
     RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
+    // R8（3-5）：公开出站策略，构造期选择；nullptr = 框架默认 no-op（全放行），
+    // 默认行为与今天逐字一致。策略在 CoApp 构造后即冻结（m_options 为 const），
+    // 无运行中替换口。shared_ptr 由 m_options 持有至 CoApp 析构，长于所有在途调用。
+    std::shared_ptr<RpcPolicy> rpc_policy{};
 };
 
 class CoApp {
@@ -404,9 +409,16 @@ private:
 
     std::atomic_bool                m_ran_once{false};
     std::atomic_bool                m_shutdown_req{false};
-    std::atomic<HostLifecycle*>     m_lifecycle{nullptr};
-    std::atomic<ShutdownState>      m_parked_state{ShutdownState::Running};
-    std::vector<std::string>        m_early_failures;   // run 前校验失败原因
+    // run 内局部生命周期对象的地址发布点。发布/读取/清空共用 m_lifecycle_mtx：
+    // 读取者在锁内完成「取指针 + 成员访问」，run 线程在同一把锁内清空指针，
+    // 故清空（以及随后的局部对象析构）必然排在任何读取者退出访问之后——
+    // 裸原子指针只保证指针值可见，不能 pin 住 run 栈上局部对象的寿命，读取者
+    // 可能进入已析构对象（CondVar destroy vs broadcast）。锁不跨阻塞的
+    // lifecycle.Run() 持有，也不与 m_mtx 形成反向嵌套。
+    mutable std::mutex m_lifecycle_mtx;
+    HostLifecycle* m_lifecycle{nullptr};
+    std::atomic<ShutdownState> m_parked_state{ShutdownState::Running};
+    std::vector<std::string> m_early_failures; // run 前校验失败原因
     // 入站分发器：_BindServices 建立、_ReleaseServices 先于
     // 注册表/实例销毁；指针在 m_mtx 下读写。
     std::unique_ptr<InboundDispatcher> m_dispatcher;

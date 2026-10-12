@@ -68,6 +68,16 @@ add_test(NAME Test_framework_f3 COMMAND Test_framework_f3)
 # （单用例实测 ~30s，全套 ~107s），60s 限时必然误杀，按实测×1.5 留裕量。
 set_tests_properties(Test_framework_f3 PROPERTIES TIMEOUT 180)
 
+# F3 关闭门判别回归（C1）：StopAccepting 闭门——「infra 已接纳、尚未进入入站包装」
+# 的迟到进入者被拒且不触达业务、WaitHandlersDone 不漏记、已过门者不被抢占；
+# 另有独立宿主的直接 Close 兼容小断言。T1 走 internal 测试缝（确定性、无 socket），
+# T2 走真实 HTTP loopback，失败路径由 RAII 夹具收尾。
+add_executable(Test_framework_rpc_close_gate Test_framework_rpc_close_gate.cc)
+target_link_libraries(Test_framework_rpc_close_gate PRIVATE bbt::framework)
+target_compile_options(Test_framework_rpc_close_gate PRIVATE -Wall -Wextra)
+add_test(NAME Test_framework_rpc_close_gate COMMAND Test_framework_rpc_close_gate)
+set_tests_properties(Test_framework_rpc_close_gate PROPERTIES TIMEOUT 30)
+
 add_executable(Test_framework_rpc Test_framework_rpc.cc)
 target_link_libraries(Test_framework_rpc PRIVATE bbt::framework)
 target_compile_options(Test_framework_rpc PRIVATE -Wall -Wextra)

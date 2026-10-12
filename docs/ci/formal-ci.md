@@ -7,7 +7,7 @@ framework 分类/结果 reusable callee。影子入口 `.github/workflows/ci-sha
 check 只有本文件一个 producer（**非双跑**）。
 
 > 状态：本次为**本地候选**（未 push / 未建 PR / 未触发 Actions）。真实 Boost 下载、依赖 clone、
-> protobuf debs 下载、C++ 构建与 19 个 CTest 均属 `UNVERIFIED`（见文末「在线未验」）。
+> protobuf debs 下载、C++ 构建与 21 个 CTest 均属 `UNVERIFIED`（见文末「在线未验」）。
 
 ## 1. 文件与操作范围
 
@@ -109,18 +109,21 @@ Boost runtime 与 protobuf 工具链：
 
 ## 4. 测试数（准确值）
 
-`-DNEED_TEST=ON` 且 `bbt_infra_rpc` 注册（锁定 protobuf 前缀）时的默认配置共注册 **19** 个 CTest：
+`-DNEED_TEST=ON` 且 `bbt_infra_rpc` 注册（锁定 protobuf 前缀）时的默认配置共注册 **21** 个 CTest：
 
-`tests/`（15）：`Test_framework_f0`、`Test_framework_f2a`、`Test_framework_f2b1`、`Test_framework_f2b2`、
+`tests/`（16）：`Test_framework_f0`、`Test_framework_f2a`、`Test_framework_f2b1`、`Test_framework_f2b2`、
 `Test_framework_f2b3`、`Test_framework_f1a`、`Test_framework_f1b1`、`Test_framework_f1b2`、`Test_framework_f3`、
-`Test_framework_rpc`、`Test_framework_resource`、`framework.rpc_xlang`、`framework.egress.phase`、
+`Test_framework_rpc_close_gate`、`Test_framework_rpc`、`Test_framework_resource`、`framework.rpc_xlang`、`framework.egress.phase`、
 `framework.getvalue.codec`、`framework.matrix`；
 
-`examples/`（4）：`examples.getvalue.xlang`、`examples.getvalue.s2s`、`examples.two_service`、
-`examples.lifecycle_matrix`。
+`examples/`（5）：`examples.getvalue.xlang`、`examples.getvalue.s2s`、`examples.two_service`、
+`examples.lifecycle_matrix`、`examples.rpc_policy`。
 
 `framework.resource.live.redis` / `.mongo` / `.combined` 在无 `hiredis/mongo` 前缀时**不注册**（因此默认
-19 个用例中**不产生 SKIP**）。dual_service 示例（`svc_a/svc_b/driver`）默认不构建。
+21 个用例中**不产生 SKIP**）。dual_service 示例（`svc_a/svc_b/driver`）默认不构建。
+
+本清单随默认配置同步维护；`Test_framework_rpc_close_gate`（F3 StopAccepting 关闭门回归，CMake TIMEOUT 30）
+由独立的关闭门修复任务注册，不属本文 §1「明确不改 `tests/**`」所述的 CI 升级变更包——该句仍是那次升级的记录。
 
 ## 5. 手动任务保留（原现役 `ci.yml`）
 
@@ -137,7 +140,7 @@ Boost runtime 与 protobuf 工具链：
 
 - callee：`yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7`。
 - dependencies：`deps.lock`（`coroutine sha=7bcda3b078f975ff2978424be7f6ba38e04fb7f6`、
-  `infra sha=162bb5fd1340e8b3c043086e8ed753aa5ec533cb`）。
+  `infra sha=3136d1de5031a2eec55475e770d5ebbadc3c32da`）。
 - Boost：`docker/toolchain.lock` 的 `BOOST_VERSION=1.90.0`、`BOOST_SHA256=5e93d582aff26868d581a52ae78c7d8edf3f3064742c6e77901a1f18a437eea9`（只编 `context`）。
 - protobuf：`docker/toolchain.lock` 的 `PROTOC_VERSION=3.21.12`；debs 与 sha256 来自
   `scripts/prepare_protobuf.sh` 的锁定包集。
@@ -175,7 +178,7 @@ BBT_CI_SHARED_DIR=<framework>/scripts/ci/shared python3 scripts/ci/test_formal_c
 - 本正式 `ci.yml` 在 `pull_request`/`push main`/`workflow_dispatch` 上的真实触发与 required check 映射；
 - `scripts/ci/prepare_boost.sh` 下载 Boost 归档并源码编译 `context`（网络 + 编译）；
 - `scripts/fetch_deps.sh` / `scripts/prepare_protobuf.sh` 的联网 clone 与 debs 下载；
-- `scripts/local_build.sh` 的完整 C++ 构建与 19 个 CTest 的真机通过；
+- `scripts/local_build.sh` 的完整 C++ 构建与 21 个 CTest 的真机通过；
 - build→test 两个**独立** runner 上 `libboost_context` / protoc 绝对路径闭包的真实可用性；
 - callee（`plan` / `result`）在四 job 汇聚下的真实判定与 rerun 复用 producer attempt 的跨 attempt 行为；
 - 两个手动 job 在 `arc-s4-framework` 上的真实运行。
