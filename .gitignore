@@ -73,3 +73,7 @@ Testing/
 
 # CI 临时依赖树（scripts/fetch_deps.sh 默认落到仓库外 ../deps）
 .deps/
+
+# WFER 运行态锁（transient，不入仓）
+.wayfinder/.locks/
+.wayfinder/**/.wfer.lock
