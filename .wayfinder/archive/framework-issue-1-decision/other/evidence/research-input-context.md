@@ -1,6 +1,6 @@
 # 分布式研究接入：输入摘录与来源边界
 
-这是供[研究与新契约对齐工单](../tickets/research-contract-alignment.md)使用的最小持久输入，不是新架构决定、完整五路报告副本或实现证据。原稿不搬迁；这里只保存能陈述本次问题的摘录与版本指纹，不依赖私有会话或本机绝对路径才能理解工单。
+这是供[研究与新契约对齐工单](../../tickets/research-contract-alignment.md)使用的最小持久输入，不是新架构决定、完整五路报告副本或实现证据。原稿不搬迁；这里只保存能陈述本次问题的摘录与版本指纹，不依赖私有会话或本机绝对路径才能理解工单。
 
 ## 输入身份
 
@@ -8,7 +8,7 @@
 - framework：`0f7873740450cf4715150cc71b903962ad3debfe`
 - infra：`3e6da6205cd02387a9685f746244a3d75277265d`
 
-本次建图只读核对的 framework HEAD：`45e98668b74acdbacd717e2b864169803ea70de9`。本地 `AGENTS.md` 已有未提交改动，`.wayfinder/` 未跟踪；HEAD 不代表这些候选规范已经发布。未在本次固定或构建当前 infra/coroutine 消费版本，后续由[消费基线工单](../tickets/p0-consumption-matrix.md)负责。
+本次建图只读核对的 framework HEAD：`45e98668b74acdbacd717e2b864169803ea70de9`。本地 `AGENTS.md` 已有未提交改动，`.wayfinder/` 未跟踪；HEAD 不代表这些候选规范已经发布。未在本次固定或构建当前 infra/coroutine 消费版本，后续由[消费基线工单](../../tickets/p0-consumption-matrix.md)负责。
 
 | 原稿文件名 | SHA-256（本次读取内容） | 证据等级 |
 |---|---|---|
@@ -33,9 +33,9 @@
 
 ## 本项目的核对入口
 
-- 规范定位：[AGENTS.md](../../../AGENTS.md)。
-- 本仓设计与测试输入：[架构基调](../../../docs/architecture/distributed-framework-baseline.md)、[验收矩阵](../../../docs/architecture/distributed-framework-validation-matrix.md)、[证据索引](../../../docs/architecture/distributed-framework-evidence.md)。这些文件也含旧基线内容，须结合较新生命周期决定复核。
-- 已确认的较新决定：[归档地图](../../coroutine-tick-lifecycle/MAP.md)、[Stop/等待机制删除](../../coroutine-tick-lifecycle/tickets/remove-scheduler-stop.md)、[资源关闭职责](../../coroutine-tick-lifecycle/tickets/resource-close-boundary.md)。归档 Resolution 明确移除公共 Stop/WaitClosed/旧 token/运行时代际，并确认同步 Close；这里只引用，不重开或推定各消费方已经迁移完成。
+- 规范定位：[AGENTS.md](../../../../../AGENTS.md)。
+- 本仓设计与测试输入：[架构基调](../../../../../docs/architecture/distributed-framework-baseline.md)、[验收矩阵](../../../../../docs/architecture/distributed-framework-validation-matrix.md)、[证据索引](../../../../../docs/architecture/distributed-framework-evidence.md)。这些文件也含旧基线内容，须结合较新生命周期决定复核。
+- 已确认的较新决定：[归档地图](../../../coroutine-tick-lifecycle/MAP.md)、[Stop/等待机制删除](../../../coroutine-tick-lifecycle/tickets/remove-scheduler-stop.md)、[资源关闭职责](../../../coroutine-tick-lifecycle/tickets/resource-close-boundary.md)。归档 Resolution 明确移除公共 Stop/WaitClosed/旧 token/运行时代际，并确认同步 Close；这里只引用，不重开或推定各消费方已经迁移完成。
 
 ## 使用限制
 

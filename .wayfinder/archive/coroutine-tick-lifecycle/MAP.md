@@ -23,10 +23,10 @@ status: archived
 - [契约与历史决策污染清理](tickets/contract-and-docs.md): 三仓按层确定规范真源与影响文件；历史 Issue/PR/报告不改写而标注 superseded；公共破坏性迁移不留兼容壳，按 SHA、self-check、真实集成、diff/check、warning 和独立 review/CI 门禁实施。
 
 ## Not yet specified
-- Connection handler 的物理执行布局（长期协程 vs 按需 handler、worker 绑定、事件预算）已明确划入 Issue #1 实施阶段，按真实连接规模和基准验证；不作为本决策地图的未决项。
+无。
 
 ## Out of scope
-- 本地图已完成决策收口；Issue #1 的执行排程与验收交接见 [`issue-1-delivery-plan.md`](../issue-1-delivery-plan.md)。该计划是实施承接产物，不代表代码已实现。
+- 本地图已完成决策收口；Issue #1 的执行排程与验收交接见 [`issue-1-delivery-plan.md`](other/notes/issue-1-delivery-plan.md)。该计划是实施承接产物，不代表代码已实现。
 - Connection handler 的长期协程/按需 handler、worker 绑定、事件预算和性能阈值：留待实现阶段基准验证，不在本地图冻结。
 - 本阶段不实现新的调度器、Poller、协程 API 或资源关闭协议。
 - 不把资源物理关闭本身视为 Scheduler 生命周期语义；infra 关闭协议形态已由 `remove-scheduler-stop` 与 `resource-close-boundary` 决定。
@@ -39,3 +39,11 @@ status: archived
 - evidence: 7/7 工单均为 `closed / resolved`；地图预览结构校验通过；执行计划为 `.wayfinder/issue-1-delivery-plan.md`。
 - decision boundary: 本地图完成生命周期、Tick、Stop 删除、网络/adapter/资源关闭、测试迁移和契约文档影响面的决策；Connection handler 物理布局不在本图冻结，转入实现阶段基准验证。
 - follow-up: 按 Issue #1 计划先做 P0 基线与跨仓消费矩阵；需要继续本地图时，必须明确重开，不因实施推进自动恢复。
+
+- 2026-10-09 20:25:00 +0800 归档（archive=incomplete）：保留已转执行的未决项，按留缺口归档；历史不删除
+- 2026-10-09 20:36:43 +0800 归档（archive=incomplete）：路径修正后恢复留缺口归档
+## Lifecycle
+- 2026-10-09 20:24:59 +0800 archived → active：临时恢复以整理归档索引（confirmed=true）
+- 2026-10-09 20:25:00 +0800 active → archived：保留已转执行的未决项，按留缺口归档；历史不删除（confirmed=true）
+- 2026-10-09 20:36:29 +0800 archived → active：临时恢复以修正历史稿链接（confirmed=true）
+- 2026-10-09 20:36:43 +0800 active → archived：路径修正后恢复留缺口归档（confirmed=true）
