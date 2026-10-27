@@ -88,6 +88,13 @@ class ClassificationTests(unittest.TestCase):
                         classification.plan_from_inputs(norm)
                     self.assertEqual(cm.exception.code, case["code"])
 
+    def test_cmakelists_is_code_not_doc(self):
+        # CMakeLists.txt 带 .txt 后缀但会改变编译结果；误判 docs-only 会跳过 build/test。
+        for paths in (["CMakeLists.txt"], ["src/CMakeLists.txt"], ["docs/CMakeLists.txt"]):
+            with self.subTest(paths=paths):
+                self.assertEqual(classification.classify_changes(paths), "code")
+        self.assertEqual(classification.classify_changes(["docs/a.md", "NOTES.txt"]), "docs-only")
+
     def test_plan_is_deterministic(self):
         payload = dict(BASE_INPUTS)
         payload.update(self.data["cases"][0]["payload"])

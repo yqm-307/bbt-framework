@@ -29,7 +29,7 @@
 
 输入是**调用方提供的受限变更数据**（仓库相对路径列表），不是任意命令或 YAML：
 
-- 所有路径均为文档类（`docs/` 前缀、`.md/.png/.jpg/.svg/...` 后缀、`LICENSE` 等）→ `docs-only`；
+- 所有路径均为文档类（`docs/` 前缀、`.md/.png/.jpg/.svg/...` 后缀、`LICENSE` 等）→ `docs-only`；`CMakeLists.txt` 虽是 `.txt` 后缀，属构建入口，按代码处理；
 - 存在代码路径 → `code`；
 - 变更集为空，或 `classifier_status != ok`（失败/未知）→ `unknown`，**保守执行全部**；
 - `docs-only` 才允许 `optional`（heavy/perf）跳过；`code`/`unknown` 禁止任何跳过。
