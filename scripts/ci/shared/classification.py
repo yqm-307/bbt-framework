@@ -10,11 +10,15 @@ from contract_errors import ContractError
 DOC_SUFFIXES = (".md", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".txt")
 DOC_PREFIXES = ("docs/",)
 DOC_BASENAMES = {"LICENSE", "NOTICE", "COPYING", "CODEOWNERS", "AUTHORS"}
+# 后缀为文档类、但实际是构建入口的文件：改它会改变编译结果，必须按 code 处理。
+CODE_BASENAMES = {"CMakeLists.txt"}
 
 
 def classify_path(path: str) -> str:
     """单路径分类：doc 或 code。"""
     base = path.rsplit("/", 1)[-1]
+    if base in CODE_BASENAMES:
+        return "code"
     if path.startswith(DOC_PREFIXES):
         return "doc"
     if path.lower().endswith(DOC_SUFFIXES):
