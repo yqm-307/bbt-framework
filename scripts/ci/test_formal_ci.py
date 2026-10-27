@@ -56,7 +56,7 @@ VERIFY_TOOLCHAIN = os.path.join(WORKTREE, "scripts", "verify_toolchain.sh")
 DEPS_LOCK = os.path.join(WORKTREE, "deps.lock")
 TOOLCHAIN_LOCK = os.path.join(WORKTREE, "docker", "toolchain.lock")
 
-CALLEE_SHA = "1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7"
+CALLEE_SHA = "ce247be9d3473432e0da6c204481ad9403c430bb"
 CALLEE = f"yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@{CALLEE_SHA}"
 CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
 UPLOAD_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"

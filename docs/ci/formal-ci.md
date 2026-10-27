@@ -42,7 +42,7 @@ check 只有本文件一个 producer（**非双跑**）。
   `Build (pinned deps)` / `Test (ctest -j1)`），避免 required context 悬空；新增 `分类/计划`
   与 `结果汇聚` 两个 callee 消费 job。
 - **分类/结果**：`plan` 与 `result` job 通过 `uses:` 调用**已发布、fixed-SHA 的 callee**
-  `yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7`；
+  `yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@ce247be9d3473432e0da6c204481ad9403c430bb`；
   `changed_files` 由本仓真实 diff 计算后作为**受限数据**传入，`source`（`github.sha`）与 callee
   automation 身份由 callee 自身 `job.workflow_*` 分离解析（caller-callee 分离）。
 
@@ -138,7 +138,7 @@ Boost runtime 与 protobuf 工具链：
 
 ## 6. 固定输入（fixed SHA / 锁定值）
 
-- callee：`yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7`。
+- callee：`yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@ce247be9d3473432e0da6c204481ad9403c430bb`。
 - dependencies：`deps.lock`（`coroutine sha=7bcda3b078f975ff2978424be7f6ba38e04fb7f6`、
   `infra sha=3136d1de5031a2eec55475e770d5ebbadc3c32da`）。
 - Boost：`docker/toolchain.lock` 的 `BOOST_VERSION=1.90.0`、`BOOST_SHA256=5e93d582aff26868d581a52ae78c7d8edf3f3064742c6e77901a1f18a437eea9`（只编 `context`）。
