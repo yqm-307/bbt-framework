@@ -245,9 +245,10 @@ cmd_build() {
     log "dual-service gate: OFF 默认生效；缺前缀时 ON fail-closed (rc=$rc)"
     rm -rf "$work_dir/ds-gate-negative"
 
-    # ---- provenance（复用已发布 shared artifact 契约，不新增第二 public API）----
-    # 记录 producer/source/run/attempt/job 审计元数据；摘要由 shared 逻辑对真实写入字节计算，
-    # 不接受外部传入摘要。随归档一起传递，接收侧用同一 shared cli.py 复核身份。
+    # ---- provenance（本仓内联实现；不引用已删除的 shared callee 契约）----
+    # 记录 producer/source/run/attempt/job 审计元数据；manifest 按真实写入字节计算
+    # sha256 摘要，envelope 绑定 producer 身份。摘要绝不接受外部传入。
+    # 接收侧复核在 workflow（.github/workflows/ci.yml，归 fw-p3b）接线。
     local meta_dir="$work_dir/artifact-meta"
     local meta_in="$work_dir/.artifact-manifest-input.json"
     python3 - "$meta_in" "$source_repo" "$source_sha" "$automation_repo" \
@@ -276,8 +277,37 @@ with open(out, "w", encoding="utf-8") as handle:
     json.dump(doc, handle, ensure_ascii=False, sort_keys=True)
 PY
     local meta_out="$work_dir/.artifact-produce.out"
-    python3 "$repo_dir/scripts/ci/shared/cli.py" produce \
-        --file "$meta_in" --out-dir "$meta_dir" --github-output "$meta_out" >/dev/null
+    python3 - "$meta_in" "$meta_dir" "$meta_out" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+src, out_dir, emit_path = sys.argv[1:4]
+with open(src, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+os.makedirs(out_dir, exist_ok=True)
+# 唯一规范化字节序列；摘要只针对实际写入的 payload 字节。
+data = json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":")).encode("utf-8")
+with open(os.path.join(out_dir, "manifest.json"), "wb") as handle:
+    handle.write(data)
+digest = "sha256:" + hashlib.sha256(data).hexdigest()
+envelope = {
+    "producer_repo": manifest["source_repo"],
+    "producer_source_sha": manifest["source_sha"],
+    "producer_run_id": manifest["run_id"],
+    "producer_run_attempt": manifest["run_attempt"],
+    "workflow_sha": manifest["automation_sha"],
+    "job": manifest["job"],
+    "artifact_digest": digest,
+    "artifact_path": "manifest.json",
+}
+with open(os.path.join(out_dir, "envelope.json"), "w", encoding="utf-8") as handle:
+    json.dump({"envelope": envelope}, handle, ensure_ascii=False, sort_keys=True)
+with open(emit_path, "w", encoding="utf-8") as handle:
+    handle.write("artifact_digest=" + digest + "\n")
+PY
     local prov_digest
     prov_digest="$(grep '^artifact_digest=' "$meta_out" | head -1 | cut -d= -f2-)"
     rm -f "$meta_in" "$meta_out"
