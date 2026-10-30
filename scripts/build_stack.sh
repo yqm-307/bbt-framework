@@ -105,6 +105,17 @@ _need "$BBT_COROUTINE_SOURCE_DIR/bbt/coroutine/object/interface/ICoObject.hpp" "
 # ---- 2) 目标工程配置/构建 ---------------------------------------------------
 # coroutine/infra 经 add_subdirectory 源码接入；产物链接到 build 树内的真实
 # target，不写 /usr/local。
+# 上游 infra RPC core 已迁到新 http 栈（BBT_INFRA_RPC_NET 闭包，需
+# BBT_INFRA_HTTP_NET + BBT_PROTOBUF_PREFIX，缺一 configure fail-closed）。
+# 调用方经 BBT_CMAKE_ARGS 显式锁定 protobuf 前缀时（如 CI gate），配方补齐
+# 两个 *_NET 开关使 bbt_infra_rpc_net 注册；未锁前缀时不开（本仓该形态下
+# 只有迁移期 header 桥，与「不显式选择 ProtoWireV1」语义一致）。
+if [[ "$BBT_CMAKE_ARGS" =~ (^|[[:space:]])-DBBT_PROTOBUF_PREFIX=([^[:space:]]+) ]]; then
+    protobuf_prefix_arg="${BASH_REMATCH[2]}"
+    if [[ "$protobuf_prefix_arg" != '""' && "$protobuf_prefix_arg" != "''" ]]; then
+        BBT_CMAKE_ARGS="-DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON $BBT_CMAKE_ARGS"
+    fi
+fi
 log "配置: $BBT_PROJECT_DIR -> $BBT_BUILD_DIR (BBT_NEED_TEST=$BBT_NEED_TEST)"
 # shellcheck disable=SC2086
 cmake -S "$BBT_PROJECT_DIR" -B "$BBT_BUILD_DIR" -G Ninja \
