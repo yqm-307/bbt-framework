@@ -1,7 +1,7 @@
 #pragma once
-// co-service-actor/v1 F2-a：Actor 邮箱——单 Actor 的串行执行资格 + 有界等待队列。
+// Actor 邮箱（机器面，internal/）：单 Actor 的串行执行资格 + 有界等待队列。
 //
-// 语义（契约 §F2 保序承诺，第 173-175 行）：
+// 语义（串行执行承诺）：
 //  - 接纳顺序：TryEnqueue 成功的项按接纳先后排队；容量仅计等待中项，
 //    不含执行中项；满则拒绝并返回 Overloaded——不排队等待、不淘汰已接纳项。
 //  - 非重入：同一邮箱同一时刻至多一个 handler 在执行；前一条 handler
@@ -51,8 +51,8 @@ public:
     // 调度器不可用 → err(RuntimeUnavailable) 且不占有队列位。
     result<void> TryEnqueue(Task task);
 
-    // 仅停止接纳：已接纳的等待项仍由 drain 消费完（v1 的停机排空/取消
-    // 属 F3 语义，本切片不丢弃在途项）。
+    // 仅停止接纳：已接纳的等待项仍由 drain 消费完（停机排空/取消语义
+    // 由关闭序列负责，本组件不丢弃在途项）。
     void Close();
     bool IsClosed() const;
 

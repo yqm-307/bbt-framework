@@ -1,6 +1,6 @@
 #pragma once
-// co-service-actor/v1 F2-a：Actor 实例注册表。
-// 落实契约第 167 行实例化规则的服务侧簿记：
+// Actor 实例注册表（机器面，internal/）。
+// 服务侧簿记规则：
 //  - 每个 (service-name, actor-key) 至多一次构造/激活；重复取同一 key
 //    返回同一实例；
 //  - 每个 service 的存活 Actor 数不超过该服务注册的 max_actors，超限
@@ -11,7 +11,7 @@
 //    经 ICoService::_bind_actor_key 绑定 key，使 co_actor_key() 可读回。
 //
 // 线程安全：全部入口走同一把 m_mtx，「查重 → 上限 → 构造 → 登记」在同一
-// 临界区完成，保证至多一次语义无竞态窗口。工厂在锁内被调用——v1 业务类型
+// 临界区完成，保证至多一次语义无竞态窗口。工厂在锁内被调用——业务类型
 // 约定默认可构造且构造期不做 I/O（BindRpc 已 static_assert 同一约束），
 // 不会引入长临界区。
 

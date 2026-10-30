@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""framework #4：G5 RpcEnvelope wire profile 的 Python 客户端（零依赖）。
+"""G5 RpcEnvelope wire profile 的 Python 客户端（零依赖）。
 
 不依赖 google.protobuf：按 proto3 wire format 手写
 proto/bbt/infra/rpc/v1/rpc_envelope.proto 的编解码，直接向 C++

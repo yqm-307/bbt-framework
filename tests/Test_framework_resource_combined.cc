@@ -1,5 +1,5 @@
-// framework #8 F8-T3：真实 HTTP loopback → 框架入站 → 命名资源业务 Service
-// → 真实 Redis + MongoDB 联合消费验收。
+// 联合 live 验收：真实 HTTP loopback → 框架入站 → 命名资源业务 Service
+// → 真实 Redis + MongoDB 联合消费。
 //
 // 与单资源 live 的差别（不得以单资源 live 替代联合验收）：
 //  - 宿主是框架公开构造 CoApp(CoAppOptions) 默认装配的真实 InfraHttpHost +
@@ -10,7 +10,7 @@
 //    internal（线桥编码 + 返回码常量）。业务实现与宿主分属不同编译单元——不靠
 //    「同一 TU 先 include 公共头」的标签声称隔离。
 //
-// 覆盖（F8-T3 最小业务链路）：
+// 覆盖（最小业务链路）：
 //  C1 联合业务：cache miss→Mongo 查询→写 cache；hit（经 Service 侧 Mongo
 //     读数计数可观察，不靠猜测）；更新先落 Mongo 再失效/刷新 Redis；强制
 //     cache miss 后从 Mongo 读回新值（独立证明持久化，非复用已刷新的 cache）；

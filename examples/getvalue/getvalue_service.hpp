@@ -1,5 +1,5 @@
 #pragma once
-// bbt-framework Issue #4（P0-A）：GetValue 示例业务。
+// bbt-framework GetValue 示例业务。
 //
 // 这是应用层最小 typed codec + 服务实现：
 //   - ProtoCodec<GetValueRequest/Response> 特化：只经公开 protobuf

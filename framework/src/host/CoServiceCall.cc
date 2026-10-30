@@ -1,4 +1,4 @@
-// service-actor/v2：ICoService::call 的机器面半身。
+// ICoService::call 的机器面半身。
 //
 // 公共头的 call<Reply> 模板只做编译期 codec 选择与请求编码；本文件
 // 承接类型擦除后的发送路径：受管校验、隐式请求上下文、envelope 组装、

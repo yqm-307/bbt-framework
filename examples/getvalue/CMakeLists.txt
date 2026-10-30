@@ -1,4 +1,4 @@
-# Issue #4（P0-A）：GetValue 业务切片。
+# GetValue 业务切片。
 #
 # - 业务 .proto 是唯一 schema 真源；protoc 生成到构建目录（不进仓库）；
 # - C++ server 经公开 CoApp/CoService + 正式 body wire bridge 装配；
@@ -68,9 +68,9 @@ add_test(
             --proto-root "${GV_PROTO_ROOT}"
             --protoc "${_gv_protoc}"
             --protoc-libdir "${_gv_protoc_libdir}")
-set_tests_properties(examples.getvalue.xlang PROPERTIES TIMEOUT 120)
+set_tests_properties(examples.getvalue.xlang PROPERTIES TIMEOUT 120 LABELS "integration")
 
-# Issue #4（P0-A）：正式 Service→Service 出站 caller 进程。宿主
+# 正式 Service→Service 出站 caller 进程。宿主
 # GetValueCallerService，其 handler 经公开 typed service.call<Req,Resp> 向另一
 # framework CoApp（callee）发起真实 body 出站。与 server 同装配口径。
 add_executable(getvalue_caller getvalue_caller.cc)
@@ -88,4 +88,4 @@ add_test(
             --callee-bin "$<TARGET_FILE:getvalue_server>"
             --caller-bin "$<TARGET_FILE:getvalue_caller>"
             --workdir "${CMAKE_CURRENT_BINARY_DIR}/s2s-work")
-set_tests_properties(examples.getvalue.s2s PROPERTIES TIMEOUT 120)
+set_tests_properties(examples.getvalue.s2s PROPERTIES TIMEOUT 120 LABELS "integration")

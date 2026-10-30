@@ -1,4 +1,4 @@
-// framework F2-b3：OrderedIngress 真实 HTTP loopback 接线验收。
+// OrderedIngress 真实 HTTP loopback 接线验收。
 // 覆盖无票拒绝、grant、成功执行、重复重放、内容冲突与序号缺口；
 // 通过真实 InfraHttpHost + HttpClient，不直接调用 InboundDispatcher。
 #define BOOST_TEST_MAIN

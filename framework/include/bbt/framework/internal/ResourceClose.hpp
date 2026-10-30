@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2 #8：资源关闭（机器面，internal/）。
+// 资源关闭（机器面，internal/）。
 //
 // infra 关闭是同步契约：ICoCloseable::Close() 返回即物理资源已释放、后端
 // 不再访问，无 RequestClose/WaitClosed 等待，也不绑定 coroutine runtime。

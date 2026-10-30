@@ -1,7 +1,7 @@
 #pragma once
-// infra #39：framework.actor 域专属错误语义校验。
+// framework.actor 域专属错误语义校验（机器面，internal/）。
 //
-// 分层约定（协调 infra 决策 0002 修订后文本）：
+// 分层约定（与 infra 侧分工）：
 //  - infra::ValidateErrorDetails 只做通用结构校验：条目/键/值上限、UTF-8
 //    良构、重复键；不登记任何上层域的保留键表。
 //  - 本头承载 framework.actor 域的保留键语义：`expected_sequence` 只允许
@@ -14,7 +14,7 @@
 //    框架回复出站边界（http_bridge::ToHttpResponse）校验；
 //    EnvelopeFromResponse 只做既有 wire 字段
 //    （code/domain/domain_code/message）的信封还原——
-//    Error.details 当前不上 HTTP wire（属 #8 协议范围），还原侧因此也
+//    Error.details 当前不上 HTTP wire，还原侧因此也
 //    不重放域规则。
 //
 // 不引入动态 validator 注册平台或全局回调：规则是编译期固定的静态表驱动。

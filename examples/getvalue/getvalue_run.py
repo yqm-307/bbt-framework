@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bbt-framework Issue #4（P0-A）：GetValue 跨进程验收驱动器。
+"""bbt-framework GetValue 跨进程验收驱动器。
 
 由 ctest 调用：
   getvalue_run.py --server-bin <bin> --client-py <client> --proto <get_value.proto>

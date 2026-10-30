@@ -1,38 +1,37 @@
 #pragma once
-// co-service-actor/v1 F2-b2：有序入口接收侧——授权流校验 + 每流序号状态机
-// + 去重终态缓存（契约 §F2「有序入口与重试」，Issue #2 第 247-259 行）。
+// 有序入口接收侧（机器面，internal/）：授权流校验 + 每流序号状态机
+// + 去重终态缓存。
 //
-// 本切片只做接收侧语义核，不做入站接线：从 RpcEnvelope 顶层字段与 fw.*
-// 系统元数据提取「有序请求事实」是入站适配器的职责，把本组件接进
-// InboundDispatcher 的执行路径属 F2-b3。因此本组件不持有传输类型，
-// 只消费调用方给出的事实，不伪造字段来源。
+// 本组件只做接收侧语义核，不做入站接线：从 RpcEnvelope 顶层字段与 fw.*
+// 系统元数据提取「有序请求事实」是入站适配器（InboundDispatcher）的职责，
+// 因此本组件不持有传输类型，只消费调用方给出的事实，不伪造字段来源。
 //
-// 语义要点（逐条对应契约）：
+// 语义要点：
 //  - 未启用有序入口的目标不构造本组件；一旦请求到达本组件而没带票据
 //    （has_ordered_stamp == false）→ err(RemoteError, OrderedStampRequired)，
-//    不消费序号（契约第 249 行）。
+//    不消费序号。
 //  - 授权流由装配者安装（对应 CoApp::grant_ordered_stream）：只接受匹配
 //    service/actor/producer_epoch/receiver_epoch 且 peer_principal 获授权的
 //    流；loopback 的空 peer_principal 表示匿名本地身份，仍要求请求精确
-//    匹配；任何其他字段校验失败一律拒绝，不自动建流（契约第 247 行）。
+//    匹配；任何其他字段校验失败一律拒绝，不自动建流。
 //  - 序号状态按 (actor-key, producer_id, producer_epoch) 维护，从 1 起、
-//    只在「接纳同步边界」自增，永不回退（契约第 253/257 行）。
+//    只在「接纳同步边界」自增，永不回退。
 //  - 未来序号 → err(SequenceGap) + Error.details[expected_sequence]，
-//    不缓冲缺口、不执行 handler、不消费序号（契约第 253 行）。
+//    不缓冲缺口、不执行 handler、不消费序号。
 //  - 已消耗序号：在途 → InProgress；已完成落缓存 → 直接重放原终态结果，
-//    不重新执行；缓存已淘汰 → ResultExpired，不重新执行（契约第 255 行）。
-//  - 同序号但 request_id 或请求摘要不同 → SequenceConflict（契约第 255 行）。
-//  - 接纳后取消/排队到期/业务失败都消耗序号并保留终态（契约第 257 行）。
+//    不重新执行；缓存已淘汰 → ResultExpired，不重新执行。
+//  - 同序号但 request_id 或请求摘要不同 → SequenceConflict。
+//  - 接纳后取消/排队到期/业务失败都消耗序号并保留终态。
 //  - 六个错误统一 infra ErrorCode::RemoteError、domain="framework.actor"、
-//    domain_code 取 OrderedTypes.hpp 的常量（契约第 213 行）。
+//    domain_code 取 OrderedTypes.hpp 的常量。
 //
 // 实现策略（契约留有的自由度，须显式记录，不作为契约承诺）：
 //  - 同一 producer/epoch/actor-key 安装新的 receiver_epoch 授权时，旧
 //    receiver_epoch 授权被撤销并丢弃其序号状态：旧会话请求此后一律
 //    StreamRejected。契约只要求「旧会话拒绝」，未规定撤销的触发方式；
-//    此处以「同一 producer 流的再次授权」为触发点（契约第 251 行）。
-//  - 结果缓存按条数 + 字节双限、服务级 FIFO 淘汰（契约第 207 行把三项
-//    有序上限并列在 ServiceOptions，与 max_ordered_streams 同为服务级）。
+//    此处以「同一 producer 流的再次授权」为触发点。
+//  - 结果缓存按条数 + 字节双限、服务级 FIFO 淘汰（三项有序上限在
+//    ServiceOptions 并列，与 max_ordered_streams 同为服务级）。
 //    cached_order_ 记录全局完成顺序，跨流按完成先后淘汰，绝不回退某条流的
 //    next_sequence；如果单条终态本身超过字节上限，它无法被保留（立即淘汰），
 //    该序号此后一律 ResultExpired。这是「有限保留」内的实现选择。
@@ -78,7 +77,7 @@ struct OrderedIngressRequest {
 };
 
 // 接收侧上限：三项必须 > 0，与 ServiceOptions 中 ordered_ingress 启用时
-// 的约束一致（契约第 207 行）。三项均为服务级：max_ordered_streams 上限
+// 的约束一致。三项均为服务级：max_ordered_streams 上限
 // 授权流条数；max_cached_results / max_cached_result_bytes 上限本组件
 // （本服务）跨流保留终态的条数 / 总字节。service 非空且为已注册的有序目标服务名。
 struct OrderedIngressConfig {

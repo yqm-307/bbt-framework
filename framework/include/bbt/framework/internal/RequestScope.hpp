@@ -1,5 +1,5 @@
 #pragma once
-// co-service-actor/v1 F1-a：受管请求上下文的登记/取出（契约第 139 行）。
+// 受管请求上下文的登记/取出（机器面，internal/）。
 // this->co_rpc_call 从当前受管请求取得隐式上下文；非受管请求协程调用返回
 // InvalidContext。启动代码要调用远端，必须由宿主显式建立受管请求上下文
 // （构造 RequestScope）。

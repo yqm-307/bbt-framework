@@ -104,7 +104,7 @@ cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-deps/project-build --target getvalue_server getvalue_caller \
   Test_framework_getvalue_codec --parallel 2
 ctest --test-dir build-deps/project-build -j1 --output-on-failure \
-  -R "examples.getvalue.xlang|examples.getvalue.s2s|framework.getvalue.codec"
+  -R "examples.getvalue.xlang|examples.getvalue.s2s|framework.getvalue_codec"
 ```
 
 - `examples.getvalue.xlang`：C++ server + Python 标准库 client 真实跨进程
@@ -113,7 +113,7 @@ ctest --test-dir build-deps/project-build -j1 --output-on-failure \
 - `examples.getvalue.s2s`：`getvalue_server`（callee）+ `getvalue_caller`（caller）
   两个独立 CoApp 进程 + 真实黑障端点的正式出站验收，并含 #5 EX-T3 的四类非法
   静态路由启动拒绝负例（见 §5.1）。
-- `framework.getvalue.codec`：descriptor/字段号/类型、方法表 schema 推导、
+- `framework.getvalue_codec`：descriptor/字段号/类型、方法表 schema 推导、
   golden vectors、handler 分支（Boost.Test 内嵌）。
 
 手跑：`getvalue_server server <port> <meta> <journal>`（读 stdin EOF 后优雅关闭）；
@@ -215,12 +215,12 @@ fail 并回收自有进程）。
   预算回显 clamp；driver 已覆盖发送前过期、非法路由和断连，但**跨 hop 预算不放大、
   排队耗预算的发送端观察**未在专门矩阵中重验。
 - **R5**：客户端断连→unknown 为真实观测；「已提交后丢 reply → 远端
-  OutcomeUnknown」已在本切片产生，证据 = `framework.egress.phase` 的 T3
+  OutcomeUnknown」已在本切片产生，证据 = `framework.egress_request_phase` 的 T3
   （完整写出后丢 reply → OutcomeUnknown、phase=RequestCommitted、对端只连接
   一次）+ `examples.getvalue.s2s` 的 `s2s-blackhole-unknown`（code=14、
   blackhole_accepts=1）。服务端 in-memory 无副作用。
 - **R6/R7/R8 并发/容量/关闭矩阵**：本轮只验证双进程正常退出和固定 infra 修复后的
-  基础关闭路径；既有 `Test_framework_f1b2` 覆盖并发不串扰，非本切片新路径。容量耗尽
+  基础关闭路径；既有 `framework.inbound_http` 覆盖并发不串扰，非本切片新路径。容量耗尽
   Overloaded、超时后 inflight 强持有、ShutdownIncomplete、独立 supervisor 硬停机
   journal 未新增。
 - **V06–V08 排除**（OrderedIngress/ActorSerial/写幂等）；**V10 留 #38**。
@@ -240,4 +240,4 @@ fail 并回收自有进程）。
 | 正式出站 profile | 选 `ProtoWireV1` 时 `HttpEgress` 自动走正式 body 信封（与入站同 profile） |
 | typed 出站调用 | `service.call<Req, Resp>(service_name, method, req, ...)`（schema 由 descriptor 推导） |
 | wire | infra `POST /rpc` + `application/x-protobuf` + `RpcEnvelopeMsg` |
-| 运行/验收 | ctest `examples.getvalue.xlang`、`framework.getvalue.codec` |
+| 运行/验收 | ctest `examples.getvalue.xlang`、`framework.getvalue_codec` |

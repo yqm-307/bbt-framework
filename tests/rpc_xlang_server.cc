@@ -1,6 +1,6 @@
-// framework #4：G5 RpcEnvelope wire profile 的跨语言互通 C++ 服务端。
+// RpcEnvelope wire profile 的跨语言互通 C++ 服务端。
 //
-// 消费 bbt::infra_rpc_net（Issue #8 的正式 wire profile，新 bbt::infra::http
+// 消费 bbt::infra_rpc_net（正式 wire profile，新 bbt::infra::http
 // 栈绑定）+ 旧栈 bbt::infra_http（BBT_INFRA_LEGACY_STACK 保留的 ListenHttp），
 // 提供多场景 RPC 端点供非 C++ 客户端（tests/rpc_xlang_client.py）经
 // 真实 HTTP loopback 调用。argv 分流：

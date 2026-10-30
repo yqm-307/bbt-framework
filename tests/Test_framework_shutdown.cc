@@ -1,4 +1,4 @@
-// co-service-actor/v1 F3 切片验证：资源管理与关闭（F-06 三条）。
+// 资源管理与关闭。
 //
 // 覆盖（全部真实断言、真实 HTTP loopback、无 mock 传输、无 sleep 凑时序）：
 //  T1 request_shutdown_external_thread   外部控制线程 request_shutdown 生效：
@@ -28,7 +28,7 @@
 //                                      等待获得无界期限、未完成项可观察、run
 //                                      不返回、迟到收尾 → kExitShutdownLate。
 //
-// 进程内单例 Scheduler 约束：同一时刻至多一个 CoApp 在 run 内（F1-b1 已冻结
+// 进程内单例 Scheduler 约束：同一时刻至多一个 CoApp 在 run 内（装配用例已冻结
 // 口径），故「在途 handler 出站」的对端不是第二个 CoApp，而是独立
 // NetworkRuntime 上的裸 HTTP echo peer——出站能力本身是证据对象，对端实现
 // 形态无关。测试客户端同样使用独立 runtime。
@@ -92,7 +92,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-// ── 测试屏障原语（与 F1-b1/F1-b2 同形态：std CV，无 sleep 凑时序）──
+// ── 测试屏障原语（std CV，无 sleep 凑时序）──
 
 class TestLatch {
 public:
@@ -213,7 +213,7 @@ fw::CoRpcResp ReplyInt(const fw::result<std::int32_t>& value) {
 }
 
 // 线桥别名：框架默认 bridge（internal/RpcHttpBridge.hpp），测试侧不再
-// 手撸 header 映射（与 F1-b2 同一形态）。
+// 手撸 header 映射（与入站用例同一形态）。
 namespace Wire = fw::http_bridge;
 
 // ── 观测态 ──
@@ -448,7 +448,7 @@ struct RunHandle {
 // 路由 endpoint 逻辑标记 → 对端真实地址的解析槽：NetworkRuntime::Create
 // 依赖已 Start 的调度器，echo peer 只能在 app 起来之后创建，其真实
 // endpoint 无法写进 run 前固定的 static_routes——路由白名单仍由
-// find_route 把关，发送闭包在发送时刻经此槽解析标记（同 F1-b2 的
+// find_route 把关，发送闭包在发送时刻经此槽解析标记（同入站用例的
 // "self" 处理形态）。空标记值发送 → RuntimeUnavailable 如实返回。
 struct EndpointSlot {
     void Set(std::string s) {
@@ -487,7 +487,7 @@ struct AppBox {
 
 // 组装 app 并安装入站 handler，但不启动 run（供「早于 run 的
 // request_shutdown」用例与正常启动路径共用）。routes 为完整静态路由
-// （endpoint 即真实 host:port——F3 的出站对端是已就位的 echo peer）。
+// （endpoint 即真实 host:port——出站对端是已就位的 echo peer）。
 AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
                   std::chrono::milliseconds step_budget,
                   std::vector<fw::StaticRoute> routes,
@@ -508,7 +508,7 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
     auto slot = box.egress_slot;
     auto eps  = box.peer_ep;
     // 测试缝出站：endpoint 逻辑标记 "peer" 在发送时刻经解析槽换成
-    // echo peer 的真实地址（同 F1-b2 的 "self" 处理形态）；路由门
+    // echo peer 的真实地址（同入站用例的 "self" 处理形态）；路由门
     // （服务名白名单）仍完整生效。
     fw::CoAppSeam seam;
     seam.host     = box.host;
@@ -552,7 +552,7 @@ std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
     // Start 前生效（runtime 进程寿命单例，后续调用只复用）。
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
     // 受管 handler 的嵌套出站链（入站派发 → this->call → 出站适配 →
-    // client->Request → 信号等待）在 12KB 默认栈触底（F1-b2 实测）；
+    // client->Request → 信号等待）在 12KB 默认栈触底（入站用例实测）；
     // 本文件同样含嵌套出站，沿用 64KB。
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
     auto h = std::make_unique<RunHandle>();
@@ -995,7 +995,7 @@ BOOST_AUTO_TEST_CASE(request_shutdown_external_thread_clean_rc0) {
     tc.Stop();
 }
 
-// T2：关闭期间在途 handler 仍可完成真实出站（F-06①）。
+// T2：关闭期间在途 handler 仍可完成真实出站。
 BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
     g_probe = std::make_shared<Probe>(1);
     auto box = StartApp(
@@ -1034,7 +1034,7 @@ BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
     g_probe->CompleteGate();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
-    // F-06①：关闭期间在途 handler 被放行后仍完成真实出站（应答码非假装）——
+    // 关闭期间在途 handler 被放行后仍完成真实出站（应答码非假装）——
     // 以 handler 侧 outbound:ok 事件与 peer 命中为证。infra 同步 Close 契约
     // （owner Close 丢弃未发送响应、不做 flush）下，回复不保证送达原客户端，
     // 故不以其为断言对象。
@@ -1068,7 +1068,7 @@ BOOST_AUTO_TEST_CASE(request_shutdown_before_run) {
 }
 
 // T4：预算耗尽 → ShutdownIncomplete → actor 在途 handler 迟到完成真实出站
-//     → 资源强持有证据 → kExitShutdownLate（F-06②③ 主用例）。
+//     → 资源强持有证据 → kExitShutdownLate（迟到收尾主用例）。
 BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     g_probe = std::make_shared<Probe>(1);
     auto box = StartApp(
@@ -1121,7 +1121,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     g_probe->CompleteGate();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     BOOST_REQUIRE(inflight_res.has_value());
-    // F-06②③：actor 在途 handler 迟到完成真实出站，应答码来自 peer，不是
+    // actor 在途 handler 迟到完成真实出站，应答码来自 peer，不是
     // 假装——以 handler 侧 actor_outbound:ok 事件与 peer 命中为证。infra
     // 同步 Close 丢弃未发送响应，回复不保证送达原客户端。
     BOOST_CHECK(g_probe->HasEvent("actor_outbound:ok"));
@@ -1299,7 +1299,7 @@ BOOST_AUTO_TEST_CASE(wait_handlers_budget_exhaustion) {
 
 // T8：CallRpc 超等待上限返回后任务迟到完成（无栈借用，f3 侧同根判别回归）。
 //
-// 构造（与 F1-b2 T11 同形）：请求的发送期限（5s）远长于调用者等待上限
+// 构造（与入站用例的迟到完成用例同形）：请求的发送期限（5s）远长于调用者等待上限
 // （150ms），relay/wait_dial handler 停在 probe 门上（ctx 预算 30s）。调用者
 // 必然先超限返回——任务在门放行前不可能完成——随后放行 handler：迟到任务在
 // CallRpc 已返回之后把结果写进共享堆状态并通知 latch（修复前该写入落在调用者
@@ -1484,7 +1484,7 @@ BOOST_AUTO_TEST_CASE(wire_inbound_bridge_success_five_fields)
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
 }
 
-// ── 多 hop 预算（R4/S4）：同一进程同一 CoApp 的两个方法经 loopback socket 相扣 ──
+// ── 多 hop 预算：同一进程同一 CoApp 的两个方法经 loopback socket 相扣 ──
 //
 // 口径（如实声明）：不是跨机器、不是跨进程、不涉及认证/授权。进程内单例
 // Scheduler 只允许一个 CoApp 处于 run 内（CoApp.cc 的活跃宿主登记），故「两跳」
@@ -1722,7 +1722,7 @@ AppBox PrepareHopApp(std::chrono::milliseconds incoming_timeout, std::chrono::mi
     return box;
 }
 
-// T9：真实两跳的预算不放大（R4/S4「跨 hop」）——A（测试侧真实框架出站）→
+// T9：真实两跳的预算不放大——A（测试侧真实框架出站）→
 // B（本进程 CoApp hop1 入站）→ B 的出站 → B（同一 CoApp hop2 入站）。
 // 断言全部落在同一 steady_clock 的绝对期限上：
 //  - 每跳 local-min 之后 framework 恰扣一次 20ms（同钟精确等值）；
@@ -1912,7 +1912,7 @@ BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_boundary_20ms)
     BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
 }
 
-// ── 本轮 review 修复的定向回归（F1/F2/F3/F4 + WaitStopped 结果处理）──
+// ── 复审修复点的定向回归（入站保序/出站/关闭/WaitStopped 结果处理）──
 
 // T10（F1+F2）：合法的较小 header 限额 + 仅 2 workers（无出站 Engine 槽）的
 // 纯入站 ProtoWireV1 宿主必须 Create/Start 成功并保持既有配置可启动。
@@ -2009,7 +2009,7 @@ BOOST_AUTO_TEST_CASE(wire_engine_start_occupied_port_fails_fast)
     ok_host->Close();
 }
 
-// T12（F3）：ProtoWireV1 出站恢复 runtime 限额 owner 的请求/响应字节校验
+// T12：ProtoWireV1 出站恢复 runtime 限额 owner 的请求/响应字节校验
 // ——超限请求在发送侧被拒，远端 handler 零触达。修复前走默认
 // http::ClientOptions（body=8MiB），超限请求实际进入远端 handler。
 BOOST_AUTO_TEST_CASE(wire_egress_body_limit_rejected_remote_untouched)

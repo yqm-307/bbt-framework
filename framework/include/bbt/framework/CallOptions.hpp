@@ -1,8 +1,8 @@
 #pragma once
-// co-service-actor/v1 F0：OrderedStamp 完整拥有型声明（仅内部 State 不完整）
-// 与 CallOptions。票据由 OrderedSession（F2）签发，ICoService 在调用时读取
-// 票据字段写入 fw.* 系统元数据；F0 不提供票据的创建入口。
-// F2-b1：State 持有 OrderedTicket（序号、request_id、发送绑定内容）。
+// 有序调用票据（OrderedStamp）与调用选项（CallOptions，业务面）。
+// 票据由 OrderedSession 签发，ICoService 在调用时读取票据字段写入
+// fw.* 系统元数据；本面不提供票据的创建入口。
+// OrderedStamp::State 持有 OrderedTicket（序号、request_id、发送绑定内容）。
 
 #include <cstdint>
 #include <memory>
@@ -38,14 +38,14 @@ struct CallOptions {
     std::optional<OrderedStamp>             ordered;
 };
 
-// —— 以下为 F0 内部实现细节；State 是 OrderedStamp 的私有成员类型，
+// —— 以下为内部实现细节；State 是 OrderedStamp 的私有成员类型，
 //    外部代码无法命名或构造，票据字段不可由业务修改。
-//    F2-b1：State 持有 OrderedTicket，sequence、绑定请求内容经
+//    State 持有 OrderedTicket，sequence、绑定请求内容经
 //    OrderedSession/ICoService 友元读写；拷贝 OrderedStamp 共享同一
 //    票据，保证重发语义作用于同一状态。
 struct OrderedStamp::State {
     std::shared_ptr<OrderedTicket> ticket;
-    // F1-b2：签发会话弱指针，co_rpc_call 经它执行 BindForSend
+    // 签发会话弱指针：co_rpc_call 经它执行 BindForSend
     // （首次发送绑定/重放校验/序号水位检查）；会话已销毁的票据
     // 如实失败，不静默直发。
     std::weak_ptr<OrderedSession>  session;

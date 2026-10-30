@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：服务侧上下文与资源缝（业务面，protected 访问）。
+// 服务侧上下文与资源缝（业务面，protected 访问）。
 //
 // ServiceContext 是框架注入到每个服务实例的上下文对象：
 //  - request()：当前受管请求上下文（同一逻辑请求随协程绑定；非受管

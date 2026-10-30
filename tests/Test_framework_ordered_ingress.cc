@@ -1,6 +1,5 @@
-// co-service-actor/v1 F2-b2：有序入口接收侧测试。
-// 覆盖契约 §F2「有序入口与重试」接收侧语义与 F-04 有序入口验收项中
-// 属本切片的部分：乱序缺口、重复/冲突、在途、缓存淘汰、授权流校验、
+// 有序入口接收侧测试。
+// 覆盖「有序入口与重试」接收侧语义：乱序缺口、重复/冲突、在途、缓存淘汰、授权流校验、
 // epoch 切换与旧会话拒绝、无票据拒绝。
 // 用例真实断言；并发用屏障构造同时进入，不用 sleep 凑时序。
 #define BOOST_TEST_MAIN
@@ -133,7 +132,7 @@ void CompleteErr(const fw::OrderedIngress::SPtr& ingress,
     BOOST_REQUIRE_MESSAGE(static_cast<bool>(r), "complete must succeed");
 }
 
-// 契约第 213 行：统一 RemoteError + domain="framework.actor" + 固定
+// 统一 RemoteError + domain="framework.actor" + 固定
 // domain_code。
 void ExpectOrderedError(const fw::Error& e, const char* domain_code) {
     BOOST_CHECK(e.code == fw::ErrorCode::RemoteError);
@@ -195,7 +194,7 @@ BOOST_AUTO_TEST_CASE(create_validates_config) {
 }
 
 // 用例 2：序号从 1 起、逐条递增；不同 Actor/不同 producer 各自独立
-// 计数（契约第 253 行：接收端为该 producer/epoch/Actor 维护下一个
+// 计数（接收端为该 producer/epoch/Actor 维护下一个
 // sequence，不承诺跨 producer 全序）。
 BOOST_AUTO_TEST_CASE(sequence_starts_at_one_per_stream) {
     auto ing = MakeIngress();
@@ -228,7 +227,7 @@ BOOST_AUTO_TEST_CASE(sequence_starts_at_one_per_stream) {
 }
 
 // 用例 3：未来序号 → SequenceGap + expected_sequence，不缓冲缺口、
-// 不执行 handler、不消费序号；按序补齐后可正常接纳（契约第 253 行）。
+// 不执行 handler、不消费序号；按序补齐后可正常接纳（接收端按序接纳语义）。
 BOOST_AUTO_TEST_CASE(future_sequence_returns_gap_with_expected) {
     auto ing = MakeIngress();
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -241,7 +240,7 @@ BOOST_AUTO_TEST_CASE(future_sequence_returns_gap_with_expected) {
     const std::string* expected = DetailValue(gap.error(), "expected_sequence");
     BOOST_REQUIRE(expected != nullptr);
     BOOST_CHECK_EQUAL(*expected, "2");
-    // infra #39：期望序号的域归属/十进制格式由 framework 边界校验负责
+    // 期望序号的域归属/十进制格式由 framework 边界校验负责
     BOOST_CHECK(fw::ValidateErrorAtBoundary(gap.error()));
     // 未消费序号、未登记在途
     BOOST_CHECK_EQUAL(NextSequenceOf(ing, g), 2u);
@@ -252,7 +251,7 @@ BOOST_AUTO_TEST_CASE(future_sequence_returns_gap_with_expected) {
 }
 
 // 用例 4：已接纳序号在途 → InProgress；同序号但 request_id 或请求摘要
-// 不同 → SequenceConflict（契约第 255 行）。
+// 不同 → SequenceConflict（序号冲突语义）。
 BOOST_AUTO_TEST_CASE(in_progress_and_sequence_conflict) {
     auto ing = MakeIngress();
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -278,7 +277,7 @@ BOOST_AUTO_TEST_CASE(in_progress_and_sequence_conflict) {
 }
 
 // 用例 5：已完成重复请求重放原终态结果，不重新执行；成功与失败
-// （业务失败/取消/排队到期）都保留终态（契约第 255/257 行）。
+// （业务失败/取消/排队到期）都保留终态（终态保留语义）。
 BOOST_AUTO_TEST_CASE(completed_duplicate_replays_terminal_state) {
     auto ing = MakeIngress();
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -325,7 +324,7 @@ BOOST_AUTO_TEST_CASE(completed_duplicate_replays_terminal_state) {
 }
 
 // 用例 6：结果缓存条数上限 FIFO 淘汰；淘汰后的旧序号 → ResultExpired，
-// 不重新执行；淘汰不回退序号高水位（契约第 207/255 行）。
+// 不重新执行；淘汰不回退序号高水位（淘汰不回退序号高水位）。
 BOOST_AUTO_TEST_CASE(cache_eviction_by_count_then_expired) {
     auto ing = MakeIngress(8, 2, 4096);
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -391,7 +390,7 @@ BOOST_AUTO_TEST_CASE(oversized_single_result_is_not_retained) {
 
 // 用例 9：服务级缓存上限跨流聚合——max_cached_results 是本组件（本服务）
 // 跨流保留终态的总条数上限，不是每流上限。两条流各缓存若干条后，聚合
-// CachedResultCount 不得超过上限；按全局完成序淘汰最旧条目（契约第 207
+// CachedResultCount 不得超过上限；按全局完成序淘汰最旧条目（缓存条目数上限与
 // 行把三项有序上限并列在 ServiceOptions，与 max_ordered_streams 同为
 // 服务级）。
 BOOST_AUTO_TEST_CASE(cache_limit_is_service_wide_across_streams) {
@@ -425,7 +424,7 @@ BOOST_AUTO_TEST_CASE(cache_limit_is_service_wide_across_streams) {
 }
 
 // 用例 10：授权流校验——未授权/不匹配字段一律 StreamRejected，不自动
-// 建流、不消费序号（契约第 247 行）。
+// 建流、不消费序号（无票据不建流）。
 BOOST_AUTO_TEST_CASE(grant_mismatch_is_stream_rejected) {
     auto ing = MakeIngress();
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1",
@@ -489,7 +488,7 @@ BOOST_AUTO_TEST_CASE(zero_sequence_is_gap) {
 }
 
 // 用例 11：无票据调用启用有序入口的目标 → OrderedStampRequired，
-// 不消费序号、不执行（契约第 249 行）。
+// 不消费序号、不执行（epoch 不匹配不消费序号）。
 BOOST_AUTO_TEST_CASE(ticket_less_call_requires_ordered_stamp) {
     auto ing = MakeIngress();
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -553,7 +552,7 @@ BOOST_AUTO_TEST_CASE(grant_install_idempotent_conflict_and_capacity) {
 
 // 用例 13：epoch 切换——同一 producer 流安装新 receiver_epoch 授权即
 // 撤销旧授权与旧序号状态：旧 epoch 请求一律 StreamRejected，新 epoch
-// 重新从序号 1 开始（契约第 251 行）。
+// 重新从序号 1 开始（新 epoch 从序号 1 开始）。
 BOOST_AUTO_TEST_CASE(old_receiver_epoch_session_rejected) {
     auto ing = MakeIngress();
     const auto g_old = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -577,7 +576,7 @@ BOOST_AUTO_TEST_CASE(old_receiver_epoch_session_rejected) {
 }
 
 // 用例 14：未接纳请求不消耗序号——连续拒绝后，下一个新请求仍按
-// 原期望序号接纳（契约第 257 行）。
+// 原期望序号接纳（旧 epoch 按原期望序号）。
 BOOST_AUTO_TEST_CASE(rejected_admission_does_not_consume_sequence) {
     auto ing = MakeIngress();
     const auto g = MakeGrant("actor.a", "producer.1", "pe1", "re1");
@@ -727,10 +726,10 @@ BOOST_AUTO_TEST_CASE(complete_rejects_foreign_admission) {
     BOOST_CHECK(r2.error().code == fw::ErrorCode::InvalidArgument);
 }
 
-// 用例 17（infra #39 收口）：非法 actor details 的终态错误在 Complete
+// 用例 17：非法 actor details 的终态错误在 Complete
 // 入缓存前被边界校验规范化为安全的 ProtocolError；同一请求重发走
 // Replay（非 HTTP 路径）时观察到的是规范化后的错误，不再携带非法
-// framework.actor/expected_sequence。覆盖审查 t_8380ad3d 的 🟡 阻断：
+// framework.actor/expected_sequence。此前评审发现该路径的规范化缺口：
 // 非法 actor details 不能缓存也不能经 Replay 绕过边界。
 BOOST_AUTO_TEST_CASE(complete_normalizes_invalid_actor_error_before_replay) {
     auto ing = MakeIngress();
@@ -769,7 +768,7 @@ BOOST_AUTO_TEST_CASE(complete_normalizes_invalid_actor_error_before_replay) {
     BOOST_CHECK(fw::ValidateErrorAtBoundary(e));
 }
 
-// 用例 18（infra #39 收口）：跨域写保留键的终态错误同样被规范化；
+// 用例 18：跨域写保留键的终态错误同样被规范化；
 // 合法 actor 错误与合法非 actor 扩展错误经 Complete→Replay 原样保留，
 // 边界校验不误伤合规终态。
 BOOST_AUTO_TEST_CASE(complete_preserves_legal_terminal_errors) {

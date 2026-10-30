@@ -1,8 +1,8 @@
 #pragma once
-// framework #8 F8-T3 业务 Service——只依赖 framework/infra/coroutine **公开头**。
+// 联合 live 验收的业务 Service——只依赖 framework/infra/coroutine **公开头**。
 //
 // 本头与其实现 framework_resource_service.cc 构成独立编译单元，用于提供
-// issue #8 验收「干净消费者 Service 只 include framework/infra 公共头即可按
+// 「干净消费者 Service 只 include framework/infra 公共头即可按
 // 名称使用资源」的真实编译证据：实现 .cc 只 include 公开头 + stdlib，编译产
 // 生的 include 闭包中不得出现 bbt/framework/internal/* 或任何第三方 driver
 // （hiredis/mongocxx/bsoncxx）。测试宿主（真实 HTTP 装配、线桥编码）在

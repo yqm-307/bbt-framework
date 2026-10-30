@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""bbt-framework Issue #5（EX-T2）：单进程双 Service fixture 验收驱动器。
+"""bbt-framework 单进程双 Service fixture 验收驱动器。
 
 由 ctest 调用：
   two_service_run.py --bin <two_service> --results <json>
 
 职责（R1/S1，全部为真实运行结果）：
   1. spawn fixture 子进程（自有进程、动态 loopback 端口、就绪以 port 文件为准）；
-  2. 经 #4 的 Python 标准库 wire codec 真实 HTTP POST /rpc 打 caller 服务，
+  2. 经 getvalue 切片的 Python 标准库 wire codec 真实 HTTP POST /rpc 打 caller 服务，
      覆盖 正常请求 / 业务错误 / 有限 deadline / 未配置路由；
   3. 读 fixture journal：callee handler 只被真正到达的请求进入；关闭记录
      rc=0、state=Closed、owner 同步 Close 且**在最后一条 handler 进入之后**
      （即 handler 排空后同步 Close）；
   4. 收尾：关 stdin 触发 request_shutdown，有限等待；异常路径回收自有进程。
 
-wire 编解码复用 examples/getvalue/getvalue_client.py（#4 唯一手写 proto3
-codec），#5 不另造第二套 schema/codec。
+wire 编解码复用 examples/getvalue/getvalue_client.py（唯一手写 proto3
+codec），不另造第二套 schema/codec。
 
 所有结构化结果标注 auth_state=unauthenticated_loopback：本路径只证明公开
-App/Service 消费面与生命周期，不证明身份可信或授权完成（认证见 #38）。
+App/Service 消费面与生命周期，不证明身份可信或授权完成（认证由后续范围承载）。
 """
 
 import argparse
@@ -31,7 +31,7 @@ import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 复用 #4 的 codec 但不让 import 在源码树里留下 __pycache__。
+# 复用 getvalue 切片的 codec 但不让 import 在源码树里留下 __pycache__。
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(HERE, "..", "getvalue"))
 try:

@@ -224,7 +224,7 @@ result<void> InfraHttpHost::Start() {
 
         // Engine::Run 占宿主专用 native 线程；Run 结果经 promise/future 跨线程
         // 发布（唯一同步口），Run 提前返回经 wait_for(0) 即刻可见——不复制
-        // error_code、不等满窗口（F4）。
+        // error_code、不等满窗口。
         auto [th, run_result] = StartEngineThread(engine, config);
         m_engine_thread = std::move(th);
         m_engine_result = std::move(run_result);
@@ -252,7 +252,7 @@ result<void> InfraHttpHost::Start() {
         // ProtoWireV1 出站不需要额外 Engine：正式 wire 由同一
         // NetworkRuntime::CreateHttpClient 出站通道承载（共享 runtime 限额
         // owner），不再单独占用 Engine/driver 槽——纯入站（2 workers）保持
-        // 既有可启动配置（F2/F3）。
+        // 既有可启动配置。
         //
         // bound_address() 的就绪判据原子（server 已 Start + bound 已就位）。
         // net::Address::ToString() 已含端口，故主机部分沿用配置
@@ -380,7 +380,7 @@ void InfraHttpHost::Close() noexcept {
     //   凭据后停 Engine 并释放 owner。未取得凭据（未经 WaitHandlersDone
     //   的裸 Close，或续等仍失败）→ 保留 server/engine/runtime  owner 与
     //   Run 线程，由外部终止进程或后续 HostLifecycle 续等收口；不伪报
-    //   「已物理关闭」（review-fixes §29-42 缺口修复）。Engine Run 的
+    //   「已物理关闭」（fail-closed）。Engine Run 的
     //   future 结果与 Stopped 相位必须实际检查：Run 返回非零或相位未
     //   Stopped（同代解绑失败保留 Closing）都不是「网络资源/回调/driver
     //   已收口」的证据，此时同样保留 owner 不释放（fail-closed）。

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# examples/dual_service/run_demo.sh — Issue #5 阶段 2 一条路径验收：
+# examples/dual_service/run_demo.sh — 一条路径验收：
 # 真实启动两个服务进程 + 一个 driver 进程，覆盖正常/业务错误/服务端超时/
 # 未路由/对端下线/优雅关闭六条路径，并独立校验后端残留，打印过程与退出码。
 #

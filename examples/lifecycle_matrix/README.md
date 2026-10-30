@@ -76,7 +76,7 @@ transport（loopback 无认证 → 空串），不被 metadata 升级。
   `max_inflight` 覆盖）。
 - **出站 / 跨 hop 预算未在本切片重验**：本 fixture 无静态路由（未配置即
   `NotFound`）；Service→Service 真实出站与预算矩阵由 #4 的
-  `examples.getvalue.s2s` / `framework.getvalue.codec` / `Test_framework_matrix`
+  `examples.getvalue.s2s` / `framework.getvalue_codec` / `framework.rpc_matrix`
   承载。
 - **单进程自有 fixture**：本切片是「一个 fixture 进程 + 外部 driver」的独立网络/
   进程证据；**两个独立 CoApp 进程 + 静态路由（EX-T3）** 不在本目录。

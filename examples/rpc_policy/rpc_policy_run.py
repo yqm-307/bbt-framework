@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""bbt-framework R8（3-5）：公开出站策略 fixture 验收驱动器。
+"""bbt-framework 公开出站策略 fixture 验收驱动器。
 
 由 ctest 调用：
   rpc_policy_run.py --bin <rpc_policy> --results <json>
 
-每场景独立 spawn 一个 fixture 子进程（一 CoApp 一策略），经 #4 的 Python 标准
+每场景独立 spawn 一个 fixture 子进程（一 CoApp 一策略），经 getvalue 切片的 Python 标准
 库 wire codec 真实 HTTP POST /rpc 打 caller 服务，读 fixture journal 断言：
 
   1. allow     —— 策略放行：调用成功、Preflight 恰一次、callee handler 恰一次；
@@ -25,7 +25,7 @@ ECONNREFUSED，与框架是否关闭 listener 无关，那种断言恒真、不�
 （result=error）判失败。该探针只证明「存活期 listener 已关」，不证明关闭期零额外
 I/O。
 
-wire 编解码复用 examples/getvalue/getvalue_client.py（#4 唯一手写 proto3 codec）。
+wire 编解码复用 examples/getvalue/getvalue_client.py（唯一手写 proto3 codec）。
 所有结构化结果标注 auth_state=unauthenticated_loopback。
 """
 

@@ -1,4 +1,4 @@
-// issue #8 资源生命周期 live 验收：真实 Redis/MongoDB 容器经
+// 资源生命周期 live 验收：真实 Redis/MongoDB 容器经
 // add_resource<R>(name, factory) 装配进 CoApp，service handler 在受管
 // 请求上下文（协程 + InboundDispatcher 注入的 RequestScope）内经
 // context().resource<R>(name) 消费真实命令往返；request_shutdown 后
@@ -433,7 +433,7 @@ struct RunHandle {
             state->app->request_shutdown();
         drained = _Drain(kWait);
         if (!drained) {
-            std::fputs("framework.resource.live: FATAL 在途派发协程未在窗口内"
+            std::fputs("framework.resource_live: FATAL 在途派发协程未在窗口内"
                        "归零；保留 RunState（含 App 所有权）以避免悬垂"
                        "（不 destroy/不强杀）\n",
                        stderr);

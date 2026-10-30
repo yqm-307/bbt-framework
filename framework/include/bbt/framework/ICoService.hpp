@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：服务接口边界（业务面）。
+// 服务接口边界（业务面）。
 //
 // 业务只感知三件事：
 //  - co_service_name()：服务名（CoService<T> 从 kServiceName 供给）；
@@ -58,7 +58,7 @@ protected:
         const RouteFields& custom = {},
         const CallOptions& options = {});
 
-    // Issue #4：typed proto 出站调用（最小 typed seam，向后兼容）。
+    // typed proto 出站调用（最小 typed seam，向后兼容）。
     // request/response schema 取自生成物 descriptor::full_name()（.proto 唯一
     // 真源），payload 经业务特化的 ProtoCodec<Req>/ProtoCodec<Resp> 编解码；
     // 其余（envelope、deadline 适配、路由门、发送注入点）与 CoRpcReq 路径共用
@@ -104,7 +104,7 @@ private:
                        std::optional<std::string> actor_key,
                        RpcSendFn send,
                        std::shared_ptr<const ResourceMap> resources);
-    // F2-a：Actor 实例创建时绑定 key；仅 ActorRegistry 可建立。
+    // Actor 实例创建时绑定 key；仅 ActorRegistry 可建立。
     void _bind_actor_key(std::optional<std::string> actor_key);
 
     std::string _NextRequestId();

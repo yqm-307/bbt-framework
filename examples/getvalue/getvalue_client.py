@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bbt-framework Issue #4（P0-A）：GetValue 示例的 Python 标准库客户端。
+"""bbt-framework GetValue 示例的 Python 标准库客户端。
 
 不依赖 google.protobuf：按 proto3 wire format 手写业务 .proto
 (examples/getvalue/proto/bbt/example/v1/get_value.proto) 与 infra
@@ -7,7 +7,7 @@ rpc_envelope.proto 的编解码，直接向 C++ getvalue_server 发起真实
 HTTP POST /rpc 调用。手写编解码本身即字节级互通证据。
 
 结构化结果均带 auth_state=unauthenticated_loopback：本路径只证明业务/传输
-行为，不证明身份可信或授权（认证轨道见 #38）。
+行为，不证明身份可信或授权（认证/授权由后续范围承载）。
 
 用法：
   getvalue_client.py --port <port> [--request-schema S] [--response-schema S]

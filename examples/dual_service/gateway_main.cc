@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
     const std::string storage_ep = argv[2];
 
     // handler 内嵌套出站调用（入站 → this->call → HTTP client →
-    // 等回包），协程栈按 F1-b2 实测放大到 64KB。
+    // 等回包），协程栈按实测放大到 64KB。
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 

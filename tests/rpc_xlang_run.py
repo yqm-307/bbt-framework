@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""framework #4：跨语言 round-trip 驱动器。
+"""跨语言 round-trip 驱动器。
 
 由 ctest 调用：
   rpc_xlang_run.py --server-bin <path> --client-py <path> --pb2-dir <dir>

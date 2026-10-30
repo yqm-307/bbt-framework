@@ -1,4 +1,4 @@
-// bbt-framework R8（3-5）：公开出站策略 fixture。
+// bbt-framework 公开出站策略 fixture。
 //
 // 形态：**一个**公开 `CoApp`（含 caller + callee 两服务 + 指向自身 loopback 的
 // 静态路由；正式 ProtoWireV1 body wire），caller 的 handler 内经受保护的
@@ -203,7 +203,7 @@ std::uint16_t PickLoopbackPort()
 }
 
 // —— B1 关闭后存活期 listener 探针（本段与负例替身共用同一份源码文本；
-//    scratch 负例按 BEGIN/END 标记抽取，见报告 §负例） BEGIN ——
+//    scratch 负例按 BEGIN/END 标记抽取） BEGIN ——
 enum class ListenerProbeResult { kRefused, kConnected, kError };
 
 // 有界 nonblocking connect：只有 ECONNREFUSED 判「listener 已关」；connect
@@ -403,7 +403,7 @@ int main(int argc, char* argv[])
     options.inbound_bridge = fw::RpcInboundBridge::ProtoWireV1;
     options.static_routes = {
         fw::StaticRoute{std::string(PolicyCallerService::kCalleeService), inf::RpcAddress{"http", endpoint}}};
-    // R8：唯一组装点——构造期选择公开策略。
+    // 唯一组装点——构造期选择公开策略。
     options.rpc_policy = MakePolicy(mode);
 
     fw::CoApp app{options};

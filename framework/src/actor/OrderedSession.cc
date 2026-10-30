@@ -1,4 +1,4 @@
-// co-service-actor/v1 F2-b1：OrderedSession 发送侧实现。语义见头注释。
+// OrderedSession 发送侧实现。语义见头注释。
 
 #include <bbt/framework/OrderedSession.hpp>
 
@@ -15,8 +15,8 @@ std::vector<OrderedSession::RegistryEntry> OrderedSession::s_registry;
 
 namespace {
 
-// 契约第 213 行：六个错误统一 RemoteError + domain="framework.actor"。
-// infra #39：本函数是 actor 域错误的真实构造边界，经
+// 六个错误统一 RemoteError + domain="framework.actor"。
+// 本函数是 actor 域错误的真实构造边界，经
 // ValidateErrorAtBoundary 落实域保留键归属/格式校验后才返回；
 // 校验失败整体降级为 ProtocolError，不放行非法 actor 错误。
 Error OrderedDomainError(const char* domain_code, std::string message) {
@@ -117,7 +117,7 @@ result<OrderedStamp> OrderedSession::prepare() {
     tickets_.emplace(ticket->request_id(), ticket);
     auto state = std::make_shared<OrderedStamp::State>();
     state->ticket  = std::move(ticket);
-    // F1-b2：票据回指签发会话，co_rpc_call 经它执行 BindForSend；
+    // 票据回指签发会话：co_rpc_call 经它执行 BindForSend；
     // 弱指针不影响会话生命周期语义（析构即释放 grant 占位）。
     state->session = shared_from_this();
     return result<OrderedStamp>::ok(OrderedStamp(std::move(state)));
@@ -150,7 +150,7 @@ result<void> OrderedSession::BindForSend(
             ordered_domain_code::kSequenceConflict,
             "ordered ticket already bound to a different request"));
     }
-    // 首次发送不得越过仍未发送的更小序号票据（契约第 209 行）。
+    // 首次发送不得越过仍未发送的更小序号票据。
     if (ticket->sequence() != bind_watermark_ + 1) {
         return result<void>::err(OrderedDomainErrorWithDetails(
             ordered_domain_code::kSequenceGap,

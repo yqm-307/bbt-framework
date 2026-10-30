@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：RPC 方法表（机器面，internal/）。
+// RPC 方法表（机器面，internal/）。
 // 业务用 fw::Method / fw::ActorMethodAt / fw::RpcMethods 声明方法清单
 // （声明糖见公共头 RpcMethods.hpp，业务在 CoService<T>::kRpcMethods
 // 上书写），本头把声明展开为类型擦除的分发闭包：handler 签名统一
@@ -210,7 +210,7 @@ struct MethodDeclBuilder<PositionalActorMethodDecl<Ptr, Key, Index>> {
     }
 };
 
-// Issue #4：proto schema 方法。request/response_schema 从生成 message 的
+// proto schema 方法。request/response_schema 从生成 message 的
 // descriptor full_name 推导——.proto 是唯一真源，杜绝手写漂移。本特化只在
 // 业务以真实 protobuf 类型实例化 ProtoMethod 时展开，框架库本体不依赖
 // protobuf 头。
@@ -253,10 +253,9 @@ RpcMethodTable BuildMethodTable() {
         return RpcMethodTable{};
 }
 
-// F2-a：启动期校验——ActorSerial 服务的每个方法都必须经 ActorMethod 安装
+// 启动期校验——ActorSerial 服务的每个方法都必须经 ActorMethod 安装
 // key 提取器。缺失 → err(InvalidArgument)，message 指明方法名。
-// Concurrent 不要求提取器；Concurrent 下声明 ActorMethod 是否合法契约未
-// 冻结，此处不拒绝（见 F2-a 报告的契约澄清项）。
+// Concurrent 不要求提取器；Concurrent 下声明 ActorMethod 此处不拒绝。
 result<void> ValidateActorKeying(const RpcMethodTable& table,
                                  ExecutionPolicy execution);
 

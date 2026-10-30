@@ -84,7 +84,7 @@ bbt::infra::HttpResponse ToHttpResponse(
         res.body.assign(r.value().payload.begin(), r.value().payload.end());
         return res;
     }
-    // infra #39：回复出站是框架可信边界——携带 details 的错误在离开本进程前
+    // 回复出站是框架可信边界——携带 details 的错误在离开本进程前
     // 过一遍完整校验（通用结构 + framework 域保留键），非法错误不序列化上
     // wire；校验失败降级为通用 ProtocolError，不静默放行。
     const Error* ep = &r.error();
@@ -163,7 +163,7 @@ result<bbt::infra::RpcEnvelope> HttpEgress::_SendWireProfile(const bbt::infra::R
     // （与 LegacyHeaders 共用懒建缓存）——runtime 限额 owner 统一持有
     // max_connections/max_inflight，ValidateRequest 与响应 parser 都按宿主
     // NetworkLimits 做请求/响应字节校验；不另建 http::Client/Engine/pool，
-    // 也不引入丢失共享限额的第二 owner（F3/F2）。wire 编码/关联/预算换算
+    // 也不引入丢失共享限额的第二 owner。wire 编码/关联/预算换算
     // 全部经 infra 公开 wire 面（ToWireEnvelope/EncodeRpcWireEnvelope/
     // DecodeRpcWireEnvelope/FromWireEnvelope），POST /rpc 固定 profile；
     // 本地 deadline→remaining_budget_ms 的换算与五字段关联校验沿用旧

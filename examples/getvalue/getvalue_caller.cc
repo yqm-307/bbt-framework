@@ -1,4 +1,4 @@
-// bbt-framework Issue #4（P0-A）：Service→Service 正式出站 caller 进程。
+// bbt-framework Service→Service 正式出站 caller 进程。
 //
 // 与 getvalue_server 同装配口径：公开 CoApp（inbound_bridge=ProtoWireV1）
 // + 公开 CoService，不使用测试缝。宿主 GetValueCallerService；其 handler 内
@@ -10,7 +10,7 @@
 //   getvalue_caller caller <port_file> <callee_ep> <blackhole_ep> <meta_file>
 //     callee_ep / blackhole_ep 形如 127.0.0.1:<port>（静态路由 endpoint 形态）。
 //   getvalue_caller badroute <kind> <result_file>
-//     #5 EX-T3：以公开入口验证四类非法静态路由在 run 启动任何组件前被拒绝。
+//     以公开入口验证四类非法静态路由在 run 启动任何组件前被拒绝。
 //     kind ∈ {empty-service, empty-transport, empty-endpoint, duplicate}；
 //     写出机器可读观测（rc/lifecycle_failures/bound_endpoint/资源工厂计数）。
 
@@ -96,7 +96,7 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
-// #5 EX-T3 公开入口：装配非法静态路由 → add_service/add_resource → run()。
+// 公开入口：装配非法静态路由 → add_service/add_resource → run()。
 // 断言依据是 run() 的返回码与公开观测口（lifecycle_failures/bound_endpoint/
 // 资源工厂计数），本进程只如实写观测，不打印硬编码期望值。
 int RunBadRoute(const std::string& kind, const std::string& result_file) {
@@ -166,7 +166,7 @@ int main(int argc, char* argv[]) {
         return 90;
     const std::string mode = argv[1];
 
-    // #5 EX-T3：非法静态路由的公开入口验收模式。
+    // 非法静态路由的公开入口验收模式。
     if (mode == "badroute") {
         if (argc < 4 || !IsKnownBadRouteKind(argv[2]))
             return 90;

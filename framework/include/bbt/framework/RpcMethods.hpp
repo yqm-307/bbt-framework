@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：RPC 方法清单的声明糖（业务面）。
+// RPC 方法清单的声明糖（业务面）。
 //
 // 业务在服务类型上声明一份 constexpr 方法清单：
 //   static constexpr auto kRpcMethods = fw::RpcMethods(
@@ -35,7 +35,7 @@ struct PositionalActorMethodDecl {
     const char* name;
 };
 
-// Issue #4：带 schema 类型的方法声明。请求/回复类型是 protobuf Message 类型，
+// 带 schema 类型的方法声明。请求/回复类型是 protobuf Message 类型，
 // 方法表在构建期从二者的 descriptor full_name 推导 request_schema /
 // response_schema——.proto 是唯一真源，业务不手写 schema 字符串。
 template <auto Ptr, class Req, class Resp>
@@ -65,7 +65,7 @@ ActorMethodAt(const char* name) {
     return detail::PositionalActorMethodDecl<Ptr, Key, Index>{name};
 }
 
-// Issue #4：proto schema 方法声明。
+// proto schema 方法声明。
 //   fw::ProtoMethod<&Svc::GetValue,
 //                   bbt::example::v1::GetValueRequest,
 //                   bbt::example::v1::GetValueResponse>("GetValue")

@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
     }
     const std::string mongo_uri = argv[3];
 
-    // 嵌套出站链的协程栈需求见 tests/F1-b2 实测记录：默认 12KB 触底，
+    // 嵌套出站链的协程栈需求见实测记录：默认 12KB 触底，
     // 本进程 handler 经资源缝发起真实 Redis/Mongo 出站，与对端保持同一配置。
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;

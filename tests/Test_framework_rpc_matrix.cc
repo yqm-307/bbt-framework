@@ -1,9 +1,8 @@
-// bbt-framework Issue #4 RPC-T4（修偏轮）：并发隔离 / 容量 / 迟到寿命 / 关闭矩阵。
+// 正式 wire 路径上的并发隔离 / 容量 / 迟到寿命 / 关闭矩阵。
 //
 // 修正要点（相对旧候选 4207772d…）：
-//   旧候选经 MakeCoAppForTest + DispatchInboundForTest + StubNetHost（INetworkHost
-//   桩）走 LegacyHeaders/positional，未走正式 wire 路径——那不是本票核心验收。
-//   本文件改为：
+//   早期草案曾走 MakeCoAppForTest + DispatchInboundForTest + StubNetHost（INetworkHost
+//   桩）+ LegacyHeaders/positional，未走正式 wire 路径。本文件固定为：
 //     * 服务端：公开 `fw::CoApp app(opts)`（opts.inbound_bridge=ProtoWireV1），
 //       真实 InfraHttpHost 监听 127.0.0.1:0，业务服务经公开 ProtoMethod 注册
 //       测试专用 Hold/Fast（只读 GetValue 语义，无写副作用）；
@@ -26,8 +25,8 @@
 //                                                 迟到完成 → 资源 Close 在 handler
 //                                                 完成后。
 //
-// 诚实缺口：R4/S4（跨 hop 预算）、R8/S8（独立 supervisor 硬停）未覆盖；
-// NetworkLimits 的 max_inflight/字节维度未分别压测（R7 partial）。
+// 诚实缺口：跨 hop 预算、独立 supervisor 硬停未覆盖；
+// NetworkLimits 的 max_inflight/字节维度未分别压测。
 //
 // 与仓内既有单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
 
@@ -81,7 +80,7 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 constexpr std::chrono::milliseconds kWait{15000};
-// P0-A 结构化结果标记：未认证 loopback，不表示身份已认证。
+// 结构化结果标记：未认证 loopback，不表示身份已认证。
 constexpr const char* kAuthState = "unauthenticated_loopback";
 
 // ── 屏障原语（std CV / 协程闩；无固定 sleep 凑时序）────────────────────
@@ -699,7 +698,7 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
 }
 
 // T3（D）：Service max_inflight=2 有界 → 第三个明确 Overloaded（不排队）；峰值恰为
-//         声明 limit；释放后恢复接纳。NetworkLimits 维度未分别压测（R7 partial）。
+//         声明 limit；释放后恢复接纳。NetworkLimits 维度未分别压测。
 BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     g_probe = std::make_shared<ProbeState>(2);
     fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
