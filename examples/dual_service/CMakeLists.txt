@@ -5,11 +5,12 @@
 #          CoRedisCli "cache" + CoMongoCli "docs"，无 KvStore 替身）
 #   svc_b  gateway（handler 内 this->call 跨进程到 svc_a；static_routes 显式
 #          白名单唯一出口）
-#   driver 演示客户端（NetworkRuntime + HttpClient，x-bbt-* 线格式在本地重新
-#          实现——不引用 framework internal 头）
+#   driver 演示客户端（NetworkRuntime + HttpClient，按 infra 正式 RpcWire
+#          （ProtoWireV1，POST /rpc + application/x-protobuf）收发——不引用
+#          framework internal 头）
 #
 # 本目录只在 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 且根 CMakeLists 的 fail-closed
-# 门禁通过时被加入：NEED_TEST、bbt_infra_rpc、bbt::infra_redis、bbt::infra_mongo
+# 门禁通过时被加入：NEED_TEST、bbt_infra_rpc_net、bbt::infra_redis、bbt::infra_mongo
 # 四项齐备，缺任一条件在 configure 阶段即 FATAL。因此这里的三个 target 不需要
 # 再做条件判定，也不会出现「缺依赖时静默少编译一个二进制」。
 

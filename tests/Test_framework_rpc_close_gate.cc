@@ -73,6 +73,13 @@
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+// T6/T7 的真实 ProtoWireV1 loopback：有效 wire body 才能过 infra 解析抵达
+// framework handler（否则在 HandleRpcRequest 编码边界即被拒，不形成
+// in-flight/TaskLease）。
+#include <bbt/infra/rpc/RpcWire.hpp>
+#endif
+
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 
 namespace fw = bbt::framework;
@@ -510,6 +517,164 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight)
     BOOST_CHECK_MESSAGE(drained, "framework in-flight count must be released on handler exception");
 
     h.Stop();
+}
+
+// T6（关闭收口责任移交回归，review-fixes §29-42）：迟到 handler/callback 排空
+// 收口责任已由 WaitHandlersDone 承担（Drain → Close → WaitStopped），不再由
+// Close 的 5s 兜底掩盖。
+// 真实判别链（全部经同一真实 loopback InfraHttpHost，无 mock）：
+//   1) 已 Start 宿主上发起真实 RPC 请求，handler 挂起（inflight>0）；
+//   2) StopAccepting → WaitHandlersDone(有界期限) 必须返回 TimedOut——此时
+//      Drain/WaitStopped 尚未执行，rpc::Server 不得已被 Close/Stopped，
+//      Engine 仍 Running（owner 未释放），区分「Drain==0 当 tasks==0」；
+//   3) 放行 handler → WaitHandlersDone(Deadline::max) 续等必须成功完成
+//      全链（inflight 归零 → Drain → server->Close() → WaitStopped）；
+//   4) IsClosed() 为 true 证明 Close 已被调用；随后宿主 Close() 释放
+//      owner（rpc_server() 置空）且 close_error() 为空——证明 Engine
+//      Run 结果与 Stopped 相位被实际检查（非只 join 后放行）。
+// 修前：步骤 2 的 WaitStopped 在 Close 内以独立 5s 期限兜底，失败后仍
+// RequestClose/join/reset owner——本断言（步骤 4 的 close_error 为空 +
+// IsClosed 为真）无法区分；修法后才把失败如实传播给 WaitHandlersDone。
+BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
+{
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+        g_scheduler->Start();
+    }
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
+
+    struct Shared {
+        std::atomic<int> calls{0};
+        Gate handler_gate;
+        Latch entered{1};
+        std::optional<inf::result<inf::HttpResponse>> out;
+        Latch done{1};
+    };
+    auto st = std::make_shared<Shared>();
+
+    auto host = std::make_shared<fw::InfraHttpHost>(
+        Limits(), inf::ListenAddress{"127.0.0.1", 0});
+    host->InstallRpcHandler(
+        [st](inf::IncomingCallContext, inf::RpcEnvelope req)
+            -> fw::result<inf::RpcEnvelope> {
+            st->calls.fetch_add(1);
+            st->entered.Down();
+            st->handler_gate.Wait();
+            return fw::result<inf::RpcEnvelope>::ok(std::move(req));
+        });
+    BOOST_REQUIRE(host->Create());
+    BOOST_REQUIRE(host->Start());
+    const auto bound = host->bound_address();
+    BOOST_REQUIRE(bound.has_value());
+    BOOST_REQUIRE(host->rpc_server() != nullptr);
+
+    // 真实 loopback 请求：独立 runtime + HttpClient → 被测 server。
+    auto rt = inf::NetworkRuntime::Create(Limits());
+    BOOST_REQUIRE(rt);
+    BOOST_REQUIRE(rt.value()->Start());
+    auto client = rt.value()->CreateHttpClient();
+    BOOST_REQUIRE(client);
+
+    bool succ = false;
+    const auto endpoint = host->bound_endpoint();
+    // 有效 ProtoWireV1 wire body：ToWireEnvelope + EncodeRpcWireEnvelope——
+    // 过 infra HandleRpcRequest 解析后才抵达 framework handler（形成真实
+    // in-flight 与 TaskLease）；裸 POST 空 body 会在编码边界被拒。
+    inf::rpc::RpcWireEnvelope wire;
+    auto wire_r = inf::rpc::ToWireEnvelope(
+        inf::RpcEnvelope{"probe", "hold", "t6-1", "", "", {}, {}},
+        /*remaining_budget_ms*/ 30000);
+    BOOST_REQUIRE(wire_r);
+    wire = wire_r.value();
+    auto body = inf::rpc::EncodeRpcWireEnvelope(wire, /*is_response=*/false);
+    BOOST_REQUIRE(body);
+    g_scheduler->RegistCoroutineTask(
+        [st, client = client.value(), endpoint, body = std::move(body.value())] {
+            inf::HttpRequest req;
+            req.method = "POST";
+            req.url = "http://" + endpoint + "/rpc";
+            req.headers = {{std::string(inf::rpc::kRpcWireContentTypeKey),
+                            std::string(inf::rpc::kRpcWireContentType)}};
+            req.body.assign(body.begin(), body.end());
+            inf::CallOptions opt;
+            opt.deadline = Clock::now() + 5s;
+            st->out.emplace(client->Request(std::move(req), opt));
+            st->done.Down();
+        },
+        succ);
+    BOOST_REQUIRE(succ);
+
+    // handler 已过门并挂起（framework inflight==1 + infra inflight==1）。
+    BOOST_REQUIRE(st->entered.WaitFor(5s));
+    BOOST_CHECK_EQUAL(st->calls.load(), 1);
+
+    host->StopAccepting();
+
+    // 有界期限：inflight>0 → TimedOut；此时 server 不得已被 Close/Stopped，
+    // Engine 不得已被 RequestClose——owner 未释放（fail-closed 前段）。
+    auto r1 = host->WaitHandlersDone(Clock::now() + 150ms);
+    BOOST_CHECK_MESSAGE(!r1, "drain must fail while handler in-flight");
+    if (!r1)
+        BOOST_CHECK(r1.error().code == fw::ErrorCode::TimedOut);
+    BOOST_REQUIRE(host->rpc_server() != nullptr);
+    BOOST_CHECK(!host->rpc_server()->IsClosed());   // 未提前逻辑封口
+    // 底层 Engine 仍在驱动（AcceptingStopped 未置位前 Run 不返回），未停。
+
+    // 放行 → Deadline::max 续等：inflight 归零 → Drain → Close →
+    // WaitStopped 全链成功。
+    st->handler_gate.Open();
+    BOOST_REQUIRE(st->done.WaitFor(5s));
+    auto r2 = host->WaitHandlersDone(co::Deadline::max());
+    BOOST_CHECK_MESSAGE(r2,
+        "Deadline::max retry must complete full server drain+stop chain");
+
+    // 收口凭据：rpc::Server 已逻辑关闭（IsClosed），WaitStopped 已成功。
+    BOOST_REQUIRE(host->rpc_server() != nullptr);
+    BOOST_CHECK(host->rpc_server()->IsClosed());
+
+    // Close：取得收口凭据后停 Engine（Run 返回 + Phase==Stopped 实际检查）
+    // 并释放 owner——无 close_error 证明 Engine 未走「未达 Stopped 保留」路径。
+    host->Close();
+    BOOST_CHECK(!host->close_error().has_value());
+    BOOST_CHECK(host->rpc_server() == nullptr);   // owner 已释放
+
+    client.value()->Close();
+    rt.value()->Close();
+}
+
+// T7（直接 Close 兜底路径）：不经 StopAccepting/WaitHandlersDone 的裸
+// Close 也必须安全收口——兜底 WaitStopped 成功后正常释放（原同步关闭契约），
+// 不是把「未走 WaitHandlersDone」当永久失败保留 owner。
+BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
+{
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+        g_scheduler->Start();
+    }
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
+
+    auto probe = std::make_shared<CloseProbe>();
+    auto host = std::make_shared<fw::InfraHttpHost>(
+        Limits(), inf::ListenAddress{"127.0.0.1", 0});
+    host->InstallRpcHandler(
+        [probe](inf::IncomingCallContext, inf::RpcEnvelope req)
+            -> fw::result<inf::RpcEnvelope> {
+            probe->calls.fetch_add(1);
+            return fw::result<inf::RpcEnvelope>::ok(std::move(req));
+        });
+    BOOST_REQUIRE(host->Create());
+    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(host->bound_address().has_value());
+
+    // 直接 Close：fallback WaitStopped 必成功（无在途 handler/callback），
+    // owner 正常释放，close_error 为空。
+    host->Close();
+    BOOST_CHECK(!host->close_error().has_value());
+    BOOST_CHECK(host->rpc_server() == nullptr);
+    // 幂等重入安全（不重复 join/get）。
+    host->Close();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

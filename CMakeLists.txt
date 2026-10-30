@@ -112,9 +112,9 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/RpcHttpBridge.hpp
     internal/CoAppSeam.hpp
     internal/ResourceClose.hpp)
-# Issue #4：正式 wire 桥头只在 protobuf 前缀锁定（infra 注册 bbt_infra_rpc）时
+# Issue #4：正式 wire 桥头只在 protobuf 前缀锁定（infra 注册 bbt_infra_rpc_net）时
 # 进入自给自检；未配置时该头不参与（其 include 的上游头不可得）。
-if(TARGET bbt_infra_rpc)
+if(TARGET bbt_infra_rpc_net)
     list(APPEND BBT_FRAMEWORK_INTERNAL_HEADERS internal/RpcWireBridge.hpp)
 endif()
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
@@ -133,7 +133,7 @@ target_compile_options(bbt_framework_header_selfcheck PRIVATE -Wall -Wextra)
 set_target_properties(bbt_framework_header_selfcheck PROPERTIES LINKER_LANGUAGE CXX)
 
 # Issue #5：显式开启 dual_service 的 fail-closed 门禁（只增判定，不改默认路径）。
-# 示例挂在 examples 入口（NEED_TEST=ON 且 bbt_infra_rpc 可用）之下，svc_a 又
+# 示例挂在 examples 入口（NEED_TEST=ON 且 bbt_infra_rpc_net 可用）之下，svc_a 又
 # 需要真实 Redis/Mongo 两个 infra 模块；四项前置条件任一缺失都必须在这里
 # configure 失败，不能变成「开关说 ON、实际被静默跳过」。
 if(BBT_ENABLE_DUAL_SERVICE_EXAMPLE)
@@ -141,9 +141,9 @@ if(BBT_ENABLE_DUAL_SERVICE_EXAMPLE)
     if(NOT NEED_TEST)
         list(APPEND _bbt_ds_missing "NEED_TEST=ON（examples 入口由它开启）")
     endif()
-    if(NOT TARGET bbt_infra_rpc)
+    if(NOT TARGET bbt_infra_rpc_net)
         list(APPEND _bbt_ds_missing
-            "-DBBT_PROTOBUF_PREFIX=<protobuf 前缀>（使 bbt_infra_rpc 注册，examples 入口前置）")
+            "-DBBT_PROTOBUF_PREFIX=<protobuf 前缀>（使 bbt_infra_rpc_net 注册，examples 入口前置）")
     endif()
     if(NOT TARGET bbt::infra_redis)
         list(APPEND _bbt_ds_missing
@@ -165,14 +165,14 @@ endif()
 
 # Issue #4（P0-A）：GetValue 业务切片示例（唯一业务 .proto 真源 + C++ 服务端 +
 # Python 标准库客户端）。仅在测试构建（NEED_TEST=ON）且 protobuf 前缀锁定、
-# bbt_infra_rpc 目标可用时构建/注册；仓库约定 `-DNEED_TEST=ON` 才开启本仓
+# bbt_infra_rpc_net 目标可用时构建/注册；仓库约定 `-DNEED_TEST=ON` 才开启本仓
 # tests 与示例 ctest，不给只想链接 bbt::framework 的库消费者强加 Python3/Boost
 # 示例工具链依赖，也不在非测试构建跑示例用例。未配置前缀时不注册（示例不静默
 # 降级为 echo/header 旁路）。
 if(NEED_TEST)
     # add_test 需要先 enable_testing；示例与 tests 都在此块内。
     enable_testing()
-    if(NEED_EXAMPLE AND TARGET bbt_infra_rpc)
+    if(NEED_EXAMPLE AND TARGET bbt_infra_rpc_net)
         add_subdirectory(examples)
     endif()
     add_subdirectory(tests)

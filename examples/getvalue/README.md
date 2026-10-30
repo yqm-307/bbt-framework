@@ -87,7 +87,7 @@ app.run();
   `ParseRpcWireHttpRequest → local-min → dispatch_inbound → MakeRpcWireHttpResponse`）；
 - `framework/.../RpcMethods.hpp` + `internal/MethodTable.hpp`：`ProtoMethod`
   声明糖，schema 取自 descriptor；
-- `framework/src/CMakeLists.txt`：仅当 `bbt_infra_rpc` 可用时编译本桥（未配置
+- `framework/src/CMakeLists.txt`：仅当 `bbt_infra_rpc_net` 可用时编译本桥（未配置
   protobuf 前缀时框架只有迁移期 header 桥，显式选择 ProtoWireV1 会 fail-closed）。
 
 ## 4. 构建 / 运行 / 验收入口
@@ -97,8 +97,9 @@ app.run();
 
 ```bash
 cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DNEED_TEST=ON -DBBT_INFRA_SOURCE_DIR=<infra-162bb5fd> \
-  -DBBT_COROUTINE_SOURCE_DIR=<coroutine-7bcda3b> \
+  -DNEED_TEST=ON -DBBT_INFRA_SOURCE_DIR=<bbtools-infra 源码树> \
+  -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \
+  -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
   -DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12> -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build-deps/project-build --target getvalue_server getvalue_caller \
   Test_framework_getvalue_codec --parallel 2
@@ -201,10 +202,15 @@ fail 并回收自有进程）。
   profile**：`HttpEgress` 增加 `ProtoWireV1` 分支（同一 HttpClient 发送 root，
   只换 wire 编解码；`ToWireEnvelope`/`FromWireEnvelope` helper），egress 发起
   I/O 前再次按本地 deadline 换算 remaining_budget_ms（过期 → TimedOut 无 I/O），
-  回复校验 request_id/response_schema 并保留 Error（含 `OutcomeUnknown`）。当前
-  候选固定 infra merge `162bb5fd…`，Release 构建下已验证 7 个耦合场景，
-  caller/callee 均 rc=0；本轮未在 ASan/UBSan 构建下重跑。结果均带
-  `auth_state=unauthenticated_loopback`。
+  回复校验 request_id/response_schema 并保留 Error（含 `OutcomeUnknown`）。
+  「Release 构建下 7 个耦合场景 caller/callee 均 rc=0」完成于较早候选（infra
+  `162bb5fd…` 轮次，结果均带 `auth_state=unauthenticated_loopback`，且未在
+  ASan/UBSan 构建下重跑）；当前 deps.lock 已固定 infra
+  `d254c10a8a660057a85784b1155a7260460548e4` + coroutine
+  `206772b821ce6bd5ffc3afe547e11d21f5794b5a`，新 pin 下完成的是注册用例验证：
+  `examples.getvalue.s2s`（callee+caller 真实双进程）等 examples 4 项、受影响
+  RPC/HTTP 路径 11 项在 Release 候选构建全部通过；7 场景人工 caller/callee 在
+  新 pin 下未复跑。
 - **R2/R4 部分**：已覆盖接收端 local-min、0 预算与「可解码但过期」不进 handler、
   预算回显 clamp；driver 已覆盖发送前过期、非法路由和断连，但**跨 hop 预算不放大、
   排队耗预算的发送端观察**未在专门矩阵中重验。

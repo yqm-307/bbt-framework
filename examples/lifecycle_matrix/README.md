@@ -38,11 +38,12 @@ coroutine 的进程级启动配置访问头 `bbt/coroutine/detail/GlobalConfig.h
 
 ## 构建与运行（一条路径）
 
-前置与 `examples/getvalue`、`examples/two_service` 完全相同（`-DNEED_TEST=ON`
-且 `-DBBT_PROTOBUF_PREFIX=<protobuf 3.21.12 前缀>` 使 `bbt_infra_rpc` 注册）：
+前置与 `examples/getvalue`、`examples/two_service` 完全相同（`-DNEED_TEST=ON`、
+`-DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON` 且
+`-DBBT_PROTOBUF_PREFIX=<protobuf 3.21.12 前缀>` 使 `bbt_infra_rpc_net` 注册）：
 
 ```bash
-cmake --build <build> --target lifecycle_fixture --parallel $(( $(nproc) / 4 ))
+cmake --build <build> --target lifecycle_fixture --parallel 2
 ctest --test-dir <build> -R '^examples\.lifecycle_matrix$' --output-on-failure
 ```
 

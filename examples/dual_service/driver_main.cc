@@ -46,6 +46,7 @@
 #include <bbt/infra/HttpClient.hpp>
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/http/Client.hpp>      // wire 回复解析的新值类型边界
 #include <bbt/infra/rpc/RpcWire.hpp>       // 公开 wire profile 契约（非 framework internal）
 
 #include <bbt/framework/Framework.hpp>     // CoRpcReq/位置参数 codec
@@ -123,13 +124,22 @@ Reply Send(const std::string& service, const std::string& method,
     w.payload             = req.payload();
     w.success             = true;
 
-    auto http_req = rpcw::MakeRpcWireHttpRequest(w, "http://" + g_endpoint);
-    if (!http_req) {
-        out.error = std::move(http_req.error());
+    // 上游新栈删去旧 MakeRpcWireHttpRequest：客户端出站归 rpc::Client，
+    // 手工发送自行编码 body + 显式 POST /rpc + 固定 Content-Type（与 wire
+    // profile 同一线路）。
+    auto wire_body = rpcw::EncodeRpcWireEnvelope(w, /*is_response=*/false);
+    if (!wire_body) {
+        out.error = std::move(wire_body.error());
         out.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - t0);
         return out;
     }
+    inf::HttpRequest http_req;
+    http_req.method  = "POST";
+    http_req.url     = "http://" + g_endpoint + rpcw::kRpcWireHttpPath;
+    http_req.headers = {{std::string(rpcw::kRpcWireContentTypeKey),
+                         std::string(rpcw::kRpcWireContentType)}};
+    http_req.body.assign(wire_body.value().begin(), wire_body.value().end());
     const std::string want_request_id = w.request_id;
 
     // client->Request 只在协程内合法；控制线程这边用 latch（mutex+CV）
@@ -151,7 +161,13 @@ Reply Send(const std::string& service, const std::string& method,
             r.ok    = false;
             r.error = std::move(res.error());
         } else {
-            auto parsed = rpcw::ParseRpcWireHttpResponse(res.value());
+            // 旧栈 HttpResponse → 新栈 http::Response 的边界值转换
+            // （status→status_code；headers/body 同名透传）。
+            inf::http::Response wire_resp;
+            wire_resp.status_code = static_cast<int>(res.value().status);
+            wire_resp.headers     = res.value().headers;
+            wire_resp.body        = std::move(res.value().body);
+            auto parsed = rpcw::ParseRpcWireHttpResponse(wire_resp);
             if (!parsed) {
                 r.error = std::move(parsed.error());   // 非法 wire body
             } else {

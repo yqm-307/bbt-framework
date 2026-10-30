@@ -406,10 +406,17 @@ def scenario_r3_r4(fx):
 
 
 def scenario_r4_byte_limit(fx):
-    """R4 字节上限维度：超过 NetworkLimits.max_body_bytes 的请求被拒（功能检查）。"""
+    """R4 字节上限维度：超过 NetworkLimits.max_body_bytes 的请求被拒（功能检查）。
+
+    新栈（bbt::infra::http::Server）对 body_limit 超限的契约是「协议拒绝或
+    断开」二选一的可观察拒绝——实测为不回复直接断连（上游
+    docs/rpc-net.md 边界：旧栈 413 应答与断开同属合法拒绝形态）。本场景断言
+    「请求被真实拒绝（413 或预期断连：EOF/reset）且未触达 handler、服务器
+    健康」；读超时或任何非预期异常一律判失败，不放宽为「被拒」。"""
     big_key = "x" * 8000   # 信封 body 远超 max_body_bytes=4096
     status = None
     outcome = None
+    rejected = None
     try:
         s = open_and_send(fx.port, enc_hold("r4-big", big_key, "Fast"),
                           timeout=5)
@@ -418,21 +425,46 @@ def scenario_r4_byte_limit(fx):
             env = gvc.dec_envelope(body)
             outcome = {"status": status, "success": env.get("success"),
                        "error_code": env.get("error", {}).get("code")}
+            # 只有 413 是协议级拒绝应答；其它任何 HTTP 响应（含 200）都不算
+            # 「超限被拒」——进入正常路径即漏检。
+            rejected = (status == 413)
         finally:
             s.close()
+    except (socket.timeout, TimeoutError) as exc:
+        # 读超时不是拒绝证据：服务端可能挂起或在途，必须判失败。
+        outcome = {"status": None, "exception": type(exc).__name__}
+        rejected = False
+    except (ConnectionResetError, ConnectionAbortedError,
+            BrokenPipeError) as exc:
+        # 预期断连形态：服务端不回复直接断开连接。
+        outcome = {"status": None, "exception": type(exc).__name__}
+        rejected = True
+    except RuntimeError as exc:
+        # read_full_http 的「未收齐 HTTP 头即 EOF」＝ 服务端无应答断连；
+        # 只接受这一种 RuntimeError，其余（含脚本自身缺陷）判失败。
+        outcome = {"status": None, "exception": type(exc).__name__}
+        rejected = "no http headers" in str(exc)
     except Exception as exc:  # noqa: BLE001
         outcome = {"status": None, "exception": type(exc).__name__}
-    rejected = (status == 413)
-    check(rejected, f"oversized body did not return HTTP 413: {outcome}",
+        rejected = False
+    check(rejected is True,
+          f"oversized body was not rejected (413 or expected EOF/reset): "
+          f"{outcome}", "r4-byte-limit")
+    # 超大请求未触达 handler 的独立证据：journal 没有 r4-big 的进入记录。
+    big_entered = any(e.get("event") == "handler_entered"
+                      and e.get("req") == "r4-big" for e in fx.entries())
+    check(not big_entered,
+          "oversized request reached handler (r4-big handler_entered)",
           "r4-byte-limit")
     # 服务器仍健康：正常请求成功。
     st, env = rpc_call(fx.port, "r4-after", "Fast", "kafter")
     healthy = (env.get("success") is True)
     check(healthy, f"server unhealthy after oversized request: {env}",
           "r4-byte-limit")
-    finish("r4-byte-limit", rejected and healthy,
+    finish("r4-byte-limit", bool(rejected) and not big_entered and healthy,
            {"max_body_bytes": 4096, "oversized_body_bytes":
             len(enc_hold("r4-big", big_key, "Fast")), "outcome": outcome,
+            "reached_handler": big_entered,
             "server_healthy_after": healthy})
 
 

@@ -8,7 +8,7 @@
 # ShutdownIncomplete/外部硬杀 journal。
 #
 # 本目录只在 examples/ 入口被加入时构建（根 CMakeLists：NEED_TEST=ON 且
-# bbt_infra_rpc 已注册），与 examples/getvalue、examples/two_service 同一前置，
+# bbt_infra_rpc_net 已注册），与 examples/getvalue、examples/two_service 同一前置，
 # 无额外依赖（无 Redis/Mongo/Compose/认证）。
 
 # find_package 作用域按目录，不跨兄弟目录传播，故各自声明。

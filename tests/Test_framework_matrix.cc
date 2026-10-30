@@ -56,6 +56,7 @@
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
 
 #include <bbt/example/v1/get_value.pb.h>
@@ -457,13 +458,20 @@ std::shared_ptr<ClientCallOut> CallAsync(
         out->done.CountDown();
         return out;
     }
-    auto req = rpcw::MakeRpcWireHttpRequest(wire.value(), "http://" + endpoint);
-    if (!req) {
-        out->r.emplace(inf::result<inf::HttpResponse>::err(req.error()));
+    // 上游新栈删去旧 MakeRpcWireHttpRequest：手工发送自行编码 body +
+    // 显式 POST /rpc + 固定 Content-Type（与 wire profile 同一线路）。
+    auto wire_body = rpcw::EncodeRpcWireEnvelope(wire.value(), /*is_response=*/false);
+    if (!wire_body) {
+        out->r.emplace(inf::result<inf::HttpResponse>::err(wire_body.error()));
         out->done.CountDown();
         return out;
     }
-    inf::HttpRequest r = std::move(req.value());
+    inf::HttpRequest r;
+    r.method  = "POST";
+    r.url     = "http://" + endpoint + rpcw::kRpcWireHttpPath;
+    r.headers = {{std::string(rpcw::kRpcWireContentTypeKey),
+                  std::string(rpcw::kRpcWireContentType)}};
+    r.body.assign(wire_body.value().begin(), wire_body.value().end());
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [out, client, r = std::move(r), deadline]() mutable {
@@ -476,6 +484,16 @@ std::shared_ptr<ClientCallOut> CallAsync(
     return succ ? out : nullptr;
 }
 
+// 旧栈 HttpResponse → 新栈 http::Response 的边界值转换（status→status_code；
+// headers/body 同名透传）。wire 解析面只接新类型。
+inf::http::Response ToWireResponse(const inf::HttpResponse& res) {
+    inf::http::Response out;
+    out.status_code = static_cast<int>(res.status);
+    out.headers     = res.headers;
+    out.body        = res.body;
+    return out;
+}
+
 bool WaitCall(const std::shared_ptr<ClientCallOut>& out,
               std::chrono::milliseconds ms = kWait) {
     return out && out->done.WaitFor(ms);
@@ -485,7 +503,8 @@ bool GetWireReply(const std::shared_ptr<ClientCallOut>& out,
                   rpcw::RpcWireEnvelope& w) {
     if (!out || !out->r.has_value()) return false;
     if (!out->r.value()) return false;                      // transport 失败
-    auto parsed = rpcw::ParseRpcWireHttpResponse(out->r.value().value());
+    auto parsed = rpcw::ParseRpcWireHttpResponse(
+        ToWireResponse(out->r.value().value()));
     if (!parsed) return false;
     w = std::move(parsed.value());
     return true;
@@ -535,7 +554,7 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
                     msg += " msg=" + outs[i]->r.value().error().message;
                 } else {
                     auto pr = rpcw::ParseRpcWireHttpResponse(
-                        outs[i]->r.value().value());
+                        ToWireResponse(outs[i]->r.value().value()));
                     if (pr) {
                         msg += " wire_success=" + std::string(
                             pr.value().success ? "true" : "false");

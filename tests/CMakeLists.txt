@@ -95,7 +95,7 @@ set_tests_properties(Test_framework_resource PROPERTIES TIMEOUT 30)
 # issue #8 强制 live 验收开关（默认 OFF）：live runner/CI 显式
 # -DBBT_REQUIRE_RESOURCE_LIVE_TESTS=ON 时，Redis/Mongo 任一 infra 模块未注册即
 # configure 阶段 FATAL——不允许静默缺模块导致验收证据缺口（与 framework.rpc_xlang
-# 对 bbt_infra_rpc 的 fail-closed 同一口径）。OFF 时维持可选 target：缺模块走
+# 对 bbt_infra_rpc_net 的 fail-closed 同一口径）。OFF 时维持可选 target：缺模块走
 # 下面的 STATUS 提示，环境缺后端时进程 77 退出配合 SKIP_RETURN_CODE 标 Skipped，
 # 均不宣称 live 通过。
 option(BBT_REQUIRE_RESOURCE_LIVE_TESTS
@@ -185,18 +185,18 @@ else()
 endif()
 
 # framework #4：G5 RpcEnvelope wire profile 的跨语言互通验证。
-# C++ 服务端消费 bbt::infra_rpc + bbt::infra_http；Python 客户端经
+# C++ 服务端消费 bbt::infra_rpc_net + bbt::infra_http；Python 客户端经
 # http.client 真实 POST /rpc 收发 protobuf body。
 # fail-closed：本测试是 issue #4 验收的强制项。infra 未注册
-# bbt_infra_rpc 目标（例如接入时漏给 BBT_PROTOBUF_PREFIX）时必须在
+# bbt_infra_rpc_net 目标（例如接入时漏给 BBT_PROTOBUF_PREFIX）时必须在
 # configure 阶段非零失败，不允许静默跳过导致验收证据缺口。
-if(NOT TARGET bbt_infra_rpc)
+if(NOT TARGET bbt_infra_rpc_net)
     message(FATAL_ERROR
-        "bbt_infra_rpc 目标未注册：framework.rpc_xlang 是强制验收测试，"
+        "bbt_infra_rpc_net 目标未注册：framework.rpc_xlang 是强制验收测试，"
         "不允许静默跳过。请为接入的 infra 提供 "
         "-DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12 前缀>（须含 protoc 与 "
         "libprotobuf，详见 infra docs/dependencies/protobuf-3.21.12.provenance.md），"
-        "使 bbt_infra_rpc 目标被注册后重新配置。")
+        "使 bbt_infra_rpc_net 目标被注册后重新配置。")
 endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_package(Boost REQUIRED)
@@ -204,7 +204,7 @@ find_package(Threads REQUIRED)
 
 add_executable(rpc_xlang_server rpc_xlang_server.cc)
 target_link_libraries(rpc_xlang_server PRIVATE
-    bbt::infra_rpc bbt::infra_http Boost::boost Threads::Threads)
+    bbt::infra_rpc_net bbt::infra_http Boost::boost Threads::Threads)
 target_compile_options(rpc_xlang_server PRIVATE -Wall -Wextra)
 
 # Python 客户端零依赖（手写 proto3 wire format），仅需解释器本体；
@@ -222,7 +222,7 @@ set_tests_properties(framework.rpc_xlang PROPERTIES TIMEOUT 60)
 # OutcomeUnknown 契约（RequestPhase / IsRequestCommitted / Error::request_phase）。
 # 覆盖：R5 committed→OutcomeUnknown；另覆盖发送前过期、未提交失败、remaining
 # budget 换算与 clamp。不覆盖 R6/R7/R8 并发/容量/关闭矩阵。
-# 需要 bbt::infra_rpc 与 protobuf 前缀——上方已 fail-closed 保证该目标在场。
+# 需要 bbt::infra_rpc_net 与 protobuf 前缀——上方已 fail-closed 保证该目标在场。
 # 对端是测试自有裸 TCP loopback，不依赖实例。
 add_executable(Test_framework_egress_phase Test_framework_egress_phase.cc)
 target_link_libraries(Test_framework_egress_phase PRIVATE bbt::framework)

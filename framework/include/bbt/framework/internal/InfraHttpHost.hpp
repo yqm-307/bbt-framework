@@ -1,27 +1,52 @@
 #pragma once
 // co-service-actor/v1 F1-b2：INetworkHost 的真实实现——infra
-// NetworkRuntime + HttpServer/RpcServer（已验收的真实 loopback 传输）。
+// NetworkRuntime + HttpServer（LegacyHeaders 旧栈）或 net::Engine +
+// rpc::Server（ProtoWireV1 新栈；已验收的真实 loopback 传输）。
 //
 // 两种入站模式（Start 前二选一安装）：
 //  - InstallHandler(HttpHandler)：LegacyHeaders 迁移期桥。Start 经
 //    NetworkRuntime::ListenHttp 监听；x-bbt-* header 承载 envelope。
-//  - InstallRpcHandler(RpcHandler)：ProtoWireV1 正式桥。Start 经
-//    NetworkRuntime::ListenRpc 监听；wire 编解码、接收端 local-min 预算、
-//    成功/错误信封回显、五字段关联与 remaining 回填全部由 infra
+//    旧栈上游仍在（BBT_INFRA_LEGACY_STACK 默认 ON），路径不变。
+//  - InstallRpcHandler(RpcHandler)：ProtoWireV1 正式桥。上游
+//    NetworkRuntime::ListenRpc 已删除，改经
+//    net::Engine::Run（宿主专用 native 线程）+ rpc::Server::Create(engine,
+//    handler, http::ServerOptions) + Start；wire 编解码、接收端 local-min
+//    预算、成功/错误信封回显、五字段关联与 remaining 回填全部由 infra
 //    HandleRpcRequest 承担，framework 只提供 dispatch 适配。
 //  二者共用本类的在途 handler 记账与关闭序列；均未安装时 Start 跳过监听
 //  （纯出站宿主）。
 //
-// 口径差异（契约 F1/F3 与 infra N0）：
-//  - infra 关闭是同步契约（ICoCloseable::Close 返回即物理释放）；本类
-//    Close 在控制线程直接调用 NetworkRuntime::Close，与 infra 同一语义，
-//    不做协程等待桥接。
+// 口径差异（契约 F1/F3 与 infra N0/rpc-net）：
+//  - infra 关闭是同步收口：rpc::Server 序列
+//    StopAccepting → Drain → Close → WaitStopped 均由宿主控制线程驱动；
+//    Engine::RequestClose + Run 线程 join 返回即网络资源/回调/driver 已收口
+//    （docs/architecture/gnet-network-execution.md §6）。旧栈
+//    NetworkRuntime::Close 语义不变。
+//  - Engine::Run 占用一个宿主专用 native 线程（不是 control 线程本身，
+//    也不是协程/P 线程：Run 在协程上下文或已登记 Processer 上会被拒）。
+//    执行底座（coroutine Scheduler + Engine）由本类装配并收口。Run 返回的
+//    error_code 经 promise/future 跨线程发布（唯一同步口，Start 的相位
+//    等待据此即刻观察失败，不复制共享变量）。**出站不另建 Engine**：
+//    ProtoWireV1 与 LegacyHeaders 出站都由同一
+//    NetworkRuntime::CreateHttpClient 通道承载（runtime 限额 owner 共享
+//    max_connections/max_inflight 与请求/响应字节校验）——server Engine
+//    只占监听所需驱动槽，纯入站既有 worker 配置保持可启动。
 //  - handler 在 Close 前完成的出站回复按 infra 的正常发送语义处理；Close
 //    开始后仍在途且尚未交给传输层的回复不承诺送达原客户端，测试应断言
 //    handler/owner 侧收口证据而不是伪造 flush 保证。
-//  - WaitHandlersDone 是控制线程语义：infra 不暴露「已接纳 handler 排空」
-//    入口，本类对已安装的 handler 做在途记账，由自身
-//    std::condition_variable 在给定期限内等待排空，不走协程等待。
+//  - WaitHandlersDone 是控制线程语义：先等本类已记账的 framework 在途
+//    handler 归零（测试缝 InvokeRpcForTest 的迟到进入者不在 infra 账本内，
+//    只能由本记账覆盖），再对 rpc::Server 调 Drain（等已授权 handler 返回
+//    且回复写终态），随后 server->Close()+WaitStopped（listener 停、全部
+//    callback 销毁、连接 Released）——Drain==0 只证明 inflight==0，
+//    tasks==0 只能由 WaitStopped 证实（TaskLease 在 callback 捕获最后销毁
+//    时递减）。Drain/WaitStopped 仅 native 宿主可调用——本类按契约在控制
+//    线程调用，不挂协程。失败（超时/非超时）如实返回给 HostLifecycle：
+//    预算耗尽经 Deadline::max 续等，续等仍失败 → fail-closed 保留 owner。
+//  - Close 只在取得 WaitStopped 成功凭据（m_stopped）后停 Engine
+//    （RequestClose+join+Run 结果+Stopped 相位实际检查）并释放
+//    server/engine owner；未取得凭据（裸 Close 兜底失败或续等仍失败）→
+//    保留 owner，不伪报已物理关闭（review-fixes §29-42）。
 //
 // 寿命边界（如实记录，不在本类内宣称已解决业务入口寿命）：
 //  - handler 闭包按 shared_ptr 捕获 HandlerState，不捕获宿主裸 this：宿主
@@ -39,21 +64,32 @@
 //    「先排空（WaitHandlersDone，耗尽预算后无界续等）再 Close」保证，不由本
 //    shared_ptr 保证。
 //
-// 生命周期：Create（NetworkRuntime::Create）→ Start（runtime Start +
-// 按需 ListenHttp/ListenRpc）→ StopAccepting → WaitHandlersDone → Close（同步）。
+// 生命周期：Create（NetworkRuntime::Create；RPC 模式另建 Engine 与
+// rpc::Server）→ Start（runtime Start + 按需 ListenHttp，或 Engine::Run 线程
+// + rpc::Server::Start）→ StopAccepting → WaitHandlersDone（inflight 归零 +
+// Drain + server Close/WaitStopped）→ Close（Engine RequestClose + join +
+// Run 结果/Stopped 相位核验后释放 owner；legacy 走 NetworkRuntime::Close；
+// 均同步）。未证实收口保留 owner（fail-closed）。
 
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
+#include <thread>
 
 #include <bbt/infra/HttpServer.hpp>
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
-#include <bbt/infra/RpcServer.hpp>
+
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+#include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/rpc/Server.hpp>
+#endif
 
 #include <bbt/framework/internal/HostLifecycle.hpp>
 #include <bbt/framework/Result.hpp>
@@ -62,10 +98,14 @@ namespace bbt::framework {
 
 class InfraHttpHost final : public INetworkHost {
 public:
-    // limits 透传 NetworkRuntime::Create；listen 为监听地址
-    // （port==0 时内核分配，Start 后经 bound_address() 可读）。
+    // limits 透传 NetworkRuntime::Create / rpc::Server 的 http::ServerOptions；
+    // listen 为监听地址（port==0 时内核分配，Start 后经 bound_address() 可读）。
     InfraHttpHost(bbt::infra::NetworkLimits limits,
                   bbt::infra::ListenAddress listen);
+    // 析构兜底按 Close() 收（幂等）：Engine Run 线程是 joinable std::thread，
+    // 不经 Close 析构会以 std::thread::~thread terminate。handler 闭包自持
+    // 状态（m_state）不随宿主析构失效（见文件头寿命边界）。
+    ~InfraHttpHost() noexcept override { Close(); }
 
     // 安装入站 HttpHandler（LegacyHeaders；Start 前调用）。幂等覆盖；未安装
     // 任何 handler 时 Start 跳过监听（该宿主只做出站）。handler 在受管协程内
@@ -73,7 +113,7 @@ public:
     void InstallHandler(bbt::infra::HttpHandler handler);
 
     // 安装入站 RpcHandler（ProtoWireV1；Start 前调用）。Start 经
-    // NetworkRuntime::ListenRpc 监听，wire/local-min/五字段关联由 infra
+    // net::Engine + rpc::Server 监听，wire/local-min/五字段关联由 infra
     // 承担。与 InstallHandler 二选一（同一次 Start 只安装一条入站桥）。
     void InstallRpcHandler(bbt::infra::RpcHandler handler);
 
@@ -91,13 +131,19 @@ public:
     std::string bound_endpoint() const;
 
     // 桥接断言/观测用：被托管的 infra 对象本体（可能为空）。
-    // http_server() 只在 LegacyHeaders 模式非空（ProtoWireV1 模式下 infra 的
-    // 底层 HttpServer 由 ListenRpc 内部持有，不经本类暴露）；观测 RPC 模式请用
+    // http_server() 只在 LegacyHeaders 模式非空（ProtoWireV1 模式下底层
+    // http::Server 由 rpc::Server 内部持有，不经本类暴露）；观测 RPC 模式请用
     // rpc_server()。
     std::shared_ptr<bbt::infra::HttpServer>     http_server() const;
     std::shared_ptr<bbt::infra::NetworkRuntime> network_runtime() const;
-    // ProtoWireV1 模式下托管的 RpcServer（观测用，可能为空）。
-    std::shared_ptr<bbt::infra::RpcServer> rpc_server() const;
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    // ProtoWireV1 模式下托管的 rpc::Server（观测用，可能为空）。
+    std::shared_ptr<bbt::infra::rpc::Server> rpc_server() const;
+    // Close 收口期 rpc::Server::WaitStopped 的失败事实（观测用，可能为空）。
+    // WaitStopped 超时仍保留任务责任——Engine RequestClose+join 是物理凭据；
+    // 该错误只用于如实观测/诊断，不改变幂等同步收口契约。
+    std::optional<bbt::infra::Error> close_error() const;
+#endif
 
     // 测试缝（internal，仅框架回归使用）：在受控时刻重放一次「infra 已接纳、
     // 但协程尚未进入入站包装」的调用——走与 infra 完全相同的生产包装
@@ -148,10 +194,32 @@ private:
     // 同一临界区成对可见，否则轮询方能读到半成品就绪状态。
     std::shared_ptr<bbt::infra::NetworkRuntime> m_runtime;
     std::shared_ptr<bbt::infra::HttpServer> m_server;    // LegacyHeaders
-    std::shared_ptr<bbt::infra::RpcServer> m_rpc_server; // ProtoWireV1
     bbt::infra::ListenAddress m_bound{};
+    // bound_*/就绪判据：仅在 Start 成功完成监听装配后置位（rpc::Server 本体
+    // 在 Create 期已就位，不能用它冒充「已监听」）。
+    bool m_bound_ready{false};
 
     mutable std::mutex m_mtx;
+
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    // ProtoWireV1：server Engine + rpc::Server + 其专属 Run 线程。
+    // Run 线程只在本类 Start 与 Close 控制下生灭；Engine::Run 的阻塞循环
+    // 必须跑在宿主专用 native 线程。Run 结果经 m_engine_result
+    // （promise/future）发布——Start 相位等待与失败观察的唯一同步口。
+    std::shared_ptr<bbt::infra::net::Engine>  m_engine;
+    std::shared_ptr<bbt::infra::rpc::Server>  m_rpc_server;
+    std::thread                             m_engine_thread;
+    std::future<std::error_code>            m_engine_result;
+
+    // Close 期 WaitStopped 的失败事实（观测用；Engine join 仍为物理凭据）。
+    std::optional<bbt::infra::Error>          m_close_error;
+    // RPC 收口凭据：WaitHandlersDone（或 Close 兜底路径）取得
+    // rpc::Server::WaitStopped 成功后置位；Close 只在此凭据成立后停 Engine
+    // 并释放 server/engine owner，否则 fail-closed 保留（review-fixes §29-42）。
+    bool                                      m_stopped{false};
+    // Engine 收口（RequestClose+join+get）只尝试一次：幂等重入不再重复。
+    bool                                      m_engine_closed{false};
+#endif
 };
 
 } // namespace bbt::framework
