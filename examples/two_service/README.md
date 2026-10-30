@@ -38,8 +38,9 @@ schema、协议、错误信封或跨语言 client。
 
 ## 构建与运行（一条路径）
 
-前置与 `examples/getvalue` 完全相同：`-DNEED_TEST=ON` 且
-`-DBBT_PROTOBUF_PREFIX=<protobuf 3.21.12 前缀>` 使 `bbt_infra_rpc` 注册（否则
+前置与 `examples/getvalue` 完全相同：`-DNEED_TEST=ON`、
+`-DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON` 且
+`-DBBT_PROTOBUF_PREFIX=<protobuf 3.21.12 前缀>` 使 `bbt_infra_rpc_net` 注册（否则
 examples 入口根本不加入，不会静默降级）：
 
 ```bash
@@ -47,10 +48,11 @@ cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DNEED_TEST=ON \
   -DBBT_INFRA_SOURCE_DIR=<bbtools-infra 源码树> \
   -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \
+  -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
   -DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12 前缀> \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build-deps/project-build --target two_service \
-  --parallel $(( $(nproc) / 4 ))
+  --parallel 2
 ctest --test-dir build-deps/project-build -R '^examples\.two_service$' \
   --output-on-failure
 ```

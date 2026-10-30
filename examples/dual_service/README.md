@@ -30,7 +30,7 @@ driver ──wire──> svc_b(gateway) ──wire──> svc_a(storage)
 把入站预算收敛为 `min(传输硬看门, now+budget)` 并据此中止。迁移期 header 桥
 （`LegacyHeaders`）没有任何预算字段，服务端只能吃传输层 `incoming_timeout`
 ——调用方预算根本到不了对端，做不到真正继承。因此本示例三个进程统一走
-ProtoWireV1（该 profile 需要 `bbt_infra_rpc`，即 protobuf 前缀在场）。
+ProtoWireV1（该 profile 需要 `bbt_infra_rpc_net`，即 protobuf 前缀在场）。
 
 ## 覆盖路径
 
@@ -82,7 +82,8 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
   `storage_main.cc` 等核心示例代码永不编译，形成「CI 绿灯但没有覆盖」）：
 
   1. `-DNEED_TEST=ON`（examples 入口由它开启）；
-  2. `-DBBT_PROTOBUF_PREFIX=<protobuf 前缀>`（使 `bbt_infra_rpc` 注册）；
+  2. `-DBBT_INFRA_HTTP_NET=ON` + `-DBBT_INFRA_RPC_NET=ON` +
+     `-DBBT_PROTOBUF_PREFIX=<protobuf 前缀>`（三者齐备使 `bbt_infra_rpc_net` 注册）；
   3. `-DBBT_HIREDIS_PREFIX=<hiredis 前缀>`（使 `bbt::infra_redis` 注册，`svc_a` 必需）；
   4. `-DBBT_MONGOC_PREFIX=<mongo-c 前缀>` 与 `-DBBT_MONGOCXX_PREFIX=<mongo-cxx 前缀>`
      （使 `bbt::infra_mongo` 注册，`svc_a` 必需）。
@@ -96,6 +97,7 @@ cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DNEED_TEST=ON \
   -DBBT_INFRA_SOURCE_DIR=/path/to/bbtools-infra \
   -DBBT_COROUTINE_SOURCE_DIR=/path/to/bbtools-coroutine \
+  -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
   -DBBT_PROTOBUF_PREFIX=/path/to/protobuf \
   -DBBT_HIREDIS_PREFIX=/path/to/hiredis \
   -DBBT_MONGOC_PREFIX=/path/to/mongoc \

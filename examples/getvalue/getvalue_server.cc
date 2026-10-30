@@ -6,7 +6,8 @@
 //
 // argv: getvalue_server server <port_file> <meta_file> <journal_file>
 //
-// 版本/来源：链接 bbtools-infra locked 162bb5fd… 的 bbt::infra_rpc（protobuf
+// 版本/来源：链接 deps.lock 固定的 bbtools-infra（当前
+// d254c10a8a660057a85784b1155a7260460548e4）之 bbt::infra_rpc_net（protobuf
 // 3.21.12），bbt::framework 经 BBT_FRAMEWORK_HAS_RPC_WIRE 启用正式桥。
 
 #include <chrono>

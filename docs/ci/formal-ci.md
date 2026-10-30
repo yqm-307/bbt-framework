@@ -109,7 +109,7 @@ Boost runtime 与 protobuf 工具链：
 
 ## 4. 测试数（准确值）
 
-`-DNEED_TEST=ON` 且 `bbt_infra_rpc` 注册（锁定 protobuf 前缀）时的默认配置共注册 **21** 个 CTest：
+`-DNEED_TEST=ON` 且 `bbt_infra_rpc_net` 注册（锁定 protobuf 前缀 + `BBT_INFRA_HTTP_NET`/`BBT_INFRA_RPC_NET`）时的默认配置共注册 **21** 个 CTest：
 
 `tests/`（16）：`Test_framework_f0`、`Test_framework_f2a`、`Test_framework_f2b1`、`Test_framework_f2b2`、
 `Test_framework_f2b3`、`Test_framework_f1a`、`Test_framework_f1b1`、`Test_framework_f1b2`、`Test_framework_f3`、
@@ -139,8 +139,8 @@ Boost runtime 与 protobuf 工具链：
 ## 6. 固定输入（fixed SHA / 锁定值）
 
 - callee：`yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@ce247be9d3473432e0da6c204481ad9403c430bb`。
-- dependencies：`deps.lock`（`coroutine sha=7bcda3b078f975ff2978424be7f6ba38e04fb7f6`、
-  `infra sha=3136d1de5031a2eec55475e770d5ebbadc3c32da`）。
+- dependencies：`deps.lock`（`coroutine sha=206772b821ce6bd5ffc3afe547e11d21f5794b5a`、
+  `infra sha=d254c10a8a660057a85784b1155a7260460548e4`）。
 - Boost：`docker/toolchain.lock` 的 `BOOST_VERSION=1.90.0`、`BOOST_SHA256=5e93d582aff26868d581a52ae78c7d8edf3f3064742c6e77901a1f18a437eea9`（只编 `context`）。
 - protobuf：`docker/toolchain.lock` 的 `PROTOC_VERSION=3.21.12`；debs 与 sha256 来自
   `scripts/prepare_protobuf.sh` 的锁定包集。

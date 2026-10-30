@@ -291,8 +291,8 @@ result<void> CoApp::_ValidateConfig() const {
 #if !defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
     if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
         return FailInvalid(
-            "CoApp: ProtoWireV1 inbound bridge requires bbt::infra_rpc "
-            "(protobuf prefix not configured); refusing to silently fall back");
+            "CoApp: ProtoWireV1 inbound bridge requires bbt::infra_rpc_net "
+            "(BBT_INFRA_RPC_NET + protobuf prefix not configured); refusing to silently fall back");
 #endif
     for (const auto& r : m_options.static_routes) {
         if (r.service_name.empty())

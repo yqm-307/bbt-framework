@@ -4,7 +4,7 @@
 # wire 真实 socket 回环；caller handler 出站经公开策略 CoAppOptions::rpc_policy。
 # 只用公开面（bbt/framework/CoApp.hpp + RpcPolicy.hpp + getvalue 业务），不触
 # internal seam。本目录只在 examples/ 入口被加入时构建（根 CMakeLists：
-# NEED_TEST=ON 且 bbt_infra_rpc 已注册），与 examples/getvalue 同一前置。
+# NEED_TEST=ON 且 bbt_infra_rpc_net 已注册），与 examples/getvalue 同一前置。
 #
 # find_package 作用域按目录，不跨兄弟目录传播，故这里各自声明。
 find_package(Boost REQUIRED)

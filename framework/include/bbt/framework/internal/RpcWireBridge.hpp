@@ -7,13 +7,14 @@
 // x-bbt-* 头。
 //
 // 3-2 下沉后：wire 编解码、接收端 local-min 预算、成功/错误信封回显、五字段
-// 关联与 remaining 回填**全部**由 infra 承担（NetworkRuntime::ListenRpc →
-// HandleRpcRequest）。本桥的 handler 只是把 infra 已解析的 IncomingCallContext +
+// 关联与 remaining 回填**全部**由 infra 承担（rpc::Server →
+// HandleRpcRequest；上游 NetworkRuntime::ListenRpc 已删除）。本桥的 handler
+// 只是把 infra 已解析的 IncomingCallContext +
 // RpcEnvelope 交给公开的 app.dispatch_inbound，并在错误返回给 infra 之前过一遍
 // framework 错误边界（ValidateErrorAtBoundary）——infra 无 framework.actor 保留
 // 键表，非法 details 若不降级会被 infra 编码期拒绝或静默绕过域校验。
 //
-// 依赖 bbt::infra_rpc（仅在 protobuf 前缀锁定可用时编译）。
+// 依赖 bbt::infra_rpc_net（仅在 BBT_INFRA_RPC_NET + protobuf 前缀锁定可用时编译）。
 
 #include <bbt/framework/Result.hpp>
 

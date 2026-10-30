@@ -1,6 +1,7 @@
 // framework #4：G5 RpcEnvelope wire profile 的跨语言互通 C++ 服务端。
 //
-// 消费 bbt::infra_rpc（Issue #8 的正式 wire profile）+ bbt::infra_http，
+// 消费 bbt::infra_rpc_net（Issue #8 的正式 wire profile，新 bbt::infra::http
+// 栈绑定）+ 旧栈 bbt::infra_http（BBT_INFRA_LEGACY_STACK 保留的 ListenHttp），
 // 提供多场景 RPC 端点供非 C++ 客户端（tests/rpc_xlang_client.py）经
 // 真实 HTTP loopback 调用。argv 分流：
 //   <bin> server <port_file>
@@ -14,6 +15,11 @@
 // envelope 层错误（profile_version 不支持、metadata 违规、空标识符等）
 // 由 ParseRpcWireHttpRequest/DecodeRpcWireEnvelope 在 adapter 内拒绝，
 // 本服务把该 Error 原样装入 error envelope 返回，不让协议错误丢失。
+//
+// 移植说明：上游 RPC core 已迁到新 http 栈，wire 绑定类型是
+// http::IncomingRequest/http::Response；本服务继续使用旧栈 ListenHttp
+// （旧 HttpRequest/HttpResponse），在边界做逐字段值转换（method/target/
+// headers/body 一一对应；旧栈 server 侧 url 即 origin-form target）。
 
 #include <chrono>
 #include <cstdio>
@@ -40,6 +46,7 @@
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
+#include <bbt/infra/http/Server.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
 
 using namespace bbt::infra;
@@ -57,6 +64,20 @@ std::shared_ptr<HttpServer>     g_server;
 // 非空，无法解析入站 envelope 时用占位值保持 out envelope 自身可编码。
 // remaining_budget_ms=0 在 G5 冻结契约中是非法值（编码端显式拒绝），
 // 错误回填路径取 1 保证 envelope 可编码；正常路径回显入站预算。
+//
+// 新栈 http::Response → 旧栈 HttpResponse 的边界值转换（status_code→status；
+// headers/body 同名透传）。wire 生成物只在 bbt::infra::http 类型上提供，
+// 旧栈出参在此一次性转回，不扩散两套值类型。
+result<HttpResponse> ToLegacyResponse(result<http::Response> wire) {
+    if (!wire)
+        return result<HttpResponse>::err(std::move(wire.error()));
+    HttpResponse out;
+    out.status  = static_cast<unsigned>(wire.value().status_code);
+    out.headers = std::move(wire.value().headers);
+    out.body    = std::move(wire.value().body);
+    return result<HttpResponse>::ok(std::move(out));
+}
+
 result<HttpResponse> ErrorEnvelopeResponse(const Error& e,
                                            const std::string& request_id) {
     RpcWireEnvelope err_env;
@@ -66,12 +87,19 @@ result<HttpResponse> ErrorEnvelopeResponse(const Error& e,
     err_env.remaining_budget_ms = 1;
     err_env.success             = false;
     err_env.error               = e;
-    return MakeRpcWireHttpResponse(err_env);
+    return ToLegacyResponse(MakeRpcWireHttpResponse(err_env));
 }
 
 result<HttpResponse> XlangRpcHandler(IncomingCallContext ctx, HttpRequest req) {
     (void)ctx;
-    auto parsed = ParseRpcWireHttpRequest(req);
+    // 旧栈 HttpRequest → 新栈 http::IncomingRequest（server 侧 url 即
+    // origin-form target；headers/body 同名透传）。
+    http::IncomingRequest incoming;
+    incoming.method  = req.method;
+    incoming.target  = req.url;
+    incoming.headers = req.headers;
+    incoming.body    = std::move(req.body);
+    auto parsed = ParseRpcWireHttpRequest(incoming);
     if (!parsed)
         return ErrorEnvelopeResponse(parsed.error(), "");
     const auto& in = parsed.value();
@@ -116,7 +144,7 @@ result<HttpResponse> XlangRpcHandler(IncomingCallContext ctx, HttpRequest req) {
     auto http = MakeRpcWireHttpResponse(out);
     if (!http)
         return result<HttpResponse>::err(http.error());
-    return result<HttpResponse>::ok(std::move(http.value()));
+    return ToLegacyResponse(std::move(http));
 }
 
 void RuntimeSetup() {

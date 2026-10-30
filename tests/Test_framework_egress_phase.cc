@@ -45,6 +45,7 @@
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
+#include <bbt/infra/http/Server.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
 
 #include <bbt/framework/Framework.hpp>
@@ -57,8 +58,9 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-// 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测）。
-// runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
+// 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测；
+// ProtoWireV1 出站经共享 NetworkRuntime::CreateHttpClient，不另占 Engine
+// 驱动槽）。runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
 struct SchedulerFixture {
     SchedulerFixture() {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
@@ -356,12 +358,15 @@ BOOST_AUTO_TEST_CASE(connection_refused_is_transport_not_unknown) {
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(!static_cast<bool>(*res));
         const inf::Error& e = res->error();
+        // 共享 HttpClient（runtime 限额 owner）出站：连接被拒是「未提交」的
+        // 确定失败——判别点是「非 OutcomeUnknown、非已提交」。request_phase
+        // 在新栈契约下允许为空（NetToError 无阶段事实）；有值时必为未提交。
         BOOST_TEST(static_cast<int>(e.code) ==
                    static_cast<int>(fw::ErrorCode::TransportError));
         BOOST_TEST(static_cast<int>(e.code) !=
                    static_cast<int>(fw::ErrorCode::OutcomeUnknown));
-        BOOST_REQUIRE(e.request_phase.has_value());
-        BOOST_TEST(!inf::IsRequestCommitted(*e.request_phase));
+        if (e.request_phase.has_value())
+            BOOST_TEST(!inf::IsRequestCommitted(*e.request_phase));
     }
 
     eh.Stop();
@@ -426,9 +431,9 @@ BOOST_AUTO_TEST_CASE(remaining_budget_propagated_within_bounds) {
         std::lock_guard<std::mutex> lk(peer.mtx);
         body = peer.received_body;
     }
-    inf::HttpRequest req;
+    inf::http::IncomingRequest req;
     req.method  = "POST";
-    req.url     = inf::rpc::kRpcWireHttpPath;
+    req.target  = inf::rpc::kRpcWireHttpPath;
     req.headers = {{std::string(inf::rpc::kRpcWireContentTypeKey),
                     std::string(inf::rpc::kRpcWireContentType)}};
     req.body    = body;

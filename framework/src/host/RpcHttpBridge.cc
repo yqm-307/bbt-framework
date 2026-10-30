@@ -1,6 +1,13 @@
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
 
+#include <chrono>
+#include <cctype>
+#include <string_view>
 #include <utility>
+
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+#include <bbt/infra/rpc/RpcWire.hpp>
+#endif
 
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/internal/ErrorDomainRule.hpp>
@@ -152,12 +159,64 @@ result<bbt::infra::RpcEnvelope> HttpEgress::_SendWireProfile(const bbt::infra::R
                                                              const bbt::infra::CallOptions& opt)
 {
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-    // 懒建并缓存 RpcClient（一次）。缓存锁不跨 Call：Call 是协程阻塞调用，
-    // 持锁会串行化所有出站并可能与取消路径互锁。
-    std::shared_ptr<bbt::infra::RpcClient> client;
+    // 正式 ProtoWireV1 出站：承载通道是同一 NetworkRuntime::CreateHttpClient
+    // （与 LegacyHeaders 共用懒建缓存）——runtime 限额 owner 统一持有
+    // max_connections/max_inflight，ValidateRequest 与响应 parser 都按宿主
+    // NetworkLimits 做请求/响应字节校验；不另建 http::Client/Engine/pool，
+    // 也不引入丢失共享限额的第二 owner（F3/F2）。wire 编码/关联/预算换算
+    // 全部经 infra 公开 wire 面（ToWireEnvelope/EncodeRpcWireEnvelope/
+    // DecodeRpcWireEnvelope/FromWireEnvelope），POST /rpc 固定 profile；
+    // 本地 deadline→remaining_budget_ms 的换算与五字段关联校验沿用旧
+    // CreateRpcClient→CreateHttpClient 链路的同一语义（上游把客户端封装
+    // 下沉为 rpc::Client，本仓按既有 wire 语义经公开函数直接承载）。
+
+    // endpoint 边界：裸 authority（host[:port]），同旧链路 IsRpcAuthority。
+    auto is_authority = [](std::string_view ep) noexcept {
+        if (ep.empty() || ep.find("://") != std::string_view::npos)
+            return false;
+        for (const char ch : ep) {
+            const auto c = static_cast<unsigned char>(ch);
+            if (c <= 0x20 || c == 0x7f || ch == '/' || ch == '?' ||
+                ch == '#' || ch == '@')
+                return false;
+        }
+        return true;
+    };
+    if (!is_authority(addr.endpoint))
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::InvalidArgument,
+            "http egress: rpc endpoint must be an authority without scheme or path"));
+
+    // 本地期限 → wire remaining_budget_ms：已过期 → TimedOut（不做任何 I/O）；
+    // 合法值 clamp 到 [1, kMaxRemainingBudgetMs]（同旧链路 RemainingBudgetMs）。
+    const auto now = std::chrono::steady_clock::now();
+    if (opt.deadline <= now)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::TimedOut, "rpc deadline already expired"));
+    auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            opt.deadline - now).count();
+    if (remaining < 1)
+        remaining = 1;
+    if (remaining > static_cast<long long>(bbt::infra::rpc::kMaxRemainingBudgetMs))
+        remaining = static_cast<long long>(bbt::infra::rpc::kMaxRemainingBudgetMs);
+    const auto budget = static_cast<std::uint32_t>(remaining);
+
+    auto wire = bbt::infra::rpc::ToWireEnvelope(env, budget);
+    if (!wire)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(wire.error()));
+    auto body = bbt::infra::rpc::EncodeRpcWireEnvelope(
+        wire.value(), /*is_response=*/false);
+    if (!body)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(body.error()));
+
+    // 懒建并缓存共享 HttpClient（一次；runtime 限额 owner）。缓存锁不跨
+    // Request：Request 是协程阻塞调用，持锁会串行化所有出站并可能与取消
+    // 路径互锁。
+    std::shared_ptr<bbt::infra::HttpClient> client;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        client = m_rpc_client;
+        client = m_client;
     }
     if (!client) {
         auto host = m_host.lock();
@@ -165,32 +224,90 @@ result<bbt::infra::RpcEnvelope> HttpEgress::_SendWireProfile(const bbt::infra::R
         if (host)
             rt = host->network_runtime();
         if (!rt)
-            return result<bbt::infra::RpcEnvelope>::err(
-                MakeError(ErrorCode::RuntimeUnavailable, "http egress: network runtime unavailable"));
-        auto created = rt->CreateRpcClient();
+            return result<bbt::infra::RpcEnvelope>::err(MakeError(
+                ErrorCode::RuntimeUnavailable,
+                "http egress: network runtime unavailable"));
+        auto created = rt->CreateHttpClient();
         if (!created)
-            return result<bbt::infra::RpcEnvelope>::err(std::move(created.error()));
+            return result<bbt::infra::RpcEnvelope>::err(
+                std::move(created.error()));
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_rpc_client)
-            m_rpc_client = std::move(created.value());
-        client = m_rpc_client;
+        if (!m_client)
+            m_client = std::move(created.value());
+        client = m_client;
     }
-    // 正式 ProtoWireV1 出站唯一实现：infra RpcClient::Call 承担定址 HTTP 发送、
-    // wire 编解码、本地期限→remaining_budget_ms（含上限 clamp 与已过期拒绝）、
-    // 五字段关联校验与结构化错误上报。framework 不再自算 remaining、不再自组
-    // wire/HTTP、不做第二套字段规则。
-    auto res = client->Call(addr, env, opt);
+
+    bbt::infra::HttpRequest req;
+    req.method  = "POST";
+    req.url     = "http://" + addr.endpoint + bbt::infra::rpc::kRpcWireHttpPath;
+    req.headers = {{std::string(bbt::infra::rpc::kRpcWireContentTypeKey),
+                    std::string(bbt::infra::rpc::kRpcWireContentType)}};
+    req.body.assign(reinterpret_cast<const char*>(body.value().data()),
+                    body.value().size());
+
+    // 传输/排队/取消/未知结果错误原样透传（含 request_phase 事实）。
+    auto res = client->Request(std::move(req), opt);
     if (!res)
         return result<bbt::infra::RpcEnvelope>::err(std::move(res.error()));
-    return result<bbt::infra::RpcEnvelope>::ok(std::move(res.value()));
+
+    const auto& resp = res.value();
+    if (resp.status != 200) {
+        auto error = MakeError(ErrorCode::Unavailable,
+            "rpc endpoint returned non-success HTTP status");
+        error.backend_category = "http";
+        error.backend_code = static_cast<int>(resp.status);
+        return result<bbt::infra::RpcEnvelope>::err(std::move(error));
+    }
+    // 回复形态（与 infra ParseRpcWireHttpResponse 同契约）：Content-Type
+    // 恰为 application/x-protobuf + 非空 body；违规 InvalidArgument/ProtocolError。
+    const auto has_content_type = [&resp]() {
+        const auto eq_ci = [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i = 0; i < a.size(); ++i)
+                if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                    std::tolower(static_cast<unsigned char>(b[i])))
+                    return false;
+            return true;
+        };
+        for (const auto& [k, v] : resp.headers)
+            if (eq_ci(k, bbt::infra::rpc::kRpcWireContentTypeKey) &&
+                v == bbt::infra::rpc::kRpcWireContentType)
+                return true;
+        return false;
+    };
+    if (!has_content_type())
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::InvalidArgument,
+            "rpc wire response missing Content-Type"));
+    if (resp.body.empty())
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::ProtocolError, "rpc wire response empty body"));
+
+    auto decoded = bbt::infra::rpc::DecodeRpcWireEnvelope(
+        resp.body, /*is_response=*/true);
+    if (!decoded)
+        return result<bbt::infra::RpcEnvelope>::err(
+            std::move(decoded.error()));
+    const auto& reply = decoded.value();
+    if (reply.request_id != env.request_id ||
+        reply.service != env.service ||
+        reply.method != env.method ||
+        reply.request_schema != env.request_schema ||
+        reply.response_schema != env.response_schema)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::ProtocolError,
+            "rpc reply envelope association mismatch"));
+    if (!reply.success)
+        return result<bbt::infra::RpcEnvelope>::err(reply.error);
+    return bbt::infra::rpc::FromWireEnvelope(reply);
 #else
     (void)addr;
     (void)env;
     (void)opt;
     return result<bbt::infra::RpcEnvelope>::err(MakeError(
         ErrorCode::RuntimeUnavailable,
-        "http egress: ProtoWireV1 profile requires bbt::infra_rpc "
-        "(protobuf prefix not configured)"));
+        "http egress: ProtoWireV1 profile requires bbt::infra_rpc_net "
+        "(BBT_INFRA_RPC_NET + protobuf prefix not configured)"));
 #endif
 }
 
@@ -207,8 +324,9 @@ result<bbt::infra::RpcEnvelope> HttpEgress::Send(
             ErrorCode::InvalidArgument,
             "http egress: empty endpoint"));
 
-    // ProtoWireV1 走独立 infra RpcClient 缓存；LegacyHeaders 保持原 HttpClient
-    // 路径与 x-bbt-* 编解码逐字不变。
+    // ProtoWireV1 走正式 body wire（同一共享 HttpClient + infra 公开 RpcWire
+    // 编解码）；LegacyHeaders 保持 x-bbt-* 编解码逐字不变。两者共用同一份
+    // 懒建 HttpClient 缓存（同一 runtime 限额 owner）。
     if (m_profile == RpcEgressProfile::ProtoWireV1)
         return _SendWireProfile(addr, env, opt);
 

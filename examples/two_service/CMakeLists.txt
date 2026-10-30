@@ -7,7 +7,7 @@
 # getvalue_proto 与 ProtoCodec 特化，#5 不另造第二套。
 #
 # 本目录只在 examples/ 入口被加入时构建（根 CMakeLists：NEED_TEST=ON 且
-# bbt_infra_rpc 已注册），与 examples/getvalue 同一前置，无额外依赖。
+# bbt_infra_rpc_net 已注册），与 examples/getvalue 同一前置，无额外依赖。
 
 # 复用 examples/getvalue 的业务服务头（公开面；与 tests/Test_framework_matrix.cc
 # 同一 include 口径）。

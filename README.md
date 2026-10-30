@@ -50,9 +50,27 @@ INFRA=/path/to/bbtools-infra            # 含顶层 CMakeLists.txt 与 include/
 CO=/path/to/bbtools-coroutine           # 含顶层 CMakeLists.txt 与 bbt/
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DNEED_TEST=ON \
-  -DBBT_INFRA_SOURCE_DIR=$INFRA -DBBT_COROUTINE_SOURCE_DIR=$CO
-ninja -C build
-ctest --test-dir build -j1 --output-on-failure
+  -DBBT_INFRA_SOURCE_DIR=$INFRA -DBBT_COROUTINE_SOURCE_DIR=$CO \
+  -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
+  -DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12 前缀>
+
+# 构建按目标进行，固定 `--parallel 2`；同机多 agent 时构建/测试经宿主已有
+# 共享验证队列串行执行（一次只跑一个重任务），不按逻辑核数放大并发。
+# 下列目标覆盖下面三条聚焦 ctest 选集所需的全部可执行文件/fixture
+# （tests/ 与 examples/ 各自 add_executable，ctest 不负责构建）。
+cmake --build build --parallel 2 --target \
+  bbt_framework \
+  Test_framework_f0 Test_framework_f1a Test_framework_f1b1 Test_framework_f1b2 \
+  Test_framework_f2a Test_framework_f2b1 Test_framework_f2b2 Test_framework_f2b3 \
+  Test_framework_f3 Test_framework_rpc Test_framework_rpc_close_gate \
+  Test_framework_resource Test_framework_egress_phase \
+  Test_framework_getvalue_codec Test_framework_matrix rpc_xlang_server \
+  getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture
+
+# 测试一律 ctest -j1，只跑聚焦集；本地不跑全量，全量走 PR CI。
+ctest --test-dir build -j1 -R 'Test_framework_rpc$|Test_framework_rpc_close_gate|framework\.rpc_xlang|framework\.getvalue\.codec|framework\.egress\.phase|framework\.matrix|Test_framework_f3|Test_framework_f2b|examples\.getvalue\.xlang' --output-on-failure
+ctest --test-dir build -j1 -R 'Test_framework_f0$|Test_framework_f1a|Test_framework_f1b|Test_framework_f2a$|Test_framework_resource$' --output-on-failure
+ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
 ```
 
 说明：
@@ -62,6 +80,19 @@ ctest --test-dir build -j1 --output-on-failure
   仍无 `bbt::infra_common` 目标则 `FATAL_ERROR` 并指明两条路径选项。
 - `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名
   `NEED_TEST`、`BUILD_TESTING` 开关在接入时被局部屏蔽。
+- 上游 infra RPC core 已迁到新 `bbt::infra::http` 栈：正式 wire 由
+  `bbt::infra_rpc_net` 目标承载，需要 `BBT_INFRA_RPC_NET=ON` +
+  `BBT_INFRA_HTTP_NET=ON` + `BBT_PROTOBUF_PREFIX`，三者缺一在 infra
+  configure 阶段 fail-closed；NEED_TEST=ON 的本仓验收（
+  `framework.rpc_xlang` 等强制用例）同样要求该目标在场。不显式选择
+  ProtoWireV1 的普通库构建可不配这组开关（仅迁移期 header 桥）。
+- ProtoWireV1 装配要求宿主进程 coroutine 已登记 worker ≥2：server
+  `net::Engine` 绑 1 main+1 sub 驱动槽；正式 wire 出站由同一
+  `NetworkRuntime::CreateHttpClient` 通道承载（runtime 限额 owner 共享
+  `max_connections`/`max_inflight` 与请求/响应字节校验），不另占
+  Engine/driver 槽。`g_bbt_coroutine_config->m_cfg_static_thread_num`
+  不足会在 Engine::Run 绑定时以 `no_buffer_space` 失败（`Engine::Run` 另占
+  宿主专用 native 线程，不是协程/P 线程）。
 - 构建产物只进已忽略的 `build/`。
 
 ## 跨语言 RPC 示例：GetValue（Issue #4 P0-A）
@@ -94,7 +125,7 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
 - 默认 OFF：普通 framework 构建与测试不加入该示例，不要求
   hiredis / mongo-cxx-driver，也不要求真实 Redis/Mongo 后端。
 - 显式 ON：fail-closed。必须同时具备 `NEED_TEST=ON`、protobuf 前缀
-  （`bbt_infra_rpc`）、hiredis 前缀（`bbt::infra_redis`）、
+  （`bbt_infra_rpc_net`）、hiredis 前缀（`bbt::infra_redis`）、
   `BBT_MONGOC_PREFIX`+`BBT_MONGOCXX_PREFIX`（`bbt::infra_mongo`）；
   任一缺失都在 configure 阶段 `FATAL_ERROR`，不静默跳过。
 - 协议：三个进程统一 ProtoWireV1（infra 正式 body wire），只有它携带

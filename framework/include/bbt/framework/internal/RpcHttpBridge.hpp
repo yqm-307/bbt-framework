@@ -53,16 +53,18 @@ result<bbt::infra::RpcEnvelope> EnvelopeFromResponse(
 // app.dispatch_inbound → ToHttpResponse。测试缝与业务默认路径共用。
 void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 
-// 默认出站：client 懒建（首个发送时在协程内创建，协程约束与 infra 一致）；
+// 默认出站：client 懒建（首个发送时创建，协程约束与 infra 一致）；
 // runtime 不可得 → RuntimeUnavailable。
 // Issue #4：出站协议 profile 与入站一致：
 //  - LegacyHeaders 走 x-bbt-* header 迁移期桥（HttpClient；
 //    http_bridge::ToHttpRequest/EnvelopeFromResponse）。
-//  - ProtoWireV1 走 infra 正式 body 信封，**唯一**发送方式 =
-//    NetworkRuntime::CreateRpcClient() + RpcClient::Call(addr, env, opt)：
-//    wire 编解码/本地期限→remaining_budget_ms/五字段关联/结构化错误全部由
-//    infra 承担，framework 不再自组 wire/HTTP。两者各自独立懒建缓存
-//    （RpcClient 内部自持 HttpClient，不再与 Legacy 分支共享同一发送 root）。
+//  - ProtoWireV1 走 infra 正式 body 信封：同一
+//    NetworkRuntime::CreateHttpClient 出站通道承载（runtime 限额 owner
+//    共享 max_connections/max_inflight，请求/响应字节按宿主
+//    NetworkLimits 校验），wire 编码/关联/预算换算经 infra 公开
+//    RpcWire 面（POST /rpc 固定 profile）。两个 profile 共用同一份懒建
+//    HttpClient 缓存（同一个 runtime、同一个限额 owner，profile 只决定
+//    wire 编解码）。
 enum class RpcEgressProfile { LegacyHeaders, ProtoWireV1 };
 
 class HttpEgress {
@@ -80,9 +82,11 @@ public:
         const bbt::infra::CallOptions& opt);
 
 private:
-    // ProtoWireV1 分支：懒建 RpcClient 一次并缓存，调用 infra Call；不在
-    // 调用期间持缓存锁（Call 是协程阻塞调用）。仅
-    // BBT_FRAMEWORK_HAS_RPC_WIRE 时可用。
+    // ProtoWireV1 分支：endpoint 边界检查 → 本地期限→remaining_budget_ms
+    // （已过期 → TimedOut 零 I/O）→ ToWireEnvelope/EncodeRpcWireEnvelope →
+    // 共享 HttpClient POST /rpc → 状态/Content-Type/五字段关联校验 →
+    // DecodeRpcWireEnvelope/FromWireEnvelope。仅 BBT_FRAMEWORK_HAS_RPC_WIRE
+    // 时可用。
     result<bbt::infra::RpcEnvelope> _SendWireProfile(const bbt::infra::RpcAddress& addr,
                                                      const bbt::infra::RpcEnvelope& env,
                                                      const bbt::infra::CallOptions& opt);
@@ -90,8 +94,10 @@ private:
     std::weak_ptr<InfraHttpHost> m_host;
     RpcEgressProfile m_profile;
     std::mutex m_mtx;
-    std::shared_ptr<bbt::infra::HttpClient> m_client;    // LegacyHeaders
-    std::shared_ptr<bbt::infra::RpcClient> m_rpc_client; // ProtoWireV1
+    // 懒建共享 HttpClient：runtime 限额 owner（max_connections/max_inflight
+    // 与请求/响应字节校验）由 NetworkRuntime 统一持有；两个 profile 共用
+    // 这一个发送 root，不另建独立 client/engine/pool。
+    std::shared_ptr<bbt::infra::HttpClient> m_client;
 };
 
 } // namespace bbt::framework
