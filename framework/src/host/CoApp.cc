@@ -52,22 +52,28 @@ CoApp::CoApp(CoAppOptions options)
         m_options.network_limits, m_options.listen);
     m_network_host = m_default_host;
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-    if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
+    if (m_options.inbound_bridge != RpcInboundBridge::LegacyHeaders) {
+        m_default_host->SetRpcInboundTransport(m_options.inbound_bridge);
         InstallRpcWireBridge(*m_default_host, *this);
-    else
+    } else {
         InstallRpcHttpBridge(*m_default_host, *this);
+    }
 #else
-    // 无 protobuf 前缀锁定时只有迁移期 header 桥；显式选择 ProtoWireV1 会在
-    // _ValidateConfig 被拒绝（不静默降级为另一协议）。
+    // 无 protobuf 前缀锁定时只有迁移期 header 桥；显式选择 ProtoWireV1/TcpV1
+    // 会在 _ValidateConfig 被拒绝（不静默降级为另一协议）。
     InstallRpcHttpBridge(*m_default_host, *this);
 #endif
-    // 出站 profile 与入站一致：选 ProtoWireV1 时出站走正式 body 信封（同一
-    // HttpClient 发送 root，只换编解码），不与入站协议分叉；LegacyHeaders 保留
-    // 迁移期 header 桥行为。
+    // 出站 profile 与入站一致：ProtoWireV1/TcpV1 时出站走 infra 公开
+    // rpc::Client + 对应 adapter（wire 编解码由 infra 承担，不与入站协议分叉）；
+    // LegacyHeaders 保留迁移期 header 桥行为。
+    const auto egress_profile =
+        m_options.inbound_bridge == RpcInboundBridge::TcpV1
+            ? RpcEgressProfile::TcpV1
+            : m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1
+                  ? RpcEgressProfile::ProtoWireV1
+                  : RpcEgressProfile::LegacyHeaders;
     m_default_egress = std::make_shared<HttpEgress>(m_default_host,
-        m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1
-            ? RpcEgressProfile::ProtoWireV1
-            : RpcEgressProfile::LegacyHeaders);
+                                                    egress_profile);
     for (const auto& r : m_options.static_routes)
         m_routes.emplace(r.service_name, r.address);   // 重复名保先见，run 校验拒绝
 }
@@ -289,10 +295,16 @@ result<void> CoApp::_ValidateConfig() const {
     if (m_options.shutdown_step_budget <= std::chrono::milliseconds{0})
         return FailInvalid("CoApp: shutdown_step_budget must be > 0");
 #if !defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-    if (m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1)
+    if (m_options.inbound_bridge != RpcInboundBridge::LegacyHeaders)
         return FailInvalid(
-            "CoApp: ProtoWireV1 inbound bridge requires bbt::infra_rpc_net "
+            "CoApp: ProtoWireV1/TcpV1 inbound bridge requires bbt::infra_rpc_net "
             "(BBT_INFRA_RPC_NET + protobuf prefix not configured); refusing to silently fall back");
+#endif
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE) && !defined(BBT_FRAMEWORK_HAS_RPC_TCP)
+    if (m_options.inbound_bridge == RpcInboundBridge::TcpV1)
+        return FailInvalid(
+            "CoApp: TcpV1 inbound bridge requires bbt::infra_rpc_tcp "
+            "(BBT_INFRA_RPC_TCP not configured); refusing to silently fall back");
 #endif
     for (const auto& r : m_options.static_routes) {
         if (r.service_name.empty())

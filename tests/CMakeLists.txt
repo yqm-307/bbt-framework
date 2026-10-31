@@ -114,6 +114,17 @@ add_test(NAME framework.rpc_codec COMMAND Test_framework_rpc_codec)
 set_tests_properties(framework.rpc_codec PROPERTIES
     TIMEOUT 15 LABELS "smoke;unit")
 
+# 三仓迁移 impl-framework-rpc：RPC profile 契约测试——TCP loopback roundtrip、
+# 默认 HTTP 回归、OutcomeUnknown/request_phase、Close 与 LegacyHeaders 保持。
+# TCP 用例仅在 bbt_infra_rpc_tcp 注册时编译进目标（否则文件内 TCP 段为空，
+# 只剩 legacy 用例——TCP 证据由 infra rpc.net.tcp_* 与本测试 TCP 段共同提供）。
+add_executable(Test_framework_rpc_profile Test_framework_rpc_profile.cc)
+target_link_libraries(Test_framework_rpc_profile PRIVATE bbt::framework)
+target_compile_options(Test_framework_rpc_profile PRIVATE -Wall -Wextra)
+add_test(NAME framework.rpc_profile COMMAND Test_framework_rpc_profile)
+set_tests_properties(framework.rpc_profile PROPERTIES
+    TIMEOUT 60 LABELS "integration")
+
 # 命名资源 Registry：工厂装配、Create/Start 相位、失败回滚与
 # 关闭序列下的同步 Close 收束（INetworkHost 桩驱动）。
 add_executable(Test_framework_resource_lifecycle
@@ -134,11 +145,12 @@ set_tests_properties(framework.resource_lifecycle PROPERTIES
 option(BBT_REQUIRE_RESOURCE_LIVE_TESTS
     "强制真实 Redis+Mongo live 验收（缺模块即 configure 失败）" OFF)
 if(BBT_REQUIRE_RESOURCE_LIVE_TESTS)
-    if(NOT TARGET bbt::infra_redis OR NOT TARGET bbt::infra_mongo)
+    if(NOT TARGET bbt::infra_redis_net OR NOT TARGET bbt::infra_mongo)
         message(FATAL_ERROR
-            "BBT_REQUIRE_RESOURCE_LIVE_TESTS=ON 但 bbt::infra_redis/"
+            "BBT_REQUIRE_RESOURCE_LIVE_TESTS=ON 但 bbt::infra_redis_net/"
             "bbt::infra_mongo 未全部注册：live 验收为强制项，不允许"
-            "静默缺模块。请提供 -DBBT_HIREDIS_PREFIX=<hiredis 前缀> 与 "
+            "静默缺模块。Redis 侧需要 -DBBT_INFRA_REDIS_NET=ON 与 "
+            "-DBBT_HIREDIS_PREFIX=<hiredis 前缀>；Mongo 侧需要 "
             "-DBBT_MONGOC_PREFIX=/-DBBT_MONGOCXX_PREFIX=<mongoc/mongocxx 前缀>"
             " 使两个目标注册后重新配置。")
     endif()
@@ -149,11 +161,15 @@ endif()
 # 各自显式要求对应 infra 模块已构建（缺 target → 编译期失败而不是静默
 # 消失）；环境变量缺失时进程以 77 退出，配合 SKIP_RETURN_CODE 标为
 # CTest Skipped——缺后端必须显式 skipped 或非零失败，不得记为 Passed。
-if(TARGET bbt::infra_redis)
+# Redis 用例消费新 net 入口（framework/include/bbt/framework/
+# RedisNetResource.hpp），不再走旧 bbt::infra::CoRedisCli 栈；Mongo 用例
+# 消费新 owner/句柄入口（framework/include/bbt/framework/
+# MongoDbResource.hpp），不再走旧 bbt::infra::CoMongoCli 栈。
+if(TARGET bbt::infra_redis_net)
     add_executable(Test_framework_resource_live_redis
         Test_framework_resource_live.cc)
     target_link_libraries(Test_framework_resource_live_redis PRIVATE
-        bbt::framework bbt::infra_redis)
+        bbt::framework bbt::infra_redis_net)
     target_compile_options(Test_framework_resource_live_redis PRIVATE
         -Wall -Wextra)
     target_compile_definitions(Test_framework_resource_live_redis PRIVATE
@@ -166,8 +182,8 @@ if(TARGET bbt::infra_redis)
         LABELS "live")
 else()
     message(STATUS
-        "framework.resource_live_redis: 未构建 bbt::infra_redis "
-        "(BBT_HIREDIS_PREFIX)，本配置无 Redis live 门禁")
+        "framework.resource_live_redis: 未构建 bbt::infra_redis_net "
+        "(BBT_INFRA_REDIS_NET+BBT_HIREDIS_PREFIX)，本配置无 Redis live 门禁")
 endif()
 
 if(TARGET bbt::infra_mongo)
@@ -195,7 +211,7 @@ endif()
 # 真实 Redis + Mongo 联合消费。要求两个 infra 资源模块都在场（任一缺失
 # 即不注册本 target——单资源 live 不能替代联合验收），缺环境时进程 77
 # 退出配合 SKIP_RETURN_CODE 标 Skipped。
-if(TARGET bbt::infra_redis AND TARGET bbt::infra_mongo)
+if(TARGET bbt::infra_redis_net AND TARGET bbt::infra_mongo)
     # 业务 Service 在独立 TU framework_resource_service.cc 中实现（只 include
     # framework/infra/coroutine 公开头），与测试宿主分属不同编译单元——这是
     # 「干净消费者 Service 只公共头即可按名称使用资源」的真实编译证据。
@@ -203,7 +219,7 @@ if(TARGET bbt::infra_redis AND TARGET bbt::infra_mongo)
         Test_framework_resource_combined.cc
         framework_resource_service.cc)
     target_link_libraries(Test_framework_resource_live_combined PRIVATE
-        bbt::framework bbt::infra_redis bbt::infra_mongo)
+        bbt::framework bbt::infra_redis_net bbt::infra_mongo)
     target_compile_options(Test_framework_resource_live_combined PRIVATE
         -Wall -Wextra)
     target_compile_definitions(Test_framework_resource_live_combined PRIVATE
@@ -216,7 +232,7 @@ if(TARGET bbt::infra_redis AND TARGET bbt::infra_mongo)
         LABELS "live")
 else()
     message(STATUS
-        "framework.resource_live_combined: 需要 bbt::infra_redis 与 "
+        "framework.resource_live_combined: 需要 bbt::infra_redis_net 与 "
         "bbt::infra_mongo 同时在场，本配置无联合 live 门禁")
 endif()
 

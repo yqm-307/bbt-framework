@@ -39,3 +39,12 @@ else()
         "bbt-framework: 未注册 bbt_infra_rpc_net（缺 BBT_PROTOBUF_PREFIX）："
         "只有迁移期 header 入站桥")
 endif()
+
+# 三仓 §6 迁移：TCP profile（TcpRpcTransport/TcpRpcInboundTransport）只在
+# infra 注册 bbt_infra_rpc_tcp 时编译；未注册时 TcpV1 选择 fail-closed
+# （Create/_ValidateConfig 显式失败，不降级为 HTTP）。
+if(TARGET bbt_infra_rpc_tcp)
+    target_link_libraries(bbt_framework PUBLIC bbt::infra_rpc_tcp)
+    target_compile_definitions(bbt_framework PUBLIC BBT_FRAMEWORK_HAS_RPC_TCP=1)
+    message(STATUS "bbt-framework: 启用 RPC TCP profile (bbt::infra_rpc_tcp)")
+endif()

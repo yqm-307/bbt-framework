@@ -56,6 +56,7 @@
 #include <bbt/infra/NetworkRuntime.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/http/Client.hpp>
+#include <bbt/infra/rpc/HttpTransport.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
 
 #include <bbt/example/v1/get_value.pb.h>

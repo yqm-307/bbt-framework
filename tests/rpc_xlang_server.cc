@@ -47,6 +47,7 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/http/Server.hpp>
+#include <bbt/infra/rpc/HttpTransport.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
 
 using namespace bbt::infra;

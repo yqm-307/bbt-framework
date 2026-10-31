@@ -48,8 +48,8 @@ struct BsonBuilder {
         const auto d = sub.Finish();
         m_body.insert(m_body.end(), d.bytes.begin(), d.bytes.end());
     }
-    inf::MongoDocument Finish() const {
-        inf::MongoDocument d;
+    inf::mongo::MongoDocument Finish() const {
+        inf::mongo::MongoDocument d;
         PutI32(d.bytes, static_cast<std::int32_t>(m_body.size() + 5));
         d.bytes.insert(d.bytes.end(), m_body.begin(), m_body.end());
         d.bytes.push_back(0x00);
@@ -57,18 +57,18 @@ struct BsonBuilder {
     }
 };
 
-inf::MongoDocument DocId(std::string_view id) {
+inf::mongo::MongoDocument DocId(std::string_view id) {
     BsonBuilder b;
     b.Str("_id", id);
     return b.Finish();
 }
-inf::MongoDocument DocIdV(std::string_view id, std::string_view v) {
+inf::mongo::MongoDocument DocIdV(std::string_view id, std::string_view v) {
     BsonBuilder b;
     b.Str("_id", id);
     b.Str("v", v);
     return b.Finish();
 }
-inf::MongoDocument DocSetV(std::string_view v) {
+inf::mongo::MongoDocument DocSetV(std::string_view v) {
     BsonBuilder inner;
     inner.Str("v", v);
     BsonBuilder b;
@@ -78,7 +78,7 @@ inf::MongoDocument DocSetV(std::string_view v) {
 
 // 读取顶层 string 字段（本业务只写入 string/int32；其他类型不出现）。
 std::optional<std::string> ReadStrField(
-    const inf::MongoDocument& d, std::string_view key) {
+    const inf::mongo::MongoDocument& d, std::string_view key) {
     const auto& b = d.bytes;
     if (b.size() < 5) return std::nullopt;
     std::size_t pos = 4;
@@ -124,8 +124,8 @@ KvSvc::ResolvedOrError KvSvc::_Res() {
     ResolvedOrError out;
     auto ctx = context().request();
     if (!ctx) { out.resp = fw::CoRpcResp::Error(ctx.error()); return out; }
-    out.res.cache = context().resource<inf::CoRedisCli>("cache");
-    out.res.docs  = context().resource<inf::CoMongoCli>("docs");
+    out.res.cache = context().resource<fw::RedisNetResource>("cache");
+    out.res.docs  = context().resource<fw::MongoDbResource>("docs");
     out.res.deadline = ctx.value()->deadline;
     if (!out.res.cache) { out.resp = _Missing("cache"); return out; }
     if (!out.res.docs)  { out.resp = _Missing("docs");  return out; }
@@ -141,19 +141,19 @@ fw::CoRpcResp KvSvc::Get(fw::CoRpcReq req) {
     inf::CallOptions o;
     o.deadline = base.res.deadline;
     const std::string key = "kv:" + id.value();
-    auto c = base.res.cache->Get(key, o);
+    auto c = bbt_co_await base.res.cache->Get(key, o);
     if (!c) return fw::CoRpcResp::Error(c.error());
     if (c.value().has_value())
         return _Reply(0, c.value().value());          // cache hit
     mongo_reads.fetch_add(1, std::memory_order_acq_rel);
-    auto f = base.res.docs->FindOne(DocId(id.value()), o);
+    auto f = bbt_co_await base.res.docs->FindOne(DocId(id.value()), o);
     if (!f) return fw::CoRpcResp::Error(f.error());
     if (!f.value().has_value())
         return _Reply(1, "");                          // not-found
     auto v = ReadStrField(f.value().value(), "v");
     if (!v) return fw::CoRpcResp::Error(fw::MakeError(
         fw::ErrorCode::ProtocolError, "kv: document missing 'v'"));
-    auto w = base.res.cache->Set(key, *v, o);              // 写回 cache
+    auto w = bbt_co_await base.res.cache->Set(key, *v, o);              // 写回 cache
     if (!w) return fw::CoRpcResp::Error(w.error());
     return _Reply(0, *v);
 }
@@ -166,7 +166,7 @@ fw::CoRpcResp KvSvc::Insert(fw::CoRpcReq req) {
     inf::CallOptions o;
     o.deadline = base.res.deadline;
     const auto& [id, v] = args.value();
-    auto r = base.res.docs->InsertOne(DocIdV(id, v), o);
+    auto r = bbt_co_await base.res.docs->InsertOne(DocIdV(id, v), o);
     if (!r) return fw::CoRpcResp::Error(r.error());    // 原样传播
     return _Reply(0, v);
 }
@@ -181,11 +181,11 @@ fw::CoRpcResp KvSvc::Update(fw::CoRpcReq req) {
     o.deadline = base.res.deadline;
     const auto& [id, v] = args.value();
     const std::string key = "kv:" + id;
-    auto u = base.res.docs->UpdateOne(DocId(id), DocSetV(v), o);
+    auto u = bbt_co_await base.res.docs->UpdateOne(DocId(id), DocSetV(v), o);
     if (!u) return fw::CoRpcResp::Error(u.error());
-    auto d = base.res.cache->Delete({key}, o);             // 失效
+    auto d = bbt_co_await base.res.cache->Delete({key}, o);             // 失效
     if (!d) return fw::CoRpcResp::Error(d.error());
-    auto w = base.res.cache->Set(key, v, o);               // 刷新
+    auto w = bbt_co_await base.res.cache->Set(key, v, o);               // 刷新
     if (!w) return fw::CoRpcResp::Error(w.error());
     return _Reply(static_cast<std::int32_t>(u.value().matched), v);
 }
@@ -197,7 +197,7 @@ fw::CoRpcResp KvSvc::Exists(fw::CoRpcReq req) {
     if (!base.ok) return base.resp;
     inf::CallOptions o;
     o.deadline = base.res.deadline;
-    auto e = base.res.cache->Exists("kv:" + id.value(), o);
+    auto e = bbt_co_await base.res.cache->Exists("kv:" + id.value(), o);
     if (!e) return fw::CoRpcResp::Error(e.error());
     return _Reply(e.value() ? 1 : 0, "");
 }
@@ -209,7 +209,7 @@ fw::CoRpcResp KvSvc::Ping(fw::CoRpcReq req) {
     if (!base.ok) return base.resp;
     inf::CallOptions o;
     o.deadline = base.res.deadline;
-    auto r = base.res.cache->Ping(o);
+    auto r = bbt_co_await base.res.cache->Ping(o);
     if (!r) return fw::CoRpcResp::Error(r.error());
     return _Reply(0, "PONG");
 }
@@ -236,7 +236,7 @@ fw::CoRpcResp KvSvc::ExpiredSet(fw::CoRpcReq req) {
     if (!args) return fw::CoRpcResp::Error(args.error());
     auto ctx = context().request();
     if (!ctx) return fw::CoRpcResp::Error(ctx.error());
-    auto cache = context().resource<inf::CoRedisCli>("cache");
+    auto cache = context().resource<fw::RedisNetResource>("cache");
     if (!cache) return _Missing("cache");
     inf::CallOptions o;
     o.deadline = ctx.value()->deadline;
@@ -246,7 +246,7 @@ fw::CoRpcResp KvSvc::ExpiredSet(fw::CoRpcReq req) {
     wo.deadline = o.deadline;
     (void)waiter->Wait(wo);
     const auto& [id, v] = args.value();
-    auto s = cache->Set("kv:" + id, v, o);   // 期望 TimedOut（无 I/O）
+    auto s = bbt_co_await cache->Set("kv:" + id, v, o);   // 期望 TimedOut（无 I/O）
     if (!s) return fw::CoRpcResp::Error(s.error());
     return _Reply(0, "SET");
 }
@@ -264,19 +264,19 @@ fw::CoRpcResp KvSvc::Hold(fw::CoRpcReq req) {
     hold_gate();
     // 放行后（ShutdownIncomplete 期间）：真实 Redis 写-读回环 + Mongo 落库。
     // 失败路径原样回传底层错误（不泛化），并如实向观察者报告 false。
-    auto cache = context().resource<inf::CoRedisCli>("cache");
-    auto docs  = context().resource<inf::CoMongoCli>("docs");
+    auto cache = context().resource<fw::RedisNetResource>("cache");
+    auto docs  = context().resource<fw::MongoDbResource>("docs");
     if (!cache) return _Missing("cache");
     if (!docs)  return _Missing("docs");
     inf::CallOptions o;
     o.deadline = ctx.value()->deadline;
     const std::string key = "kv:" + id.value();
-    auto s = cache->Set(key, "held", o);
+    auto s = bbt_co_await cache->Set(key, "held", o);
     if (!s) {
         if (hold_op_report) hold_op_report(false);
         return fw::CoRpcResp::Error(s.error());
     }
-    auto g = cache->Get(key, o);
+    auto g = bbt_co_await cache->Get(key, o);
     if (!g) {
         if (hold_op_report) hold_op_report(false);
         return fw::CoRpcResp::Error(g.error());
@@ -287,7 +287,7 @@ fw::CoRpcResp KvSvc::Hold(fw::CoRpcReq req) {
             fw::ErrorCode::ProtocolError,
             "kv: hold readback mismatch during shutdown"));
     }
-    auto ins = docs->InsertOne(DocIdV("c3-held-" + id.value(), "held"), o);
+    auto ins = bbt_co_await docs->InsertOne(DocIdV("c3-held-" + id.value(), "held"), o);
     if (!ins) {
         if (hold_op_report) hold_op_report(false);
         return fw::CoRpcResp::Error(ins.error());

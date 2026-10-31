@@ -1,20 +1,21 @@
 #pragma once
 // INetworkHost 的真实实现（机器面，internal/）：infra
 // NetworkRuntime + HttpServer（LegacyHeaders 旧栈）或 net::Engine +
-// rpc::Server（ProtoWireV1 新栈；已验收的真实 loopback 传输）。
+// rpc::Server + inbound transport adapter（ProtoWireV1=HTTP、TcpV1=TCP；
+// 三仓 §5/§6 迁移后的新栈）。
 //
-// 两种入站模式（Start 前二选一安装）：
+// 三种入站模式（Start 前按 InstallHandler/InstallRpcHandler + 桥选择二选一）：
 //  - InstallHandler(HttpHandler)：LegacyHeaders 迁移期桥。Start 经
 //    NetworkRuntime::ListenHttp 监听；x-bbt-* header 承载 envelope。
 //    旧栈上游仍在（BBT_INFRA_LEGACY_STACK 默认 ON），路径不变。
-//  - InstallRpcHandler(RpcHandler)：ProtoWireV1 正式桥。上游
-//    NetworkRuntime::ListenRpc 已删除，改经
-//    net::Engine::Run（宿主专用 native 线程）+ rpc::Server::Create(engine,
-//    handler, http::ServerOptions) + Start；wire 编解码、接收端 local-min
-//    预算、成功/错误信封回显、五字段关联与 remaining 回填全部由 infra
-//    HandleRpcRequest 承担，framework 只提供 dispatch 适配。
-//  二者共用本类的在途 handler 记账与关闭序列；均未安装时 Start 跳过监听
-//  （纯出站宿主）。
+//  - InstallRpcHandler(RpcHandler) + RpcInboundBridge::ProtoWireV1：
+//    HttpRpcInboundTransport + rpc::Server，宿主专用 Engine::Run 线程。
+//  - InstallRpcHandler(RpcHandler) + RpcInboundBridge::TcpV1：
+//    TcpRpcInboundTransport + rpc::Server，独立的 TCP server Engine::Run
+//    线程（accept-handoff 每 Engine 独占，HTTP/TCP 不可共享）。
+// wire 编解码、接收端 local-min 预算、五字段关联与 remaining 回填全部由
+// infra rpc::Server 承担，framework 只提供 dispatch 适配。未安装 handler
+// 时 Start 跳过监听（纯出站宿主）。
 //
 // 口径差异（framework 侧契约与 infra 网络栈之间）：
 //  - infra 关闭是同步收口：rpc::Server 序列
@@ -25,11 +26,11 @@
 //    也不是协程/P 线程：Run 在协程上下文或已登记 Processer 上会被拒）。
 //    执行底座（coroutine Scheduler + Engine）由本类装配并收口。Run 返回的
 //    error_code 经 promise/future 跨线程发布（唯一同步口，Start 的相位
-//    等待据此即刻观察失败，不复制共享变量）。**出站不另建 Engine**：
-//    ProtoWireV1 与 LegacyHeaders 出站都由同一
-//    NetworkRuntime::CreateHttpClient 通道承载（runtime 限额 owner 共享
-//    max_connections/max_inflight 与请求/响应字节校验）——server Engine
-//    只占监听所需驱动槽，纯入站既有 worker 配置保持可启动。
+//    等待据此即刻观察失败，不复制共享变量）。
+//    出站：ProtoWireV1/TcpV1 出站经 infra 公开 rpc::Client + adapter
+//    seam——HttpEgress 懒建的 rpc::Client 底座由本类 egress_engine()
+//    提供（client-only Engine，Start 时按需创建并 Run 在独立线程）；
+//    LegacyHeaders 出站仍走旧栈 NetworkRuntime::CreateHttpClient。
 //  - handler 在 Close 前完成的出站回复按 infra 的正常发送语义处理；Close
 //    开始后仍在途且尚未交给传输层的回复不承诺送达原客户端，测试应断言
 //    handler/owner 侧收口证据而不是伪造 flush 保证。
@@ -90,6 +91,7 @@
 #include <bbt/infra/rpc/Server.hpp>
 #endif
 
+#include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/internal/HostLifecycle.hpp>
 #include <bbt/framework/Result.hpp>
 
@@ -111,10 +113,18 @@ public:
     // 被调用，其整个执行期计入在途 handler 记账。
     void InstallHandler(bbt::infra::HttpHandler handler);
 
-    // 安装入站 RpcHandler（ProtoWireV1；Start 前调用）。Start 经
-    // net::Engine + rpc::Server 监听，wire/local-min/五字段关联由 infra
-    // 承担。与 InstallHandler 二选一（同一次 Start 只安装一条入站桥）。
+    // 安装入站 RpcHandler（ProtoWireV1/TcpV1；Start 前调用）。Start 经
+    // 对应 server Engine + inbound transport + rpc::Server 监听，
+    // wire/local-min/五字段关联由 infra 承担。与 InstallHandler 二选一
+    // （同一次 Start 只安装一条入站桥）。
     void InstallRpcHandler(bbt::infra::RpcHandler handler);
+
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    // 入站桥选择（Start 前调用，默认 ProtoWireV1）：ProtoWireV1 =
+    // HttpRpcInboundTransport，TcpV1 = TcpRpcInboundTransport；两者都只换
+    // transport adapter，rpc::Server/wire profile/关闭序列不变。
+    void SetRpcInboundTransport(bbt::framework::RpcInboundBridge bridge);
+#endif
 
     // ---- INetworkHost（全部在宿主控制线程调用）----
     result<void> Create() override;
@@ -135,6 +145,10 @@ public:
     // rpc_server()。
     std::shared_ptr<bbt::infra::HttpServer>     http_server() const;
     std::shared_ptr<bbt::infra::NetworkRuntime> network_runtime() const;
+    // 宿主装配限额（构造期常量）：出站 adapter 的 body/连接预算据此收敛。
+    const bbt::infra::NetworkLimits& network_limits() const noexcept {
+        return m_limits;
+    }
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
     // ProtoWireV1 模式下托管的 rpc::Server（观测用，可能为空）。
     std::shared_ptr<bbt::infra::rpc::Server> rpc_server() const;
@@ -142,6 +156,11 @@ public:
     // WaitStopped 超时仍保留任务责任——Engine RequestClose+join 是物理凭据；
     // 该错误只用于如实观测/诊断，不改变幂等同步收口契约。
     std::optional<bbt::infra::Error> close_error() const;
+
+    // 出站执行底座：client-only Engine（Start 时按需创建并 Run；HttpEgress
+    // 经此装配 HttpRpcTransport/TcpRpcTransport 的 rpc::Client 底座）。
+    // LegacyHeaders 出站不走本 Engine。未创建返回 nullptr。
+    std::shared_ptr<bbt::infra::net::Engine> egress_engine() const;
 #endif
 
     // 测试缝（internal，仅框架回归使用）：在受控时刻重放一次「infra 已接纳、
@@ -218,6 +237,18 @@ private:
     bool                                      m_stopped{false};
     // Engine 收口（RequestClose+join+get）只尝试一次：幂等重入不再重复。
     bool                                      m_engine_closed{false};
+
+    // 入站桥选择：Start 前经 SetRpcInboundTransport 设定（默认 ProtoWireV1）。
+    RpcInboundBridge                          m_inbound_bridge{
+                                                  RpcInboundBridge::ProtoWireV1};
+
+    // client-only 出站 Engine（按需）：Start 时创建并 Run 在独立线程；
+    // Close 在取得 server 收口凭据后 RequestClose+join。HttpEgress 的
+    // rpc::Client 底座（HttpRpcTransport/TcpRpcTransport）借用它。
+    std::shared_ptr<bbt::infra::net::Engine>  m_egress_engine;
+    std::thread                             m_egress_thread;
+    std::future<std::error_code>            m_egress_result;
+    bool                                    m_egress_engine_closed{false};
 #endif
 };
 

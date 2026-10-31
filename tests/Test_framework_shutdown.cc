@@ -68,6 +68,8 @@
 // T7(b)/T7c 的 raw-wire 回复解析边界值类型（ParseRpcWireHttpResponse 只接
 // 新栈 http::Response；发送仍走共享 HttpClient，仅做值转换）。
 #include <bbt/infra/http/Client.hpp>
+#include <bbt/infra/rpc/HttpTransport.hpp>
+#include <bbt/infra/rpc/RpcWire.hpp>
 #endif
 
 #include <bbt/framework/Framework.hpp>
@@ -545,12 +547,12 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
 }
 
 std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
-    // ProtoWireV1 宿主需要 2 个已登记 worker：server Engine 绑 1 main+1 sub
-    // 驱动槽（上游 DriverBinder 槽不足时拒绝整个绑定）。出站不另占槽——
-    // 正式 wire 由同一 NetworkRuntime::CreateHttpClient 通道承载（F2：
-    // 纯入站 2 workers 保持既有可启动配置）。本设置必须在 Scheduler 首次
-    // Start 前生效（runtime 进程寿命单例，后续调用只复用）。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    // ProtoWireV1 宿主需要 ≥3 个已登记 worker：server Engine 绑 1 main+1 sub
+    // 驱动槽；进程内独立纯出站宿主（caller）另需 1 个 client-only egress
+    // Engine 槽（三仓迁移后 ProtoWireV1/TcpV1 出站经 rpc::Client + net::Engine
+    // ——无 server Engine 可借的纯出站宿主无法再免槽）。进程内单例已在场时
+    // 该配置只复用，故本设置必须在 Scheduler 首次 Start 前生效。
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
     // 受管 handler 的嵌套出站链（入站派发 → this->call → 出站适配 →
     // client->Request → 信号等待）在 12KB 默认栈触底（入站用例实测）；
     // 本文件同样含嵌套出站，沿用 64KB。
@@ -2014,7 +2016,12 @@ BOOST_AUTO_TEST_CASE(wire_engine_start_occupied_port_fails_fast)
 // http::ClientOptions（body=8MiB），超限请求实际进入远端 handler。
 BOOST_AUTO_TEST_CASE(wire_egress_body_limit_rejected_remote_untouched)
 {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    // 3 workers：被测 app 的 ProtoWireV1 server Engine 占 1 main+1 sub；独立
+    // 纯出站 caller 宿主自带 client-only egress Engine 再占 1 sub。三仓迁移
+    // 后 ProtoWireV1/TcpV1 出站经 rpc::Client + net::Engine（不再走
+    // NetworkRuntime::CreateHttpClient），无 server Engine 可借的纯出站宿主
+    // 需要这 +1 驱动槽——这是真实资源需求，不是可隐藏的时序。
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());

@@ -2,10 +2,19 @@
 
 #include <boost/scope/scope_exit.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <utility>
 #include <vector>
+
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+#include <bbt/infra/http/Server.hpp>
+#include <bbt/infra/rpc/HttpTransport.hpp>
+#endif
+#if defined(BBT_FRAMEWORK_HAS_RPC_TCP)
+#include <bbt/infra/rpc/TcpTransport.hpp>
+#endif
 
 namespace bbt::framework {
 
@@ -86,6 +95,24 @@ void InfraHttpHost::InstallRpcHandler(bbt::infra::RpcHandler handler)
     m_state->rpc = std::move(handler);
 }
 
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+void InfraHttpHost::SetRpcInboundTransport(
+    bbt::framework::RpcInboundBridge bridge) {
+    // Start 前装配期调用；Start 后不再变更。调用方（CoApp 构造）保证不越过
+    // Create/Start 窗口——与 InstallRpcHandler 同一时序约束。
+    m_inbound_bridge = bridge;
+}
+
+std::shared_ptr<bbt::infra::net::Engine> InfraHttpHost::egress_engine() const {
+    std::lock_guard<std::mutex> lk(m_mtx);
+    // 入站宿主：共享 server Engine（Running 时即可 CoDial，零额外驱动槽）；
+    // 纯出站宿主：Start 期创建的 client-only Engine。
+    if (m_engine)
+        return m_engine;
+    return m_egress_engine;
+}
+#endif
+
 result<void> InfraHttpHost::Create() {
     auto rt = bbt::infra::NetworkRuntime::Create(m_limits);
     if (!rt)
@@ -97,27 +124,51 @@ result<void> InfraHttpHost::Create() {
         m_runtime = std::move(rt.value());
     }
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-    // ProtoWireV1：rpc::Server::Create 必须发生在 Engine Idle 期（只配置
-    // handoff，不 Run/监听/建线程），故 server 装配放这里而不是 Start。
-    // Engine 的 Run/Start 归 Start 相位；监听器归 EngineConfig，不由
-    // rpc::Server 暴露。
+    // ProtoWireV1/TcpV1：inbound transport + rpc::Server::Create 必须发生在
+    // Engine Idle 期（只配置 handoff，不 Run/监听/建线程），故 server 装配
+    // 放这里而不是 Start。Engine 的 Run/Start 归 Start 相位；监听器归
+    // EngineConfig，不由 rpc::Server 暴露。transport 选择：
+    //   ProtoWireV1 → HttpRpcInboundTransport（HTTP/1.1 + protobuf body）
+    //   TcpV1       → TcpRpcInboundTransport（u32be 长度前缀帧）
     if (m_state->rpc) {
         auto engine = std::make_shared<bbt::infra::net::Engine>(
             std::shared_ptr<bbt::infra::net::RawHandler>{});
-        bbt::infra::http::ServerOptions options;
-        options.limits = m_limits;
-        // 上游要求 max_target_bytes <= limits.max_header_bytes：target 上限不能
-        // 超过已配置 header 上限。从既有 header 限额导出（不放大用户限额），
-        // 保持较小的合法 max_header_bytes（如 4096）可用。
-        options.max_target_bytes = std::min<std::size_t>(
-            options.max_target_bytes, m_limits.max_header_bytes);
+        std::shared_ptr<bbt::infra::rpc::IRpcInboundTransport> inbound;
+        if (m_inbound_bridge == RpcInboundBridge::TcpV1) {
+#if defined(BBT_FRAMEWORK_HAS_RPC_TCP)
+            bbt::infra::rpc::TcpRpcServerOptions options;
+            options.limits = m_limits;
+            auto made = bbt::infra::rpc::TcpRpcInboundTransport::Create(
+                engine, options);
+            if (!made)
+                return result<void>::err(std::move(made.error()));
+            inbound = std::move(made).value();
+#else
+            return result<void>::err(MakeError(
+                ErrorCode::RuntimeUnavailable,
+                "InfraHttpHost::Create: TcpV1 requires bbt::infra_rpc_tcp "
+                "(BBT_INFRA_RPC_TCP not configured)"));
+#endif
+        } else {
+            bbt::infra::http::ServerOptions options;
+            options.limits = m_limits;
+            // 上游要求 max_target_bytes <= limits.max_header_bytes：target
+            // 上限不能超过已配置 header 上限。从既有 header 限额导出（不放大
+            // 用户限额），保持较小的合法 max_header_bytes（如 4096）可用。
+            options.max_target_bytes = std::min<std::size_t>(
+                options.max_target_bytes, m_limits.max_header_bytes);
+            auto made = bbt::infra::rpc::HttpRpcInboundTransport::Create(
+                engine, options);
+            if (!made)
+                return result<void>::err(std::move(made.error()));
+            inbound = std::move(made).value();
+        }
         auto server = bbt::infra::rpc::Server::Create(
-            engine,
+            std::move(inbound),
             [state = m_state](bbt::infra::IncomingCallContext ctx,
                               bbt::infra::RpcEnvelope req) {
                 return _InvokeRpc(state, std::move(ctx), std::move(req));
-            },
-            options);
+            });
         if (!server)
             return result<void>::err(std::move(server.error()));
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -178,9 +229,6 @@ result<bbt::infra::RpcEnvelope> InfraHttpHost::_InvokeRpc(const std::shared_ptr<
     return st->rpc(std::move(ctx), std::move(request));
 }
 
-#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-#endif
-
 result<void> InfraHttpHost::Start() {
     std::shared_ptr<bbt::infra::NetworkRuntime> rt;
     {
@@ -224,7 +272,7 @@ result<void> InfraHttpHost::Start() {
 
         // Engine::Run 占宿主专用 native 线程；Run 结果经 promise/future 跨线程
         // 发布（唯一同步口），Run 提前返回经 wait_for(0) 即刻可见——不复制
-        // error_code、不等满窗口。
+        // error_code、不等满窗口（F4）。
         auto [th, run_result] = StartEngineThread(engine, config);
         m_engine_thread = std::move(th);
         m_engine_result = std::move(run_result);
@@ -249,10 +297,10 @@ result<void> InfraHttpHost::Start() {
         if (auto r = server->Start(); !r)
             return r;
 
-        // ProtoWireV1 出站不需要额外 Engine：正式 wire 由同一
-        // NetworkRuntime::CreateHttpClient 出站通道承载（共享 runtime 限额
-        // owner），不再单独占用 Engine/driver 槽——纯入站（2 workers）保持
-        // 既有可启动配置。
+        // ProtoWireV1/TcpV1 出站不另建 server-side 资源：rpc::Client 经
+        // HttpRpcTransport/TcpRpcTransport 借用本 Engine（Running 即可
+        // CoDial）；egress_engine() 对本路径返回 m_engine——零额外驱动槽，
+        // 纯入站既有 worker 配置保持可启动（F2/F3）。
         //
         // bound_address() 的就绪判据原子（server 已 Start + bound 已就位）。
         // net::Address::ToString() 已含端口，故主机部分沿用配置
@@ -274,11 +322,45 @@ result<void> InfraHttpHost::Start() {
         });
         if (!srv)
             return result<void>::err(std::move(srv.error()));
-        std::lock_guard<std::mutex> lk(m_mtx);
-        m_server = std::move(srv.value());
-        m_bound  = m_server->LocalAddress();
-        m_bound_ready = true;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_server = std::move(srv.value());
+            m_bound  = m_server->LocalAddress();
+            m_bound_ready = true;
+        }
     }
+#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
+    // 非 wire 入站（无 server Engine 可借）时创建 client-only 出站 Engine：
+    // HttpEgress 的 rpc::Client（HttpRpcTransport/TcpRpcTransport）借用底座。
+    // 与 server Engine 同一装配/收口模型：Start 拉起 Run 线程，Close
+    // RequestClose+join+Stopped 核验。LegacyHeaders 出站不经此 Engine
+    // （旧栈 NetworkRuntime::CreateHttpClient），但本宿主无法预知出站
+    // profile——底座常备，代价固定为 1 个驱动槽 + 1 条 Run 线程。
+    // 已装 server Engine（state->rpc）时跳过：egress_engine() 直接借用它。
+    if (!state->rpc) {
+        auto engine = std::make_shared<bbt::infra::net::Engine>(
+            std::shared_ptr<bbt::infra::net::RawHandler>{});
+        bbt::infra::net::EngineConfig config;
+        config.runtime_progress = bbt::infra::net::RuntimeProgress::Independent;
+        config.options.num_event_loop = 1;
+        auto [th, run_result] = StartEngineThread(engine, config);
+        m_egress_thread = std::move(th);
+        m_egress_result = std::move(run_result);
+        const auto wait = WaitEngineRunning(engine, m_egress_result);
+        if (wait != EngineWait::Running) {
+            if (wait == EngineWait::TimedOut)
+                engine->RequestClose();
+            if (m_egress_thread.joinable())
+                m_egress_thread.join();
+            return result<void>::err(EngineError(m_egress_result.get(),
+                "InfraHttpHost::Start: egress engine did not reach Running"));
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_egress_engine = std::move(engine);
+        }
+    }
+#endif
     return result<void>::ok();
 }
 
@@ -380,7 +462,7 @@ void InfraHttpHost::Close() noexcept {
     //   凭据后停 Engine 并释放 owner。未取得凭据（未经 WaitHandlersDone
     //   的裸 Close，或续等仍失败）→ 保留 server/engine/runtime  owner 与
     //   Run 线程，由外部终止进程或后续 HostLifecycle 续等收口；不伪报
-    //   「已物理关闭」（fail-closed）。Engine Run 的
+    //   「已物理关闭」（review-fixes §29-42 缺口修复）。Engine Run 的
     //   future 结果与 Stopped 相位必须实际检查：Run 返回非零或相位未
     //   Stopped（同代解绑失败保留 Closing）都不是「网络资源/回调/driver
     //   已收口」的证据，此时同样保留 owner 不释放（fail-closed）。
@@ -456,6 +538,49 @@ void InfraHttpHost::Close() noexcept {
             // 幂等重入不再重复 join/get；未证实时 owner 保留由下方释放门
             // （stopped || !m_engine）负责。
             m_engine_closed = true;
+        }
+    }
+
+    // client-only 出站 Engine 收口（与 server Engine 同一判据：Run 线程 join +
+    // 结果零 + Stopped 相位实际检查）。无 rpc::Server/WaitStopped 凭据责任
+    // （client-only 无已接纳 handler/callback）；仅当 Run 线程曾拉起时收口。
+    // 未证实 Stopped → 保留 owner（fail-closed），不伪报已释放。
+    std::shared_ptr<bbt::infra::net::Engine> egress;
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        egress = m_egress_engine;
+    }
+    if (egress && !m_egress_engine_closed) {
+        bool egress_stopped = false;
+        if (m_egress_thread.joinable()) {
+            egress->RequestClose();
+            m_egress_thread.join();
+        }
+        if (!m_egress_result.valid()) {
+            egress_stopped = true;   // Run 线程从未拉起：Idle 即已收口
+        } else {
+            std::error_code run_ec =
+                std::make_error_code(std::errc::io_error);
+            const bool run_ready =
+                m_egress_result.wait_for(std::chrono::milliseconds{0}) ==
+                    std::future_status::ready;
+            if (run_ready)
+                run_ec = m_egress_result.get();
+            egress_stopped =
+                run_ready && !run_ec &&
+                egress->Phase() == bbt::infra::net::EnginePhase::Stopped;
+            if (!egress_stopped) {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                if (!m_close_error)
+                    m_close_error = EngineError(run_ec,
+                        "InfraHttpHost::Close: egress engine did not reach Stopped");
+            }
+        }
+        // 收口只尝试一次：无论成败都标记，幂等重入不再重复 join/get。
+        m_egress_engine_closed = true;
+        if (egress_stopped) {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_egress_engine.reset();
         }
     }
 #endif

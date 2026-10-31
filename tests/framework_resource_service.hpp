@@ -25,9 +25,16 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/sync/WaitTypes.hpp>
 
-#include <bbt/infra/CoMongoCli.hpp>
-#include <bbt/infra/CoRedisCli.hpp>
+#include <bbt/infra/mongo/Client.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
+
+// 新 mongo owner/句柄入口：框架侧资源适配器（owner Close 是同步物理收口，
+// 句柄 Close 只封该集合接纳；公开头不泄漏 mongocxx/bsoncxx）。
+#include <bbt/framework/MongoDbResource.hpp>
+
+// 新 net Redis 入口：经框架侧资源适配器（公开头，engine+显式 Connect 收口
+// 归资源本体，本 TU 不见 hiredis/Engine 类型实体——头内仅前向声明）。
+#include <bbt/framework/RedisNetResource.hpp>
 
 #include <bbt/framework/Framework.hpp>
 
@@ -48,12 +55,13 @@ class KvSvc final : public fw::CoService<KvSvc> {
 public:
     static constexpr std::string_view kServiceName = "kv";
 
-    // 资源缝观察口（宿主断言共享/隔离与 IsClosed/ConnectStatus 用）。
-    std::shared_ptr<inf::CoRedisCli> Cache() {
-        return context().resource<inf::CoRedisCli>("cache");
+    // 资源缝观察口（宿主断言共享/隔离与 IsClosed 终态用；ConnectStatus 属
+    // 旧栈语义，新入口不再暴露——宿主改用 engine_stopped/显式命令探测）。
+    std::shared_ptr<fw::RedisNetResource> Cache() {
+        return context().resource<fw::RedisNetResource>("cache");
     }
-    std::shared_ptr<inf::CoMongoCli> Docs() {
-        return context().resource<inf::CoMongoCli>("docs");
+    std::shared_ptr<fw::MongoDbResource> Docs() {
+        return context().resource<fw::MongoDbResource>("docs");
     }
 
     // 经 Service 侧真实调用计数，让「cache hit 未再查 Mongo」可观察而非猜测。
@@ -96,9 +104,9 @@ public:
 
 private:
     struct Resolved {
-        std::shared_ptr<inf::CoRedisCli> cache;
-        std::shared_ptr<inf::CoMongoCli> docs;
-        co::Deadline                     deadline{};
+        std::shared_ptr<fw::RedisNetResource> cache;
+        std::shared_ptr<fw::MongoDbResource>  docs;
+        co::Deadline                          deadline{};
     };
     struct ResolvedOrError {
         bool         ok{false};

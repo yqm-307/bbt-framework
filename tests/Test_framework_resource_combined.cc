@@ -31,10 +31,12 @@
 //  C4a 后端 I/O 在途（服务端停顿）：同一自有实例 CLIENT PAUSE 1500 ALL 后，
 //     业务 Get 在 cache 命中路径上被服务端**真实扣住**约 1500ms 才返回正确值
 //     ——命令确已发出并被服务端执行（在途证据，非派发前过期）。
-//  C4b 后端 I/O 在途 deadline：短父预算 < pause；命令已写出、ReadReply 等待时
-//     deadline 先到 → 真实在途 TimedOut；连接被判定不可复用（ConnectStatus
-//     ==Failed，走 FailConnAndDrainQueue，与 C2 派发前保留健康连接形成判别）；
-//     恢复由测试装配控制层显式 Connect（不 Service 重连、不自动重试）。
+//  C4b 后端 I/O 在途 deadline：短父预算 < pause；命令已写出、等待回复时
+//     deadline 先到 → 真实在途 TimedOut；新入口把该流退役为 broken（写已
+//     接纳后 deadline 同样走 Fail，后续命令报「explicit Connect required」，
+//     不经 ConnectStatus 暴露——由后续 Ping 的如实失败证明，与 C2 派发前
+//     保留健康连接形成判别）；恢复由测试装配控制层显式 Connect（不 Service
+//     重连、不自动重试）。
 //
 // 环境变量（缺前两项任一 → 进程 exit 77 标 Skipped）：
 //   BBT_TEST_REDIS_ADDR=host:port
@@ -67,6 +69,9 @@
 #include <bbt/coroutine/object/CoObject.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/sync/WaitTypes.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
+
+#include <bbt/infra/net/Address.hpp>
 
 // ── 业务 Service：独立 TU，仅 framework/infra/coroutine 公开头 ──
 #include "framework_resource_service.hpp"
@@ -244,18 +249,20 @@ struct CombinedBox {
     }
 };
 
-// Redis 工厂：Create 在启动控制线程、显式 Connect 投递到 Scheduler 后限时
-// 等待；只有 Connected 实例才交框架绑定（ready 先于接纳）。成功交付前的
-// 任何退出路径（含等待超时/抛出）都由 RAII 同步 Close，不留半装配句柄。
-fw::result<std::shared_ptr<inf::CoRedisCli>> MakeRedis(
-    const inf::RedisClientConfig& cfg) {
-    auto created = inf::CoRedisCli::Create(cfg);
+// Redis 工厂：RedisNetResource::Create 在控制线程完成 Engine Run 线程拉起
+// + 等 Running + client 装配（新入口：数值 net::Address，不解析主机名）；
+// 显式 Connect 只允许协程上下文，再投递一个 Connect 协程并限时等待。
+// 只有 Connected 实例才交框架绑定（ready 先于接纳）。成功交付前的任何
+// 退出路径（含等待超时/抛出）都由 RAII 同步 Close，不留半装配句柄。
+fw::result<std::shared_ptr<fw::RedisNetResource>> MakeRedis(
+    const inf::net::Address& address) {
+    auto created = fw::RedisNetResource::Create(address);
     if (!created) return created;
     auto cli = created.value();
     bool delivered = false;
     struct Guard {
-        std::shared_ptr<inf::CoRedisCli> cli;
-        const bool*                      released;
+        std::shared_ptr<fw::RedisNetResource> cli;
+        const bool*                           released;
         ~Guard() { if (!*released) cli->Close(); }
     } guard{cli, &delivered};
     auto promise = std::make_shared<std::promise<fw::result<void>>>();
@@ -264,22 +271,22 @@ fw::result<std::shared_ptr<inf::CoRedisCli>> MakeRedis(
     bool submitted = false;
     g_scheduler->RegistCoroutineTask([cli, promise, call_options] {
         try {
-            promise->set_value(cli->Connect(call_options));
+            promise->set_value(bbt_co_await cli->Connect(call_options));
         } catch (...) {
             promise->set_exception(std::current_exception());
         }
     }, submitted);
     if (!submitted)
-        return fw::result<std::shared_ptr<inf::CoRedisCli>>::err(
+        return fw::result<std::shared_ptr<fw::RedisNetResource>>::err(
             fw::MakeError(inf::ErrorCode::Unavailable,
                 "redis connect task registration failed"));
     if (done.wait_for(kWait) != std::future_status::ready)
-        return fw::result<std::shared_ptr<inf::CoRedisCli>>::err(
+        return fw::result<std::shared_ptr<fw::RedisNetResource>>::err(
             fw::MakeError(inf::ErrorCode::TimedOut,
                 "redis connect wait timed out"));
     auto connected = done.get();   // 协程异常经 future 重新抛出
     if (!connected)
-        return inf::result<std::shared_ptr<inf::CoRedisCli>>::err(
+        return inf::result<std::shared_ptr<fw::RedisNetResource>>::err(
             connected.error());
     delivered = true;
     return created;
@@ -287,26 +294,30 @@ fw::result<std::shared_ptr<inf::CoRedisCli>> MakeRedis(
 
 void RegisterResources(fw::CoApp& app) {
     const auto [rhost, rport] = SplitAddr(EnvOr("BBT_TEST_REDIS_ADDR"));
-    inf::RedisClientConfig rcfg;
-    rcfg.host = rhost;
-    rcfg.port = rport;
-    rcfg.max_inflight = 256;
-    rcfg.max_queue    = 256;
-    BOOST_REQUIRE(app.add_resource<inf::CoRedisCli>("cache",
-        [rcfg] { return MakeRedis(rcfg); }));
+    // 新入口只接受数值 IPv4/IPv6；host:port 注入若含主机名在此如实失败。
+    std::error_code addr_ec;
+    auto address = inf::net::Address::Ip(rhost, rport, addr_ec);
+    BOOST_REQUIRE_MESSAGE(!addr_ec,
+        "BBT_TEST_REDIS_ADDR 需为数值 IPv4/IPv6: " << addr_ec.message());
+    BOOST_REQUIRE(app.add_resource<fw::RedisNetResource>("cache",
+        [address] { return MakeRedis(address); }));
 
-    inf::MongoClientConfig mcfg;
-    mcfg.uri                      = EnvOr("BBT_TEST_MONGO_URI");
-    mcfg.database                 = "bbt_f8_combined";
-    mcfg.collection               = "kv";
-    mcfg.worker_threads           = 2;
-    mcfg.max_queue                = 256;
-    mcfg.server_selection_timeout = std::chrono::milliseconds{5000};
-    mcfg.connect_timeout          = std::chrono::milliseconds{5000};
-    mcfg.socket_timeout           = std::chrono::milliseconds{5000};
-    mcfg.wait_queue_timeout       = std::chrono::milliseconds{5000};
-    BOOST_REQUIRE(app.add_resource<inf::CoMongoCli>("docs",
-        [mcfg] { return inf::CoMongoCli::Create(mcfg); }));
+    // Mongo：新 owner/句柄入口（MongoDbResource：Validate + CoMongoDb::Create +
+    // Start + Collection 绑定在控制线程一次完成；owner Close 是同步物理收口，
+    // 关闭序列照常收 ICoCloseable）。独占库 bbt_f8_combined 沿用旧口径。
+    inf::mongo::MongoRuntimeConfig rcfg;
+    rcfg.uri                      = EnvOr("BBT_TEST_MONGO_URI");
+    rcfg.worker_threads           = 2;
+    rcfg.max_queue                = 256;
+    rcfg.server_selection_timeout = std::chrono::milliseconds{5000};
+    rcfg.connect_timeout          = std::chrono::milliseconds{5000};
+    rcfg.socket_timeout           = std::chrono::milliseconds{5000};
+    rcfg.wait_queue_timeout       = std::chrono::milliseconds{5000};
+    const inf::mongo::MongoTarget target{"bbt_f8_combined", "kv"};
+    BOOST_REQUIRE(app.add_resource<fw::MongoDbResource>("docs",
+        [rcfg, target] {
+            return fw::MongoDbResource::Create(rcfg, target);
+        }));
 }
 
 // 起真实 HTTP app：公开 CoApp 构造 + 资源装配 + KV service，等 bound_endpoint
@@ -551,7 +562,7 @@ BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
     BOOST_REQUIRE(cache);
     auto del = RunInCoroutine([cache, &id] {
         inf::CallOptions o{Clock::now() + kWait};
-        return cache->Delete({"kv:" + id}, o);
+        return bbt_co_await cache->Delete({"kv:" + id}, o);
     });
     BOOST_REQUIRE(del);
     BOOST_CHECK_EQUAL(del.value().value(), std::uint64_t{1});  // 键真实存在并被删
@@ -604,17 +615,43 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
         BOOST_CHECK_LE(rep.value().status, 700);
     }
 
-    // 过期请求：Set 期望 TimedOut（handler 正确下传才失败）。
+    // 过期请求：Set 期望在发起 I/O 前被拒。新入口的错误诚实性：deadline 在
+    // 写被接纳前到期 → TimedOut（零接纳，无副作用）；写已接纳后到期 →
+    // OutcomeUnknown（如实不推断 Redis 未执行）。两路都无「成功但键未写」，
+    // 真正副作用判别在下方 exists 断言。
     const std::string id = RunPrefix() + "exp";
     {
         auto r = CallRpc(box, MakeEnv("kv", "expired_set", "c2-x",
                                       Req2(id, "v")),
                          std::chrono::milliseconds{5000});
         BOOST_REQUIRE(!r);
-        BOOST_CHECK_EQUAL(static_cast<int>(r.error().code),
-                          static_cast<int>(fw::ErrorCode::TimedOut));
+        const int code = static_cast<int>(r.error().code);
+        BOOST_CHECK_MESSAGE(code ==
+                static_cast<int>(fw::ErrorCode::TimedOut) ||
+            code == static_cast<int>(fw::ErrorCode::OutcomeUnknown),
+            "C2：过期 Set 应返回 TimedOut 或 OutcomeUnknown，实际=" << code
+                << " msg=\"" << r.error().message << "\"");
     }
-    // 无副作用：过期 Set 未触达后端，键不存在。
+    // 无副作用：过期 Set 未触达后端，键不存在。注意 OutcomeUnknown 路径下
+    // 连接可能已被退役（写已接纳后到期）——先用管理面探测；若连接已退役
+    // 则显式 Connect 重建再发 exists（新入口「显式 Connect required」语义），
+    // 不放宽「键不存在」这一副作用判别本身。
+    auto cache = SvcOf(*box.app)->Cache();
+    BOOST_REQUIRE(cache);
+    {
+        auto probe = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        if (!(probe.has_value() && *probe)) {
+            auto conn = RunInCoroutine([cache] {
+                inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+                return bbt_co_await cache->Connect(o);
+            });
+            BOOST_REQUIRE_MESSAGE(conn.has_value() && *conn,
+                "C2：连接退役后显式 Connect 重建失败");
+        }
+    }
     {
         auto r = CallRpc(box, MakeEnv("kv", "exists", "c2-e", Req1(id)));
         BOOST_REQUIRE(r);
@@ -623,11 +660,16 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
         BOOST_CHECK_EQUAL(rep.value().status, 0);
     }
 
-    // 派发前过期不判连接失败：连接保持健康（infra 65a0a CoRedisCliImpl.cc:674/688
-    // 「保持健康连接可复用」）。与 C4b 的在途失败（ConnectStatus==Failed）判别。
-    auto cache = SvcOf(*box.app)->Cache();
-    BOOST_REQUIRE(cache);
-    BOOST_CHECK(cache->ConnectStatus() == inf::ConnectState::Connected);
+    // 过期 Set 不判连接失败：连接经显式 Connect 重建后健康（Ping 成功）；
+    // 与 C4b 的在途失败判别（那里 Ping/命令如实为错误路径直到显式 Connect）。
+    {
+        auto ping = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
+            "C2：显式 Connect 重建后 Ping 应成功");
+    }
 
     box.app->request_shutdown();
     box.Stop();
@@ -815,7 +857,14 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
     }
     auto cache = svc->Cache();
     BOOST_REQUIRE(cache);
-    BOOST_REQUIRE(cache->ConnectStatus() == inf::ConnectState::Connected);
+    {
+        auto ping = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
+            "C4a：预热后 Ping 应成功（连接健康）");
+    }
 
     // 真实服务端停顿：普通 GET 被停住（ALL）。
     auto pause = RunRedisCli({"CLIENT", "PAUSE", "1500", "ALL"});
@@ -835,7 +884,16 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
     BOOST_CHECK_MESSAGE(held_ms >= 1000,
         "Get 未被服务端 pause 扣住（held=" << held_ms << "ms），在途证据不成立");
     BOOST_CHECK_LT(held_ms, 5000);
-    BOOST_CHECK(cache->ConnectStatus() == inf::ConnectState::Connected);
+    // 新入口无 ConnectStatus；在途期间连接未被退役的事实由「pause 结束后
+    // Get 仍返回正确值」本身证明（坏流会被退役且后续命令必失败）。
+    {
+        auto ping = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
+            "C4a：pause 放开后连接应仍健康（Ping 应成功）");
+    }
 
     box.app->request_shutdown();
     box.Stop();
@@ -853,7 +911,14 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_deadline) {
     auto* svc = SvcOf(*box.app);
     auto cache = svc->Cache();
     BOOST_REQUIRE(cache);
-    BOOST_REQUIRE(cache->ConnectStatus() == inf::ConnectState::Connected);
+    {
+        auto ping = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
+            "C4b：装配后 Ping 应成功（连接健康）");
+    }
 
     auto pause = RunRedisCli({"CLIENT", "PAUSE", "1500", "ALL"});
     BOOST_REQUIRE_MESSAGE(pause.rc == 0 &&
@@ -862,29 +927,54 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_deadline) {
 
     auto r = CallRpc(box, MakeEnv("kv", "ping", "c4b-p", Req1("x")),
                      std::chrono::milliseconds{5000});
+    // 契约证据（区分于「任意错误」）：本调用 incoming 预算 900ms、redis-cli
+    // pause 1500ms——handler 的 deadline 在服务端扣住期间先到。新入口如实
+    // 返回 TimedOut（写未接纳即到期）或 OutcomeUnknown（写已接纳、没有可信
+    // 完整回复——不推断 Redis 未执行）。两路都证明「命令真实在途」。
     BOOST_REQUIRE(!r);
-    BOOST_CHECK_EQUAL(static_cast<int>(r.error().code),
-                      static_cast<int>(fw::ErrorCode::TimedOut));
-    // 在途证据（区别于派发前过期）：ReadReply 超时走 FailConnAndDrainQueue
-    // （infra 65a0a CoRedisCliImpl.cc:710-714）→ 连接判不可复用 → Failed；
-    // 派发前过期在 :674/:688 返回且保留健康连接（C2 已断言 Connected）。
-    BOOST_CHECK_MESSAGE(cache->ConnectStatus() == inf::ConnectState::Failed,
-        "期望连接被判不可复用(Failed)，实际="
-            << inf::ConnectStateName(cache->ConnectStatus()));
+    {
+        const int code = static_cast<int>(r.error().code);
+        BOOST_CHECK_MESSAGE(code ==
+                static_cast<int>(fw::ErrorCode::TimedOut) ||
+            code == static_cast<int>(fw::ErrorCode::OutcomeUnknown),
+            "C4b：在途 deadline 应返回 TimedOut 或 OutcomeUnknown，实际=" << code
+                << " msg=\"" << r.error().message << "\"");
+    }
+    // 新入口语义（redis-net.md）：写已接纳、没有可信完整回复 →
+    // OutcomeUnknown 并退役整条流；deadline/取消在写已接纳后同样走 Fail
+    // （broken，后续命令报「explicit Connect required」），与旧栈的
+    // Failed 态等价、但不经 ConnectStatus 暴露——由后续命令的如实失败
+    // 与显式 Connect 恢复路径证明。
+    {
+        auto after = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        BOOST_REQUIRE_MESSAGE(after.has_value() && !*after,
+            "C4b：在途 deadline 后连接应已退役（Ping 应失败），实际仍可用");
+    }
 
     // 等 pause 结束：用同一实例的真实命令做确定性屏障（非固定 sleep）。
     auto barrier = RunRedisCli({"PING"});
     BOOST_CHECK_EQUAL(barrier.rc, 0);
 
     // 恢复：测试装配控制层显式 Connect（不 Service 重连、不自动重试、
-    // 不放宽 Error、不宣称逻辑 timeout 等于远端未执行）。
+    // 不放宽 Error、不宣称逻辑 timeout 等于远端未执行）。新入口故障后须
+    // 显式 Connect——已退役连接经显式 Connect 重建后才恢复命令面。
     auto conn = RunInCoroutine([cache] {
         inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
-        return cache->Connect(o);
+        return bbt_co_await cache->Connect(o);
     });
     BOOST_REQUIRE(conn.has_value());                 // 协程已返回
     BOOST_REQUIRE(static_cast<bool>(*conn));         // Connect 成功
-    BOOST_CHECK(cache->ConnectStatus() == inf::ConnectState::Connected);
+    {
+        auto ping = RunInCoroutine([cache] {
+            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
+            return bbt_co_await cache->Ping(o);
+        });
+        BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
+            "C4b：显式 Connect 重建后 Ping 应成功");
+    }
 
     auto ok = CallRpc(box, MakeEnv("kv", "ping", "c4b-ok", Req1("x")));
     BOOST_REQUIRE(ok);

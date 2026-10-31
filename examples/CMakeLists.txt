@@ -18,7 +18,7 @@ add_subdirectory(lifecycle_matrix)
 # 双服务资源示例（svc_a/svc_b/driver）。只在显式
 # BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 时加入——默认 OFF 时本仓不引入
 # hiredis/mongo-cxx-driver。四项前置条件（NEED_TEST、bbt_infra_rpc_net、
-# bbt::infra_redis、bbt::infra_mongo）与 fail-closed 门禁都在根 CMakeLists
+# bbt::infra_redis_net、bbt::infra_mongo）与 fail-closed 门禁都在根 CMakeLists
 # 判定（那里能看到全部条件），此处不重复判定、不做降级跳过。
 if(BBT_ENABLE_DUAL_SERVICE_EXAMPLE)
     add_subdirectory(dual_service)
