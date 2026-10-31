@@ -20,8 +20,8 @@ namespace bbt::framework {
 
 namespace {
 
-// custom 路由字段的有界接收上限：契约要求「有上限」但未冻结数值
-// （见本切片报告待澄清项），取与 Error.details 同构的保守界。
+// custom 路由字段的有界接收上限：要求「有上限」但未冻结数值，
+// 取与 Error.details 同构的保守界。
 constexpr std::size_t kMaxRouteFieldCount  = 16;
 constexpr std::size_t kMaxRouteKeyBytes    = 64;
 constexpr std::size_t kMaxRouteValueBytes  = 256;
@@ -137,7 +137,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         } else if (k == kFwTraceId) {
             trace_id = v;
         } else if (IsOrderedFwKey(k)) {
-            // 受限系统字段：格式校验（有序流语义 F2-b3 才消费）。
+            // 受限系统字段：格式校验（有序流语义由 OrderedIngress 消费）。
             if (v.empty())
                 return result<RpcEnvelope>::err(
                     ErrInvalid("malformed " + k));
@@ -161,7 +161,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
                 ErrInvalid("metadata key outside route.*: " + k));
         }
     }
-    (void)custom;   // 本切片不驱动路由策略；custom 只验签不收进上下文。
+    (void)custom;   // 不驱动路由策略；custom 只验签不收进上下文。
 
     // 3. 服务与方法查找；schema 不符显式失败，不等 handler 随机失败。
     auto svc_it = m_services.find(request.service);
@@ -197,7 +197,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
     ctx->peer_principal = incoming.peer_principal;
     ctx->trace_id       = std::move(trace_id);
 
-    // R4/S4：入站「已过期不进 handler」在共享入口统一拒绝，actor 与
+    // 入站「已过期不进 handler」在共享入口统一拒绝，actor 与
     // Concurrent 两条策略一致——不再进入等待/内联执行，也不扩大 actor
     // 路径职责。此处尚未做有序流接纳（Admit），故过期的请求不产生
     // ordered 终态副作用；0 预算已在 wire 解码期拒绝，本门承载「可解码
@@ -244,7 +244,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             if (admitted.value().kind == OrderedIngress::DecisionKind::Replay) {
                 const auto& replay = admitted.value().replay;
                 if (!replay.is_ok) {
-                    // infra #39 收口：Replay 是缓存终态离开本组件的边界。
+                    // Replay 是缓存终态离开本组件的边界。
                     // 尽管 Complete 入缓存前已规范化，这里仍对出缓存的
                     // 错误做同一边界校验作防御——任何经其他路径进入缓存的
                     // 非法错误不会经非 HTTP Dispatch 原样重放。

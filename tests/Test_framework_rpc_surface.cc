@@ -1,4 +1,4 @@
-// F0：CoRpc 公共面、声明式方法表、错误边界、actor key、路由与资源缝。
+// CoRpc 公共面、声明式方法表、错误边界、actor key、路由与资源缝。
 // 不联网、不起真实 I/O、不启动 Scheduler。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>

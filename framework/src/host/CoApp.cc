@@ -23,8 +23,8 @@ namespace bbt::framework {
 
 namespace {
 
-// 进程内活跃宿主登记：契约「默认一个进程共享现有单例 Scheduler；不宣称
-// 多个 CoApp 可各自创建独立 Scheduler」。本切片口径：同一时刻至多一个
+// 进程内活跃宿主登记：默认一个进程共享现有单例 Scheduler，不宣称
+// 多个 CoApp 可各自创建独立 Scheduler。本实现口径：同一时刻至多一个
 // CoApp 处于 run 内；完整收束后允许另一实例顺序复用同一单例。
 std::mutex g_active_app_mtx;
 CoApp*     g_active_app = nullptr;
@@ -473,7 +473,7 @@ ICoService::RpcSendFn CoApp::_MakeEgress() {
         if (!addr)
             return result<bbt::infra::RpcEnvelope>::err(addr.error());
 
-        // R8（3-5）：公开出站策略在路由授权之后、发送之前调用一次。策略只见
+        // 公开出站策略在路由授权之后、发送之前调用一次。策略只见
         // 只读事实（已解析目标 + 不可改写 envelope + 已适配绝对期限），只能
         // Allow/Reject 或收紧期限；无策略（nullptr）时逐字保持今天的行为。
         bbt::infra::CallOptions opt = options;

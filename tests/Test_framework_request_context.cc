@@ -1,4 +1,4 @@
-// co-service-actor/v1 F1-a：RequestContext/RequestScope 与
+// RequestContext/RequestScope 与
 // CallOptionsAdapter 的 deadline 继承语义测试。业务取消由流程按 CoXxx
 // 返回值决定，框架不提供单操作业务取消；协程等待结果按 coroutine 契约处理。
 // 全部确定性可测：通过注入点断言「未发起 I/O / 未消耗序号」，
@@ -29,7 +29,7 @@ namespace co = bbt::coroutine;
 using Clock = std::chrono::steady_clock;
 
 // 用例 9 的编译期部分：framework::CallOptions 与 infra::CallOptions
-// 是分层类型，不可直接互换（契约第 143 行）。
+// 是分层类型，不可直接互换（分层类型契约）。
 static_assert(!std::is_same<fw::CallOptions, bbt::infra::CallOptions>::value,
     "framework::CallOptions and infra::CallOptions must be distinct types");
 static_assert(

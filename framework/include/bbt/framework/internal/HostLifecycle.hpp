@@ -1,6 +1,6 @@
 #pragma once
-// co-service-actor/v1 F1-b1：宿主生命周期状态机与网络宿主注入点。
-// 落实契约 F3 的固定资源顺序（仓内验收矩阵与 HostLifecycle 实现为真源）：
+// 宿主生命周期状态机与网络宿主注入点（机器面，internal/）。
+// 固定资源顺序（本仓验收矩阵与 HostLifecycle 实现为真源）：
 //   coroutine runtime 初始化（一次 Start，已初始化则复用）→ 网络组件
 //   Create/Start（开始接纳）→ 运行 → StopAccepting → 等 handler 结束
 //   → 资源 Close（同步）→ 网络 Close（同步收口）→ 释放网络/业务对象
@@ -24,7 +24,7 @@
 //
 // 可测性：网络组件的创建/启动/停止接纳/等待排空/同步关闭全部经过
 // INetworkHost 抽象接口（注入点），测试可用桩组件断言调用顺序、异常路径
-// 与超时路径，不需要真实 socket。真实 HTTP 适配属 F1-b2。
+// 与超时路径，不需要真实 socket；真实 HTTP 适配见 InfraHttpHost。
 
 #include <atomic>
 #include <chrono>
@@ -42,9 +42,9 @@
 
 namespace bbt::framework {
 
-// INetworkHost：CoApp 的网络依赖组件（契约第 137 行——Server/Client/连接池
-// 由它拥有，不是 Service 的父类）。全部方法在宿主控制线程（Run 所在线程）
-// 调用；实现不得依赖「运行在协程内」。真实实现（F1-b2）在内部桥接 infra
+// INetworkHost：CoApp 的网络依赖组件（Server/Client/连接池由它拥有，
+// 不是 Service 的父类）。全部方法在宿主控制线程（Run 所在线程）
+// 调用；实现不得依赖「运行在协程内」。真实实现在内部桥接 infra
 // NetworkRuntime/HttpServer 的同步关闭语义；桩实现用于断言顺序与异常路径。
 //
 // 实现约束：
@@ -79,7 +79,7 @@ public:
 // 监督线程调用）。
 class HostLifecycle {
 public:
-    // 比契约枚举更细的可观测相位；State() 归并到契约四态。
+    // 比对外枚举更细的可观测相位；State() 归并到 ShutdownState 四态。
     // Failed：启动失败已回退、或关闭收尾存在硬性失败项；对外归并为 Closed
     // （不再运行），真实原因经 Failures()/IncompleteSteps() 与返回码表达。
     enum class Phase {

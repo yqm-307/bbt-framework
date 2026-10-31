@@ -1,4 +1,4 @@
-// co-service-actor/v1 F2-b2：有序入口接收侧实现。语义与实现自由度见头注释。
+// 有序入口接收侧实现。语义与实现自由度见头注释。
 
 #include <bbt/framework/internal/OrderedIngress.hpp>
 
@@ -10,7 +10,7 @@ namespace bbt::framework {
 
 namespace {
 
-// 契约第 213 行：六个有序错误统一 RemoteError + domain="framework.actor"。
+// 六个有序错误统一 RemoteError + domain="framework.actor"。
 Error OrderedIngestError(const char* domain_code, std::string message) {
     Error e = MakeError(ErrorCode::RemoteError, std::move(message));
     e.domain = kOrderedErrorDomain;
@@ -34,7 +34,7 @@ result<OrderedIngress::SPtr> OrderedIngress::Create(
             OrderedIngestInvalid("ordered ingress: empty service name"));
     }
     // 与 ValidateServiceOptions 对 ordered_ingress 启用分支同一约束：
-    // 三项有序上限必须 > 0（契约第 207 行）。
+    // 三项有序上限必须 > 0。
     if (config.max_ordered_streams == 0 || config.max_cached_results == 0 ||
         config.max_cached_result_bytes == 0) {
         return result<SPtr>::err(OrderedIngestInvalid(
@@ -76,7 +76,7 @@ std::size_t OrderedIngress::ReplyBytes(const OrderedTerminalReply& reply) {
 }
 
 Error OrderedIngress::_GapError(std::uint64_t next_sequence) const {
-    // infra #39：带 details 的 actor 域错误在构造边界过
+    // 带 details 的 actor 域错误在构造边界过
     // ValidateErrorAtBoundary；非法形态整体降级为 ProtocolError。
     Error e = OrderedIngestError(ordered_domain_code::kSequenceGap,
         "ordered sequence gap: future sequence not buffered");
@@ -133,14 +133,13 @@ result<void> OrderedIngress::GrantStream(const OrderedGrant& grant) {
     grants_.push_back(GrantEntry{grant});
     auto& state = streams_[StreamKey{grant.actor_key, grant.producer_id,
                                      grant.producer_epoch}];
-    state.next_sequence = 1;  // 新授权流从 1 起（契约第 249 行）
+    state.next_sequence = 1;  // 新授权流从 1 起
     return result<void>::ok();
 }
 
 result<OrderedIngress::Admission> OrderedIngress::Admit(
     const OrderedIngressRequest& request) {
-    // 无票据调用启用了 ordered_ingress 的目标：不消费序号，不执行
-    // （契约第 249 行）。
+    // 无票据调用启用了 ordered_ingress 的目标：不消费序号，不执行。
     if (!request.has_ordered_stamp) {
         return result<Admission>::err(OrderedIngestError(
             ordered_domain_code::kOrderedStampRequired,
@@ -191,7 +190,7 @@ result<OrderedIngress::Admission> OrderedIngress::Admit(
 
     if (request.sequence < state.next_sequence) {
         // 已消耗序号：在途 → InProgress；已完成 → 重放原终态；
-        // 已淘汰 → ResultExpired。均不重新执行（契约第 255 行）。
+        // 已淘汰 → ResultExpired。均不重新执行。
         auto in_flight = state.in_flight.find(request.sequence);
         if (in_flight != state.in_flight.end()) {
             if (in_flight->second.request_id == request.request_id &&
@@ -229,7 +228,7 @@ result<OrderedIngress::Admission> OrderedIngress::Admit(
             "ordered result of this sequence was evicted from the cache"));
     }
 
-    // 接纳同步边界：在此一次性完成序号消耗与在途登记（契约第 257 行）。
+    // 接纳同步边界：在此一次性完成序号消耗与在途登记。
     state.in_flight.emplace(request.sequence,
                             InFlight{request.request_id, request.request_digest});
     ++state.next_sequence;
@@ -269,8 +268,7 @@ void OrderedIngress::_DropStreamCache(const StreamKey& key) {
 
 void OrderedIngress::_EvictToLimits() {
     // 服务级条数 + 字节双限 FIFO：cached_order_ 是全局完成顺序，跨流淘汰
-    // 最旧终态；同步清所属流的 cached_seqs，绝不回退 next_sequence
-    // （契约第 207/255 行）。
+    // 最旧终态；同步清所属流的 cached_seqs，绝不回退 next_sequence。
     while (!cached_order_.empty() &&
            (cached_.size() > config_.max_cached_results ||
             cached_bytes_ > config_.max_cached_result_bytes)) {
@@ -305,7 +303,7 @@ result<void> OrderedIngress::Complete(const Admission& admission,
     const std::string digest     = in_flight->second.digest;
     state.in_flight.erase(in_flight);
 
-    // infra #39 收口：缓存终态前过 framework.actor 域边界校验。违规错误
+    // 缓存终态前过 framework.actor 域边界校验。违规错误
     // （如非本域写入 expected_sequence 保留键或值格式非法）不进入缓存——
     // 规范化为无 details 的 ProtocolError 终态，保证后续非 HTTP Replay
     // 不会把非法 actor details 重放到框架内部消费路径。序号终态语义不变：
@@ -319,7 +317,7 @@ result<void> OrderedIngress::Complete(const Admission& admission,
     }
 
     // 接纳后取消、排队到期、业务失败都保留终态：后续重复请求重放该终态，
-    // 不重新执行（契约第 257 行）。
+    // 不重新执行。
     const std::size_t bytes = ReplyBytes(reply);
     if (bytes > config_.max_cached_result_bytes) {
         // 单条终态本身超字节上限：无法保留（下一次重复请求 → ResultExpired）。

@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：RPC envelope ↔ infra HTTP 的默认桥（机器面，internal/）。
+// RPC envelope ↔ infra HTTP 的默认桥（机器面，internal/）。
 //
 // 这是框架的默认 HTTP 绑定：envelope 字段一对一映射到 x-bbt-* header，
 // metadata 映射到 x-bbt-meta-<key>，payload 为 body；回复错误映射到
@@ -55,7 +55,7 @@ void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 
 // 默认出站：client 懒建（首个发送时创建，协程约束与 infra 一致）；
 // runtime 不可得 → RuntimeUnavailable。
-// Issue #4：出站协议 profile 与入站一致：
+// 出站协议 profile 与入站一致：
 //  - LegacyHeaders 走 x-bbt-* header 迁移期桥（HttpClient；
 //    http_bridge::ToHttpRequest/EnvelopeFromResponse）。
 //  - ProtoWireV1 走 infra 正式 body 信封：同一

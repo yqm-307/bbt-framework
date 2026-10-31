@@ -1,6 +1,6 @@
-// F3 关闭门判别回归（独立文件）：C1 —— StopAccepting 闭门的最小根因修复。
+// 关闭门判别回归：StopAccepting 闭门的最小根因修复。
 //
-// 背景（独立复审 C1）：旧实现只在 Close() 置关拒绝门（InfraHttpHost::HandlerState::
+// 背景：旧实现只在 Close() 置关拒绝门（InfraHttpHost::HandlerState::
 // open）。关闭顺序是 StopAccepting → WaitHandlersDone → Close，故
 // [StopAccepting, Close) 窗口内 open 仍为 true：一个 infra 在 StopAccepting 之前
 // 已用 TryAcquireHandler 接纳、但协程尚未进入本类入站包装（_InvokeRpc/_InvokeHttp）
@@ -11,14 +11,14 @@
 //  - 修法后：StopAccepting 之后进入的通行者被拒（RuntimeUnavailable），不触达
 //    handler；已过门者不被抢占，WaitHandlersDone 不漏记。
 //  - 修法前（负例判别力）：上面的断言会真实失败——迟到进入者会过门、触达 handler
-//    （计数 +1，late 为 ok）。故本文件对 C1 有真实判别力，而非恒真回归。
+//    （计数 +1，late 为 ok）。故本文件对本次根因修复有真实判别力，而非恒真回归。
 //
-// 测试缝：C1 的判别点是「infra 已接纳、协程尚未进入入站包装」的到达时刻。infra
+// 测试缝：本回归的判别点是「infra 已接纳、协程尚未进入入站包装」的到达时刻。infra
 // pin（@3136d1de）没有 http Dispatch→RunHandler 的可控注入点（无 gate/tick seam，
 // 且公开面不暴露已注册的 handler），故无法在不改 infra 的前提下从网络侧决定性地
 // 命中该时刻。本文件经 InfraHttpHost 自身新增的 internal 测试缝 **InvokeRpcForTest**
 // 在受控时刻重放该进入——走与 infra 完全相同的生产包装（同一 _InvokeRpc 与同一
-// 拒绝门），只把调度交给测试。该缝只有 RPC 一路：受审候选（C1 窗口）只存在于 RPC
+// 拒绝门），只把调度交给测试。该缝只有 RPC 一路：受审候选（StopAccepting 窗口）只存在于 RPC
 // 包装路径的关闭序列中；HTTP 侧未新增缝（现头无 InvokeHttpForTest），本文件也不调用。
 //
 // T1 仅用测试缝（确定性、无 socket）：StopAccepting 闭门、不触达业务、WaitHandlersDone
@@ -26,7 +26,7 @@
 // T2 走真实 infra loopback（HTTP）：已过门 handler 不被 StopAccepting 抢占，排空后
 //    WaitHandlersDone 返回 ok、回复路径不被关断。
 // T3 独立宿主：直接 Close（不经 StopAccepting）也拒绝之后进入者——兼容性小断言。
-//    修前/修后均应通过，**不是** C1 判别点，只固定已有语义不被后续改动去掉。
+//    修前/修后均应通过，**不是**本回归判别点，只固定已有语义不被后续改动去掉。
 //
 // 第二组判别性（异常路径：handler 抛异常时框架在途计数不能漏减）：
 //  - 事实：infra 侧 `HttpSession::RunHandler` 有 try/catch 边界（异常转 InternalError、
@@ -270,7 +270,7 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant)
 // T3：独立宿主的「直接 Close」兼容小断言——不经 StopAccepting，Close 也必须置关
 // （拒绝之后进入者、不触达 handler），且幂等。宿主未 Create/Start（无 runtime），
 // 断言只针对拒绝门，语义与已启动宿主一致（同一 m_state 门）。修前代码同样在 Close
-// 置关，故此用例不是 C1 判别点。
+// 置关，故此用例不是本回归判别点。
 BOOST_AUTO_TEST_CASE(direct_close_without_stop_accepting_refuses_entrant)
 {
     auto probe = std::make_shared<CloseProbe>();

@@ -1,9 +1,9 @@
-// bbt-framework Issue #5（EX-T4）：容量 / 并发上下文 / 关闭生命周期验收 fixture。
+// bbt-framework 容量 / 并发上下文 / 关闭生命周期验收 fixture。
 //
 // 形态：**一个自有进程**（真实公开 `CoApp` + 真实 infra HTTP loopback 宿主 +
 // 正式 ProtoWireV1 body profile）注册一个公开 `CoService<T>`
-// （lifecycle::LifecycleGateService，复用 #4 getvalue schema/codec）。外部
-// Python 驱动器用 #4 的手写 proto3 wire codec 打真实 POST /rpc。
+// （lifecycle::LifecycleGateService，复用 getvalue 切片 schema/codec）。外部
+// Python 驱动器用 getvalue 切片的手写 proto3 wire codec 打真实 POST /rpc。
 //
 // 覆盖（真实公开入口；不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
 // DispatchInboundForTest、INetworkHost 桩或任何发送注入；不额外创建 io_thread）：
@@ -42,7 +42,7 @@
 
 #include <bbt/framework/CoApp.hpp>
 
-#include "lifecycle_service.hpp"   // 验收服务 + 验收闩（复用 #4 getvalue codec）
+#include "lifecycle_service.hpp"   // 验收服务 + 验收闩（复用 getvalue 切片 codec）
 
 namespace fw  = bbt::framework;
 namespace inf = bbt::infra;
@@ -144,7 +144,7 @@ int main(int argc, char* argv[]) {
     // handler 内做 protobuf 编解码 + 入站分发，默认 12KB 协程栈不足；经
     // coroutine 公开配置宏（须在调度器 Start 前设置；process-global）放大到
     // 512KB 并给足静态线程（4），使并发挂起与入站接纳互不阻塞。本进程在
-    // app.run() 前设置——此刻调度器尚未初始化（同 #4 示例口径）。
+    // app.run() 前设置——此刻调度器尚未初始化（同 getvalue 切片口径）。
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size        = 512 * 1024;
 

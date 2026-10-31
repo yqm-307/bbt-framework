@@ -1,12 +1,12 @@
 #pragma once
-// bbt-framework Issue #4（P0-A）：正式 RPC body bridge（机器面，internal/）。
+// 正式 RPC body bridge（机器面，internal/）。
 //
 // 与默认 RpcHttpBridge（x-bbt-* header 承载 envelope，迁移期绑定）不同，本桥
-// 使用 bbtools-infra Issue #8 冻结的版本化 wire profile：HTTP POST /rpc，
+// 使用 infra 冻结的版本化 wire profile：HTTP POST /rpc，
 // Content-Type: application/x-protobuf，body = RpcEnvelopeMsg；不读写任何
 // x-bbt-* 头。
 //
-// 3-2 下沉后：wire 编解码、接收端 local-min 预算、成功/错误信封回显、五字段
+// wire 编解码、接收端 local-min 预算、成功/错误信封回显、五字段
 // 关联与 remaining 回填**全部**由 infra 承担（rpc::Server →
 // HandleRpcRequest；上游 NetworkRuntime::ListenRpc 已删除）。本桥的 handler
 // 只是把 infra 已解析的 IncomingCallContext +

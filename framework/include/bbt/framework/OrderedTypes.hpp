@@ -1,12 +1,11 @@
 #pragma once
-// co-service-actor/v1 F2-b1：有序入口发送侧共享类型。
-//  - OrderedGrant：授权流标识 + 授权身份，字段与契约 §F2
-//    （decisions/0001，第 184-191 行）逐字一致；operator== 是「同一完整
+// 有序入口发送侧共享类型（业务面）。
+//  - OrderedGrant：授权流标识 + 授权身份；operator== 是「同一完整
 //    grant」的判定基础，用于幂等重开与冲突判定。
 //  - OrderedTicket：OrderedSession::prepare 签发的票据状态——已分配但
 //    尚未发送的序号与 request_id，以及首次发送时绑定的请求内容。
-//  - ordered_domain_code::* 与 kOrderedErrorDomain：契约第 213 行规定
-//    的 domain / 六个 domain_code，逐字集中定义。
+//  - ordered_domain_code::* 与 kOrderedErrorDomain：有序错误的
+//    domain / domain_code 常量，集中定义。
 
 #include <cstdint>
 #include <mutex>
@@ -36,9 +35,9 @@ inline bool operator!=(const OrderedGrant& a, const OrderedGrant& b) {
     return !(a == b);
 }
 
-// 契约第 205 行：接收方匹配 service/actor/producer/epoch/receiver_epoch，
-// 这五个字段即流标识；流标识相同但完整 grant 不同（如 peer_principal
-// 不同）属冲突 grant → StreamRejected。
+// 接收方按 service/actor/producer/epoch/receiver_epoch 匹配流标识；
+// 流标识相同但完整 grant 不同（如 peer_principal 不同）属冲突 grant
+// → StreamRejected。
 inline bool SameOrderedStreamId(const OrderedGrant& a, const OrderedGrant& b) {
     return a.service == b.service &&
            a.actor_key == b.actor_key &&
@@ -47,8 +46,8 @@ inline bool SameOrderedStreamId(const OrderedGrant& a, const OrderedGrant& b) {
            a.receiver_epoch == b.receiver_epoch;
 }
 
-// 契约第 213 行：六个错误统一 ErrorCode::RemoteError，
-// domain="framework.actor"，domain_code 取下列常量之一。
+// 有序错误统一 ErrorCode::RemoteError，domain="framework.actor"，
+// domain_code 取下列常量之一。
 inline constexpr const char* kOrderedErrorDomain = "framework.actor";
 
 namespace ordered_domain_code {
@@ -66,7 +65,7 @@ inline constexpr const char* kStreamRejected       = "StreamRejected";
 // IsSent()==true，之后只允许以同一内容重发。
 class OrderedTicket {
 public:
-    // 首次发送时绑定的请求内容（契约第 207 行）：
+    // 首次发送时绑定的请求内容：
     // service/method、actor-key、custom 与编码后的请求字节。
     // custom 以编码后字节承载；字段级一致性即「同一请求」的判定。
     struct BoundContent {
@@ -87,7 +86,7 @@ public:
     const std::string& request_id() const noexcept { return request_id_; }
 
     // 「该票据是否已发送」。false 即「已准备但尚未发送」——发送端丢弃
-    // 它会制造序号缺口，必须保留重试或停止整流（契约第 209 行）。
+    // 它会制造序号缺口，必须保留重试或停止整流。
     bool IsSent() const {
         std::lock_guard<std::mutex> lk(mtx_);
         return bound_;

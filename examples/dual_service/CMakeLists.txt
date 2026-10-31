@@ -1,4 +1,4 @@
-# examples/dual_service — Issue #5：双服务 / 跨进程示例（真实 Redis+Mongo 后端）。
+# examples/dual_service — 双服务 / 跨进程示例（真实 Redis+Mongo 后端）。
 #
 # 三个独立进程（framework 默认 HTTP 线桥做真实 client/server）：
 #   svc_a  storage（put/get/del/sleep_ms；经 CoApp::add_resource 工厂装配真实

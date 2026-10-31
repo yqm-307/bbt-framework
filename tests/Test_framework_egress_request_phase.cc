@@ -1,6 +1,6 @@
-// bbt-framework Issue #4 下游 request-phase/OutcomeUnknown 消费验收：
-// R5 committed→OutcomeUnknown；另覆盖发送前过期、未提交失败、remaining budget；
-// 不覆盖 R6/R7/R8 并发/容量/关闭矩阵。
+// 下游 request-phase/OutcomeUnknown 消费验收：
+// committed→OutcomeUnknown；另覆盖发送前过期、未提交失败、remaining budget；
+// 不覆盖并发/容量/关闭矩阵。
 // 消费已合入 infra 的公开 request-phase / OutcomeUnknown 契约
 // （bbt::infra::RequestPhase、IsRequestCommitted、Error::request_phase），
 // 在真实 framework HttpEgress（ProtoWireV1）上机器断言：
@@ -65,7 +65,7 @@ struct SchedulerFixture {
     SchedulerFixture() {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
         // 用例在协程内做 proto wire 编解码与嵌套调用；默认 12KB 栈在
-        // 同仓 Test_framework_f1b2 的同一条出站链上已实测触底（guard 页
+        // 同仓 inbound_http 用例的同一条出站链上已实测触底（guard 页
         // SIGSEGV）。按同口径在 Start() 前放大到 64 KiB。
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         if (!g_scheduler->IsInitialized())

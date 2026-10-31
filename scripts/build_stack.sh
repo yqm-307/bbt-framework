@@ -146,8 +146,8 @@ done < <(find "$BBT_BUILD_DIR" -maxdepth 3 -type f -perm -u+x \
 log "链接来源报告: $LINK_REPORT"
 cat "$LINK_REPORT"
 
-echo "## [diag] Test_framework_f0 RUNPATH"
-readelf -d "$BBT_BUILD_DIR/tests/Test_framework_f0" 2>/dev/null | grep -iE 'RPATH|RUNPATH' || true
+echo "## [diag] Test_framework_rpc_surface RUNPATH"
+readelf -d "$BBT_BUILD_DIR/tests/Test_framework_rpc_surface" 2>/dev/null | grep -iE 'RPATH|RUNPATH' || true
 echo "## [diag] coroutine runtime dependencies"
 readelf -d "$BBT_BUILD_DIR/_deps/bbtools-coroutine/lib/libbbt_coroutine.so" 2>/dev/null | grep -iE 'RPATH|RUNPATH|NEEDED' || true
 

@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：业务服务基类（CRTP，可选便利层）。
+// 业务服务基类（CRTP，可选便利层）。
 //
 // 业务服务形如：
 //   class EchoSvc final : public fw::CoService<EchoSvc> {

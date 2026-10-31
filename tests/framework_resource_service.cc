@@ -1,4 +1,4 @@
-// framework #8 F8-T3 业务 Service 实现——独立 TU，只 include 公开头 + stdlib。
+// 联合 live 验收的业务 Service 实现——独立 TU，只 include 公开头 + stdlib。
 // 本文件的 include 闭包必须不含 bbt/framework/internal/* 与第三方 driver；
 // runner 以编译器 -H 记录并断言（logs/service-include-closure.txt）。
 #include "framework_resource_service.hpp"

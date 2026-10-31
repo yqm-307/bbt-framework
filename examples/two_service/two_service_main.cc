@@ -1,9 +1,9 @@
-// bbt-framework Issue #5（EX-T2）：单进程双 Service fixture。
+// bbt-framework 单进程双 Service fixture。
 //
-// 形态（R8/S9）：**一个** 公开 `CoApp` 经 `add_service<T>` 注册两个公开
+// 形态：**一个** 公开 `CoApp` 经 `add_service<T>` 注册两个公开
 // `CoService<T>`，其中一个服务的 handler 经受保护公开调用路径
 // `this->call<Req,Resp>(service, method, req, ...)` 调用另一个服务；两个服务
-// 的入站/出站都走 #4 的正式 ProtoWireV1 body profile。
+// 的入站/出站都走 getvalue 切片的正式 ProtoWireV1 body profile。
 //
 //   caller 服务（getvalue::GetValueCallerService，命名 "…GetValueCallerService"）
 //     └─ this->call("bbt.example.v1.GetValueService", "GetValue", …)
@@ -15,8 +15,8 @@
 // 分发器。这证明公开 App/Service 注册、调用、错误与生命周期消费面，不证明
 // 跨进程、真实后端或身份可信。
 //
-// 业务 schema/服务实现/typed codec 全部复用 #4 的 fixtures
-// （getvalue_service.hpp / getvalue_caller.hpp + getvalue.proto），#5 不另造
+// 业务 schema/服务实现/typed codec 全部复用 getvalue 切片的 fixtures
+// （getvalue_service.hpp / getvalue_caller.hpp + getvalue.proto），不另造
 // schema、协议、错误信封或第二套 codec。
 //
 // 不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
@@ -50,8 +50,8 @@
 
 #include <bbt/framework/CoApp.hpp>
 
-#include "getvalue_caller.hpp"   // #4 caller 服务（公开面）
-#include "getvalue_service.hpp"  // #4 callee 服务 + ProtoCodec<GetValueRequest/Response>
+#include "getvalue_caller.hpp"   // caller 服务（公开面）
+#include "getvalue_service.hpp"  // callee 服务 + ProtoCodec<GetValueRequest/Response>
 
 namespace fw  = bbt::framework;
 namespace inf = bbt::infra;
@@ -69,7 +69,7 @@ void Journal(const std::string& line) {
     g_journal.flush();
 }
 
-// callee handler 被真正调用时回调（#4 公开观测钩子）。request_id 是**出站**
+// callee handler 被真正调用时回调（公开观测钩子）。request_id 是**出站**
 // 调用生成的 id（框架不把上游 request_id 透传给下游），故它只用于计数与
 // 交叉对照，不能与驱动器 request_id 直接比对。
 void AppendCalleeHandlerEntered(const std::string& request_id,
@@ -155,7 +155,7 @@ int main(int argc, char* argv[]) {
 
     // 单进程内 handler 既要跑入站 wire 解码/分发，又要发起同进程 loopback 出站
     // （父 handler 与 callee handler 并发）。默认 12KB 协程栈不足以承载
-    // protobuf 业务 codec（见 #4 README 实测记录）；经 coroutine 公开配置宏
+    // protobuf 业务 codec（见 getvalue 切片 README 实测记录）；经 coroutine 公开配置宏
     // （须在调度器 Start 前设置；process-global）放大到 512KB 并给足静态线程，
     // 使自环出站与入站接纳互不阻塞。
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;

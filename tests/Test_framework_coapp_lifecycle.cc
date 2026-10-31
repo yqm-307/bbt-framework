@@ -1,9 +1,9 @@
-// service-actor/v2 F1-b1 切片验证：CoApp 装配、run 前校验、生命周期
+// CoApp 装配、run 前校验、生命周期
 // 启动/关闭顺序、启动中途失败回退、关闭超时 ShutdownIncomplete、多宿主
 // 拒绝。网络组件全部走 INetworkHost 桩（经 internal 测试缝注入）：断言
 // 真实调用序列、每步发生时 coroutine runtime 已初始化、超时与异常路径；
 // 无真实 socket、无 sleep 凑时序、无空断言。
-// 自定义 main（BOOST_TEST_NO_MAIN）：若环境带 BBT_F1B1_DRAIN_CHILD 标志，则
+// 自定义 main（BOOST_TEST_NO_MAIN）：若环境带 BBT_DRAIN_CHILD 标志，则
 // 本进程作为「干净 exec 的自有子进程」运行永久排空失败探针；否则走 Boost 套件。
 #define BOOST_TEST_NO_MAIN
 #include <boost/test/included/unit_test.hpp>
@@ -48,7 +48,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-// ── 测试屏障原语（与 F2-a 同一形态：std CV，无 sleep 凑时序）──
+// ── 测试屏障原语（std CV，无 sleep 凑时序）──
 
 class TestGate {
 public:
@@ -222,7 +222,7 @@ public:
         fw::Method<&UnkeyedSvc::Ping>("ping"));
 };
 
-// 资源缝验证类型（F0 已覆盖装配校验；此处验证运行期可取回）。
+// 资源缝验证类型（装配校验已由 rpc_surface 用例覆盖；此处验证运行期可取回）。
 struct DummyResource { int n = 7; };
 
 fw::ServiceOptions ConcurrentOpts() {
@@ -435,7 +435,7 @@ struct SpawnEnv {
     explicit SpawnEnv(const std::vector<std::string>& extra) {
         for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
             const std::string_view s{*e};
-            if (s.rfind("BBT_F1B1_DRAIN_", 0) == 0) continue;
+            if (s.rfind("BBT_DRAIN_", 0) == 0) continue;
             store.emplace_back(s);
         }
         for (const auto& x : extra) store.push_back(x);
@@ -468,8 +468,8 @@ DrainChildEvidence ProbeDrainFailureChild(DrainFailure mode) {
     posix_spawn_file_actions_adddup2(&fa, ev_w, 3);
     if (ev_w != 3) posix_spawn_file_actions_addclose(&fa, ev_w);
 
-    SpawnEnv env({std::string("BBT_F1B1_DRAIN_CHILD=") + ModeName(mode),
-                  std::string("BBT_F1B1_DRAIN_EVFD=3")});
+    SpawnEnv env({std::string("BBT_DRAIN_CHILD=") + ModeName(mode),
+                  std::string("BBT_DRAIN_EVFD=3")});
     char* argv[] = {exe, nullptr};
 
     pid_t pid = -1;
@@ -681,7 +681,7 @@ BOOST_AUTO_TEST_CASE(add_service_registers_and_rejects_duplicate) {
     BOOST_TEST(h->rc == fw::HostLifecycle::kExitOk);
 }
 
-// 用例 2：ServiceOptions 违反 F2-a 校验 → add_service 失败，任何组件未
+// 用例 2：ServiceOptions 违反执行策略校验 → add_service 失败，任何组件未
 // 启动（桩计数 0）；run 自身配置非法同样 run 前失败。
 BOOST_AUTO_TEST_CASE(invalid_options_fail_before_any_startup) {
     auto host = std::make_shared<StubNetHost>();
@@ -945,8 +945,8 @@ BOOST_AUTO_TEST_SUITE_END()
 boost::unit_test::test_suite* init_unit_test(int, char**) { return nullptr; }
 
 int main(int argc, char* argv[]) {
-    const char* mode = std::getenv("BBT_F1B1_DRAIN_CHILD");
-    const char* evfd = std::getenv("BBT_F1B1_DRAIN_EVFD");
+    const char* mode = std::getenv("BBT_DRAIN_CHILD");
+    const char* evfd = std::getenv("BBT_DRAIN_EVFD");
     if (mode != nullptr && evfd != nullptr) {
         RunDrainFailureChild(std::atoi(evfd),
             std::string(mode) == "nontimeout"

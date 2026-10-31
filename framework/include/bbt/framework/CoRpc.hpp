@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v3：位置参数 RPC 公共面。
+// 位置参数 RPC 公共面（业务面）。
 //
 // CoRpcReq/CoRpcResp 只拥有 payload 与错误结果；线格式不暴露给业务。
 // 通用位置参数 codec（字节规则/schema/错误码）的唯一实现下沉到

@@ -1,5 +1,5 @@
 #pragma once
-// service-actor/v2：CoApp 测试缝（机器面，internal/）。
+// CoApp 测试缝（机器面，internal/）。
 //
 // 业务路径只用 CoApp(CoAppOptions)——宿主与出站由框架默认装配
 // （InfraHttpHost + RpcHttpBridge + HttpEgress）。本头暴露的注入点

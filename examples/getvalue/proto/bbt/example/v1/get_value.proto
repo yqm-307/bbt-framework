@@ -1,11 +1,11 @@
-// bbt-framework Issue #4（P0-A）：首个业务切片的唯一 schema 真源。
+// bbt-framework 首个业务切片的唯一 schema 真源。
 //
 // 这是 GetValue 示例业务的 .proto，**不是** wire profile。传输信封（service/
 // method/request_id/remaining_budget_ms/outcome 等）由 bbtools-infra 的
 // proto/bbt/infra/rpc/v1/rpc_envelope.proto 拥有；本文件只定义业务请求/响应，
 // 作为 bbt.example.v1.GetValueService.GetValue 的 payload codec。
 //
-// 单一真源约束（Issue #4 契约）：
+// 单一真源约束：
 //   - C++ 服务端不手写 schema 字符串；方法表从生成本文件得到的 descriptor
 //     full_name（bbt.example.v1.GetValueRequest / GetValueResponse）推导，
 //     杜绝 .proto 与 C++ 类型表双写漂移。

@@ -1,4 +1,4 @@
-// service-actor/v2 F1-b2 切片验证：真实 infra HTTP loopback 闭环。
+// 真实 infra HTTP loopback 闭环。
 //
 // 覆盖（全部真实断言、无 mock/stub、无 sleep 凑时序）：
 //  T1 inbound_context_fields_land     入站字段落地：request_id/deadline/
@@ -110,7 +110,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-// ── 测试屏障原语（与 F1-b1 同形态：std CV，无 sleep 凑时序）──
+// ── 测试屏障原语（std CV，无 sleep 凑时序）──
 
 class TestLatch {
 public:
@@ -595,7 +595,7 @@ struct RunHandle {
 
 std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
-    // F1-b2 的受管 handler 会在协程内做嵌套出站调用（入站派发 →
+    // 受管 handler 会在协程内做嵌套出站调用（入站派发 →
     // this->call → 出站适配 → 发送闭包 → client->Request → 信号等待），
     // 链上各帧携带 Error/result/envelope 等值类型；12KB 默认栈在首个
     // 真实嵌套调用即触底（guard 页 SIGSEGV）。按真实工作负载放大栈。
@@ -1444,7 +1444,7 @@ BOOST_AUTO_TEST_CASE(inbound_deadline_reply_reserve_exact)
 //    且期限恰减一次 20ms（同钟精确等值）。
 // 口径：期限在派发协程内、紧邻 DispatchInboundForTest 之前取（deadline_at_dispatch），
 // 注册/调度耗时不再进入判别式；两侧都不使用 wall-clock 容差。本用例不涉及跨层
-// （infra local-min → framework）顺序声明；跨层等值见 f3 T7 与 T7c。
+// （infra local-min → framework）顺序声明；跨层等值由 shutdown 用例的对应断言复核。
 BOOST_AUTO_TEST_CASE(inbound_deadline_reply_reserve_boundary)
 {
     using std::chrono::milliseconds;

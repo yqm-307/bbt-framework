@@ -1,4 +1,4 @@
-// bbt-framework Issue #4（P0-A）：GetValue 业务切片的 C++ 侧单测。
+// GetValue 业务切片的 C++ 侧单测。
 //
 // 机器断言：
 //  - 唯一 schema 真源 = .proto：descriptor full_name / 字段号 / 字段类型；

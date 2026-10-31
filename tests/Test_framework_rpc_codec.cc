@@ -29,7 +29,7 @@ struct FakeProto {
 } // namespace
 
 // 特化必须写在包络被特化模板的命名空间（匿名命名空间类型可在全局域特化，
-// 同 F0 的 RouteTraits 写法）。
+// 同 rpc_surface 用例的 RouteTraits 写法）。
 template <>
 struct bbt::framework::rpc_detail::ProtoCodec<FakeProto> {
     static constexpr bool kDefined = true;

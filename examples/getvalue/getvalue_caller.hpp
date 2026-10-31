@@ -1,5 +1,5 @@
 #pragma once
-// bbt-framework Issue #4（P0-A）：Service→Service 出站 caller 业务（应用层）。
+// bbt-framework Service→Service 出站 caller 业务（应用层）。
 //
 // 只用公开面：CoApp 装配的显式静态路由 + CoService + ICoService::call<Req,Resp>
 // （typed 出站 seam，schema 由生成物 descriptor 推导）。业务不接触 envelope/

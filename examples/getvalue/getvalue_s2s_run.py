@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bbt-framework Issue #4（P0-A）：正式 Service→Service 出站跨进程验收驱动器。
+"""bbt-framework 正式 Service→Service 出站跨进程验收驱动器。
 
 两个真实 framework CoApp，各自独立进程：
   - callee 进程（getvalue_server）：宿主 GetValueService（正式 ProtoWireV1 入站）
@@ -18,7 +18,7 @@
   - s2s-blackhole-unknown：请求已完整写出后对端丢 reply（读完整个请求再断开）
     → caller 得到 OutcomeUnknown(14)，非未提交传输错误；对端只被连接一次（无 retry），
     callee journal 无新 handler
-  - s2s-badroute-{empty-service,empty-transport,empty-endpoint,duplicate}（#5 EX-T3）：
+  - s2s-badroute-{empty-service,empty-transport,empty-endpoint,duplicate}：
     caller 以公开入口载入四类非法静态路由 → run 启动任何组件前拒绝
     （rc=1=kExitRejected），lifecycle_failures 恰 1 条且为对应原因，bound_endpoint
     为空，资源工厂计数 0（拒绝断言由驱动器独立核对进程观测，不信任自报结论）
@@ -59,7 +59,7 @@ TIMED_OUT = 6
 NOT_FOUND = 11
 OUTCOME_UNKNOWN = 14   # RpcErrorCode.RPC_ERROR_CODE_OUTCOME_UNKNOWN
 
-# #5 EX-T3：四类非法静态路由 → 公开入口 run 前拒绝。期望的 lifecycle_failures
+# 四类非法静态路由 → 公开入口 run 前拒绝。期望的 lifecycle_failures
 # 单条子串来自 CoApp::_ValidateConfig 的对应校验分支。
 BADROUTE_CASES = [
     ("empty-service", "empty service_name"),
@@ -413,7 +413,7 @@ def _reap(name, proc, failures):
 
 
 def run_badroute(caller_bin, wd, kind, expect, timeout):
-    """#5 EX-T3：独立进程经公开入口验证非法静态路由 run 前拒绝。
+    """独立进程经公开入口验证非法静态路由 run 前拒绝。
 
     只读该进程自己写的机器可读观测（rc/lifecycle_failures/bound_endpoint/
     resource_factory_calls），断言由驱动器独立做出，不信任进程自报结论；
@@ -497,7 +497,7 @@ def main():
             except OSError:
                 pass
 
-        # 0) #5 EX-T3：四类非法静态路由 → 公开入口 run 前拒绝（四个独立进程）。
+        # 0) 四类非法静态路由 → 公开入口 run 前拒绝（四个独立进程）。
         for kind, expect in BADROUTE_CASES:
             run_badroute(args.caller_bin, wd, kind, expect, args.timeout)
 

@@ -1,9 +1,9 @@
 #pragma once
-// bbt-framework Issue #5（EX-T4）：容量 / 并发上下文 / 关闭生命周期“验收专用”服务。
+// bbt-framework 容量 / 并发上下文 / 关闭生命周期“验收专用”服务。
 //
-// 本头**只**为 EX-T4 验收 fixture 服务，明确“仅验收用”：
-//   - 业务 schema / typed codec 完整复用 #4 的 getvalue（getvalue_service.hpp +
-//     get_value.proto）；#5 不另造第二套 schema、协议或 codec；
+// 本头**只**为验收 fixture 服务，明确“仅验收用”：
+//   - 业务 schema / typed codec 完整复用 getvalue 切片（getvalue_service.hpp +
+//     get_value.proto）；不另造第二套 schema、协议或 codec；
 //   - 不引用 framework/internal/、Binder、CoAppSeam、MakeCoAppForTest、
 //     DispatchInboundForTest、INetworkHost 桩或任何发送注入；
 //   - 唯一的“控制”是进程内的验收闩 OpenGate：Hold 在其上以无界期限挂起
@@ -33,7 +33,7 @@
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
 
-// ProtoCodec<GetValueRequest/Response> 特化 + in-memory store（#4 唯一真源）。
+// ProtoCodec<GetValueRequest/Response> 特化 + in-memory store（getvalue 唯一真源）。
 #include "getvalue_service.hpp"
 
 namespace lifecycle {
@@ -56,7 +56,7 @@ inline void Journal(const std::string& line) {
 }
 
 // ── 验收闩：单次放行、多等待者；Open 早到不丢唤醒 ──────────────────────────
-// 与 tests/Test_framework_matrix.cc 的 CoGate 同构；此处作为 fixture 进程的
+// 与 tests/Test_framework_rpc_matrix.cc 的 CoGate 同构；此处作为 fixture 进程的
 // 验收控制原语，Open 由 fixture 主线程（stdin `open`）调用。
 class OpenGate {
 public:

@@ -1,9 +1,8 @@
 #pragma once
-// co-service-actor/v1 F2-a：执行策略与服务级装配选项。
-// ServiceOptions 字段与契约 §F2（decisions/0001，第 153-162 行）逐字一致；
+// 执行策略与服务级装配选项（业务面）。
 // 所有字段必须显式填写，不提供默认值。
-// ValidateServiceOptions 落实契约第 165 行的装配期规则；「容量耗尽返回
-// Overloaded」属运行期行为，不在此检查。
+// ValidateServiceOptions 落实装配期规则；「容量耗尽返回 Overloaded」
+// 属运行期行为，不在此检查。
 
 #include <cstddef>
 

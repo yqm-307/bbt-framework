@@ -1,5 +1,5 @@
 #pragma once
-// co-service-actor/v1 F1-a：请求上下文值类型（契约第 139 行）。
+// 受管请求上下文的值类型（业务面）。
 // 入站适配器从 infra::IncomingCallContext 接收已换算的 deadline 与已验证的
 // peer_principal，并从 RpcEnvelope 取得 request_id；本类型是这些已验证字段
 // 在框架层的受管形态，字段不得由业务侧自行伪造。
@@ -29,7 +29,7 @@ struct RequestContext {
     std::optional<std::string>         actor_key;   // Actor key（若有）
     // 调用预算上界（绝对时刻）：剩余预算 = deadline - now。
     // Deadline::max() 表示无有限预算；出站适配拒绝生成无有限预算的
-    // infra deadline（契约第 141/143 行）。
+    // infra deadline。
     bbt::coroutine::Deadline           deadline =
         bbt::coroutine::Deadline::max();
     std::string                        peer_principal; // 权限上下文：已验证对端身份

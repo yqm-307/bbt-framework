@@ -1,4 +1,4 @@
-// co-service-actor/v1 F2-b1：OrderedSession 发送侧测试。
+// OrderedSession 发送侧测试。
 // 用例真实断言；并发用屏障构造同时进入，不用 sleep 凑时序。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
@@ -229,7 +229,7 @@ BOOST_AUTO_TEST_CASE(one_sender_per_grant) {
     BOOST_CHECK_EQUAL(r4.value()->prepare().value().sequence(), 1u);
 }
 
-// 用例 6（契约第 209 行）：首次发送不得跳过未发送票据——越序首发
+// 用例 6：首次发送不得跳过未发送票据——越序首发
 // 本地拒绝 SequenceGap 并给出 expected_sequence；按序补齐后可发；
 // 已发送票据的重发不受水位影响。
 BOOST_AUTO_TEST_CASE(first_send_cannot_skip_unsent_ticket) {
@@ -260,7 +260,7 @@ BOOST_AUTO_TEST_CASE(first_send_cannot_skip_unsent_ticket) {
     BOOST_CHECK(s->BindForSend(t1, content));  // 重发旧票不受水位限制
 }
 
-// 用例 7：六个 domain_code 与契约第 213 行逐字一致。
+// 用例 7：六个 domain_code 与契约的 domain_code 表逐字一致。
 BOOST_AUTO_TEST_CASE(domain_code_constants_match_contract) {
     BOOST_CHECK_EQUAL(std::string(fw::ordered_domain_code::kSequenceGap),
                       "SequenceGap");
@@ -278,7 +278,7 @@ BOOST_AUTO_TEST_CASE(domain_code_constants_match_contract) {
     BOOST_CHECK_EQUAL(std::string(fw::kOrderedErrorDomain), "framework.actor");
 }
 
-// 用例 8（infra #39）：actor 域专属语义校验迁回 framework 边界后的归属回归。
+// 用例 8：actor 域专属语义校验在 framework 边界的归属回归。
 // infra::ValidateErrorDetails 只做通用结构校验，不再拒绝非法 actor 键；
 // framework 边界（ValidateErrorAtBoundary）必须维持旧版拒绝集：
 //   合法 actor 错误通过、非 actor 合法扩展通过、跨域写保留键拒绝、
@@ -355,14 +355,14 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
     }
 }
 
-// 用例 9（infra #39 R2）：真实 ToHttpResponse 出站边界的降级回归。
+// 用例 9：真实 ToHttpResponse 出站边界的降级回归。
 // 不走 helper 直连——构造 result<RpcEnvelope>::err(...) 喂给
 // http_bridge::ToHttpResponse，断言 wire 输出本身：
 //   a) actor 域非法 expected_sequence → 降级为 ProtocolError，且
 //      原始非法值/保留键不出现在任何 header；
 //   b) 跨域携带保留键 → 同样降级；
 //   c) 合法 actor 错误 → 既有 code/domain/domain_code/message 映射不变；
-//   d) 合法错误的 details 不上 wire（#8 未实现，不得宣称传递）。
+//   d) 合法错误的 details 不上 wire（现有 wire 未实现 details 传递，不得宣称传递）。
 BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
     namespace Wire = fw::http_bridge;
     using inf::RpcEnvelope;
@@ -443,7 +443,7 @@ BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
             "SequenceGap");
         BOOST_CHECK_EQUAL(header_of(res, "x-bbt-err-message").value_or(""),
                           "gap msg");
-        // details 不经现有 wire 传递（#8 范围）：无 header 携带 42
+        // details 不经现有 wire 传递：无 header 携带 42
         for (const auto& [k, v] : res.headers) {
             BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
             BOOST_CHECK(v != "42");

@@ -1,4 +1,4 @@
-// F2-a 切片验证：执行策略校验矩阵、ActorSerial 缺 key 提取器启动失败、
+// 执行策略校验矩阵、ActorSerial 缺 key 提取器启动失败、
 // Actor 邮箱保序/非重入/容量/异常续跑/Close、跨 Actor 并发、
 // ActorRegistry 至多一次与上限。
 // 并发用例用条件变量屏障构造真实重叠窗口：handler 在 drain 协程内被

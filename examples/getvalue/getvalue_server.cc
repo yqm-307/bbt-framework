@@ -1,4 +1,4 @@
-// bbt-framework Issue #4（P0-A）：C++ framework 服务端（正式 body wire bridge）。
+// bbt-framework C++ framework 服务端（正式 body wire bridge）。
 //
 // 装配路径与业务一致：公开 CoApp（inbound_bridge=ProtoWireV1）+ 公开 CoService，
 // 不使用测试缝、不提供 Binder、不伪造结果。监听 loopback 动态端口，启动后写
@@ -61,8 +61,7 @@ int main(int argc, char* argv[]) {
     // payload 编解码（解析请求 + 编码响应），叠加框架分发与 wire 桥的栈占用，
     // 超过 coroutine 默认 12KB 栈。示例 server 经 coroutine **公开配置入口**
     // `g_bbt_coroutine_config`（= GlobalConfig 访问宏；头
-    // bbt/coroutine/detail/GlobalConfig.hpp，见 coroutine agent-docs
-    // api-reference.md §12「配置」）显式把协程栈调到 512KB。
+    // bbt/coroutine/detail/GlobalConfig.hpp，见 coroutine agent-docs「配置」）显式把协程栈调到 512KB。
     //   - 该配置非线程安全，必须在调度器 Start 前（即 app.run() 前）设置；
     //   - 是 process-global：影响本进程全部协程，不是 per-service/per-request；
     //   - 这是运行期资源配置，不是业务/协议语义。

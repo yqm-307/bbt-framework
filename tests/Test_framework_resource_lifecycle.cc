@@ -1,10 +1,10 @@
-// service-actor/v2 #8 切片验证：命名资源 Registry 的工厂装配、
+// 命名资源 Registry 的工厂装配、
 // Create/Start 相位、失败回滚与关闭序列下的同步 Close 收束（infra 关闭
 // 是同步契约：Close() 返回即物理释放，无 RequestClose/WaitClosed 等待）。
-// 全部经 INetworkHost 桩驱动生命周期（与 F1-b1 同一形态：无真实 socket、
+// 全部经 INetworkHost 桩驱动生命周期（与装配用例同一形态：无真实 socket、
 // 无 sleep 凑时序、真实断言调用序与运行时就绪）。
 //
-// 覆盖（issue #8 验收的资源生命周期切片）：
+// 覆盖：
 //  T1 factory_named_resources_start_after_scheduler
 //      两个同名类型不同名工厂资源在 Scheduler 启动后创建并各 Start 一次；
 //      两个 Service 取同名资源得到同一实例、不同名隔离；关闭序列对资源
@@ -98,7 +98,7 @@ private:
 
 constexpr std::chrono::milliseconds kWait{5000};
 
-// ── INetworkHost 桩（与 F1-b1 同形态）：记录调用名与调用时运行时就绪态。──
+// ── INetworkHost 桩：记录调用名与调用时运行时就绪态。──
 struct NetCall {
     std::string name;
     bool        sched_ready;   // 调用发生时 coroutine runtime 已初始化

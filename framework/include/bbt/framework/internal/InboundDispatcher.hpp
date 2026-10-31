@@ -1,7 +1,7 @@
 #pragma once
-// co-service-actor/v1 F1-b2：入站适配器——把 infra 的入站调用事实
+// 入站适配器（机器面，internal/）：把 infra 的入站调用事实
 // （IncomingCallContext + RpcEnvelope）落成受管请求上下文并分发到
-// 已托管 Service/Actor 实例（契约 F1 第 139 行）。
+// 已托管 Service/Actor 实例。
 //
 // 字段来源纪律（不得伪造）：
 //  - deadline/peer_principal 只取 infra 已换算/已验证的
@@ -10,9 +10,9 @@
 //  - metadata 中 route.* 与受限 fw.* 白名单之外的键一律拒绝
 //    （err(InvalidArgument)），不静默忽略、不转写进上下文。
 //  - 白名单 fw.*：fw.trace_id 落入上下文 trace_id；有序流四元组
-//    （fw.producer_id/producer_epoch/sequence/receiver_epoch）本切片
+//    （fw.producer_id/producer_epoch/sequence/receiver_epoch）此处
 //    只做存在性与格式校验（非空、sequence 为无符号十进制）——有序
-//    入口的执行语义属 F2-b3，不提前消费。
+//    入口的执行语义在 OrderedIngress，不提前消费。
 //
 // 绑定语义：RequestContext 随逻辑请求/协程绑定（RequestScope），
 // 不用 thread_local 跨挂起缓存；Service 并发处理多请求互不串扰——

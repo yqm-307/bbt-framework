@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bbt-framework Issue #5（EX-T4）：容量 / 并发上下文 / 关闭生命周期验收驱动器。
+"""bbt-framework 容量 / 并发上下文 / 关闭生命周期验收驱动器。
 
 由 ctest 调用：
   lifecycle_run.py --bin <lifecycle_fixture> [--results <json>]
@@ -7,7 +7,7 @@
 职责（R3–R5 的真实运行证据，全部为真实公开入口 + 自有进程 + 动态 loopback）：
   1. spawn 自有 fixture 进程（真实公开 CoApp + real infra HTTP loopback +
      正式 ProtoWireV1 body profile），就绪以 port 文件为准；
-  2. 经 #4 的 Python 标准库 wire codec（getvalue_client.py）打真实 POST /rpc；
+  2. 经 getvalue 切片的 Python 标准库 wire codec（getvalue_client.py）打真实 POST /rpc；
   3. 场景：
      - S3 并发挂起两项，放行后上下文/协程不串（req_id/co_id 跨挂起一致）；
      - S3 客户端读超时后 work 仍物理在途占容量（新请求精确 Overloaded）；
@@ -17,8 +17,8 @@
      - R5 外部 supervisor 硬杀只留「未完成」证据、不称优雅完成。
   4. 收尾：stdin 触发关闭、有限等待；异常路径回收自有进程。
 
-wire 编解码复用 examples/getvalue/getvalue_client.py（#4 唯一手写 proto3 codec），
-#5 不另造第二套 schema/codec。全部结构化结果带 auth_state=unauthenticated_loopback。
+wire 编解码复用 examples/getvalue/getvalue_client.py（唯一手写 proto3 codec），
+不另造第二套 schema/codec。全部结构化结果带 auth_state=unauthenticated_loopback。
 """
 
 import argparse
@@ -116,7 +116,7 @@ def event_index(entries, sign, occurrence=1):
     return -1
 
 
-# ── HTTP over raw socket（复用 #4 wire codec；可控制超时/延迟读取）───────────
+# ── HTTP over raw socket（复用 getvalue wire codec；可控制超时/延迟读取）───────────
 
 def enc_hold(request_id, key="hold", method="Hold", budget_ms=30000):
     return gvc.enc_envelope(

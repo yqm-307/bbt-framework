@@ -1,4 +1,4 @@
-// bbt-framework Issue #4（P0-A）：正式 RPC body bridge 实现（3-2 下沉后）。
+// 正式 RPC body bridge 实现。
 //
 // 入站在受管协程内被 infra RpcServer 调用（经 InfraHttpHost::_InvokeRpc 记账）。
 // 全部 RPC 元数据只来自 envelope；不读任何 x-bbt-* 头（wire profile 契约）。

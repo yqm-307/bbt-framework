@@ -1,5 +1,5 @@
 #pragma once
-// co-service-actor/v1 F1-b2：INetworkHost 的真实实现——infra
+// INetworkHost 的真实实现（机器面，internal/）：infra
 // NetworkRuntime + HttpServer（LegacyHeaders 旧栈）或 net::Engine +
 // rpc::Server（ProtoWireV1 新栈；已验收的真实 loopback 传输）。
 //
@@ -16,12 +16,11 @@
 //  二者共用本类的在途 handler 记账与关闭序列；均未安装时 Start 跳过监听
 //  （纯出站宿主）。
 //
-// 口径差异（契约 F1/F3 与 infra N0/rpc-net）：
+// 口径差异（framework 侧契约与 infra 网络栈之间）：
 //  - infra 关闭是同步收口：rpc::Server 序列
 //    StopAccepting → Drain → Close → WaitStopped 均由宿主控制线程驱动；
-//    Engine::RequestClose + Run 线程 join 返回即网络资源/回调/driver 已收口
-//    （docs/architecture/gnet-network-execution.md §6）。旧栈
-//    NetworkRuntime::Close 语义不变。
+//    Engine::RequestClose + Run 线程 join 返回即网络资源/回调/driver 已收口。
+//    旧栈 NetworkRuntime::Close 语义不变。
 //  - Engine::Run 占用一个宿主专用 native 线程（不是 control 线程本身，
 //    也不是协程/P 线程：Run 在协程上下文或已登记 Processer 上会被拒）。
 //    执行底座（coroutine Scheduler + Engine）由本类装配并收口。Run 返回的
@@ -46,7 +45,7 @@
 //  - Close 只在取得 WaitStopped 成功凭据（m_stopped）后停 Engine
 //    （RequestClose+join+Run 结果+Stopped 相位实际检查）并释放
 //    server/engine owner；未取得凭据（裸 Close 兜底失败或续等仍失败）→
-//    保留 owner，不伪报已物理关闭（review-fixes §29-42）。
+//    保留 owner，不伪报已物理关闭（fail-closed）。
 //
 // 寿命边界（如实记录，不在本类内宣称已解决业务入口寿命）：
 //  - handler 闭包按 shared_ptr 捕获 HandlerState，不捕获宿主裸 this：宿主
@@ -215,7 +214,7 @@ private:
     std::optional<bbt::infra::Error>          m_close_error;
     // RPC 收口凭据：WaitHandlersDone（或 Close 兜底路径）取得
     // rpc::Server::WaitStopped 成功后置位；Close 只在此凭据成立后停 Engine
-    // 并释放 server/engine owner，否则 fail-closed 保留（review-fixes §29-42）。
+    // 并释放 server/engine owner，否则 fail-closed 保留。
     bool                                      m_stopped{false};
     // Engine 收口（RequestClose+join+get）只尝试一次：幂等重入不再重复。
     bool                                      m_engine_closed{false};
