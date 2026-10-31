@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
 """正式 `.github/workflows/ci.yml`（唯一权威普通入口）离线冒烟与直接耦合测试。
 
-本文件是现役普通 CI（由已独立审查的 hosted 影子候选升级而来，Issue #50/#53）的**直接
-测试**：只验证「CI 配方 / archive 接收侧门禁 / 分类路由 / 静态与结构契约 / 手动任务保留」，
-**不跑 C++ 全量构建、不下载源码、不连网**（真实 build→test 走父级授权的在线 CI，在线未验
-见 `docs/ci/formal-ci.md`）。stdlib 为主，PyYAML 可选增强。
+本文件是现役普通 CI（fw-p3a 内联 callee 链删除、fw-p3b 重写为单 runner
+build_test + 本仓 result.py）的**直接测试**：只验证「CI 配方 / 内联分类与
+结果判定 / 静态与结构契约 / 手动任务保留（manual.yml）」，**不跑 C++ 全量
+构建、不下载源码、不连网**（真实 build→test 走父级授权的在线 CI）。stdlib
+为主，PyYAML 可选增强。
 
 运行：
   PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v scripts/ci/test_formal_ci.py
-  # 结构契约需 PyYAML（缺省显式 SKIP，不等于通过）；分类路由冒烟需指向已发布 callee：
-  UV_OFFLINE=1 UV_CACHE_DIR=<cache> uv run --no-project --with pyyaml \\
-    python3 scripts/ci/test_formal_ci.py
-  PYTHONDONTWRITEBYTECODE=1 BBT_CI_SHARED_DIR=<framework>/scripts/ci/shared \\
+  # 结构契约需 PyYAML（缺省显式 SKIP，不等于通过）：
+  UV_OFFLINE=1 UV_CACHE_DIR=<cache> uv run --no-project --with pyyaml \
     python3 scripts/ci/test_formal_ci.py
 
 覆盖：
-- 配方守卫：脚本 bash -n、python compile、prepare_boost --print-plan 固定值、fail-closed 拒绝；
-- archive 接收侧：sha256 校验 + 闭集成员/路径穿越/绝对路径/逃逸 symlink/设备成员拒绝
-  （真实调用 scripts/ci/run_framework_gate.sh verify-archive，synthetic 归档非真实 C++ 产物）；
-- changed_files 路由：push/PR 真实 diff 归一、未知保守回退、超预算整集回退；
-- 正式 workflow 文本契约（stdlib，恒跑，直接读真实文件）：触发面/身份/权限/concurrency/
-  hosted 与手动 runner/固定 SHA pin/callee 复用/required-optional/docs-only/always result/
-  artifact 闭包/producer attempt/no-cache/判据命令/内联 bash -n/无影子双跑；
+- 配方守卫：脚本 bash -n、python compile、prepare_boost --print-plan 固定值、
+  fail-closed 拒绝；
+- gate verify-archive 接收侧配方（独立子命令仍在仓内）：sha256 校验 + 闭集
+  成员/路径穿越/绝对路径/逃逸 symlink/设备成员拒绝（synthetic 归档非真实
+  C++ 产物）；正式 workflow 为单 runner，不再跨 runner 传归档；
+- changed_files 路由：push/PR 真实 diff 归一、本仓内联分类、未知保守回退、
+  超预算整集回退；
+- 正式 workflow 文本契约（stdlib，恒跑，直接读真实 ci.yml 与 manual.yml）：
+  触发面/身份/权限/concurrency/hosted runner/固定 SHA pin/无 callee 复用/
+  内联分类与 result.py required-optional/docs-only 跳过门禁/always result/
+  单 runner build_test 判据命令/内联 bash -n/无影子双跑/无跨 runner artifact；
 - 正式 workflow 结构契约（需 PyYAML，缺省显式 SKIP）；
-- 手动任务保留契约：toolchain-verify / resource-acceptance 及其 inputs/资源边界不删不改；
-- producer→receipt 语义：执行真实 workflow heredoc + 真实 shared cli.py，复用原 producer attempt；
-- 分类路由冒烟（需 BBT_CI_SHARED_DIR）：用**同一个真实 cli.py** 校验正式受限输入与
-  required/optional 判定，本仓不复制契约。
+- 手动任务保留契约：manual.yml 中 toolchain-verify / resource-acceptance 及
+  其 inputs/资源边界不删不改；
+- gate 内联 provenance：执行真实 heredoc 块，manifest+envelope 绑定 producer
+  身份，digest 只对实际写入字节计算；
+- 结果判定端到端：直接执行本仓 scripts/ci/result.py CLI，required/optional
+  判定与 docs-only 放行语义不依赖已删除的 shared callee。
 """
 from __future__ import annotations
 
@@ -43,10 +48,11 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKTREE = os.path.normpath(os.path.join(HERE, "..", ".."))
 CI_YML = os.path.join(WORKTREE, ".github", "workflows", "ci.yml")
-CLASSIFY_YML = os.path.join(WORKTREE, ".github", "workflows", "bbtools-classify-v1.yml")
+MANUAL_YML = os.path.join(WORKTREE, ".github", "workflows", "manual.yml")
 PREPARE_BOOST = os.path.join(HERE, "prepare_boost.sh")
 GATE = os.path.join(HERE, "run_framework_gate.sh")
 CHANGED = os.path.join(HERE, "changed_files.py")
+RESULT = os.path.join(HERE, "result.py")
 FETCH_DEPS = os.path.join(WORKTREE, "scripts", "fetch_deps.sh")
 PREPARE_PROTOBUF = os.path.join(WORKTREE, "scripts", "prepare_protobuf.sh")
 LOCAL_BUILD = os.path.join(WORKTREE, "scripts", "local_build.sh")
@@ -56,12 +62,8 @@ VERIFY_TOOLCHAIN = os.path.join(WORKTREE, "scripts", "verify_toolchain.sh")
 DEPS_LOCK = os.path.join(WORKTREE, "deps.lock")
 TOOLCHAIN_LOCK = os.path.join(WORKTREE, "docker", "toolchain.lock")
 
-CALLEE_SHA = "ce247be9d3473432e0da6c204481ad9403c430bb"
-CALLEE = f"yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@{CALLEE_SHA}"
 CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
-UPLOAD_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
-DOWNLOAD_SHA = "d3f86a106a0bac45b974a628896c90dbdf5c8093"
-SHA_PIN_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+SHA_PIN_RE = re.compile(r"^actions/[^@\s]+@[0-9a-f]{40}$")
 HOSTED_RUNNER = "ubuntu-24.04"
 MANUAL_RUNNER = "arc-s4-framework"
 
@@ -476,24 +478,30 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.text = raw(CI_YML)
         cls.stripped = body(CI_YML)
+        cls.manual_text = raw(MANUAL_YML)
+        cls.manual_stripped = body(MANUAL_YML)
 
     def test_name_and_single_authoritative_identity(self):
         self.assertIn("\nname: ci\n", self.text)
-        # 正式 artifact 名（bbt-build-<run_id>），不再是影子名；无影子双跑残留。
-        self.assertIn("bbt-build-${{ github.run_id }}", self.stripped)
+        # 无影子双跑、无跨 runner artifact 名残留（build_test 单 runner，
+        # 归档只在 runner 内中转，不上传 artifact）。
         self.assertNotIn("bbt-shadow-build-", self.stripped)
         self.assertNotIn("ci-shadow-v1", self.stripped)
+        self.assertNotIn("bbt-build-", self.stripped)
+        self.assertNotIn("upload-artifact", self.stripped)
+        self.assertNotIn("download-artifact", self.stripped)
 
     def test_triggers_are_pr_push_main_and_manual(self):
         self.assertIn("pull_request:", self.stripped)
         self.assertIn("push:", self.stripped)
         self.assertIn("workflow_dispatch:", self.stripped)
         self.assertIn("branches: [main]", self.stripped)
-        # 手动入口保留 resource_acceptance 布尔输入。
-        self.assertIn("resource_acceptance:", self.stripped)
         for forbidden in ("schedule:", "merge_group"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.stripped)
+        # 手动 resource_acceptance 输入随 manual.yml 迁移，不在正式 ci.yml。
+        self.assertNotIn("resource_acceptance:", self.stripped)
+        self.assertIn("resource_acceptance:", self.manual_stripped)
 
     def test_permissions_minimal_no_write_no_secrets(self):
         self.assertIn("permissions: {}", self.stripped)
@@ -513,125 +521,122 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
     def test_runner_split_hosted_and_preserved_manual(self):
         runs_on = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self.stripped)
         self.assertTrue(runs_on, "应存在本地 job 的 runs-on")
-        self.assertEqual(set(runs_on), {HOSTED_RUNNER, MANUAL_RUNNER})
-        # 普通重型 job 必须 hosted。
+        # 正式 ci.yml 全部 hosted（手动重型 job 已迁移到 manual.yml）。
+        self.assertEqual(set(runs_on), {HOSTED_RUNNER})
         self.assertGreaterEqual(runs_on.count(HOSTED_RUNNER), 3)
-        self.assertEqual(runs_on.count(MANUAL_RUNNER), 2)
+        # 手动 job 保留在 manual.yml，仍跑专用 runner。
+        manual_runs_on = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$",
+                                    self.manual_stripped)
+        self.assertEqual(manual_runs_on, [MANUAL_RUNNER, MANUAL_RUNNER])
 
     def test_all_uses_are_full_sha_pinned_and_expected(self):
-        uses = re.findall(r"(?m)^\s*uses:\s*(\S+)\s*$", self.stripped)
-        self.assertTrue(uses)
-        for item in uses:
-            with self.subTest(uses=item):
-                self.assertRegex(item, SHA_PIN_RE)
-        for pin in (f"actions/checkout@{CHECKOUT_SHA}",
-                    f"actions/upload-artifact@{UPLOAD_SHA}",
-                    f"actions/download-artifact@{DOWNLOAD_SHA}"):
-            with self.subTest(pin=pin):
-                self.assertIn(pin, self.stripped)
+        # 只使用 actions/* 全 40-hex pin；无 reusable workflow uses（callee 链已删）。
+        for label, text in (("ci", self.stripped), ("manual", self.manual_stripped)):
+            uses = re.findall(r"(?m)^\s*uses:\s*(\S+)\s*$", text)
+            self.assertTrue(uses, f"{label} 应存在 uses:")
+            for item in uses:
+                with self.subTest(workflow=label, uses=item):
+                    self.assertRegex(item, SHA_PIN_RE)
+        self.assertIn(f"actions/checkout@{CHECKOUT_SHA}", self.stripped)
+        self.assertIn(f"actions/checkout@{CHECKOUT_SHA}", self.manual_stripped)
 
-    def test_reuses_published_callee_not_local(self):
-        self.assertIn(CALLEE, self.stripped)
+    def test_no_reusable_callee_or_local_workflow_call(self):
+        # classify/result callee 链已删除：无 workflow_call 触发器，无
+        # `owner/repo/.github/workflows/...@sha` 或 `./.github/workflows` 复用。
+        self.assertNotIn("workflow_call", self.stripped)
+        self.assertNotIn("workflow_call", self.manual_stripped)
+        self.assertNotIn("/.github/workflows/", self.stripped)
         self.assertNotIn("./.github/workflows", self.stripped)
-        self.assertEqual(
-            self.stripped.count(CALLEE), 2, "应在 plan 与 result 各复用一次 callee"
-        )
+        self.assertNotIn("bbtools-classify", self.stripped)
+        for forbidden in ("required_checks_json:", "optional_checks_json:",
+                          "source_sha:", "profile:"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.stripped)
 
     def test_no_caller_supplied_shell_or_jobs_input(self):
-        self.assertIn("scripts/ci/changed_files.py", self.stripped)
-        self.assertNotIn("workflow_call", self.stripped)
-        self.assertIn("source_sha: ${{ github.sha }}", self.stripped)
+        # 分类在本仓 changes job 内联执行（changed_files.py），不经 callee 传参。
+        self.assertIn("python3 scripts/ci/changed_files.py", self.stripped)
+        self.assertIn("steps.diff.outputs.classification", self.stripped)
+        self.assertIn("steps.diff.outputs.changed_files_json", self.stripped)
+        self.assertIn("steps.diff.outputs.classifier_status", self.stripped)
 
     def test_required_and_optional_disjoint_and_build_test_optional(self):
-        self.assertIn("required_checks_json: '[\"changes\",\"plan\"]'", self.stripped)
-        self.assertIn("optional_checks_json: '[\"build\",\"test\"]'", self.stripped)
-        self.assertIn("needs.plan.outputs.classification != 'docs-only'", self.stripped)
-        self.assertIn("needs.plan.result == 'success'", self.stripped)
+        # result job 内联 result.py：required/optional 集合写死在 heredoc。
+        self.assertIn('"required": ["changes", "docs_check"]', self.stripped)
+        self.assertIn('"optional": ["build_test"]', self.stripped)
+        self.assertIn("needs.changes.outputs.classification != 'docs-only'", self.stripped)
+        self.assertIn("needs.changes.result == 'success'", self.stripped)
 
     def test_result_job_aggregates_always_and_passes_all_job_results(self):
         self.assertIn("if: ${{ always() }}", self.stripped)
+        self.assertIn("needs: [changes, docs_check, build_test]", self.stripped)
         self.assertIn(
-            "format('{{\"changes\":\"{0}\",\"plan\":\"{1}\",\"build\":\"{2}\",\"test\":\"{3}\"}}'",
+            "format('{{\"changes\":\"{0}\",\"docs_check\":\"{1}\",\"build_test\":\"{2}\"}}'",
             self.stripped,
         )
-        for ref in ("needs.changes.result", "needs.plan.result", "needs.build.result",
-                    "needs.test.result"):
+        for ref in ("needs.changes.result", "needs.docs_check.result",
+                    "needs.build_test.result"):
             with self.subTest(ref=ref):
                 self.assertIn(ref, self.stripped)
+        # 汇聚走本仓 result.py（fail-closed，非零即红），不再经 callee。
+        self.assertIn("python3 scripts/ci/result.py --file \"$payload\"", self.stripped)
 
     def test_result_job_has_conservative_fallbacks(self):
-        self.assertIn("|| '[]'", self.stripped)
+        # changes 失败时 outputs 为空 → classification 回退 unknown → 执行全部。
         self.assertIn("|| 'unknown'", self.stripped)
-        self.assertIn('format(\'{{"name":"{0}"}}\', github.event_name)', self.stripped)
-
-    def test_artifact_cross_runner_closure_commands_present(self):
-        # same-run only：下载名含 run_id；artifact 命名正式。
-        self.assertIn("name: bbt-build-${{ github.run_id }}", self.stripped)
-        self.assertIn("download-artifact@", self.stripped)
-        self.assertIn("upload-artifact@", self.stripped)
-        self.assertIn("retention-days: 1", self.stripped)
-        self.assertIn("compression-level: 0", self.stripped)
-        self.assertIn("if-no-files-found: error", self.stripped)
-        # 先校验 sha256 后解包（verify-archive），并做闭集成员约束。
-        self.assertIn("run_framework_gate.sh verify-archive", self.stripped)
-        self.assertIn("--expected-sha256 \"$EXPECTED_ARCHIVE_SHA256\"", self.stripped)
-        self.assertIn("--allow-prefix \".ci-work\"", self.stripped)
-        self.assertIn("--allow-prefix \"boost-prefix/lib\"", self.stripped)
-        # provenance 复用已发布 shared 契约，不新增第二 public API：
-        # build 侧 produce 在 gate 脚本，接收侧 verify-receipt 在 workflow。
-        self.assertRegex(raw(GATE), r"scripts/ci/shared/cli\.py\"?\s+produce")
-        self.assertIn("scripts/ci/shared/cli.py verify-receipt", self.stripped)
-
-    def test_producer_attempt_output_wiring(self):
         self.assertIn(
-            "producer_run_attempt: ${{ steps.pack.outputs.producer_run_attempt }}",
+            "CLASSIFICATION: ${{ needs.changes.outputs.classification || 'unknown' }}",
             self.stripped,
         )
-        self.assertIn(
-            "EXPECTED_PRODUCER_RUN_ATTEMPT: ${{ needs.build.outputs.producer_run_attempt }}",
-            self.stripped,
-        )
-        self.assertIn("|archive_bytes|producer_run_attempt)=", self.stripped)
-        self.assertIn("printf 'producer_run_attempt=%s\\n' \"$run_attempt\"", raw(GATE))
 
-    def test_receipt_reuses_producer_attempt_not_consumer(self):
-        # 执行真实 workflow 中的 receipt heredoc 和 shared CLI；不编译/执行产物。
-        blocks = [b for b in _extract_run_blocks(self.text)
-                  if "cli.py verify-receipt" in b]
-        self.assertEqual(len(blocks), 1)
-        script = blocks[0].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-        cli = os.path.join(WORKTREE, "scripts", "ci", "shared", "cli.py")
+    def test_gate_build_emits_key_value_outputs(self):
+        # gate build 的 key=value 输出保留（单 runner 内消费/日志审计），
+        # 摘要仍只对真实写入字节计算。
+        gate = raw(GATE)
+        for needle in ("printf 'build_archive_sha256=%s\\n'",
+                       "printf 'provenance_digest=%s\\n'",
+                       "printf 'producer_run_attempt=%s\\n' \"$run_attempt\"",
+                       "printf 'archive_bytes=%s\\n'"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, gate)
+
+    def test_gate_inline_produce_emits_manifest_envelope_and_real_digest(self):
+        # 执行 gate 脚本中内联 produce 块（不再调用 shared cli.py）：
+        # manifest.json + envelope.json + artifact_digest 必须真实产出，
+        # digest 是对实际写入字节的 sha256，envelope 绑定 producer 身份。
+        script = raw(GATE)
+        marker = 'python3 - "$meta_in" "$meta_dir" "$meta_out" <<\'PY\''
+        block = script.split(marker, 1)[1].split("\nPY\n", 1)[0]
         with tempfile.TemporaryDirectory() as td:
-            work = os.path.join(td, "work")
-            meta = os.path.join(work, "artifact-meta")
-            source = os.path.join(td, "input.json")
-            receipt = os.path.join(td, "receipt.json")
+            meta_in = os.path.join(td, "in.json")
+            meta_dir = os.path.join(td, "artifact-meta")
+            emit_path = os.path.join(td, "emit.out")
             sha = "a" * 40  # 明确合成身份，仅用于离线契约测试。
-            with open(source, "w", encoding="utf-8") as handle:
-                json.dump({"manifest_version": 1, "source_repo": "example/repo",
-                           "source_sha": sha, "source_head": sha,
-                           "automation_repo": "example/repo", "automation_sha": sha,
-                           "run_id": 123, "run_attempt": 1, "job": "build"}, handle)
-            produced = run([sys.executable, cli, "produce", "--file", source,
-                            "--out-dir", meta], env=ENV)
-            self.assertEqual(produced.returncode, 0, produced.stderr)
-            with open(os.path.join(meta, "envelope.json"), encoding="utf-8") as handle:
-                digest = json.load(handle)["envelope"]["artifact_digest"]
-            env = dict(ENV, BBT_WORK_DIR=work, GITHUB_REPOSITORY="example/repo",
-                       GITHUB_SHA=sha, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
-                       EXPECTED_PROVENANCE_DIGEST=digest)
-            for attempt, should_pass in (("1", True), ("2", False), ("", False), (None, False)):
-                with self.subTest(producer_attempt=attempt):
-                    env.pop("EXPECTED_PRODUCER_RUN_ATTEMPT", None)
-                    if attempt is not None:
-                        env["EXPECTED_PRODUCER_RUN_ATTEMPT"] = attempt
-                    made = run([sys.executable, "-c", script, receipt], env=env)
-                    if made.returncode:
-                        self.assertFalse(should_pass, made.stderr)
-                        continue
-                    verified = run([sys.executable, cli, "verify-receipt", "--file", receipt], env=env)
-                    self.assertEqual(verified.returncode == 0, should_pass,
-                                     verified.stdout + verified.stderr)
+            manifest = {"manifest_version": 1, "source_repo": "example/repo",
+                        "source_sha": sha, "source_head": sha,
+                        "automation_repo": "example/repo", "automation_sha": sha,
+                        "run_id": 123, "run_attempt": 1, "job": "build"}
+            with open(meta_in, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            proc = run([sys.executable, "-c", block, meta_in, meta_dir, emit_path],
+                       env=ENV)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            import hashlib
+
+            payload = os.path.join(meta_dir, "manifest.json")
+            self.assertTrue(os.path.isfile(payload))
+            with open(payload, "rb") as handle:
+                data = handle.read()
+            expected = "sha256:" + hashlib.sha256(data).hexdigest()
+            with open(os.path.join(meta_dir, "envelope.json"), encoding="utf-8") as handle:
+                env = json.load(handle)["envelope"]
+            self.assertEqual(env["artifact_digest"], expected)
+            self.assertEqual(env["artifact_path"], "manifest.json")
+            self.assertEqual(env["producer_run_attempt"], 1)
+            self.assertEqual(env["producer_source_sha"], sha)
+            self.assertEqual(env["workflow_sha"], sha)
+            with open(emit_path, encoding="utf-8") as handle:
+                self.assertIn("artifact_digest=" + expected, handle.read())
 
     def test_gate_default_repo_dir_is_repository_root(self):
         script = raw(GATE)
@@ -666,7 +671,10 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.stripped)
 
-    def test_preserves_cross_runner_gate_commands(self):
+    def test_preserves_build_test_gate_commands(self):
+        # 单 runner build_test 判据命令原样保留（deps/前缀/gate build/ctest
+        # 门禁/no-SKIP/链接来源）。跨 runner 专属的 exec-bit 恢复块已随
+        # artifact 通路退役，不在本断言内。
         for needle in (
             "bash scripts/fetch_deps.sh",
             'bash scripts/prepare_protobuf.sh "$BBT_PROTOBUF_PREFIX"',
@@ -676,7 +684,6 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
             "100% tests passed, 0 tests failed",
             "(Skipped|Not Run)",
             "rpc_xlang_server",
-            "getvalue/getvalue_server",
             "libboost_context",
         ):
             with self.subTest(needle=needle):
@@ -715,20 +722,13 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
                 with self.subTest(needle=needle, source='workflow' if source == self.stripped else 'gate'):
                     self.assertIn(needle, source)
 
-    def test_example_exec_bits_and_actual_build_directory_preserved(self):
-        block = next(b for b in _extract_run_blocks(self.text) if 'rpc_candidates=' in b)
-        for needle in (
-            "rpc_xlang_server",
-            "Test_framework_*",
-            "getvalue/getvalue_server",
-            "getvalue/getvalue_caller",
-            "two_service/two_service",
-            "lifecycle_matrix/lifecycle_fixture",
-            "rpc_policy/rpc_policy",
-            "BBT_BUILD_DIR=$actual_build_dir",
-            'chmod +x "$bin"',
-            'if [ ! -f "$bin" ]; then',
-        ):
+    def test_example_binaries_checked_via_ldd_block(self):
+        # 单 runner 下构建产物不经归档传输，exec-bit 恢复块退役；本 job 仍
+        # 对 Test_framework_* 与 rpc_xlang_server 做 ldd fail-fast 复核。
+        block = next(b for b in _extract_run_blocks(self.text) if 'boost_links=' in b)
+        for needle in ("rpc_xlang_server", "Test_framework_*",
+                       "verified binaries: $found",
+                       'if [ "$found" -eq 0 ]', "exit 9"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, block)
 
@@ -740,11 +740,13 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
                 self.assertIn(needle, block)
 
     def test_manual_jobs_preserved_with_inputs_and_resource_boundaries(self):
-        # 手动工具链验收与双服务资源验收任务、inputs/资源边界保留，不删除假完成。
+        # 手动工具链验收与双服务资源验收任务迁移到 manual.yml：
+        # inputs/资源边界（recipe SHA、Redis/Mongo digest、专用前缀、清理）不变。
+        text = self.manual_stripped
         self.assertIn("verify_toolchain.sh --in-image --lock \"$GITHUB_WORKSPACE/docker/toolchain.lock\"",
-                      self.stripped)
-        self.assertIn("if: github.event_name == 'workflow_dispatch'", self.stripped)
-        self.assertIn("inputs.resource_acceptance == true", self.stripped)
+                      text)
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", text)
+        self.assertIn("inputs.resource_acceptance == true", text)
         for needle in (
             'RESOURCE_RECIPE_SHA: "1543bbd0aca4defa1be701b45aea5ba2cc2d0d86"',
             "redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
@@ -753,22 +755,28 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
             "run_acceptance.sh",
         ):
             with self.subTest(needle=needle):
-                self.assertIn(needle, self.stripped)
+                self.assertIn(needle, text)
+        # 手动任务不得回流到正式 ci.yml（非 required 面不变）。
+        for forbidden in ("arc-s4-framework", "resource-acceptance:",
+                          "toolchain-verify:", "RESOURCE_RECIPE_SHA"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.stripped)
 
     def test_inline_run_blocks_pass_bash_n(self):
-        blocks = _extract_run_blocks(self.text)
-        self.assertTrue(blocks, "应提取到至少一个 run 块")
-        for script in blocks:
-            head = script.strip().splitlines()[0] if script.strip() else ""
-            with self.subTest(head=head):
-                fd, tmp = tempfile.mkstemp(suffix=".sh")
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        handle.write(script)
-                    proc = run(["bash", "-n", tmp], env=ENV)
-                    self.assertEqual(proc.returncode, 0, proc.stderr + script)
-                finally:
-                    os.unlink(tmp)
+        for label, text in (("ci", self.text), ("manual", self.manual_text)):
+            blocks = _extract_run_blocks(text)
+            self.assertTrue(blocks, f"{label} 应提取到至少一个 run 块")
+            for script in blocks:
+                head = script.strip().splitlines()[0] if script.strip() else ""
+                with self.subTest(workflow=label, head=head):
+                    fd, tmp = tempfile.mkstemp(suffix=".sh")
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                            handle.write(script)
+                        proc = run(["bash", "-n", tmp], env=ENV)
+                        self.assertEqual(proc.returncode, 0, proc.stderr + script)
+                    finally:
+                        os.unlink(tmp)
 
 
 # --------------------------------------------------------------------------- #
@@ -815,6 +823,7 @@ class FormalWorkflowStructureTests(unittest.TestCase):
     def setUpClass(cls):
         assert yaml is not None
         cls.wf = yaml.load(raw(CI_YML), Loader=_loader())
+        cls.manual = yaml.load(raw(MANUAL_YML), Loader=_loader())
         cls.text = raw(CI_YML)
 
     def test_toplevel_shape_and_jobs(self):
@@ -822,7 +831,12 @@ class FormalWorkflowStructureTests(unittest.TestCase):
         self.assertEqual(set(self.wf), {"name", "on", "permissions", "concurrency", "env", "jobs"})
         self.assertEqual(
             set(self.wf["jobs"]),
-            {"changes", "plan", "build", "test", "result", "toolchain-verify", "resource-acceptance"},
+            {"changes", "docs_check", "build_test", "result"},
+        )
+        self.assertEqual(self.manual["name"], "manual")
+        self.assertEqual(
+            set(self.manual["jobs"]),
+            {"toolchain-verify", "resource-acceptance"},
         )
 
     def test_triggers(self):
@@ -830,175 +844,137 @@ class FormalWorkflowStructureTests(unittest.TestCase):
         self.assertEqual(set(on), {"push", "pull_request", "workflow_dispatch"})
         self.assertEqual(on["push"]["branches"], ["main"])
         self.assertEqual(on["pull_request"]["branches"], ["main"])
-        self.assertIn("resource_acceptance", on["workflow_dispatch"]["inputs"])
+        # 正式 ci.yml 的 workflow_dispatch 无 inputs；resource_acceptance 在 manual.yml。
+        self.assertNotIn(
+            "resource_acceptance", (on["workflow_dispatch"] or {}).get("inputs") or {})
+        mon = self.manual["on"]
+        self.assertEqual(set(mon), {"workflow_dispatch"})
+        self.assertIn("resource_acceptance", mon["workflow_dispatch"]["inputs"])
 
     def test_permissions_minimal(self):
-        self.assertEqual(self.wf["permissions"], {})
-        for name, job in self.wf["jobs"].items():
-            with self.subTest(job=name):
-                self.assertNotIn("write", str(job.get("permissions", {})))
-                if "uses" not in job:
+        for label, wf in (("ci", self.wf), ("manual", self.manual)):
+            self.assertEqual(wf["permissions"], {})
+            for name, job in wf["jobs"].items():
+                with self.subTest(workflow=label, job=name):
+                    self.assertNotIn("write", str(job.get("permissions", {})))
                     self.assertEqual(job.get("permissions"), {"contents": "read"})
 
-    def test_reusable_jobs_have_no_runs_on(self):
-        for name, job in self.wf["jobs"].items():
-            if "uses" in job:
-                self.assertNotIn("runs-on", job, f"{name} 为 reusable 调用")
-                self.assertEqual(job["uses"], CALLEE)
-                self.assertEqual(job["with"]["profile"], "hosted")
-                self.assertIn("github.sha", job["with"]["source_sha"])
+    def test_no_reusable_jobs_anywhere(self):
+        for label, wf in (("ci", self.wf), ("manual", self.manual)):
+            for name, job in wf["jobs"].items():
+                with self.subTest(workflow=label, job=name):
+                    self.assertNotIn("uses", job, f"{label}/{name} 不得是 reusable 调用")
 
     def test_hosted_and_manual_runner_split(self):
-        for name in ("changes", "build", "test"):
+        for name in ("changes", "docs_check", "build_test", "result"):
             with self.subTest(job=name):
                 self.assertEqual(self.wf["jobs"][name]["runs-on"], HOSTED_RUNNER)
         for name in ("toolchain-verify", "resource-acceptance"):
             with self.subTest(job=name):
-                self.assertEqual(self.wf["jobs"][name]["runs-on"], MANUAL_RUNNER)
-                self.assertIn("workflow_dispatch", str(self.wf["jobs"][name]["if"]))
+                self.assertEqual(self.manual["jobs"][name]["runs-on"], MANUAL_RUNNER)
+                self.assertIn("workflow_dispatch", str(self.manual["jobs"][name]["if"]))
 
-    def test_build_test_chain_and_results(self):
-        build = self.wf["jobs"]["build"]
-        test = self.wf["jobs"]["test"]
-        self.assertEqual(build["needs"], ["changes", "plan"])
-        self.assertEqual(test["needs"], ["changes", "plan", "build"])
-        self.assertIn("docs-only", str(build["if"]))
-        self.assertIn("docs-only", str(test["if"]))
-        self.assertIn("archive_sha256", build["outputs"])
-        self.assertIn("provenance_digest", build["outputs"])
+    def test_build_test_and_result_chain(self):
+        build_test = self.wf["jobs"]["build_test"]
+        self.assertEqual(build_test["needs"], ["changes"])
+        self.assertIn("docs-only", str(build_test["if"]))
+        self.assertIn("changes.result", str(build_test["if"]))
         result = self.wf["jobs"]["result"]
         self.assertEqual(result["if"], "${{ always() }}")
-        self.assertEqual(set(result["needs"]), {"changes", "plan", "build", "test"})
-        self.assertEqual(json.loads(result["with"]["required_checks_json"]), ["changes", "plan"])
-        self.assertEqual(json.loads(result["with"]["optional_checks_json"]), ["build", "test"])
+        self.assertEqual(set(result["needs"]), {"changes", "docs_check", "build_test"})
+        # result job 直接运行本仓 result.py；required/optional 写死在 heredoc。
+        run_text = "\n".join(step.get("run", "") for step in result["steps"])
+        self.assertIn("scripts/ci/result.py", run_text)
+        self.assertIn('"required": ["changes", "docs_check"]', run_text)
+        self.assertIn('"optional": ["build_test"]', run_text)
 
     def test_required_check_job_names_preserved(self):
         # job 名保持现役 required check 名，避免 required context 悬空。
         self.assertEqual(self.wf["jobs"]["changes"]["name"], "变更类型检测")
-        self.assertEqual(self.wf["jobs"]["build"]["name"], "Build (pinned deps)")
-        self.assertEqual(self.wf["jobs"]["test"]["name"], "Test (ctest -j1)")
+        self.assertEqual(self.wf["jobs"]["docs_check"]["name"], "Docs check")
+        self.assertEqual(self.wf["jobs"]["build_test"]["name"],
+                         "Build + Test (pinned deps, ctest -j1)")
+        self.assertNotIn("name", self.wf["jobs"]["result"])
 
 
 # --------------------------------------------------------------------------- #
-# 分类路由冒烟：真实复用 framework callee 逻辑（不复制契约）
+# 结果判定端到端：直接执行本仓 result.py CLI（shared callee 已按 D3 删除，
+# required/optional 语义由 result.py 承接，本类走真实 CLI 不复制契约）。
 # --------------------------------------------------------------------------- #
-SHARED = os.environ.get("BBT_CI_SHARED_DIR", "")
-
-
-def _formal_payload(changed_files_json, classifier_status="ok"):
-    return {
-        "repo": "yqm-307/bbt-framework",
-        "source_sha": "a" * 40,
-        "profile": "hosted",
-        "concurrency": "2",
-        "timeout_minutes": "60",
-        "event_json": '{"name":"pull_request","base_ref":"main"}',
-        "changed_files_json": changed_files_json,
-        "required_checks_json": '["changes","plan"]',
-        "optional_checks_json": '["build","test"]',
-        "classifier_status": classifier_status,
+def _result_cli(results, required, optional, classification):
+    payload = {
+        "results": results,
+        "required": required,
+        "optional": optional,
+        "classification": classification,
     }
+    return run([sys.executable, RESULT], input=json.dumps(payload), env=ENV)
 
 
-@unittest.skipUnless(
-    SHARED and os.path.isfile(os.path.join(SHARED, "cli.py")),
-    "BBT_CI_SHARED_DIR 未指向已发布 callee scripts/ci/shared：分类路由冒烟显式 SKIP",
-)
-class ClassificationRoutingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.cli = os.path.join(SHARED, "cli.py")
+class ResultContractRoutingTests(unittest.TestCase):
+    """needs.*.result → verdict 的端到端判定（与 result job heredoc 同一 payload 形状）。"""
 
-    def _classify(self, changed, status="ok"):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump(_formal_payload(changed, status), handle)
-            path = handle.name
-        proc = run([sys.executable, self.cli, "classify", "--file", path], env=ENV)
-        os.unlink(path)
-        return proc
+    REQUIRED = ["changes", "docs_check"]
+    OPTIONAL = ["build_test"]
 
-    def _evaluate(self, plan, results):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump({"plan": plan, "results": results}, handle)
-            path = handle.name
-        proc = run([sys.executable, self.cli, "evaluate", "--file", path], env=ENV)
-        os.unlink(path)
-        return proc
+    def _eval(self, results, classification="code"):
+        return _result_cli(results, self.REQUIRED, self.OPTIONAL, classification)
 
-    def _plan_for(self, changed, status="ok"):
-        proc = self._classify(changed, status)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        return json.loads(proc.stdout)["plan"]
-
-    def test_docs_only_routing(self):
-        proc = self._classify('["docs/ci/formal-ci.md"]')
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout)["classification"], "docs-only")
-
-    def test_code_routing(self):
-        self.assertEqual(
-            json.loads(self._classify('["framework/src/Framework.cc"]').stdout)["classification"],
-            "code",
-        )
-
-    def test_classifier_failure_is_unknown_not_docs(self):
-        self.assertEqual(
-            json.loads(self._classify('["docs/ci/formal-ci.md"]', status="failed").stdout)["classification"],
-            "unknown",
-        )
-        self.assertEqual(json.loads(self._classify("[]").stdout)["classification"], "unknown")
-
-    def test_docs_only_allows_build_test_skip_and_is_success(self):
-        plan = self._plan_for('["docs/ci/formal-ci.md"]')
-        proc = self._evaluate(
-            plan,
-            {"changes": "success", "plan": "success", "build": "skipped", "test": "skipped"},
-        )
+    def test_all_success_is_success(self):
+        proc = self._eval({"changes": "success", "docs_check": "success",
+                           "build_test": "success"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "success")
 
-    def test_code_build_failure_is_failure(self):
-        plan = self._plan_for('["framework/src/x.cc"]')
-        proc = self._evaluate(
-            plan,
-            {"changes": "success", "plan": "success", "build": "failure", "test": "skipped"},
-        )
+    def test_docs_only_allows_build_test_skip_and_is_success(self):
+        proc = self._eval({"changes": "success", "docs_check": "success",
+                           "build_test": "skipped"}, "docs-only")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["verdict"], "success")
+
+    def test_code_build_test_failure_is_failure(self):
+        proc = self._eval({"changes": "success", "docs_check": "success",
+                           "build_test": "failure"})
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "failure")
 
-    def test_code_test_skipped_is_failure(self):
-        plan = self._plan_for('["framework/src/x.cc"]')
-        proc = self._evaluate(
-            plan,
-            {"changes": "success", "plan": "success", "build": "success", "test": "skipped"},
-        )
+    def test_code_build_test_skipped_is_failure(self):
+        proc = self._eval({"changes": "success", "docs_check": "success",
+                           "build_test": "skipped"})
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "failure")
 
     def test_required_skipped_is_failure(self):
-        plan = self._plan_for('["framework/src/x.cc"]')
-        proc = self._evaluate(
-            plan,
-            {"changes": "success", "plan": "skipped", "build": "skipped", "test": "skipped"},
-        )
-        self.assertEqual(proc.returncode, 1)
+        for results in (
+            {"changes": "skipped", "docs_check": "success", "build_test": "success"},
+            {"changes": "success", "docs_check": "skipped", "build_test": "success"},
+        ):
+            with self.subTest(results=results):
+                proc = self._eval(results, "docs-only")
+                self.assertEqual(proc.returncode, 1)
 
     def test_unknown_classification_forbids_skip(self):
-        plan = self._plan_for("[]", status="failed")
-        proc = self._evaluate(
-            plan,
-            {"changes": "success", "plan": "success", "build": "skipped", "test": "skipped"},
-        )
+        proc = self._eval({"changes": "success", "docs_check": "success",
+                           "build_test": "skipped"}, "unknown")
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "failure")
 
-    def test_code_build_test_success_is_success(self):
-        plan = self._plan_for('["framework/src/x.cc"]')
-        proc = self._evaluate(
-            plan,
-            {"changes": "success", "plan": "success", "build": "success", "test": "success"},
-        )
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+    def test_contract_rejects_exit_3(self):
+        # 空 required / 集合外 job / 非法状态 / required∩optional → rc 3 拒绝。
+        for payload in (
+            {"results": {"changes": "success"}, "required": []},
+            {"results": {"changes": "success", "other": "success"},
+             "required": ["changes"]},
+            {"results": {"changes": "bogus"}, "required": ["changes"]},
+            {"results": {"changes": "success"},
+             "required": ["changes"], "optional": ["changes"]},
+            "not json",
+            {"results": {}},
+        ):
+            with self.subTest(payload=payload):
+                proc = run([sys.executable, RESULT], input=json.dumps(payload),
+                           env=ENV)
+                self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":
