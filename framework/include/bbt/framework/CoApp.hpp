@@ -1,5 +1,5 @@
 #pragma once
-// CoApp 宿主装配（业务面）。
+// service-actor/v2：CoApp 宿主装配（业务面）。
 //
 // 业务路径：
 //   fw::CoApp app{opts};              // 宿主/出站/线桥全部由框架装配
@@ -11,7 +11,7 @@
 // （真实 infra HTTP loopback 传输）；测试替换经 internal/CoAppSeam.hpp。
 //
 //  - add_service<T>(ServiceOptions) 注册服务：T 为 ICoService 派生、默认
-//    构造；ServiceOptions 必须显式携带执行策略（经装配期校验 +
+//    构造；ServiceOptions 必须显式携带执行策略（F2-a 装配期校验 +
 //    ValidateActorKeying）。
 //  - add_resource<R>(ptr)：按类型装配资源客户端（CoRedisCli 等资源
 //    缝的登记口；服务经 context().resource<R>() 取用）。
@@ -72,29 +72,33 @@ struct StaticRoute {
     bbt::infra::RpcAddress   address;
 };
 
-// 入站 RPC 协议选择。
+// Issue #4 + 三仓迁移：入站 RPC 协议/transport 选择。
 //  - LegacyHeaders：迁移期绑定，envelope 字段一对一映射 x-bbt-* header（既有
 //    默认，保留既有测试）。
-//  - ProtoWireV1：infra 冻结的正式 body wire profile（POST /rpc +
-//    Content-Type: application/x-protobuf，body=RpcEnvelopeMsg）；须在 protobuf
-//    前缀锁定可用时选择，否则启动期显式失败。
-enum class RpcInboundBridge { LegacyHeaders, ProtoWireV1 };
+//  - ProtoWireV1：infra Issue #8 冻结的正式 body wire profile 经 HTTP
+//    transport（POST /rpc + Content-Type: application/x-protobuf，
+//    body=RpcEnvelopeMsg）；须在 protobuf 前缀锁定可用时选择，否则启动期
+//    显式失败。
+//  - TcpV1：同一 protobuf wire profile 经 infra 原生 TCP adapter（u32be
+//    长度前缀帧，architecture §6）；同样要求 rpc_net + rpc_tcp 已注册，
+//    否则启动期显式失败。
+enum class RpcInboundBridge { LegacyHeaders, ProtoWireV1, TcpV1 };
 
 // 运行时配置（全部字段必须显式填写，与 ServiceOptions 同一约定）：
 //  - network_limits：透传给网络依赖组件的限额（ValidateNetworkLimits）；
 //  - listen：默认宿主的监听地址（port==0 时内核分配，run 后
 //    bound_endpoint() 可读）；
 //  - static_routes：出站目标白名单，空名单 = 不允许任何出站目标；
-//  - shutdown_step_budget：关闭期每个等待步的有限预算。
+//  - shutdown_step_budget：关闭期每个等待步的有限预算（F3）。
 struct CoAppOptions {
     bbt::infra::NetworkLimits network_limits;
     bbt::infra::ListenAddress listen;
     std::vector<StaticRoute>  static_routes;
     std::chrono::milliseconds shutdown_step_budget;
-    // 入站桥选择，默认保留既有 x-bbt-* header 绑定。
+    // Issue #4：入站桥选择，默认保留既有 x-bbt-* header 绑定。
     RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
-    // 公开出站策略，构造期选择；nullptr = 框架默认 no-op（全放行），
-    // 默认行为与既有逐字一致。策略在 CoApp 构造后即冻结（m_options 为 const），
+    // R8（3-5）：公开出站策略，构造期选择；nullptr = 框架默认 no-op（全放行），
+    // 默认行为与今天逐字一致。策略在 CoApp 构造后即冻结（m_options 为 const），
     // 无运行中替换口。shared_ptr 由 m_options 持有至 CoApp 析构，长于所有在途调用。
     std::shared_ptr<RpcPolicy> rpc_policy{};
 };
@@ -235,11 +239,11 @@ public:
     // 活跃 CoApp；同一 CoApp 至多 run 一次；违反 → kExitRejected。
     int run();
 
-    // 外部控制线程请求关闭。幂等、noexcept；早于 run 的调用
+    // 契约 F3：外部控制线程请求关闭。幂等、noexcept；早于 run 的调用
     // 使 run 完成启动后立即进入关闭序列。
     void request_shutdown() noexcept;
 
-    // 当前关闭状态。run 未开始/已结束分别报 Running/Closed。
+    // 契约 F3：当前关闭状态。run 未开始/已结束分别报 Running/Closed。
     ShutdownState shutdown_state() const noexcept;
 
     // 收尾未完成项与失败项观测（转发自生命周期状态机）。
@@ -374,7 +378,7 @@ private:
 
     result<void> _ValidateConfig() const;   // run 前校验，不启动任何组件
     result<void> _BindServices();           // Scheduler::Start 后建立对象身份
-    // 资源生命周期：on_scheduler_started 相位内先 _StartResources
+    // 资源生命周期（#8）：on_scheduler_started 相位内先 _StartResources
     // （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
     // handler 排空后（on_handlers_drained）与回退路径（on_release）统一
     // 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。

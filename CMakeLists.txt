@@ -96,6 +96,40 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     CoRpc.hpp
     CoApp.hpp
     Framework.hpp)
+# RedisNetResource.hpp 依赖新 net Redis 入口公开头（bbt::infra_redis_net
+# 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
+# bbt::infra_redis_net 的公开 include 面可见，不引入 hiredis）。
+if(TARGET bbt::infra_redis_net)
+    set(_redis_net_hdr_tu
+        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/RedisNetResource.cc")
+    file(WRITE "${_redis_net_hdr_tu}"
+        "#include <bbt/framework/RedisNetResource.hpp>\n")
+    add_library(bbt_framework_redis_net_header_selfcheck STATIC
+        "${_redis_net_hdr_tu}")
+    target_link_libraries(bbt_framework_redis_net_header_selfcheck PRIVATE
+        bbt::framework bbt::infra_redis_net)
+    target_compile_options(bbt_framework_redis_net_header_selfcheck PRIVATE
+        -Wall -Wextra)
+    set_target_properties(bbt_framework_redis_net_header_selfcheck PROPERTIES
+        LINKER_LANGUAGE CXX)
+endif()
+# MongoDbResource.hpp 依赖新 mongo owner/句柄入口公开头（bbt::infra_mongo
+# 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
+# bbt::infra_mongo 的公开 include 面可见，不引入 mongocxx/bsoncxx）。
+if(TARGET bbt::infra_mongo)
+    set(_mongo_hdr_tu
+        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/MongoDbResource.cc")
+    file(WRITE "${_mongo_hdr_tu}"
+        "#include <bbt/framework/MongoDbResource.hpp>\n")
+    add_library(bbt_framework_mongo_header_selfcheck STATIC
+        "${_mongo_hdr_tu}")
+    target_link_libraries(bbt_framework_mongo_header_selfcheck PRIVATE
+        bbt::framework bbt::infra_mongo)
+    target_compile_options(bbt_framework_mongo_header_selfcheck PRIVATE
+        -Wall -Wextra)
+    set_target_properties(bbt_framework_mongo_header_selfcheck PROPERTIES
+        LINKER_LANGUAGE CXX)
+endif()
 # internal/ 机器面头文件同样做自给自检（Framework.hpp 不传递包含它们，
 # 但仍要求独立可编译）。CoApp.hpp 因 add_service 展开方法表而包含
 # MethodTable.hpp，属宿主头而非本汇总头。
@@ -145,9 +179,9 @@ if(BBT_ENABLE_DUAL_SERVICE_EXAMPLE)
         list(APPEND _bbt_ds_missing
             "-DBBT_PROTOBUF_PREFIX=<protobuf 前缀>（使 bbt_infra_rpc_net 注册，examples 入口前置）")
     endif()
-    if(NOT TARGET bbt::infra_redis)
+    if(NOT TARGET bbt::infra_redis_net)
         list(APPEND _bbt_ds_missing
-            "-DBBT_HIREDIS_PREFIX=<hiredis 前缀>（使 bbt::infra_redis 注册，svc_a 必需）")
+            "-DBBT_INFRA_REDIS_NET=ON 与 -DBBT_HIREDIS_PREFIX=<hiredis 前缀>（使 bbt::infra_redis_net 注册，svc_a 必需）")
     endif()
     if(NOT TARGET bbt::infra_mongo)
         list(APPEND _bbt_ds_missing

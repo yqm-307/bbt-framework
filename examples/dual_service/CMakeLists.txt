@@ -2,7 +2,10 @@
 #
 # 三个独立进程（framework 默认 HTTP 线桥做真实 client/server）：
 #   svc_a  storage（put/get/del/sleep_ms；经 CoApp::add_resource 工厂装配真实
-#          CoRedisCli "cache" + CoMongoCli "docs"，无 KvStore 替身）
+#          RedisNetResource "cache"（新 net 入口 bbt::infra::redis::CoRedisCli，
+#          Engine+显式 Connect 收口归资源本体）+ MongoDbResource "docs"
+#          （新 owner/句柄入口 bbt::infra::mongo::CoMongoDb+CoMongoColl，
+#          owner Close 同步物理收口），无 KvStore 替身）
 #   svc_b  gateway（handler 内 this->call 跨进程到 svc_a；static_routes 显式
 #          白名单唯一出口）
 #   driver 演示客户端（NetworkRuntime + HttpClient，按 infra 正式 RpcWire
@@ -10,13 +13,13 @@
 #          framework internal 头）
 #
 # 本目录只在 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 且根 CMakeLists 的 fail-closed
-# 门禁通过时被加入：NEED_TEST、bbt_infra_rpc_net、bbt::infra_redis、bbt::infra_mongo
-# 四项齐备，缺任一条件在 configure 阶段即 FATAL。因此这里的三个 target 不需要
-# 再做条件判定，也不会出现「缺依赖时静默少编译一个二进制」。
+# 门禁通过时被加入：NEED_TEST、bbt_infra_rpc_net、bbt::infra_redis_net、
+# bbt::infra_mongo 四项齐备，缺任一条件在 configure 阶段即 FATAL。因此这里的
+# 三个 target 不需要再做条件判定，也不会出现「缺依赖时静默少编译一个二进制」。
 
 add_executable(svc_a storage_main.cc)
 target_link_libraries(svc_a PRIVATE
-    bbt::framework bbt::infra_redis bbt::infra_mongo)
+    bbt::framework bbt::infra_redis_net bbt::infra_mongo)
 target_compile_options(svc_a PRIVATE -Wall -Wextra)
 
 add_executable(svc_b gateway_main.cc)

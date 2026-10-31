@@ -126,7 +126,8 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
 - 默认 OFF：普通 framework 构建与测试不加入该示例，不要求
   hiredis / mongo-cxx-driver，也不要求真实 Redis/Mongo 后端。
 - 显式 ON：fail-closed。必须同时具备 `NEED_TEST=ON`、protobuf 前缀
-  （`bbt_infra_rpc_net`）、hiredis 前缀（`bbt::infra_redis`）、
+  （`bbt_infra_rpc_net`）、`BBT_INFRA_REDIS_NET=ON` + hiredis 前缀
+  （`bbt::infra_redis_net`）、
   `BBT_MONGOC_PREFIX`+`BBT_MONGOCXX_PREFIX`（`bbt::infra_mongo`）；
   任一缺失都在 configure 阶段 `FATAL_ERROR`，不静默跳过。
 - 协议：三个进程统一 ProtoWireV1（infra 正式 body wire），只有它携带

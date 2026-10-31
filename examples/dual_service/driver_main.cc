@@ -2,7 +2,7 @@
 //
 // 独立进程：自起 Scheduler + NetworkRuntime + HttpClient，按 infra 正式
 // RpcWire（ProtoWireV1，POST /rpc + application/x-protobuf）向 gateway 发真实
-// RPC。只依赖 infra 公开头 <bbt/infra/rpc/RpcWire.hpp> 与 framework 公开面
+// RPC。只依赖 infra 公开头 <bbt/infra/rpc/RpcWire.hpp>、<bbt/infra/rpc/HttpTransport.hpp> 与 framework 公开面
 // （CoRpc 位置参数 codec）——不引用 framework internal 头，也不读 x-bbt-* header。
 //
 // 为什么必须是 ProtoWireV1 而非迁移期 header 桥：只有正式 wire body 携带
@@ -48,6 +48,7 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/http/Client.hpp>      // wire 回复解析的新值类型边界
 #include <bbt/infra/rpc/RpcWire.hpp>       // 公开 wire profile 契约（非 framework internal）
+#include <bbt/infra/rpc/HttpTransport.hpp> // ParseRpcWireHttpResponse（公开 HTTP adapter 头）
 
 #include <bbt/framework/Framework.hpp>     // CoRpcReq/位置参数 codec
 
@@ -151,7 +152,7 @@ Reply Send(const std::string& service, const std::string& method,
         Reply                   reply;
     };
     auto slot = std::make_shared<Slot>();
-    bbtco [http_req = std::move(http_req.value()), slot, budget,
+    bbtco [http_req = std::move(http_req), slot, budget,
            want_request_id]() mutable {
         inf::CallOptions o;
         o.deadline = Clock::now() + budget;
