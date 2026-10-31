@@ -60,16 +60,17 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DNEED_TEST=ON \
 # （tests/ 与 examples/ 各自 add_executable，ctest 不负责构建）。
 cmake --build build --parallel 2 --target \
   bbt_framework \
-  Test_framework_f0 Test_framework_f1a Test_framework_f1b1 Test_framework_f1b2 \
-  Test_framework_f2a Test_framework_f2b1 Test_framework_f2b2 Test_framework_f2b3 \
-  Test_framework_f3 Test_framework_rpc Test_framework_rpc_close_gate \
-  Test_framework_resource Test_framework_egress_phase \
-  Test_framework_getvalue_codec Test_framework_matrix rpc_xlang_server \
+  Test_framework_rpc_surface Test_framework_request_context \
+  Test_framework_coapp_lifecycle Test_framework_inbound_http \
+  Test_framework_actor_mailbox Test_framework_ordered_egress \
+  Test_framework_ordered_ingress Test_framework_ordered_ingress_http \
+  Test_framework_shutdown Test_framework_rpc_codec Test_framework_close_gate \
+  Test_framework_resource_lifecycle Test_framework_egress_request_phase \
+  Test_framework_getvalue_codec Test_framework_rpc_matrix rpc_xlang_server \
   getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture
 
-# 测试一律 ctest -j1，只跑聚焦集；本地不跑全量，全量走 PR CI。
-ctest --test-dir build -j1 -R 'Test_framework_rpc$|Test_framework_rpc_close_gate|framework\.rpc_xlang|framework\.getvalue\.codec|framework\.egress\.phase|framework\.matrix|Test_framework_f3|Test_framework_f2b|examples\.getvalue\.xlang' --output-on-failure
-ctest --test-dir build -j1 -R 'Test_framework_f0$|Test_framework_f1a|Test_framework_f1b|Test_framework_f2a$|Test_framework_resource$' --output-on-failure
+# 测试一律 ctest -j1；本地用 smoke label 跑快速集，全量走 PR CI。
+ctest --test-dir build -j1 -L smoke --output-on-failure
 ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
 ```
 
@@ -95,7 +96,7 @@ ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
   宿主专用 native 线程，不是协程/P 线程）。
 - 构建产物只进已忽略的 `build/`。
 
-## 跨语言 RPC 示例：GetValue（Issue #4 P0-A）
+## 跨语言 RPC 示例：GetValue
 
 `examples/getvalue/` 是首个真实业务切片：业务 `.proto`（唯一 schema 真源）
 + C++ framework 服务端（正式 infra body wire bridge）+ Python 标准库客户端。
@@ -108,11 +109,11 @@ ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
   版本化 `RpcEnvelope`；不使用 `x-bbt-*` header 旁路。选择该桥需配置锁定
   protobuf 前缀 `-DBBT_PROTOBUF_PREFIX=<prefix>`（未配置时框架只提供迁移期
   header 桥，选择 ProtoWireV1 会在启动前显式失败）。
-- 运行/验收（ctest 名 `examples.getvalue.xlang` 与 `framework.getvalue.codec`）；
+- 运行/验收（ctest 名 `examples.getvalue.xlang` 与 `framework.getvalue_codec`）；
   Python 客户端零依赖（手写 proto3 wire 编解码）。所有结构化结果带
   `auth_state=unauthenticated_loopback`。
 
-## 双服务资源示例：dual_service（Issue #5，默认不构建）
+## 双服务资源示例：dual_service（默认不构建）
 
 `examples/dual_service/` 是三个真实进程的跨服务示例（`svc_a` storage /
 `svc_b` gateway / `driver` 客户端，`svc_a` 用真实 Redis + Mongo 资源），
@@ -144,3 +145,15 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
   查询失败同样计为未证实并让退出码非零。
 
 详见 [`examples/dual_service/README.md`](examples/dual_service/README.md)。
+
+## 文档地图
+
+- 架构基调（设计真源）：[`docs/architecture/distributed-framework-baseline.md`](docs/architecture/distributed-framework-baseline.md)
+- 验收矩阵（测试设计，非实测结果）：[`docs/architecture/distributed-framework-validation-matrix.md`](docs/architecture/distributed-framework-validation-matrix.md)
+- 示例：[`examples/getvalue/README.md`](examples/getvalue/README.md)、
+  [`examples/two_service/README.md`](examples/two_service/README.md)、
+  [`examples/dual_service/README.md`](examples/dual_service/README.md)、
+  [`examples/lifecycle_matrix/README.md`](examples/lifecycle_matrix/README.md)、
+  [`examples/rpc_policy/README.md`](examples/rpc_policy/README.md)
+- Agent 协作与门禁：[`AGENTS.md`](AGENTS.md)
+- CI 说明：[`docs/guides/ci.md`](docs/guides/ci.md)
