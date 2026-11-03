@@ -6,7 +6,7 @@
 
 - 架构基调仍为 [distributed-framework-baseline.md](distributed-framework-baseline.md)，这里冻结具体对象接口，不替换分布式保证的边界。
 - 最新决定：工作区 `workspace/dag/bbt-v2-r1-brief.md` §Frozen design decisions / Contract-stage clarifications、`bbt-v2-r2-brief.md`，以及 `workspace/infra-interface-v2-plan.md` F14–F16。讨论稿标题中的“待确认”不覆盖 brief 已冻结决定。
-- infra 唯一消费契约：`bbtools-infra/docs/decisions/0014-app-session-v2.md`，698 行，SHA-256 `0034d5196853d99132aed4b07a6af0e4f25d7f17c9cb51cad82fbe1730e4da1b`。候选 infra 树的副本与其逐字相同；不从正在并行变化的实现另猜接口。
+- infra 唯一消费契约：`bbtools-infra/docs/decisions/0014-app-session.md`，698 行，SHA-256 `0034d5196853d99132aed4b07a6af0e4f25d7f17c9cb51cad82fbe1730e4da1b`。候选 infra 树的副本与其逐字相同；不从正在并行变化的实现另猜接口。
 - framework 候选基线 `d55cdb5ef392facd74f6929360affa141f9623aa`；infra 主仓 `8573b7a831eeab75f7d787d1709ee330f20f8b63`；只读 coroutine 主仓 `45c575b37ee6b38cfada86cc3d0339cf85c54fe3`。这不是将来构建的依赖 pin；构建必须使用 infra 声明且实测的精确 pin。
 - C++17，命名空间 `bbt::framework`；以下代码块是公共声明目标，不是可直接编译的完整头文件。`result/Error/ErrorCode` 沿用现有体系，下面的错误名不另造第二套异常或错误协议。
 
@@ -21,7 +21,7 @@
 | F15 无鉴权公开监控示例 | HTTP/RPC 默认关闭；显式开启且具备授权检查才可暴露。仅绑定 HttpComponent 不等于开启 HTTP。 |
 | F2/F7 的 MongoComponent 与 F16 的 MongoDBComponent | 唯一 framework 名为 `MongoDBComponent`；infra 仍为 `mongo::Database`。 |
 
-本轮仅新增本文和 [app-monitor-v1.schema.json](../schemas/app-monitor-v1.schema.json)。现有 `CoApp::add_service`、`add_resource`、`RpcInboundBridge`、`IncomingCallContext` 等仍是基线实现，不是这里的 v2 接口。
+本轮仅新增本文和 [app-monitor.schema.json](../schemas/app-monitor.schema.json)。现有 `CoApp::add_service`、`add_resource`、`RpcInboundBridge`、`IncomingCallContext` 等仍是基线实现，不是这里的 v2 接口。
 
 ## 2. 对象职责与所有权
 
@@ -490,7 +490,7 @@ MonitorAccessContext 是只读值：transport（local/http/rpc）、已验证 pr
 
 ## 9. 正式监控数据契约
 
-唯一 JSON 形状由 [app-monitor-v1.schema.json](../schemas/app-monitor-v1.schema.json) 定义，JSON Schema Draft 2020-12，`$ref` 仅允许该文件内的 `#/$defs/...`，验证不得联网解析外部资源。`schema = bbt.app.monitor/v1`，`view = snapshot | health | metrics | error`。不同 view 是同一有版本的输出族，不维护第二份样例式“schema”。新增不兼容字段/枚举须新版本，不静默改变 v1 的 closed object；当前未发布，不承诺旧讨论稿 JSON 的逐字兼容。
+唯一 JSON 形状由 [app-monitor.schema.json](../schemas/app-monitor.schema.json) 定义，JSON Schema Draft 2020-12，`$ref` 仅允许该文件内的 `#/$defs/...`，验证不得联网解析外部资源。`schema = bbt.app.monitor/v1`，`view = snapshot | health | metrics | error`。不同 view 是同一有版本的输出族，不维护第二份样例式“schema”。新增不兼容字段/枚举须新版本，不静默改变 v1 的 closed object；当前未发布，不承诺旧讨论稿 JSON 的逐字兼容。
 
 typed AppMonitorSnapshot 与 JSON 一一对应：snapshot(id,app_revision,captured_at,consistency,truncated,omitted)，app(id,name,state,framework_version)，nodes、edges、sessions、health、metrics。AppMonitorHealth 含 state/reasons/observed_at；AppMonitorMetrics 使用 Schema 的同名对象。AppMonitorJsonWriter 的 `Write(const AppMonitorSnapshot&) -> result<string>` 及 health/metrics 对应重载统一写 envelope；序列化失败显式错误，禁止拼接未经转义的自定义字符串。AppInspector::Capture 返回 result，取代 F15 不可表达失败的裸值签名。
 

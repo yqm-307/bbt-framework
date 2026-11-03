@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:bbt:app-monitor:v1",
   "title": "bbt.app.monitor/v1 read-only monitor responses",
-  "description": "Versioned bounded snapshot, health, metrics and redacted errors. Examples are synthetic contract fixtures, not observed runtime output. Shape validation does not prove ACL, redaction, referential integrity, generation consistency, total output bytes, or capture time limits. See framework-v2-contract.md. Only internal $refs are permitted.",
+  "description": "Versioned bounded snapshot, health, metrics and redacted errors. Examples are synthetic contract fixtures, not observed runtime output. Shape validation does not prove ACL, redaction, referential integrity, generation consistency, total output bytes, or capture time limits. See framework-contract.md. Only internal $refs are permitted.",
   "oneOf": [
     {
       "$ref": "#/$defs/snapshotResponse"
