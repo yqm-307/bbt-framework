@@ -10,6 +10,16 @@
 #   live        需要真实 Redis/Mongo 等外部服务（本地不注册）
 #   smoke       构建后快速可用性子集（unit + 快速 integration）
 
+# framework v2 最小核心切片：CoApp 唯一根与生命周期、Service/Component/
+# Actor 受控构造与 Install/Uninstall、BindComponent/Borrow/Unbind 与
+# handle 失效、Observe 事件、placement 校验；无网络依赖，真实受管协程公共面。
+add_executable(Test_framework_v2_core Test_framework_v2_core.cc)
+target_link_libraries(Test_framework_v2_core PRIVATE bbt::framework)
+target_compile_options(Test_framework_v2_core PRIVATE -Wall -Wextra)
+add_test(NAME framework.v2_core COMMAND Test_framework_v2_core)
+set_tests_properties(framework.v2_core PROPERTIES
+    TIMEOUT 30 LABELS "smoke;unit")
+
 # CoRpc 公共面、声明式方法表、错误边界、actor key、路由与资源缝；
 # 不联网、不起真实 I/O、不启动 Scheduler。
 add_executable(Test_framework_rpc_surface Test_framework_rpc_surface.cc)

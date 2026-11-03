@@ -1,0 +1,1720 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bbt:app-monitor:v1",
+  "title": "bbt.app.monitor/v1 read-only monitor responses",
+  "description": "Versioned bounded snapshot, health, metrics and redacted errors. Examples are synthetic contract fixtures, not observed runtime output. Shape validation does not prove ACL, redaction, referential integrity, generation consistency, total output bytes, or capture time limits. See framework-v2-contract.md. Only internal $refs are permitted.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/snapshotResponse"
+    },
+    {
+      "$ref": "#/$defs/healthResponse"
+    },
+    {
+      "$ref": "#/$defs/metricsResponse"
+    },
+    {
+      "$ref": "#/$defs/errorResponse"
+    }
+  ],
+  "$defs": {
+    "uint": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 35,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$(?![\\s\\S])"
+    },
+    "safeText": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^[^\\x00-\\x1f\\x7f]*$(?![\\s\\S])"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.%~-]+$(?![\\s\\S])"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(app|service|actor|component|session):[A-Za-z0-9_.%~/-]+$(?![\\s\\S])"
+    },
+    "objectState": {
+      "type": "string",
+      "enum": [
+        "created",
+        "installing",
+        "installed",
+        "starting",
+        "running",
+        "paused",
+        "stopping",
+        "stopped",
+        "install_failed",
+        "failed",
+        "stop_incomplete",
+        "uninstalling",
+        "uninstall_incomplete",
+        "destroyed",
+        "invalidated",
+        "unknown"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "$ref": "#/$defs/safeText"
+        },
+        "role": {
+          "$ref": "#/$defs/safeText"
+        },
+        "description": {
+          "$ref": "#/$defs/safeText"
+        },
+        "export_alias": {
+          "$ref": "#/$defs/safeText"
+        }
+      },
+      "required": [],
+      "additionalProperties": false,
+      "maxProperties": 4
+    },
+    "customMetrics": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z][a-z0-9_.]{0,63}$(?![\\s\\S])"
+      },
+      "additionalProperties": {
+        "type": "number",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "observed_at": {
+          "$ref": "#/$defs/time"
+        },
+        "inflight": {
+          "$ref": "#/$defs/uint"
+        },
+        "queue_depth": {
+          "$ref": "#/$defs/uint"
+        },
+        "errors_total": {
+          "$ref": "#/$defs/uint"
+        },
+        "dead_letters": {
+          "$ref": "#/$defs/uint"
+        },
+        "dropped": {
+          "$ref": "#/$defs/uint"
+        },
+        "bytes_queued": {
+          "$ref": "#/$defs/uint"
+        },
+        "active_connections": {
+          "$ref": "#/$defs/uint"
+        },
+        "retiring_connections": {
+          "$ref": "#/$defs/uint"
+        },
+        "callbacks": {
+          "$ref": "#/$defs/uint"
+        },
+        "sessions": {
+          "$ref": "#/$defs/uint"
+        },
+        "links": {
+          "$ref": "#/$defs/uint"
+        },
+        "remote_acceptance_pending": {
+          "$ref": "#/$defs/uint"
+        },
+        "captures_total": {
+          "$ref": "#/$defs/uint"
+        },
+        "capture_errors_total": {
+          "$ref": "#/$defs/uint"
+        },
+        "observer_dropped_total": {
+          "$ref": "#/$defs/uint"
+        },
+        "history_evicted_total": {
+          "$ref": "#/$defs/uint"
+        },
+        "latency_us": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "custom": {
+          "$ref": "#/$defs/customMetrics"
+        }
+      },
+      "required": [
+        "observed_at"
+      ],
+      "additionalProperties": false,
+      "description": "Measurements are optional when unavailable. Missing is not zero. Custom names must also be pre-registered and low-cardinality at the writer."
+    },
+    "healthReason": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_.]{0,63}$(?![\\s\\S])"
+        },
+        "source": {
+          "$ref": "#/$defs/id"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/time"
+        }
+      },
+      "required": [
+        "code",
+        "source",
+        "observed_at"
+      ],
+      "additionalProperties": false
+    },
+    "health": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "healthy",
+            "degraded",
+            "unhealthy",
+            "unknown"
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/time"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/healthReason"
+          },
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "state",
+        "observed_at",
+        "reasons"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "degraded",
+                  "unhealthy",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reasons": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "node": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/generation"
+        },
+        "kind": {
+          "enum": [
+            "app",
+            "service",
+            "actor",
+            "component",
+            "session"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "type": {
+          "$ref": "#/$defs/name"
+        },
+        "state": {
+          "$ref": "#/$defs/objectState"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/time"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        },
+        "scope": {
+          "enum": [
+            "app",
+            "service",
+            "actor"
+          ]
+        },
+        "owner_id": {
+          "$ref": "#/$defs/id"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        },
+        "destroyed_at": {
+          "$ref": "#/$defs/time"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "kind",
+        "name",
+        "type",
+        "state",
+        "observed_at",
+        "metadata"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "app"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "id": {
+                "pattern": "^app:"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "service"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "id": {
+                "pattern": "^service:"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "actor"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "id": {
+                "pattern": "^actor:"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "component"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "id": {
+                "pattern": "^component:"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "session"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "id": {
+                "pattern": "^session:"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "component"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "scope"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "scope"
+                  ]
+                },
+                {
+                  "required": [
+                    "owner_id"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "component"
+              },
+              "scope": {
+                "enum": [
+                  "service",
+                  "actor"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "scope"
+            ]
+          },
+          "then": {
+            "required": [
+              "owner_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "destroyed_at"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "destroyed"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "edge": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/id"
+        },
+        "to": {
+          "$ref": "#/$defs/id"
+        },
+        "from_generation": {
+          "$ref": "#/$defs/generation"
+        },
+        "to_generation": {
+          "$ref": "#/$defs/generation"
+        },
+        "kind": {
+          "enum": [
+            "owns",
+            "binds",
+            "observes",
+            "routes",
+            "calls",
+            "tells"
+          ]
+        },
+        "state": {
+          "enum": [
+            "active",
+            "invalidated",
+            "failed"
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/time"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        },
+        "count": {
+          "$ref": "#/$defs/uint"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "from_generation",
+        "to_generation",
+        "kind",
+        "state",
+        "observed_at",
+        "metadata"
+      ],
+      "additionalProperties": false
+    },
+    "trafficStats": {
+      "type": "object",
+      "properties": {
+        "queued": {
+          "$ref": "#/$defs/uint"
+        },
+        "dequeued": {
+          "$ref": "#/$defs/uint"
+        },
+        "inflight": {
+          "$ref": "#/$defs/uint"
+        },
+        "finished": {
+          "$ref": "#/$defs/uint"
+        },
+        "dropped": {
+          "$ref": "#/$defs/uint"
+        },
+        "bytes_queued": {
+          "$ref": "#/$defs/uint"
+        }
+      },
+      "required": [
+        "queued",
+        "dequeued",
+        "inflight",
+        "finished",
+        "dropped",
+        "bytes_queued"
+      ],
+      "additionalProperties": false
+    },
+    "traffic": {
+      "type": "object",
+      "properties": {
+        "system": {
+          "$ref": "#/$defs/trafficStats"
+        },
+        "service": {
+          "$ref": "#/$defs/trafficStats"
+        },
+        "actor": {
+          "$ref": "#/$defs/trafficStats"
+        }
+      },
+      "required": [
+        "system",
+        "service",
+        "actor"
+      ],
+      "additionalProperties": false
+    },
+    "session": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "pattern": "^session:"
+            }
+          ]
+        },
+        "remote_app_id": {
+          "$ref": "#/$defs/name"
+        },
+        "state": {
+          "$ref": "#/$defs/objectState"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/time"
+        },
+        "epoch": {
+          "$ref": "#/$defs/generation"
+        },
+        "links": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "traffic": {
+          "$ref": "#/$defs/traffic"
+        },
+        "unavailable": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "epoch",
+              "links",
+              "traffic"
+            ]
+          },
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "remote_app_id",
+        "state",
+        "observed_at",
+        "unavailable"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "epoch"
+              ],
+              "not": {
+                "properties": {
+                  "unavailable": {
+                    "contains": {
+                      "const": "epoch"
+                    }
+                  }
+                },
+                "required": [
+                  "unavailable"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "epoch"
+                ]
+              },
+              "properties": {
+                "unavailable": {
+                  "contains": {
+                    "const": "epoch"
+                  }
+                }
+              },
+              "required": [
+                "unavailable"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "links"
+              ],
+              "not": {
+                "properties": {
+                  "unavailable": {
+                    "contains": {
+                      "const": "links"
+                    }
+                  }
+                },
+                "required": [
+                  "unavailable"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "links"
+                ]
+              },
+              "properties": {
+                "unavailable": {
+                  "contains": {
+                    "const": "links"
+                  }
+                }
+              },
+              "required": [
+                "unavailable"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "traffic"
+              ],
+              "not": {
+                "properties": {
+                  "unavailable": {
+                    "contains": {
+                      "const": "traffic"
+                    }
+                  }
+                },
+                "required": [
+                  "unavailable"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "traffic"
+                ]
+              },
+              "properties": {
+                "unavailable": {
+                  "contains": {
+                    "const": "traffic"
+                  }
+                }
+              },
+              "required": [
+                "unavailable"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "Logical peer view. Values without a public observation source are omitted and named in unavailable, never inferred from owner totals."
+    },
+    "snapshotHeader": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "app_revision": {
+          "$ref": "#/$defs/uint"
+        },
+        "captured_at": {
+          "$ref": "#/$defs/time"
+        },
+        "consistency": {
+          "const": "best_effort"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "omitted": {
+          "type": "object",
+          "properties": {
+            "nodes": {
+              "$ref": "#/$defs/uint"
+            },
+            "edges": {
+              "$ref": "#/$defs/uint"
+            },
+            "sessions": {
+              "$ref": "#/$defs/uint"
+            },
+            "observations": {
+              "$ref": "#/$defs/uint"
+            }
+          },
+          "required": [
+            "nodes",
+            "edges",
+            "sessions",
+            "observations"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "id",
+        "app_revision",
+        "captured_at",
+        "consistency",
+        "truncated",
+        "omitted"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "truncated": {
+                "const": false
+              }
+            },
+            "required": [
+              "truncated"
+            ]
+          },
+          "then": {
+            "properties": {
+              "omitted": {
+                "properties": {
+                  "nodes": {
+                    "const": 0
+                  },
+                  "edges": {
+                    "const": 0
+                  },
+                  "sessions": {
+                    "const": 0
+                  },
+                  "observations": {
+                    "const": 0
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "omitted": {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "nodes": {
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "nodes"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "edges": {
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "edges"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "sessions": {
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "sessions"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "observations": {
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "observations"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "app": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "state": {
+          "enum": [
+            "created",
+            "starting",
+            "running",
+            "paused",
+            "stopping",
+            "stop_incomplete",
+            "stopped"
+          ]
+        },
+        "framework_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_.+~-]+$(?![\\s\\S])"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "state",
+        "framework_version"
+      ],
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            "NotFound",
+            "Unauthorized",
+            "PermissionDenied",
+            "InvalidArgument",
+            "Overloaded",
+            "Busy",
+            "TimedOut",
+            "InternalError",
+            "Closed",
+            "UnsupportedRoute"
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false,
+      "description": "Code-only redacted monitor error; never serialize raw exception messages or Error.details."
+    },
+    "snapshotResponse": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "bbt.app.monitor/v1"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshotHeader"
+        },
+        "app": {
+          "$ref": "#/$defs/app"
+        },
+        "view": {
+          "const": "snapshot"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/node"
+          },
+          "maxItems": 4096,
+          "minItems": 1
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/edge"
+          },
+          "maxItems": 16384
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/session"
+          },
+          "maxItems": 256
+        },
+        "health": {
+          "$ref": "#/$defs/health"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        }
+      },
+      "required": [
+        "schema",
+        "snapshot",
+        "app",
+        "view",
+        "nodes",
+        "edges",
+        "sessions",
+        "health",
+        "metrics"
+      ],
+      "additionalProperties": false
+    },
+    "healthResponse": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "bbt.app.monitor/v1"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshotHeader"
+        },
+        "app": {
+          "$ref": "#/$defs/app"
+        },
+        "view": {
+          "const": "health"
+        },
+        "health": {
+          "$ref": "#/$defs/health"
+        }
+      },
+      "required": [
+        "schema",
+        "snapshot",
+        "app",
+        "view",
+        "health"
+      ],
+      "additionalProperties": false
+    },
+    "metricsResponse": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "bbt.app.monitor/v1"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshotHeader"
+        },
+        "app": {
+          "$ref": "#/$defs/app"
+        },
+        "view": {
+          "const": "metrics"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        }
+      },
+      "required": [
+        "schema",
+        "snapshot",
+        "app",
+        "view",
+        "metrics"
+      ],
+      "additionalProperties": false
+    },
+    "errorResponse": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "bbt.app.monitor/v1"
+        },
+        "view": {
+          "const": "error"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        }
+      },
+      "required": [
+        "schema",
+        "view",
+        "error"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "examples": [
+    {
+      "schema": "bbt.app.monitor/v1",
+      "view": "snapshot",
+      "snapshot": {
+        "id": "snap-00042",
+        "app_revision": 91,
+        "captured_at": "2026-11-01T12:00:00Z",
+        "consistency": "best_effort",
+        "truncated": false,
+        "omitted": {
+          "nodes": 0,
+          "edges": 0,
+          "sessions": 0,
+          "observations": 0
+        }
+      },
+      "app": {
+        "id": "app-a",
+        "name": "goods-node",
+        "state": "running",
+        "framework_version": "2.0-target"
+      },
+      "nodes": [
+        {
+          "id": "app:app-a",
+          "generation": 1,
+          "kind": "app",
+          "name": "goods-node",
+          "type": "CoApp",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "service:app-a/goods",
+          "generation": 1,
+          "kind": "service",
+          "name": "goods",
+          "type": "GoodsService",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "service:app-a/orders",
+          "generation": 1,
+          "kind": "service",
+          "name": "orders",
+          "type": "OrderService",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "service:app-a/__builtin.monitor",
+          "generation": 1,
+          "kind": "service",
+          "name": "__builtin.monitor",
+          "type": "MonitorService",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "actor:app-a/player/export-1",
+          "generation": 1,
+          "kind": "actor",
+          "name": "export-1",
+          "type": "PlayerActor",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "actor:app-a/player/export-2",
+          "generation": 1,
+          "kind": "actor",
+          "name": "export-2",
+          "type": "PlayerActor",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "component:app-a/app/RedisComponent/main",
+          "generation": 1,
+          "kind": "component",
+          "name": "main",
+          "type": "RedisComponent",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {},
+          "scope": "app"
+        },
+        {
+          "id": "session:app-a/app-b",
+          "generation": 1,
+          "kind": "session",
+          "name": "app-b",
+          "type": "AppSession",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        }
+      ],
+      "edges": [
+        {
+          "from": "app:app-a",
+          "to": "service:app-a/goods",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "service:app-a/orders",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "service:app-a/__builtin.monitor",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "actor:app-a/player/export-1",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "actor:app-a/player/export-2",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "component:app-a/app/RedisComponent/main",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "session:app-a/app-b",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/goods",
+          "to": "component:app-a/app/RedisComponent/main",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "binds",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/orders",
+          "to": "component:app-a/app/RedisComponent/main",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "binds",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/__builtin.monitor",
+          "to": "actor:app-a/player/export-1",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "observes",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/goods",
+          "to": "session:app-a/app-b",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "routes",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/goods",
+          "to": "service:app-a/orders",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "calls",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "actor:app-a/player/export-1",
+          "to": "actor:app-a/player/export-2",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "tells",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:app-a/app-b",
+          "remote_app_id": "app-b",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "epoch": 7,
+          "links": 1,
+          "traffic": {
+            "system": {
+              "queued": 0,
+              "dequeued": 0,
+              "inflight": 0,
+              "finished": 0,
+              "dropped": 0,
+              "bytes_queued": 0
+            },
+            "service": {
+              "queued": 0,
+              "dequeued": 0,
+              "inflight": 0,
+              "finished": 0,
+              "dropped": 0,
+              "bytes_queued": 0
+            },
+            "actor": {
+              "queued": 0,
+              "dequeued": 0,
+              "inflight": 0,
+              "finished": 0,
+              "dropped": 0,
+              "bytes_queued": 0
+            }
+          },
+          "unavailable": []
+        }
+      ],
+      "health": {
+        "state": "healthy",
+        "observed_at": "2026-11-01T12:00:00Z",
+        "reasons": []
+      },
+      "metrics": {
+        "observed_at": "2026-11-01T12:00:00Z",
+        "inflight": 2,
+        "queue_depth": 0,
+        "errors_total": 0,
+        "custom": {
+          "exported_objects": 8
+        }
+      }
+    },
+    {
+      "schema": "bbt.app.monitor/v1",
+      "view": "snapshot",
+      "snapshot": {
+        "id": "snap-unavailable",
+        "app_revision": 91,
+        "captured_at": "2026-11-01T12:00:00Z",
+        "consistency": "best_effort",
+        "truncated": false,
+        "omitted": {
+          "nodes": 0,
+          "edges": 0,
+          "sessions": 0,
+          "observations": 0
+        }
+      },
+      "app": {
+        "id": "app-a",
+        "name": "goods-node",
+        "state": "running",
+        "framework_version": "2.0-target"
+      },
+      "nodes": [
+        {
+          "id": "app:app-a",
+          "generation": 1,
+          "kind": "app",
+          "name": "goods-node",
+          "type": "CoApp",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "service:app-a/goods",
+          "generation": 1,
+          "kind": "service",
+          "name": "goods",
+          "type": "GoodsService",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "service:app-a/orders",
+          "generation": 1,
+          "kind": "service",
+          "name": "orders",
+          "type": "OrderService",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "service:app-a/__builtin.monitor",
+          "generation": 1,
+          "kind": "service",
+          "name": "__builtin.monitor",
+          "type": "MonitorService",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "actor:app-a/player/export-1",
+          "generation": 1,
+          "kind": "actor",
+          "name": "export-1",
+          "type": "PlayerActor",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "actor:app-a/player/export-2",
+          "generation": 1,
+          "kind": "actor",
+          "name": "export-2",
+          "type": "PlayerActor",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "id": "component:app-a/app/RedisComponent/main",
+          "generation": 1,
+          "kind": "component",
+          "name": "main",
+          "type": "RedisComponent",
+          "state": "running",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {},
+          "scope": "app"
+        },
+        {
+          "id": "session:app-a/app-b",
+          "generation": 1,
+          "kind": "session",
+          "name": "app-b",
+          "type": "AppSession",
+          "state": "unknown",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        }
+      ],
+      "edges": [
+        {
+          "from": "app:app-a",
+          "to": "service:app-a/goods",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "service:app-a/orders",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "service:app-a/__builtin.monitor",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "actor:app-a/player/export-1",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "actor:app-a/player/export-2",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "component:app-a/app/RedisComponent/main",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "app:app-a",
+          "to": "session:app-a/app-b",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "owns",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/goods",
+          "to": "component:app-a/app/RedisComponent/main",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "binds",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/orders",
+          "to": "component:app-a/app/RedisComponent/main",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "binds",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/__builtin.monitor",
+          "to": "actor:app-a/player/export-1",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "observes",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/goods",
+          "to": "session:app-a/app-b",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "routes",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "service:app-a/goods",
+          "to": "service:app-a/orders",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "calls",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        },
+        {
+          "from": "actor:app-a/player/export-1",
+          "to": "actor:app-a/player/export-2",
+          "from_generation": 1,
+          "to_generation": 1,
+          "kind": "tells",
+          "state": "active",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "metadata": {}
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:app-a/app-b",
+          "remote_app_id": "app-b",
+          "state": "unknown",
+          "observed_at": "2026-11-01T12:00:00Z",
+          "unavailable": [
+            "epoch",
+            "links",
+            "traffic"
+          ]
+        }
+      ],
+      "health": {
+        "state": "unknown",
+        "observed_at": "2026-11-01T12:00:00Z",
+        "reasons": [
+          {
+            "code": "observation_unavailable",
+            "source": "session:app-a/app-b",
+            "observed_at": "2026-11-01T12:00:00Z"
+          }
+        ]
+      },
+      "metrics": {
+        "observed_at": "2026-11-01T12:00:00Z",
+        "inflight": 2,
+        "queue_depth": 0,
+        "errors_total": 0,
+        "custom": {
+          "exported_objects": 8
+        }
+      }
+    },
+    {
+      "schema": "bbt.app.monitor/v1",
+      "view": "health",
+      "snapshot": {
+        "id": "snap-00042",
+        "app_revision": 91,
+        "captured_at": "2026-11-01T12:00:00Z",
+        "consistency": "best_effort",
+        "truncated": false,
+        "omitted": {
+          "nodes": 0,
+          "edges": 0,
+          "sessions": 0,
+          "observations": 0
+        }
+      },
+      "app": {
+        "id": "app-a",
+        "name": "goods-node",
+        "state": "running",
+        "framework_version": "2.0-target"
+      },
+      "health": {
+        "state": "healthy",
+        "observed_at": "2026-11-01T12:00:00Z",
+        "reasons": []
+      }
+    },
+    {
+      "schema": "bbt.app.monitor/v1",
+      "view": "metrics",
+      "snapshot": {
+        "id": "snap-00042",
+        "app_revision": 91,
+        "captured_at": "2026-11-01T12:00:00Z",
+        "consistency": "best_effort",
+        "truncated": false,
+        "omitted": {
+          "nodes": 0,
+          "edges": 0,
+          "sessions": 0,
+          "observations": 0
+        }
+      },
+      "app": {
+        "id": "app-a",
+        "name": "goods-node",
+        "state": "running",
+        "framework_version": "2.0-target"
+      },
+      "metrics": {
+        "observed_at": "2026-11-01T12:00:00Z",
+        "inflight": 2,
+        "queue_depth": 0,
+        "errors_total": 0,
+        "custom": {
+          "exported_objects": 8
+        }
+      }
+    },
+    {
+      "schema": "bbt.app.monitor/v1",
+      "view": "error",
+      "error": {
+        "code": "Unauthorized"
+      }
+    }
+  ]
+}

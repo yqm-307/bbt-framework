@@ -131,7 +131,7 @@ result<void> InfraHttpHost::Create() {
     //   ProtoWireV1 → HttpRpcInboundTransport（HTTP/1.1 + protobuf body）
     //   TcpV1       → TcpRpcInboundTransport（u32be 长度前缀帧）
     if (m_state->rpc) {
-        auto engine = std::make_shared<bbt::infra::net::Engine>(
+        auto engine = bbt::infra::net::Engine::Create(
             std::shared_ptr<bbt::infra::net::RawHandler>{});
         std::shared_ptr<bbt::infra::rpc::IRpcInboundTransport> inbound;
         if (m_inbound_bridge == RpcInboundBridge::TcpV1) {
@@ -338,7 +338,7 @@ result<void> InfraHttpHost::Start() {
     // profile——底座常备，代价固定为 1 个驱动槽 + 1 条 Run 线程。
     // 已装 server Engine（state->rpc）时跳过：egress_engine() 直接借用它。
     if (!state->rpc) {
-        auto engine = std::make_shared<bbt::infra::net::Engine>(
+        auto engine = bbt::infra::net::Engine::Create(
             std::shared_ptr<bbt::infra::net::RawHandler>{});
         bbt::infra::net::EngineConfig config;
         config.runtime_progress = bbt::infra::net::RuntimeProgress::Independent;
