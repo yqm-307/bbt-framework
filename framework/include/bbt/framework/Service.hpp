@@ -89,12 +89,12 @@ result<ComponentHandle<C>> CoService<Components...>::GetComponent(
     if (!_AllowsComponent(typeid(C)))
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::InvalidArgument,
-            "GetComponent: 组件类型未在本 Service 的允许集合内声明"));
+            "GetComponent: component type is not declared in this Service’s allowed set"));
     BoundComponent b;
     if (!_FindBoundCopy(typeid(C), name, &b))
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::NotFound,
-            "GetComponent: 组件 '" + std::string(name) + "' 未绑定"));
+            "GetComponent: component '" + std::string(name) + "' is not bound"));
     return result<ComponentHandle<C>>::ok(
         detail::MakeComponentHandle<C>(b.object, b.binding_generation));
 }

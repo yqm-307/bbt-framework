@@ -132,12 +132,12 @@ result<ComponentHandle<C>> CoComponent::GetComponent(
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "GetComponent: C 必须继承 framework::v2::CoComponent");
+        "GetComponent: C must derive from framework::v2::CoComponent");
     BoundComponent b;
     if (!_FindBoundCopy(typeid(C), name, &b))
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::NotFound,
-            "GetComponent: 组件 '" + std::string(name) + "' 未绑定"));
+            "GetComponent: component '" + std::string(name) + "' is not bound"));
     return result<ComponentHandle<C>>::ok(
         detail::MakeComponentHandle<C>(b.object, b.binding_generation));
 }

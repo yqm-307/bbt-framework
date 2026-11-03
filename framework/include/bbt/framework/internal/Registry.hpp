@@ -1,16 +1,21 @@
 #pragma once
-// framework v2 受管对象注册表（机器面，internal/）。
-//
-// 单一 Registry 实体统一簿记 Service/Actor/Component 三种受管对象：
-// 每条目强持有对象（类型化 deleter）+ generation + 状态 + binding/观察者/
-// lease 簿记。业务不可构造、不可 delete——唯一创建/销毁路径是 Registry
-// 的类型化入口（ConstructKey + protected/private 析构 + Registry 友元）。
-//
-// 线程纪律：条目字段全部在 m_mtx 下读写；用户 hook（OnInstall/OnStart/
-// OnStop/OnUninstall/OnCreate/OnDestroy/OnBindingChanged）与观察者回调一律
-// 在锁外执行——状态推进在锁内完成、快照发布后在锁外调用，锁内不等待业务。
-// 同一对象一次只允许一个进行中的控制面操作（op_in_progress 互斥），并发
-// Install/Start/Stop/Uninstall/Unbind 冲突返回 Busy。
+
+/**
+ * @file Registry.hpp
+ * @brief framework v2 受管对象注册表的内部机器面契约。
+ *
+ * 单一 Registry 实体统一簿记 Service/Actor/Component；每条目强持有对象，
+ * 并记录 generation、状态与 binding。观察者注册和在途 lease 单独保存在
+ * Registry 的 observer 表中。业务不可构造、不可 delete 受管对象，唯一
+ * 创建/销毁路径是 Registry 的类型化入口（ConstructKey + protected/private
+ * 析构 + Registry 友元）。
+ *
+ * 线程纪律：条目字段与 observer 表均在 m_mtx 下读写；用户 hook
+ * （OnInstall/OnStart/OnStop/OnUninstall/OnCreate/OnDestroy/OnBindingChanged）
+ * 与观察者回调在锁外执行——状态推进/回调快照在锁内形成，业务回调在锁外
+ * 调用，锁内不等待业务。同一对象一次只允许一个进行中的控制面操作
+ * （op_in_progress 互斥），并发 Install/Start/Stop/Uninstall/Unbind 冲突返回 Busy。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -48,8 +53,12 @@ class CoApp;
 
 namespace detail {
 
-// 对象簿记（Registry 内部）。对象经 shared_ptr<void> + 类型化 deleter
-// 强持有；Registry 不向业务交出 shared_ptr<T>。
+/**
+ * @brief 一条组件绑定的簿记：谁绑了、代际、是否还接受新借用。
+ *
+ * `retiring` 是 Unbind 已封口、正在等本 binding 的 borrow 归零；它只等自己，
+ * 不等同一组件上别的 subject。
+ */
 struct Binding {
     ObjectId      subject_id;
     std::uint64_t generation = 0;
@@ -58,6 +67,14 @@ struct Binding {
     std::size_t   borrows = 0;         // 本 binding 的在途借用数（Unbind 只等自身）
 };
 
+/**
+ * @brief 一个受管对象的全部簿记。
+ *
+ * 对象本体经 `shared_ptr<void>` + 类型化 deleter 强持有，Registry 不向业务
+ * 交出 `shared_ptr<T>`；状态推进、绑定边与在途 lifecycle hook 计数在此记录中，
+ * 读写受 Registry 的 `m_mtx` 保护。观察者记录及其在途回调计数单独保存在
+ * Registry 的 observer 表中，同样由 `m_mtx` 保护。
+ */
 struct RegistryEntry {
     ObjectId     id;
     std::uint64_t generation = 0;
@@ -79,7 +96,7 @@ struct RegistryEntry {
     std::vector<Binding> bindings;
     std::size_t   component_borrows = 0;
 
-    // Actor 专属：该实例在邮箱层的执行租约（本切片恒 0，消息分发后续接入）。
+    // Actor 实例在邮箱层的执行租约计数，供收尾状态统计。
     std::size_t   exec_leases = 0;
 
     // 生命周期 hook 执行簿记：受管协程内仍有 hook 未达真实终态时 >0；
@@ -95,6 +112,14 @@ struct RegistryEntry {
     std::string   destroy_phase;           // 诊断：收口相位
 };
 
+/**
+ * @brief 一条观察者注册：谁在看哪个对象，以及它的在途回调租约。
+ *
+ * 状态变更先生成待派发事件快照；真正派发时在 `m_mtx` 下复查 active 并
+ * 增加 `in_flight`，再于锁外调用回调。Revoke 在同一把锁下标记 inactive，
+ * 并等待已取得 lease 的回调归零后移除注册记录；尚未派发的快照会被跳过，
+ * 但其中的闭包副本可能保留到对应事件批次释放。
+ */
 struct ObserverRecord {
     std::uint64_t   id = 0;
     ObjectId        observer_id;
@@ -109,8 +134,13 @@ struct ObserverRecord {
     std::size_t     in_flight = 0;
 };
 
-// 组件借用 lease：析构把 borrow 计数归还 Registry 并唤醒等待者。
-// ComponentBorrow<C> 的 m_binding 持有本对象（shared_ptr<void> 擦除）。
+/**
+ * @brief 组件借用租约：析构时把 borrow 计数归还 Registry 并唤醒等待者。
+ *
+ * `ComponentBorrow<C>` 以 `shared_ptr<void>` 持有本租约。`BindingLease` 自身
+ * 持有组件对象版本的 owner，并在析构时按 (component, subject, generation)
+ * 归还 Registry 的 borrow 计数；借用存在期间对象版本存活，租约不保活 Registry。
+ */
 struct BindingLease {
     std::weak_ptr<Registry> reg_w;
     std::shared_ptr<void> owner; // borrow 持有实际对象版本，不保活 Registry。
@@ -120,8 +150,19 @@ struct BindingLease {
     ~BindingLease();
 };
 
+/**
+ * @brief 受管对象注册表：Service/Actor/Component 的唯一创建、销毁与借用台账。
+ *
+ * 业务不能构造也不能 delete 受管对象——唯一入口是这里的类型化方法（配合
+ * `ConstructKey`、protected/private 析构与 Registry 友元）。
+ *
+ * 条目字段与 observer 表均在 `m_mtx` 下读写。用户 hook 与观察者回调在锁外
+ * 执行；状态推进和事件快照在锁内完成，锁内不等待业务。同一对象一次只允许
+ * 一个进行中的控制面操作（`op_in_progress`）。
+ */
 class Registry : public std::enable_shared_from_this<Registry> {
 public:
+    /// @brief 容量与预算上限；0 表示该类资源不受本表限制。
     struct Limits {
         std::size_t max_objects = 0;
         std::size_t max_bindings = 0;
@@ -209,8 +250,8 @@ public:
     result<ObserverToken> Observe(const ObjectHandle& observer,
                                   const ObjectHandle& target,
                                   ObjectObserver callback);
-    // 逻辑撤销：标记 active=false，并阻塞至已派发的在途 callback lease 归零
-    // 后抹除记录与闭包（ lease 由 DispatchEvents 持锁归还）。
+    // 逻辑撤销：标记 active=false，并阻塞至已取得 callback lease 的回调归零
+    // 后抹除注册记录；尚未派发的事件快照会被跳过，但闭包副本可存活到批次释放。
     void RevokeObserver(std::uint64_t token_id) noexcept;
     bool ObserverActive(std::uint64_t token_id) const noexcept;
     // observer 对象卸载时撤销其全部 token。Locked 版供已持锁路径调用：
@@ -219,8 +260,8 @@ public:
     void RevokeObserversOf(std::string_view observer_id);
     void RevokeObserversOfLocked(std::string_view observer_id);
     // 排空并抹除全部 inactive observer 记录（等其 in_flight 归零；
-    // 调用方不得持 m_mtx）。observer 对象卸载路径在对象析构前调用，
-    // 保证其闭包先于 owner 释放。
+    // 调用方不得持 m_mtx）。已取得 lease 的回调在返回前完成；尚未派发的
+    // 事件快照会被跳过，但其闭包副本可能存活到事件批次释放。
     void DrainInactiveObservers() noexcept;
 
     // ---- handle 观察面 ----
@@ -243,10 +284,11 @@ public:
                             const RegistryEntry& subject_entry,
                             const ObjectId& subject_id,
                             std::uint64_t* out_generation);
-    // 封该 binding 新 borrow（generation 推进使旧 handle 失效）；
+    // 封该 binding 新 borrow；旧 handle 因 active=false/retiring 而失效，
+    // generation 保持不变以便在途 BindingLease 仍按原代归还计数。
     // 若该 binding 无在途 borrow → 立即移除边，返回 ok。仍有 borrow →
     // 标记 retiring，等本 binding borrow 归零后完成（waiter 驱动）。
-    // out_generation 回填（新的）binding generation，供按边等待。
+    // out_generation 回填该 binding 的 generation，供按边等待。
     result<void> BeginUnbindLocked(RegistryEntry& component_entry,
                                    const ObjectId& subject_id,
                                    std::uint64_t* out_generation);

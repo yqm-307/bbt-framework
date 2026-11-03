@@ -141,10 +141,10 @@ result<void> CoApp::_CheckCoContext() const {
     const auto co = bbt::coroutine::GetLocalCoroutineId();
     if (co == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: Co* 入口必须在受管协程上下文调用"));
+            "lifecycle: Co* entry points require a managed coroutine context"));
     if (m_hook_co->load(std::memory_order_acquire) == co)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: 生命周期 hook 内同协程再调生命周期入口会等待自身"));
+            "lifecycle: a lifecycle entry point called by its own hook would wait on itself"));
     return result<void>::ok();
 }
 
@@ -192,7 +192,7 @@ result<void> FinishCoHookWait(const std::shared_ptr<CoHookSlot>& slot,
             "lifecycle hook wait cancelled"));
     case WS::InvalidContext:
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: CoWaiter 需在受管协程内等待"));
+            "lifecycle: CoWaiter must be awaited from a managed coroutine"));
     case WS::AlreadyWaiting:
         return result<void>::err(MakeError(ErrorCode::Overloaded,
             "lifecycle: hook wait slot already occupied"));
@@ -245,10 +245,10 @@ result<void> WaitHooksSettledCo(
             "lifecycle: hook-settle wait cancelled"));
     case WS::InvalidContext:
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: hook-settle wait 需在受管协程内"));
+            "lifecycle: hook-settle wait requires a managed coroutine"));
     case WS::AlreadyWaiting:
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "lifecycle: 另一协程已在等该对象 hook 归零"));
+            "lifecycle: another coroutine is already waiting for this object’s hooks to settle"));
     case WS::RuntimeUnavailable:
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
             "lifecycle: coroutine wait runtime unavailable"));
@@ -569,7 +569,7 @@ void CoApp::_DestroyService(const ObjectId& id,
     // 先排空本 service 作为 subject 的借用（旧 borrow 不得在 OnStop 之后
     // 仍运行同一资源版本），再跑 OnStop（受管协程）。按边排空：只等本
     // subject 名下 (component, subject, generation) 的 retiring 边归零——
-    // 共享组件上其他 subject 的合法 borrow 不阻塞本 service 收口（P1-4）。
+    // 共享组件上其他 subject 的合法 borrow 不阻塞本 service 收口。
     std::vector<std::pair<ObjectId, std::uint64_t>> retiring_edges;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
@@ -1016,7 +1016,7 @@ void CoApp::_RunActorDestroy(const ObjectId& id) noexcept {
     }
     if (!a) return;   // Actor type 登记条目无实例：无 OnDestroy 可跑，
                       // 条目收口由 _DestroyActor 的 FinishDestroyLocked
-                      // 完成（P2-1：type entry 同样进入 Destroyed/移除）。
+                      // 完成（type entry 同样进入 Destroyed/移除）。
     try {
         a->OnDestroy();
     } catch (...) {
@@ -1058,30 +1058,30 @@ result<void> CoApp::_ValidateOwner(const ComponentOptions& placement,
     if (scope == ComponentScope::App) {
         if (placement.Owner().has_value())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ComponentOptions: App scope 不允许显式 owner"));
+                "ComponentOptions: App scope does not allow an explicit owner"));
         return result<void>::ok();
     }
     if (!placement.Owner().has_value())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: Service/Actor scope 必须显式 SetOwner"));
+            "ComponentOptions: Service/Actor scope requires an explicit owner"));
 
     const ObjectHandle& owner = placement.Owner().value();
     // 跨 App 句柄拒绝：owner 必须属于本 Registry（局部 id/generation
     // 可能与他 App 句柄巧合相同，身份校验不可省）。
     if (!m_registry->OwnsHandle(owner))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: owner handle 属其他 Registry"));
+            "ComponentOptions: owner handle belongs to another Registry"));
     std::unique_lock<std::mutex> lk(m_registry->Mutex());
     const auto* e = m_registry->FindEntryLocked(owner.Id());
     if (!e || e->generation != owner.Generation())
         return result<void>::err(MakeError(ErrorCode::NotFound,
-            "ComponentOptions: owner 未登记或 generation 已变"));
+            "ComponentOptions: owner is not registered or its generation changed"));
     if (scope == ComponentScope::Service && e->kind != ObjectKind::Service)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: Service scope owner 必须是 Service"));
+            "ComponentOptions: Service scope owner must be a Service"));
     if (scope == ComponentScope::Actor && e->kind != ObjectKind::Actor)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: Actor scope owner 必须是 Actor"));
+            "ComponentOptions: Actor scope owner must be an Actor"));
     *out_owner_id = owner.Id();
     return result<void>::ok();
 }
@@ -1384,7 +1384,7 @@ result<void> CoApp::_ApplyServiceBindings(
                 (void)_UnbindComponentImpl(*x->component_type, svc_handle,
                                            x->name, {}, life);
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "BindComponent: 组件类型未在本 Service 允许集合内声明"));
+                "BindComponent: component type is not declared in this Service’s allowed set"));
         }
         auto r = _BindComponentImpl(*d.component_type, svc_handle,
                                     d.name, {}, life);
@@ -1433,7 +1433,7 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
             // 本 subject 在该组件上的边全部进收口集合：active 边先封门，
             // 上次收口超时留下的 retiring 边沿用原 generation 续等——
             // 重试跳过旧边会让未归还的 borrow 在 OnStop 之后继续使用同一
-            // 资源版本（P1-4）。
+            // 资源版本。
             std::uint64_t active_gen = 0;
             bool has_active = false;
             std::vector<std::uint64_t> retiring;
@@ -1455,7 +1455,7 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
                 ->_InvalidateComponentEntries();
     }
     // 按边排空本 service 名下的借用：只等本 subject 的 retiring 边归零，
-    // 不等共享组件上其他 subject 的合法 borrow（P1-4）。
+    // 不等共享组件上其他 subject 的合法 borrow。
     for (const auto& [cid, gen] : retiring_edges) {
         auto r = m_registry->WaitBindingDrained(cid, id, gen, deadline);
         if (!r) {
@@ -1601,7 +1601,7 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
     if (!m_registry->OwnsHandle(subject))
         return result<std::pair<ObjectHandle, std::uint64_t>>::err(
             MakeError(ErrorCode::InvalidArgument,
-                "BindComponent: subject handle 属其他 Registry"));
+                "BindComponent: subject handle belongs to another Registry"));
     ObjectId owner_id;
     if (auto r = _ValidateOwner(placement, &owner_id); !r)
         return result<std::pair<ObjectHandle, std::uint64_t>>::err(
@@ -1623,13 +1623,13 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
         if (subj->kind == ObjectKind::App)
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 MakeError(ErrorCode::InvalidArgument,
-                    "BindComponent: subject 不能是 App handle"));
+                    "BindComponent: subject cannot be an App handle"));
         if (subj->kind == ObjectKind::Service) {
             auto* svc = static_cast<CoServiceBase*>(subj->object.get());
             if (!svc->_AllowsComponent(ctype))
                 return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                     MakeError(ErrorCode::InvalidArgument,
-                        "BindComponent: 组件类型未在本 Service 允许集合内声明"));
+                        "BindComponent: component type is not declared in this Service’s allowed set"));
         }
 
         auto* comp = m_registry->FindComponentLocked(placement.Scope(),
@@ -1643,7 +1643,7 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
             _WouldFormCycleLocked(subject.Id(), comp->id))
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 MakeError(ErrorCode::InvalidArgument,
-                    "BindComponent: 依赖会形成环"));
+                    "BindComponent: dependency would form a cycle"));
         if (auto r = m_registry->BindLocked(*comp, *subj, subject.Id(), &gen); !r)
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 std::move(r.error()));
@@ -1694,7 +1694,7 @@ result<void> CoApp::_UnbindComponentImpl(
     // 跨 App 句柄拒绝：subject 必须属于本 Registry。
     if (!m_registry->OwnsHandle(subject))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "UnbindComponent: subject handle 属其他 Registry"));
+            "UnbindComponent: subject handle belongs to another Registry"));
     ObjectId owner_id;
     if (auto r = _ValidateOwner(placement, &owner_id); !r) return r;
 
@@ -1790,7 +1790,7 @@ bbt_co_async(result<void>) CoApp::CoBindObject(const ObjectHandle& subject,
         return result<void>::err(std::move(ctx.error()));
     (void)subject; (void)target;
     return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
-        "BindObject: 非拥有关系边不在本切片"));
+        "BindObject: non-owning relationship edges are not supported"));
 }
 
 bbt_co_async(result<void>) CoApp::CoUnbindObject(const ObjectHandle& subject,
@@ -1799,7 +1799,7 @@ bbt_co_async(result<void>) CoApp::CoUnbindObject(const ObjectHandle& subject,
         return result<void>::err(std::move(ctx.error()));
     (void)subject; (void)target;
     return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
-        "UnbindObject: 非拥有关系边不在本切片"));
+        "UnbindObject: non-owning relationship edges are not supported"));
 }
 
 } // namespace bbt::framework::v2

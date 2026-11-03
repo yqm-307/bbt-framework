@@ -421,11 +421,11 @@ bbt_co_async(result<void>) CoApp::CoInstallComponent(
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "CoInstallComponent: C 必须继承 framework::v2::CoComponent");
+        "CoInstallComponent: C must derive from framework::v2::CoComponent");
     static_assert(!std::is_default_constructible_v<C>,
-        "CoInstallComponent: C 构造必须只接受 ConstructKey（业务不可直接构造）");
+        "CoInstallComponent: C constructor must accept only ConstructKey");
     static_assert(!std::is_destructible_v<C>,
-        "CoInstallComponent: C 析构必须 protected/private（Registry 独有销毁权）");
+        "CoInstallComponent: C destructor must be protected or private");
     return _InstallComponentImpl(
         typeid(C), std::move(name), placement, life,
         [opts = std::move(options)](detail::ConstructKey k) mutable
@@ -443,7 +443,7 @@ bbt_co_async(result<void>) CoApp::CoUninstallComponent(
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "CoUninstallComponent: C 必须继承 framework::v2::CoComponent");
+        "CoUninstallComponent: C must derive from framework::v2::CoComponent");
     return _UninstallComponentImpl(typeid(C), name, placement, life);
 }
 
@@ -452,17 +452,17 @@ bbt_co_async(result<void>) CoApp::CoInstallService(ServiceOptions options) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoServiceBase, S>,
-        "CoInstallService: S 必须继承 framework::v2::CoService<...>");
+        "CoInstallService: S must derive from framework::v2::CoService<...>");
     static_assert(!std::is_default_constructible_v<S>,
-        "CoInstallService: S 构造必须只接受 ConstructKey（业务不可直接构造）");
+        "CoInstallService: S constructor must accept only ConstructKey");
     static_assert(!std::is_destructible_v<S>,
-        "CoInstallService: S 析构必须 protected/private（Registry 独有销毁权）");
+        "CoInstallService: S destructor must be protected or private");
     if (auto r = options.Validate(); !r) return r;
 
     std::string name = CoServiceStaticName<S>::Get();
     if (name.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "CoInstallService: S 缺 kServiceName 声明或为空"));
+            "CoInstallService: S must declare a non-empty kServiceName"));
 
     const auto decls = options.ComponentBindings();
     return _InstallServiceImpl(
@@ -479,11 +479,11 @@ bbt_co_async(result<void>) CoApp::CoUninstallService(const LifecycleOptions& lif
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoServiceBase, S>,
-        "CoUninstallService: S 必须继承 framework::v2::CoService<...>");
+        "CoUninstallService: S must derive from framework::v2::CoService<...>");
     std::string name = CoServiceStaticName<S>::Get();
     if (name.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "CoUninstallService: S 缺 kServiceName 声明"));
+            "CoUninstallService: S must declare kServiceName"));
     return _UninstallServiceImpl(name, life);
 }
 
@@ -492,17 +492,17 @@ bbt_co_async(result<void>) CoApp::CoInstallActor(ActorOptions options) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoActor, A>,
-        "CoInstallActor: A 必须继承 framework::v2::CoActor");
+        "CoInstallActor: A must derive from framework::v2::CoActor");
     static_assert(!std::is_default_constructible_v<A>,
-        "CoInstallActor: A 构造必须只接受 ConstructKey（业务不可直接构造）");
+        "CoInstallActor: A constructor must accept only ConstructKey");
     static_assert(!std::is_destructible_v<A>,
-        "CoInstallActor: A 析构必须 protected/private（Registry 独有销毁权）");
+        "CoInstallActor: A destructor must be protected or private");
     if (auto r = options.Validate(); !r) return r;
 
     std::string type = CoActorStaticName<A>::Get();
     if (type.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "CoInstallActor: A 缺 kActorType 声明或为空"));
+            "CoInstallActor: A must declare a non-empty kActorType"));
 
     return _InstallActorTypeImpl(
         typeid(A), std::move(type), options,
@@ -518,11 +518,11 @@ bbt_co_async(result<void>) CoApp::CoUninstallActor(const LifecycleOptions& life)
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoActor, A>,
-        "CoUninstallActor: A 必须继承 framework::v2::CoActor");
+        "CoUninstallActor: A must derive from framework::v2::CoActor");
     std::string type = CoActorStaticName<A>::Get();
     if (type.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "CoUninstallActor: A 缺 kActorType 声明"));
+            "CoUninstallActor: A must declare kActorType"));
     return _UninstallActorTypeImpl(type, life);
 }
 
@@ -530,7 +530,7 @@ template <class C>
 result<ObjectHandle> CoApp::FindComponent(
     std::string_view name, const ComponentOptions& placement) const {
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "FindComponent: C 必须继承 framework::v2::CoComponent");
+        "FindComponent: C must derive from framework::v2::CoComponent");
     return _FindComponentImpl(typeid(C), name, placement);
 }
 
@@ -541,7 +541,7 @@ bbt_co_async(result<ComponentHandle<C>>) CoApp::CoBindComponent(
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<ComponentHandle<C>>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "CoBindComponent: C 必须继承 framework::v2::CoComponent");
+        "CoBindComponent: C must derive from framework::v2::CoComponent");
     auto r = _BindComponentImpl(typeid(C), subject, name, placement, life);
     if (!r) return result<ComponentHandle<C>>::err(std::move(r.error()));
     return result<ComponentHandle<C>>::ok(
@@ -555,7 +555,7 @@ bbt_co_async(result<void>) CoApp::CoUnbindComponent(
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "CoUnbindComponent: C 必须继承 framework::v2::CoComponent");
+        "CoUnbindComponent: C must derive from framework::v2::CoComponent");
     return _UnbindComponentImpl(typeid(C), subject, name, placement, life);
 }
 

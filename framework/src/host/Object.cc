@@ -13,20 +13,20 @@ namespace bbt::framework {
 result<void> ServiceOptions::Validate() const {
     if (m_max_inflight == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ServiceOptions: max_inflight 必须为有限正值"));
+            "ServiceOptions: max_inflight must be a finite positive value"));
     return result<void>::ok();
 }
 
 result<void> ActorOptions::Validate() const {
     if (m_max_actors == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorOptions: max_actors 必须为有限正值"));
+            "ActorOptions: max_actors must be a finite positive value"));
     if (m_mailbox_capacity == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorOptions: mailbox_capacity 必须为有限正值"));
+            "ActorOptions: mailbox_capacity must be a finite positive value"));
     if (m_aggregate_queue_capacity == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorOptions: aggregate_queue_capacity 必须为有限正值"));
+            "ActorOptions: aggregate_queue_capacity must be a finite positive value"));
     return result<void>::ok();
 }
 
@@ -34,13 +34,13 @@ result<void> AppOptions::Validate() const {
     if (m_max_objects == 0 || m_max_bindings == 0 || m_max_observers == 0 ||
         m_observer_queue_capacity == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "AppOptions: SetLimits 四项额度必须为有限正值"));
+            "AppOptions: SetLimits requires all four limits to be positive"));
     if (m_shutdown_budget.count() <= 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "AppOptions: SetShutdownBudget 必须为正有限值"));
+            "AppOptions: SetShutdownBudget must be a finite positive value"));
     if (m_lifecycle_budget.count() <= 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "AppOptions: SetLifecycleBudget 必须为正有限值"));
+            "AppOptions: SetLifecycleBudget must be a finite positive value"));
     return result<void>::ok();
 }
 

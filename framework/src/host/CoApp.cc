@@ -59,13 +59,13 @@ CoApp::CoApp(CoAppOptions options)
         InstallRpcHttpBridge(*m_default_host, *this);
     }
 #else
-    // 无 protobuf 前缀锁定时只有迁移期 header 桥；显式选择 ProtoWireV1/TcpV1
-    // 会在 _ValidateConfig 被拒绝（不静默降级为另一协议）。
+    // 无 protobuf 支持时，显式选择 ProtoWireV1/TcpV1 会在 _ValidateConfig
+    // 被拒绝，不会静默降级为另一协议。
     InstallRpcHttpBridge(*m_default_host, *this);
 #endif
     // 出站 profile 与入站一致：ProtoWireV1/TcpV1 时出站走 infra 公开
     // rpc::Client + 对应 adapter（wire 编解码由 infra 承担，不与入站协议分叉）；
-    // LegacyHeaders 保留迁移期 header 桥行为。
+    // LegacyHeaders 使用 header 线格式。
     const auto egress_profile =
         m_options.inbound_bridge == RpcInboundBridge::TcpV1
             ? RpcEgressProfile::TcpV1

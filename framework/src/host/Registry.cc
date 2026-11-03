@@ -390,8 +390,8 @@ void Registry::RevokeObserversOfLocked(std::string_view observer_id) {
 }
 
 void Registry::DrainInactiveObservers() noexcept {
-    // 等全部 inactive 记录的在途 lease 归零后抹除（闭包销毁在锁内完成，
-    // 其捕获对象的析构不得晚于本函数返回——卸载路径据此保证 owner 顺序）。
+    // 等全部 inactive 记录的在途 lease 归零后抹除注册记录。待派发事件快照
+    // 会在 DispatchEvents 中被跳过，但其中的闭包副本可存活到事件批次释放。
     {
         std::unique_lock<std::mutex> lk(m_mtx);
         for (auto it = m_observers.begin(); it != m_observers.end();) {
@@ -458,7 +458,7 @@ result<AppObjectAddress> Registry::AddressOf(const RegistryEntry& e) {
     default:
         return result<AppObjectAddress>::err(MakeError(
             ErrorCode::InvalidArgument,
-            "GetMailBox: 仅 Service/Actor 有地址"));
+            "GetMailBox: only Service and Actor objects have addresses"));
     }
 }
 
@@ -490,7 +490,7 @@ result<void> Registry::BindLocked(RegistryEntry& component_entry,
             "BindComponent: component gate closed"));
     // subject 同临界区 gate：销毁/收口路径先封 subject（gate_closed /
     // op_in_progress / 关闭语义状态）再擦除其 retiring 边——此后新增的
-    // active 边不会被收口看到，必须以 Closed 拒绝（P1-3）。
+    // active 边不会被收口看到，必须以 Closed 拒绝。
     if (subject_entry.gate_closed || subject_entry.op_in_progress ||
         subject_entry.state == ObjectState::Stopping ||
         subject_entry.state == ObjectState::Stopped ||
