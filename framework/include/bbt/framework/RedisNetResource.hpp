@@ -78,7 +78,7 @@ public:
     // 要求 native 线程 + coroutine Scheduler 已启动。
     static bbt::infra::result<std::shared_ptr<RedisNetResource>> Create(
         bbt::infra::net::Address address) {
-        auto engine = std::make_shared<bbt::infra::net::Engine>(nullptr);
+        auto engine = bbt::infra::net::Engine::Create(nullptr);
         std::promise<std::error_code> done;
         auto run_result = done.get_future();
         std::thread run_thread(

@@ -115,7 +115,7 @@ result<std::string> ActorKeyToString(const K& key) {
         s = std::to_string(key);
     } else {
         static_assert(sizeof(D) == 0,
-            "ActorMethod: key 字段类型须为 std::string/string_view 或整型");
+            "ActorMethod: key field type must be std::string, string_view, or an integer type");
     }
     if (s.empty())
         return result<std::string>::err(MakeError(
@@ -130,7 +130,7 @@ RpcMethod::Invoker MakeCoRpcInvoker(MemberPtr handler) {
     using Traits = rpc_traits<MemberPtr>;
     using Service = typename Traits::service_type;
     static_assert(std::is_base_of_v<ICoService, Service>,
-                  "RpcMethods: Service 必须继承 ICoService");
+                  "RpcMethods: Service must derive from ICoService");
     return [handler](ICoService& base,
                      const std::vector<std::uint8_t>& payload)
         -> result<std::vector<std::uint8_t>> {
@@ -151,7 +151,7 @@ template <class MemberPtr>
 RpcMethod::Invoker SelectInvoker(MemberPtr handler) {
     using Traits = rpc_traits<MemberPtr>;
     static_assert(Traits::kCoRpc,
-        "RpcMethods: handler 签名须为 CoRpcResp(CoRpcReq)");
+        "RpcMethods: handler signature must be CoRpcResp(CoRpcReq)");
     return MakeCoRpcInvoker(handler);
 }
 
@@ -183,7 +183,7 @@ struct MethodDeclBuilder<MethodDecl<Ptr>> {
         RpcMethod m;
         m.name = d.name;
         static_assert(Traits::kCoRpc,
-            "RpcMethods: handler 签名须为 CoRpcResp(CoRpcReq)");
+            "RpcMethods: handler signature must be CoRpcResp(CoRpcReq)");
         m.request_schema = std::string(kCoRpcPositionalSchema);
         m.response_schema = std::string(kCoRpcPositionalSchema);
         m.actor_keyed = false;

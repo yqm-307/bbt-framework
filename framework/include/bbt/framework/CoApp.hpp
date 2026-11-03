@@ -1,25 +1,9 @@
 #pragma once
-// service-actor/v2：CoApp 宿主装配（业务面）。
-//
-// 业务路径：
-//   fw::CoApp app{opts};              // 宿主/出站/线桥全部由框架装配
-//   app.add_service<EchoSvc>(opts);   // 服务注册
-//   app.run();                        // 启动 → 接纳 → 关闭 → 返回码
-//   app.request_shutdown();           // 任意线程可调用
-// 业务不注入 network_host、不提供 rpc_send、不见 envelope/Codec——
-// 默认装配使用 internal::InfraHttpHost + RpcHttpBridge + HttpEgress
-// （真实 infra HTTP loopback 传输）；测试替换经 internal/CoAppSeam.hpp。
-//
-//  - add_service<T>(ServiceOptions) 注册服务：T 为 ICoService 派生、默认
-//    构造；ServiceOptions 必须显式携带执行策略（F2-a 装配期校验 +
-//    ValidateActorKeying）。
-//  - add_resource<R>(ptr)：按类型装配资源客户端（CoRedisCli 等资源
-//    缝的登记口；服务经 context().resource<R>() 取用）。
-//  - run() -> int：负责启动、接纳、调度与正常关闭，顺序由
-//    internal::HostLifecycle 状态机保证。进程内同一时刻至多一个活跃
-//    CoApp；同一 CoApp 至多 run 一次。
-//  - 启动前校验：运行时配置与静态路由在 run 前校验；默认不存在
-//    「自动连任意服务」——find_route 只认显式配置的静态路由。
+
+/**
+ * @file CoApp.hpp
+ * @brief 声明业务宿主装配根及其配置类型。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -66,43 +50,49 @@ std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
 void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app);
 
-// 显式静态路由项：service_name → 已配置的出站地址。
+/** @brief 将服务名映射到显式配置的出站地址。 */
 struct StaticRoute {
     std::string              service_name;
     bbt::infra::RpcAddress   address;
 };
 
-// Issue #4 + 三仓迁移：入站 RPC 协议/transport 选择。
-//  - LegacyHeaders：迁移期绑定，envelope 字段一对一映射 x-bbt-* header（既有
-//    默认，保留既有测试）。
-//  - ProtoWireV1：infra Issue #8 冻结的正式 body wire profile 经 HTTP
-//    transport（POST /rpc + Content-Type: application/x-protobuf，
-//    body=RpcEnvelopeMsg）；须在 protobuf 前缀锁定可用时选择，否则启动期
-//    显式失败。
-//  - TcpV1：同一 protobuf wire profile 经 infra 原生 TCP adapter（u32be
-//    长度前缀帧，architecture §6）；同样要求 rpc_net + rpc_tcp 已注册，
-//    否则启动期显式失败。
+/**
+ * @brief 选择入站 RPC 的线格式与传输适配。
+ *
+ * LegacyHeaders 将 envelope 字段映射到 x-bbt-* HTTP headers；ProtoWireV1
+ * 使用 protobuf body 经 HTTP；TcpV1 使用 protobuf body 经 infra TCP adapter。
+ * 所选传输或 protobuf 支持不可用时，CoApp 在启动校验中报告错误。
+ */
 enum class RpcInboundBridge { LegacyHeaders, ProtoWireV1, TcpV1 };
 
-// 运行时配置（全部字段必须显式填写，与 ServiceOptions 同一约定）：
-//  - network_limits：透传给网络依赖组件的限额（ValidateNetworkLimits）；
-//  - listen：默认宿主的监听地址（port==0 时内核分配，run 后
-//    bound_endpoint() 可读）；
-//  - static_routes：出站目标白名单，空名单 = 不允许任何出站目标；
-//  - shutdown_step_budget：关闭期每个等待步的有限预算（F3）。
+/**
+ * @brief CoApp 默认宿主的网络、路由与关闭预算配置。
+ *
+ * 各配置项在 run() 启动组件前校验；静态路由为空时不允许出站目标。
+ */
 struct CoAppOptions {
     bbt::infra::NetworkLimits network_limits;
     bbt::infra::ListenAddress listen;
     std::vector<StaticRoute>  static_routes;
     std::chrono::milliseconds shutdown_step_budget;
-    // Issue #4：入站桥选择，默认保留既有 x-bbt-* header 绑定。
+    // 默认使用 x-bbt-* header 线格式。
     RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
-    // R8（3-5）：公开出站策略，构造期选择；nullptr = 框架默认 no-op（全放行），
-    // 默认行为与今天逐字一致。策略在 CoApp 构造后即冻结（m_options 为 const），
-    // 无运行中替换口。shared_ptr 由 m_options 持有至 CoApp 析构，长于所有在途调用。
+    // 策略在构造时提供；nullptr 使用默认策略。m_options 持有策略至 CoApp 析构。
     std::shared_ptr<RpcPolicy> rpc_policy{};
 };
 
+/**
+ * @brief 业务宿主装配根（service-actor/v2）。
+ *
+ * 默认装配使用 InfraHttpHost + RpcHttpBridge + HttpEgress（真实 infra HTTP
+ * loopback 传输）；测试替换经 internal/CoAppSeam.hpp。
+ *
+ * 启动前校验：运行时配置与静态路由在 run 前校验；find_route 只认显式配置
+ * 的静态路由，不存在「自动连任意服务」。
+ *
+ * 生命周期约束：进程内同一时刻至多一个活跃 CoApp。通过单活跃宿主检查后，
+ * 同一 CoApp 的 run() 只执行一次；若因已有活跃宿主被拒绝，该次调用不消耗实例的 run 次数。
+ */
 class CoApp {
     // 测试缝构造仅经 internal MakeCoAppForTest 到达；默认入站线桥
     // 经 InstallRpcHttpBridge 安装，两者均在 internal/** 声明。
@@ -117,23 +107,34 @@ class CoApp {
         bbt::infra::RpcEnvelope);
 
 public:
-    // 业务路径：宿主（InfraHttpHost）、入站线桥（RpcHttpBridge）与
-    // 出站（HttpEgress）全部由框架默认装配。
+    /**
+     * @brief 从默认装配路径构造：宿主/出站/线桥全部由框架装配。
+     *
+     * 运行时配置全部字段须显式填写；启动前校验在 run() 入口执行，
+     * 不在构造期联网或建线程。
+     */
     explicit CoApp(CoAppOptions options);
     ~CoApp();
 
     CoApp(const CoApp&) = delete;
     CoApp& operator=(const CoApp&) = delete;
 
-    // 注册服务。校验：ServiceOptions 合法 + ActorSerial 全方法有 key
-    // 提取器 + 服务名非空且不重复 + 注册窗口仍开放（run 开始后拒绝）。
-    // 失败返回 err(InvalidArgument/Closed)，不登记半成品。
+    /**
+     * @brief 注册服务。
+     *
+     * @tparam T  继承 ICoService 且默认可构造的服务类型。
+     * @param options  服务配置，必须显式指定执行策略。
+     * @return 成功为 ok；ServiceOptions 非法/ActorSerial 无 key 提取器/
+     *         服务名为空或重复/注册窗口关闭 → err(InvalidArgument/Closed)。
+     *
+     * @note 失败不登记半成品；run 开始后调用返回 Closed。
+     */
     template <class T>
     result<void> add_service(ServiceOptions options) {
         static_assert(std::is_base_of_v<ICoService, T>,
-            "CoApp::add_service: T 必须继承 ICoService");
+            "CoApp::add_service: T must derive from ICoService");
         static_assert(std::is_default_constructible_v<T>,
-            "CoApp::add_service: 业务类型必须默认可构造");
+            "CoApp::add_service: service type must be default constructible");
 
         if (auto r = ValidateServiceOptions(options); !r)
             return r;
@@ -177,15 +178,27 @@ public:
         return result<void>::ok();
     }
 
-    // 资源缝登记：旧重载装配无名默认资源；命名重载以 (类型, 名称)
-    // 为键。公开命名 API 拒绝空名；重复键/空指针 → InvalidArgument；
-    // run 开始后 → Closed。本框架不提供数据库客户端实现。
+    /**
+     * @brief 装配无名默认资源客户端。
+     *
+     * @tparam R 资源类型。
+     * @param resource 非空资源指针；空指针返回 InvalidArgument。
+     * @return 成功为 ok；重复键/run 开始后 → InvalidArgument/Closed。
+     */
     template <class R>
     result<void> add_resource(std::shared_ptr<R> resource) {
         return _AddResource<R>(kDefaultResourceName,
             std::move(resource));
     }
 
+    /**
+     * @brief 装配命名资源客户端。
+     *
+     * @tparam R 资源类型。
+     * @param name 资源名，非空。
+     * @param resource 非空资源指针；空指针/空名/重复键 → InvalidArgument；
+     *                 run 开始后 → Closed。
+     */
     template <class R>
     result<void> add_resource(std::string_view name,
                               std::shared_ptr<R> resource) {
@@ -195,14 +208,17 @@ public:
         return _AddResource<R>(name, std::move(resource));
     }
 
-    // 延迟工厂装配：factory 的 Create 在 Scheduler 启动后、绑定 Service
-    // 之前执行（on_scheduler_started 相位），满足「Create 要求 Scheduler
-    // 已启动」的资源形态（如 infra CoRedisCli/CoMongoCli）。factory 须返回
-    // result<std::shared_ptr<R>>；创建出的实例若暴露 Start() 且该返回
-    // result<void> 则由框架在登记后调用一次，若实现
-    // bbt::infra::ICoCloseable 则由关闭序列统一 Close()（同步收口）。
-    // 任一资源创建/启动失败 → 启动失败回退，不留半装配资源。
-    // name 约束与 add_resource(ptr) 相同；重复键/空工厂 → InvalidArgument。
+    /**
+     * @brief 装配延迟工厂资源（在 Scheduler 启动后、绑定 Service 之前创建）。
+     *
+     * factory 须返回 `result<std::shared_ptr<R>>`；实例若暴露 `Start()` 且返回
+     * `result<void>` 则由框架调用一次；若继承 `ICoCloseable` 则由关闭序列统一
+     * Close()。任一资源创建/启动失败 → 启动失败回退，不留半装配资源。
+     *
+     * @param name     资源名，非空；空名/空工厂/重复键 → InvalidArgument；
+     *                 run 开始后 → Closed。
+     * @param factory  可调用对象，签名 `result<std::shared_ptr<R>>()`。
+     */
     template <class R, class F,
               class = std::enable_if_t<
                   std::is_invocable_r_v<result<std::shared_ptr<R>>, F>>>
@@ -213,45 +229,73 @@ public:
         return _AddResourceFactory<R>(name, std::forward<F>(factory));
     }
 
-    // 出站目标解析（「自动连任意服务」不存在的落点）：只认显式配置的
-    // 静态路由；未配置目标 → err(NotFound)。run 前后均可调用；
-    // 出站分发必须经此门，不允许绕过。
+    /**
+     * @brief 出站目标解析。
+     *
+     * 只认显式配置的静态路由；未配置目标 → err(NotFound)。
+     * run 前后均可调用；出站分发必须经此门，不允许绕过。
+     */
     result<bbt::infra::RpcAddress> find_route(
         std::string_view service_name) const;
 
-    // 安装接收端有序流授权。仅允许在 run() 前调用；run 开始后返回 Closed。
-    // service 必须已注册且启用 ordered_ingress，授权字段由调用方提供，
-    // 不自动创建未知服务或隐式放宽其他匹配条件。
+    /**
+     * @brief 安装接收端有序流授权。
+     *
+     * 仅允许在 run() 前调用；run 开始后返回 Closed。service 必须已注册
+     * 且启用 ordered_ingress，授权字段由调用方提供，不自动创建未知服务
+     * 或隐式放宽其他匹配条件。
+     */
     result<void> grant_ordered_stream(OrderedGrant grant);
 
-    // 已托管实例观察口：Concurrent 服务返回启动期绑定的单实例；
-    // ActorSerial 服务返回 err(InvalidArgument)（实例按 key 经
-    // actor_registry() 激活）；未注册名 → err(NotFound)；
-    // 尚未 run/已关闭 → err(RuntimeUnavailable)。
+    /**
+     * @brief 已托管实例观察口。
+     *
+     * Concurrent 服务返回启动期绑定的单实例；ActorSerial 服务返回
+     * err(InvalidArgument)（实例按 key 经 actor_registry() 激活）；
+     * 未注册名 → err(NotFound)；尚未 run/已关闭 → err(RuntimeUnavailable)。
+     */
     result<std::shared_ptr<ICoService>> find_service(
         std::string_view service_name) const;
 
-    // ActorSerial 实例注册表（分发/测试观察用）；未启动 → nullptr。
+    /// @brief ActorSerial 实例注册表（分发/测试观察用）；未启动 → nullptr。
     ActorRegistry* actor_registry() const noexcept;
 
-    // 控制线程入口：启动 → 等待关闭请求 → 收束 → 返回。
-    // 返回码即 internal::HostLifecycle::kExit*。进程内同一时刻至多一个
-    // 活跃 CoApp；同一 CoApp 至多 run 一次；违反 → kExitRejected。
+    /**
+     * @brief 控制线程入口：启动 → 等待关闭请求 → 收束 → 返回。
+     *
+     * 返回码即 internal::HostLifecycle::kExit*。进程内同一时刻至多一个
+     * 活跃 CoApp；通过该检查后，同一 CoApp 仅允许一次 run()，违反时返回
+     * kExitRejected。因已有活跃宿主而被拒绝的调用不消耗此次数。
+     */
     int run();
 
-    // 契约 F3：外部控制线程请求关闭。幂等、noexcept；早于 run 的调用
-    // 使 run 完成启动后立即进入关闭序列。
+    /**
+     * @brief 请求关闭：幂等、noexcept，任意线程可调用。
+     *
+     * 早于 run 的调用会让 run 完成启动后立即进入关闭序列。
+     */
     void request_shutdown() noexcept;
 
-    // 契约 F3：当前关闭状态。run 未开始/已结束分别报 Running/Closed。
+    /**
+     * @brief 当前关闭状态。
+     *
+     * 尚未运行时为 Running；提前请求关闭后为 Closing。
+     * run 生命周期已进入后，在关闭期间反映生命周期状态（可能为 ShutdownIncomplete）；
+     * 正常关闭或 HostLifecycle 启动失败完成后为 Closed。run 前配置校验拒绝时，
+     * lifecycle 尚未建立，状态保持此前的 Running 或提前请求后的 Closing。
+     */
     ShutdownState shutdown_state() const noexcept;
 
-    // 收尾未完成项与失败项观测（转发自生命周期状态机）。
+    /// @brief 收尾未完成项观测（转发自生命周期状态机）。
     std::vector<std::string> pending_cleanup() const;
+    /// @brief 启动/关闭阶段失败项观测（转发自生命周期状态机）。
     std::vector<std::string> lifecycle_failures() const;
 
-    // 默认宿主的实际绑定接入点（"host:port"）；仅默认装配路径有值，
-    // 未监听/测试缝 → 空串。
+    /**
+     * @brief 默认宿主的实际绑定接入点（"host:port"）。
+     *
+     * 仅默认装配路径有值；未监听/测试缝 → 空串。
+     */
     std::string bound_endpoint() const;
 
 private:
@@ -378,7 +422,7 @@ private:
 
     result<void> _ValidateConfig() const;   // run 前校验，不启动任何组件
     result<void> _BindServices();           // Scheduler::Start 后建立对象身份
-    // 资源生命周期（#8）：on_scheduler_started 相位内先 _StartResources
+    // on_scheduler_started 相位内先 _StartResources
     // （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
     // handler 排空后（on_handlers_drained）与回退路径（on_release）统一
     // 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。

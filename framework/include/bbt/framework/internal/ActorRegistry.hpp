@@ -38,9 +38,9 @@ public:
     template <class T>
     result<void> RegisterService(std::string service_name, std::size_t max_actors) {
         static_assert(std::is_base_of_v<ICoService, T>,
-            "ActorRegistry::RegisterService: T 必须继承 ICoService");
+            "ActorRegistry::RegisterService: T must derive from ICoService");
         static_assert(std::is_default_constructible_v<T>,
-            "ActorRegistry::RegisterService: T 必须默认可构造");
+            "ActorRegistry::RegisterService: T must be default constructible");
         return RegisterFactory(std::move(service_name),
             []() -> std::shared_ptr<ICoService> {
                 return std::static_pointer_cast<ICoService>(

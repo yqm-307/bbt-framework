@@ -9,15 +9,19 @@ add_library(bbt_framework STATIC
     actor/ActorRegistry.cc
     actor/OrderedSession.cc
     actor/OrderedIngress.cc
+    host/App.cc
     host/CallOptionsAdapter.cc
-    host/RequestScope.cc
     host/CoApp.cc
     host/CoServiceCall.cc
     host/HostLifecycle.cc
     host/InboundDispatcher.cc
     host/InfraHttpHost.cc
+    host/Object.cc
+    host/Registry.cc
+    host/RequestScope.cc
     host/ResourceClose.cc
-    host/RpcHttpBridge.cc)
+    host/RpcHttpBridge.cc
+    host/Service.cc)
 add_library(bbt::framework ALIAS bbt_framework)
 target_include_directories(bbt_framework PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>

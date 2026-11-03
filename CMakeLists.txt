@@ -95,6 +95,13 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     CoService.hpp
     CoRpc.hpp
     CoApp.hpp
+    Object.hpp
+    Address.hpp
+    Service.hpp
+    Component.hpp
+    Actor.hpp
+    App.hpp
+    V2.hpp
     Framework.hpp)
 # RedisNetResource.hpp 依赖新 net Redis 入口公开头（bbt::infra_redis_net
 # 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
@@ -143,9 +150,12 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/ActorMailbox.hpp
     internal/ActorRegistry.hpp
     internal/OrderedIngress.hpp
+    internal/Registry.hpp
     internal/RpcHttpBridge.hpp
     internal/CoAppSeam.hpp
-    internal/ResourceClose.hpp)
+    internal/ResourceClose.hpp
+    internal/ObjectBase.hpp
+    internal/ServiceBase.hpp)
 # Issue #4：正式 wire 桥头只在 protobuf 前缀锁定（infra 注册 bbt_infra_rpc_net）时
 # 进入自给自检；未配置时该头不参与（其 include 的上游头不可得）。
 if(TARGET bbt_infra_rpc_net)

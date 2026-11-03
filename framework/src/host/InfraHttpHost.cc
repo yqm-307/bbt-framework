@@ -131,7 +131,7 @@ result<void> InfraHttpHost::Create() {
     //   ProtoWireV1 → HttpRpcInboundTransport（HTTP/1.1 + protobuf body）
     //   TcpV1       → TcpRpcInboundTransport（u32be 长度前缀帧）
     if (m_state->rpc) {
-        auto engine = std::make_shared<bbt::infra::net::Engine>(
+        auto engine = bbt::infra::net::Engine::Create(
             std::shared_ptr<bbt::infra::net::RawHandler>{});
         std::shared_ptr<bbt::infra::rpc::IRpcInboundTransport> inbound;
         if (m_inbound_bridge == RpcInboundBridge::TcpV1) {
@@ -272,7 +272,7 @@ result<void> InfraHttpHost::Start() {
 
         // Engine::Run 占宿主专用 native 线程；Run 结果经 promise/future 跨线程
         // 发布（唯一同步口），Run 提前返回经 wait_for(0) 即刻可见——不复制
-        // error_code、不等满窗口（F4）。
+        // error_code、不等满窗口。
         auto [th, run_result] = StartEngineThread(engine, config);
         m_engine_thread = std::move(th);
         m_engine_result = std::move(run_result);
@@ -300,7 +300,7 @@ result<void> InfraHttpHost::Start() {
         // ProtoWireV1/TcpV1 出站不另建 server-side 资源：rpc::Client 经
         // HttpRpcTransport/TcpRpcTransport 借用本 Engine（Running 即可
         // CoDial）；egress_engine() 对本路径返回 m_engine——零额外驱动槽，
-        // 纯入站既有 worker 配置保持可启动（F2/F3）。
+        // 纯入站既有 worker 配置保持可启动。
         //
         // bound_address() 的就绪判据原子（server 已 Start + bound 已就位）。
         // net::Address::ToString() 已含端口，故主机部分沿用配置
@@ -338,7 +338,7 @@ result<void> InfraHttpHost::Start() {
     // profile——底座常备，代价固定为 1 个驱动槽 + 1 条 Run 线程。
     // 已装 server Engine（state->rpc）时跳过：egress_engine() 直接借用它。
     if (!state->rpc) {
-        auto engine = std::make_shared<bbt::infra::net::Engine>(
+        auto engine = bbt::infra::net::Engine::Create(
             std::shared_ptr<bbt::infra::net::RawHandler>{});
         bbt::infra::net::EngineConfig config;
         config.runtime_progress = bbt::infra::net::RuntimeProgress::Independent;
