@@ -58,6 +58,7 @@ PREPARE_PROTOBUF = os.path.join(WORKTREE, "scripts", "prepare_protobuf.sh")
 LOCAL_BUILD = os.path.join(WORKTREE, "scripts", "local_build.sh")
 BUILD_STACK = os.path.join(WORKTREE, "scripts", "build_stack.sh")
 RUN_CTEST = os.path.join(WORKTREE, "scripts", "run_ctest.sh")
+RUN_TEST_PROFILE = os.path.join(HERE, "run_test_profile.sh")
 VERIFY_TOOLCHAIN = os.path.join(WORKTREE, "scripts", "verify_toolchain.sh")
 DEPS_LOCK = os.path.join(WORKTREE, "deps.lock")
 TOOLCHAIN_LOCK = os.path.join(WORKTREE, "docker", "toolchain.lock")
@@ -173,7 +174,7 @@ def _verify_archive(archive, expected, dest, prefixes=(".ci-work", "boost-prefix
 class RecipeGuardTests(unittest.TestCase):
     def test_shell_recipes_parse(self):
         for path in (PREPARE_BOOST, GATE, FETCH_DEPS, PREPARE_PROTOBUF, LOCAL_BUILD,
-                     BUILD_STACK, RUN_CTEST, VERIFY_TOOLCHAIN):
+                     BUILD_STACK, RUN_CTEST, VERIFY_TOOLCHAIN, RUN_TEST_PROFILE):
             with self.subTest(path=os.path.basename(path)):
                 proc = run(["bash", "-n", path], env=ENV)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -672,17 +673,20 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
                 self.assertNotIn(forbidden, self.stripped)
 
     def test_preserves_build_test_gate_commands(self):
-        # 单 runner build_test 判据命令原样保留（deps/前缀/gate build/ctest
-        # 门禁/no-SKIP/链接来源）。跨 runner 专属的 exec-bit 恢复块已随
+        # 单 runner build_test 判据命令原样保留（deps/前缀/gate build/统一
+        # smoke profile 入口/链接来源）。跨 runner 专属的 exec-bit 恢复块已随
         # artifact 通路退役，不在本断言内。
         for needle in (
             "bash scripts/fetch_deps.sh",
             'bash scripts/prepare_protobuf.sh "$BBT_PROTOBUF_PREFIX"',
             'bash scripts/ci/prepare_boost.sh "$BOOST_PREFIX" --jobs "$BBT_JOBS"',
             "run_framework_gate.sh build",
-            'ctest --test-dir "$BBT_BUILD_DIR" -j1 --timeout 300 --output-on-failure --no-tests=error',
-            "100% tests passed, 0 tests failed",
-            "(Skipped|Not Run)",
+            "bash scripts/ci/run_test_profile.sh",
+            '--build-dir "$BBT_BUILD_DIR"',
+            "--profile smoke",
+            "--profile focused",
+            "--regex '${{ needs.changes.outputs.focused_regex }}'",
+            "needs.changes.outputs.focused_regex != ''",
             "rpc_xlang_server",
             "libboost_context",
         ):

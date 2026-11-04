@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -98,6 +99,89 @@ class ClassifyChangesTests(unittest.TestCase):
         self.assertEqual(
             changed_files.classify_status("ok", ["README.md"]), "docs-only"
         )
+
+
+def _registered_ctest_names():
+    """从本仓 CMake 源提取 add_test(NAME <name> ...) 注册名（离线，不需构建树）。"""
+    root = os.path.normpath(os.path.join(HERE, "..", ".."))
+    names = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if os.path.basename(dirpath).startswith(("build", ".git", "workspace")):
+            continue
+        for filename in filenames:
+            if filename != "CMakeLists.txt":
+                continue
+            with open(os.path.join(dirpath, filename), encoding="utf-8") as handle:
+                for match in re.finditer(
+                        r"add_test\s*\(\s*NAME\s+([A-Za-z0-9_.]+)", handle.read()):
+                    names.add(match.group(1))
+    return names
+
+
+class FocusedMapTests(unittest.TestCase):
+    """focused_regex 契约：路径→正则、无匹配→空串、映射名必须在 ctest 注册集内。"""
+
+    def test_every_mapped_name_is_registered_in_cmake(self):
+        registered = _registered_ctest_names()
+        self.assertTrue(registered, "CMake 注册集不应为空")
+        for prefix, tests in changed_files.FOCUSED_MAP:
+            for name in tests:
+                with self.subTest(prefix=prefix, name=name):
+                    self.assertIn(name, registered,
+                                  f"{prefix} 映射的 {name} 未在 CMake 注册")
+
+    def test_changed_files_to_expected_regex(self):
+        # 前缀是前缀匹配，父子前缀取并集：framework/src/host/ 命中 host 段
+        # 的同时也命中兜底段 framework/src/（rpc_surface/rpc_codec/rpc_profile）。
+        cases = {
+            ("framework/src/actor/ActorMailbox.cc",):
+                "^framework\\.actor_mailbox$|^framework\\.ordered_egress$|"
+                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_http$|"
+                "^framework\\.rpc_codec$|^framework\\.rpc_profile$|"
+                "^framework\\.rpc_surface$",
+            ("framework/src/CoApp.cc",):
+                "^framework\\.rpc_codec$|^framework\\.rpc_profile$|"
+                "^framework\\.rpc_surface$",
+            ("framework/src/host/CoApp.cc",
+             "framework/src/actor/ActorMailbox.cc"):
+                "^framework\\.actor_mailbox$|^framework\\.close_gate$|"
+                "^framework\\.coapp_lifecycle$|^framework\\.egress_request_phase$|"
+                "^framework\\.inbound_http$|^framework\\.ordered_egress$|"
+                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_http$|"
+                "^framework\\.request_context$|^framework\\.resource_lifecycle$|"
+                "^framework\\.rpc_codec$|^framework\\.rpc_profile$|"
+                "^framework\\.rpc_surface$|^framework\\.shutdown$",
+            ("examples/getvalue/getvalue_server.cc",):
+                "^examples\\.getvalue\\.s2s$|^examples\\.getvalue\\.xlang$|"
+                "^framework\\.getvalue_codec$|^framework\\.rpc_matrix$",
+            ("examples/dual_service/driver_main.cc",):
+                "^examples\\.getvalue\\.s2s$|^examples\\.getvalue\\.xlang$",
+        }
+        for paths, expected in cases.items():
+            with self.subTest(paths=paths):
+                self.assertEqual(changed_files.focused_regex(list(paths)), expected)
+
+    def test_unmatched_paths_yield_empty_string(self):
+        for paths in (["docs/guides/ci.md"], ["README.md"],
+                      [".github/workflows/ci.yml"], ["scripts/ci/result.py"],
+                      ["deps.lock"], []):
+            with self.subTest(paths=paths):
+                self.assertEqual(changed_files.focused_regex(paths), "")
+
+    def test_regex_matches_exact_test_names(self):
+        # 生成的正则必须精确锚定 ctest 名：re.fullmatch 通过、不匹配相似名。
+        # examples/two_service/ 同时命中兜底段 examples/，正则含三段 alternation。
+        regex = changed_files.focused_regex(["examples/two_service/x.cc"])
+        self.assertEqual(
+            regex,
+            "^examples\\.getvalue\\.s2s$|^examples\\.getvalue\\.xlang$|"
+            "^examples\\.two_service$")
+        for name in ("examples.two_service", "examples.getvalue.s2s",
+                     "examples.getvalue.xlang"):
+            with self.subTest(name=name):
+                self.assertRegex(name, regex)
+        self.assertNotRegex("examples.two_service_extra", regex)
+        self.assertNotRegex("framework.rpc_surface", regex)
 
 
 class ChangedFilesRoutingTests(unittest.TestCase):

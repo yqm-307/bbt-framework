@@ -69,7 +69,8 @@ cmake --build build --parallel 2 --target \
   Test_framework_getvalue_codec Test_framework_rpc_matrix rpc_xlang_server \
   getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture
 
-# 测试一律 ctest -j1；本地用 smoke label 跑快速集，全量走 PR CI。
+# 测试一律经统一 profile 入口（run_test_profile.sh，内部 ctest -j1）；
+# 本地 smoke/focused 快速集，全量走发布/手动入口；PR CI 为 smoke + 必要 focused。
 ctest --test-dir build -j1 -L smoke --output-on-failure
 ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
 ```
@@ -158,3 +159,4 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
   [`examples/rpc_policy/README.md`](examples/rpc_policy/README.md)
 - Agent 协作与门禁：[`AGENTS.md`](AGENTS.md)
 - CI 说明：[`docs/guides/ci.md`](docs/guides/ci.md)
+- 测试规范：[`docs/guides/testing.md`](docs/guides/testing.md)

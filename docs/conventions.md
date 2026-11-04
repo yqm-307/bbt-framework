@@ -127,7 +127,7 @@ cmake/                 CMake 模块
 ## 10. CI 骨架
 
 - `changes` 在本仓 workflow 内完成路径分类；不引入共享 classify/result callee 链。
-- `build-test` 在 `ubuntu-24.04` 上执行 Release 构建及 `ctest -L "smoke|unit"`。
+- `build-test` 在 `ubuntu-24.04` 上执行 Release 构建及 smoke profile 测试（`scripts/ci/run_test_profile.sh --profile smoke`，即 `-L smoke`；`changes` 的 `focused_regex` 非空时同一构建树追加 `--profile focused`，映射表 `FOCUSED_MAP` 在 `changed_files.py`；`smoke`/`focused`/`full` profile 语义与执行契约见 `docs/guides/testing.md`）。
 - 仓库专属 job：coroutine 的 perf；infra 的 live（Redis/Mongo 分开成 job）；framework 的 consume 验证。
 - `result` 汇总并作为唯一 required check。docs-only PR 只运行 `docs-check`。
 - 普通 CI 固定使用 `ubuntu-24.04`，不使用浮动 `ubuntu-latest`；ARC 仅用于 perf 和 memcheck。

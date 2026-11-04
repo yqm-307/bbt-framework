@@ -8,16 +8,18 @@
 
 | 文件 | 作用 |
 |---|---|---|
-| `.github/workflows/ci.yml` | 普通 CI 唯一入口：`changes → docs_check → build_test → result` 四个 hosted job（`ubuntu-24.04`）。`build_test` 在单 runner 内完成 Release 构建与全量 CTest，不跨 runner 传归档；`workflow_dispatch` 仅用于手动重跑同一普通流程 |
+| `.github/workflows/ci.yml` | 普通 CI 唯一入口：`changes → docs_check → build_test → result` 四个 hosted job（`ubuntu-24.04`）。`build_test` 在单 runner 内完成 Release 构建 + smoke profile 测试（必要时同一构建树追加 focused），不跨 runner 传归档；`workflow_dispatch` 仅用于手动重跑同一普通流程 |
 | `.github/workflows/manual.yml` | 手动任务（仅 `workflow_dispatch`，非 required）：`toolchain-verify` 与 `resource-acceptance`（`arc-s4-framework`），见 §7 |
-| `scripts/ci/changed_files.py` | 从真实 git diff 归一受限变更集，并完成路径分类（本仓内联，见 §2） |
+| `scripts/ci/changed_files.py` | 从真实 git diff 归一受限变更集，完成路径分类（本仓内联，见 §2），并按 `FOCUSED_MAP` 前缀映射产出 `focused_regex`（见 §5 必要 focused） |
 | `scripts/ci/result.py` | result job 的本仓内联汇总：needs.*.result → verdict，fail-closed（见 §3） |
 | `scripts/ci/prepare_boost.sh` | 按锁定版本/sha256 源码构建 Boost 1.90 `context` 到工作区私有前缀 |
 | `scripts/ci/run_framework_gate.sh` | `build` 子命令承载 build_test 的「构建+门禁+provenance+封包」；`verify-archive` 接收侧子命令仍在仓内（sha256 校验+闭集/穿越/symlink 门禁+安全解包），当前普通 workflow 无跨 runner 传递，不由其调用 |
 | `scripts/ci/check_docs.py` | docs-check：相对链接有效、docs 文件名无过程编号、README 行数上限 |
 | `scripts/ci/check_format_diff.sh` | 只检查本 PR 改动行的 clang-format 违规（changes 内 `continue-on-error`，告警不阻断） |
+| `scripts/ci/run_test_profile.sh` | 统一测试执行入口：按 profile 选集（`smoke`/`focused`/`full`）→ 注册集=实跑集校验 → skipped/Not Run/failure/error 一律失败；build_test 经其跑 `--profile smoke`，`focused_regex` 非空时追加 `--profile focused`，与 bbtools-infra / bbtools-coroutine 同一份脚本（逐字节相同） |
 | `scripts/ci/test_changed_files.py` | 分类规则 + result 契约单测（仅标准库） |
 | `scripts/ci/test_check_docs.py` | check_docs 正反例单测 |
+| `scripts/ci/test_test_profile.py` | run_test_profile.sh 离线契约测试（选集映射、fail-closed、实跑集对账） |
 | `scripts/ci/test_formal_ci.py` | 现役 workflow 的离线冒烟与文本/结构契约测试 |
 
 **分类/结果已本仓内联**：原共享 `bbtools-classify-v1` / `bbtools-verify-v1` reusable
@@ -59,8 +61,9 @@ workflows、纯 md、混合、空集、非 ok 状态）。
 
 ## 4. build_test 单 runner 内执行
 
-`build_test` 在**同一台** hosted runner（`ubuntu-24.04`）内完成构建、门禁与测试，
-构建树不离开该 runner，不再经 artifact 在 job 间传递：
+`build_test` 在**同一台** hosted runner（`ubuntu-24.04`）内完成构建、门禁与
+smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追加一次
+`--profile focused`），构建树不离开该 runner，不再经 artifact 在 job 间传递：
 
 - **Boost runtime 私有前缀**：`prepare_boost.sh` 把锁定 Boost 1.90 `context` 编到
   工作区 `boost-prefix`；测试经 `LD_LIBRARY_PATH` 指向该前缀，`ldd` 断言
@@ -75,8 +78,15 @@ workflows、纯 md、混合、空集、非 ok 状态）。
 
 ## 5. 门禁清单（不得放宽）
 
-- **no-SKIP**：ctest 输出命中 `Skipped|Not Run` 即失败；并要求
-  `100% tests passed, 0 tests failed`。
+- **smoke profile**：CTest 步走 `scripts/ci/run_test_profile.sh --profile smoke`——
+  选集即 `-L smoke`，脚本内 fail-closed：选集为空、注册集≠实跑集、任一
+  skipped/Not Run/failure/error 皆非零退出（判据与旧内联 no-SKIP 门禁同口径，
+  实跑对账由 JUnit XML 校验承担）。
+- **必要 focused**：`changed_files.py` 按仓内「路径前缀 → ctest 测试名」映射
+  （`FOCUSED_MAP`，覆盖 `framework/src/**` 与 `examples/**` 全部源码模块）产出
+  `focused_regex`；非空时 build_test 在同一构建树追加
+  `run_test_profile.sh --profile focused --regex <regex>`，空串则该步显式跳过。
+  focused 是 smoke 之外的增量加强，选集/对账/失败判据与 smoke 同一脚本契约。
 - **来源门禁**：`link-sources.txt` 命中 `/usr/local/` 即失败；`build_stack.sh`
   做 `deps.lock` 逐条 SHA 对账。
 - **dual-service 负向门禁**：默认构建树必须保持
@@ -97,15 +107,19 @@ workflows、纯 md、混合、空集、非 ok 状态）。
 
 ## 6. 测试数（当前注册面）
 
-`-DNEED_TEST=ON` 且 `bbt_infra_rpc_net` 注册时的默认配置共注册 **21** 个 CTest：
+`-DNEED_TEST=ON` 且 `bbt_infra_rpc_net` 注册时的默认配置共注册 **22** 个 CTest：
 
-`tests/`（16）与 `examples/`（5）。ctest 名均为 `<module>.<行为>` 形式
-（`framework.*`、`examples.*`）；`smoke` label 覆盖 15 个非 live 用例
-（`framework.shutdown` 只标 `integration`），5 个 `examples.*` 用例标
-`integration`（跨进程真实协作，非冒烟）。`framework.resource_live_{redis,mongo,
-combined}` 仅在 infra 相应目标在场时注册，默认配置不产生 SKIP。
+`tests/`（17）与 `examples/`（5）。ctest 名均为 `<module>.<行为>` 形式
+（`framework.*`、`examples.*`）。普通 CI 固定跑 **smoke profile**（`-L smoke`，
+15 项：unit + 快速 integration）+ **必要 focused**（`focused_regex` 命中的
+直接耦合用例，可含非 smoke 项）；`framework.shutdown`（单用例实测 ~30s、
+全套 ~107s）与 `framework.rpc_profile` 只标 `integration`，5 个 `examples.*`
+用例标 `integration`（跨进程真实协作，非冒烟）——均不进普通 smoke。
+`framework.resource_live_{redis,mongo,combined}` 仅在 infra 相应目标在场时
+注册（`live` label，默认配置不产生）。
 测试命名、label 语义与条件 target 的完整契约以 `tests/CMakeLists.txt` 与
-`docs/conventions.md` §6 为准。
+`docs/guides/testing.md`（测试规范，落实三仓统一分层）为准；全量/focused
+执行入口见该文档。
 
 ## 7. 手动任务（manual.yml，非 required，仅 workflow_dispatch）
 
@@ -140,6 +154,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/ci/test_check_docs.py
 # 现役 workflow 文本契约 + archive 接收侧门禁冒烟（stdlib 恒跑；PyYAML 结构契约
 # 在无 PyYAML 时显式 SKIP）
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/ci/test_formal_ci.py
+
+# run_test_profile.sh 离线契约测试
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/ci/test_test_profile.py
 
 # docs-check 本仓自检
 python3 -I scripts/ci/check_docs.py --root . --readme-max 200
