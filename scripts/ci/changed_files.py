@@ -7,7 +7,9 @@
 
 只做两件事：
 1. 把「真实仓库 diff」归一为仓库相对路径列表 + 有界事件对象；
-2. 按本仓分类规则把变更集判为 docs-only / code / unknown。
+2. 按本仓分类规则把变更集判为 docs-only / code / unknown，
+   并按仓内「路径前缀 → ctest 测试名」映射产出 focused 测试名正则
+   （无匹配输出空串，下游据此决定是否在 smoke 之后追加 focused profile）。
 
 分类规则（路径 → doc | code；全集 doc 才判 docs-only，其余一律 code）：
 - `CMakeLists.txt`、`.github/workflows/**`、`*.cmake`、`*.py` 一律判 code
@@ -27,7 +29,8 @@
   （classification=unknown→执行全部），**不裁剪成假子集**。
 
 输出（写入 `$GITHUB_OUTPUT`，未设置时写 stdout，便于离线冒烟）：
-  changed_files_json, classifier_status, classification, event_json
+  changed_files_json, classifier_status, classification, event_json,
+  focused_regex
 
 环境输入（由 workflow 注入；离线冒烟可用同名 env 覆盖）：
   EVENT_NAME, BASE_REF, SHA, BEFORE, REF_NAME, GITHUB_OUTPUT
@@ -89,6 +92,61 @@ def classify_status(status: str, changed_files) -> str:
     if status != "ok":
         return "unknown"
     return classify_changes(changed_files)
+
+
+# ---- affected path → focused ctest 名映射（本仓内联；唯一真源即本表，
+# 配套单测 test_changed_files.py 校验每个映射名都在当前 ctest 注册集内）----
+# 前缀按本仓源码模块划分（framework/src/<area>/、examples/<name>/），
+# 值是该模块直接耦合的 ctest 名列表（与 tests/CMakeLists.txt 的 add_test 名一一
+# 对应）。同一变更集命中多条前缀时取并集；无命中 → 空集 → 下游不追加 focused 步。
+# 维护规则：新增源码模块/ctest 注册名时必须同步本表；docs/CI 配置文件不进表。
+FOCUSED_MAP = (
+    ("framework/src/actor/",
+     ("framework.actor_mailbox", "framework.ordered_egress",
+      "framework.ordered_ingress", "framework.ordered_ingress_http")),
+    ("framework/src/host/",
+     ("framework.coapp_lifecycle", "framework.inbound_http",
+      "framework.request_context", "framework.close_gate",
+      "framework.resource_lifecycle", "framework.shutdown",
+      "framework.egress_request_phase")),
+    ("framework/src/",
+     ("framework.rpc_surface", "framework.rpc_codec",
+      "framework.rpc_profile")),
+    ("framework/include/",
+     ("framework.rpc_surface", "framework.rpc_codec",
+      "framework.coapp_lifecycle", "framework.resource_lifecycle")),
+    ("tests/",
+     ("framework.rpc_xlang", "framework.rpc_profile",
+      "framework.getvalue_codec", "framework.rpc_matrix")),
+    ("examples/getvalue/",
+     ("framework.getvalue_codec", "framework.rpc_matrix",
+      "examples.getvalue.xlang", "examples.getvalue.s2s")),
+    ("examples/two_service/", ("examples.two_service",)),
+    ("examples/rpc_policy/", ("examples.rpc_policy",)),
+    ("examples/lifecycle_matrix/", ("examples.lifecycle_matrix",)),
+    # dual_service 示例无独立 ctest 注册（run_acceptance.sh 走 manual.yml 的
+    # resource-acceptance），改动它时回退跑 getvalue 切片守护装配回归。
+    ("examples/",
+     ("examples.getvalue.xlang", "examples.getvalue.s2s")),
+)
+
+
+def focused_names(changed_files) -> set:
+    """变更文件 → 直接耦合的 focused ctest 名集合（前缀命中取并集）。"""
+    names = set()
+    for path in changed_files or ():
+        for prefix, tests in FOCUSED_MAP:
+            if path.startswith(prefix):
+                names.update(tests)
+    return names
+
+
+def focused_regex(changed_files) -> str:
+    """变更文件 → ctest -R 正则（'^a\\.b$|^c\\.d$' 形）；无匹配 → ''。"""
+    return "|".join(
+        "^" + name.replace(".", "\\.") + "$"
+        for name in sorted(focused_names(changed_files))
+    )
 
 
 # ---- 真实 diff 归一 ----
@@ -160,6 +218,10 @@ def main() -> int:
     emit("classifier_status", status if status == "ok" else "unknown")
     emit("classification", classification)
     emit("event_json", json.dumps(bounded_event(), ensure_ascii=False))
+    # focused 正则只在变更集真实已知时产出；unknown/超预算回退集为空 →
+    # 空串，下游不追加 focused 步（unknown 已由 build_test 整 job 强跑兜底，
+    # smoke 全量必跑，focused 只作增量加强而非放行依据）。
+    emit("focused_regex", focused_regex(files if status == "ok" else []))
     return 0
 
 

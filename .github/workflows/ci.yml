@@ -1,10 +1,13 @@
 # bbt-framework 正式普通 CI（唯一权威普通入口）。骨架（方案 §2.7）：
-# changes → docs-check → build-test（Release 构建 + ctest，ubuntu-24.04）→ result。
+# changes → docs-check → build-test（Release 构建 + smoke profile 测试 +
+# 必要 focused，ubuntu-24.04）→ result。
 # 分类与结果判定本仓内联（scripts/ci/changed_files.py + scripts/ci/result.py），
 # classify/result callee 链已删除；单 runner 内联执行，不再跨 runner 传归档。
 # 判据保留：deps.lock 固定 SHA、锁定 protobuf/Boost 私有前缀、dual-service 负向门禁、
-# 链接来源证据、ctest -j1 --timeout 300 --output-on-failure --no-tests=error + SKIP 门禁、
-# ldd 来源核查、provenance（manifest+envelope，真实字节 sha256）由 gate build 内联产出。
+# 链接来源证据、run_test_profile.sh --profile smoke（-L smoke + 注册集=实跑集 +
+# skipped/Not Run/failure/error 一律失败）+ 必要 focused（changes 的
+# focused_regex 非空时同一构建树追加 --profile focused）、ldd 来源核查、
+# provenance（manifest+envelope，真实字节 sha256）由 gate build 内联产出。
 # required check 唯一落点 result job；手动任务（toolchain-verify/resource-acceptance）
 # 非 required 原样保留；clang-format 改动行检查在 changes 内 continue-on-error（先非必需）。
 name: ci
@@ -47,6 +50,7 @@ jobs:
       classifier_status: ${{ steps.diff.outputs.classifier_status }}
       classification: ${{ steps.diff.outputs.classification }}
       event_json: ${{ steps.diff.outputs.event_json }}
+      focused_regex: ${{ steps.diff.outputs.focused_regex }}
     steps:
       - name: "拉取代码库（含历史，供三点 diff）"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -100,6 +104,8 @@ jobs:
 
   # 重型构建+测试（单 hosted runner）：code/unknown 才跑，docs-only 显式跳过。
   build_test:
+    # display name 保持远端 required check 现役值；profile 内部仍以 ctest -j1
+    # 统一入口执行（smoke + 必要 focused），名称不含 profile 描述不失真。
     name: "Build + Test (pinned deps, ctest -j1)"
     needs: [changes]
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.classification != 'docs-only' }}
@@ -204,7 +210,7 @@ jobs:
             exit 7
           fi
 
-      - name: "CTest (镜像 scripts/run_ctest.sh 门禁 + --timeout 300)"
+      - name: "CTest smoke profile (run_test_profile.sh)"
         run: |
           # ctest 子进程继承本 step 环境，先剔除 /usr/local（RUNPATH 救不回来）。
           if [ -n "${LD_LIBRARY_PATH:-}" ]; then
@@ -212,20 +218,29 @@ jobs:
             export LD_LIBRARY_PATH
           fi
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}"
-          set +e
-          ctest --test-dir "$BBT_BUILD_DIR" -j1 --timeout 300 --output-on-failure --no-tests=error | tee "$BBT_BUILD_DIR/ctest.log"
-          rc=${PIPESTATUS[0]}
-          set -e
-          # 只认 ctest 自身的结果行，同时要求 100% 全绿。
-          if grep -Eq '^[ ]*[0-9]+/[0-9]+ Test #[0-9]+:.*\*\*\*(Skipped|Not Run)' "$BBT_BUILD_DIR/ctest.log"; then
-            echo "FATAL: 检测到 SKIP/Not Run，禁止报全绿" >&2
-            exit 8
+          # 统一 profile 入口：-L smoke 选集 → 注册集=实跑集校验 →
+          # skipped/Not Run/failure/error 一律失败（脚本内 fail-closed，
+          # 空选集同样非零退出）。
+          bash scripts/ci/run_test_profile.sh \
+            --build-dir "$BBT_BUILD_DIR" \
+            --profile smoke \
+            --timeout 300
+
+      - name: "CTest focused profile (run_test_profile.sh, 必要追加)"
+        # 同一构建树内追加必要 focused：changes 按「路径前缀→ctest 名」映射
+        # 产出 focused_regex；空串（无映射命中，如纯 docs/CI 配置改动）不执行本步。
+        if: ${{ needs.changes.outputs.focused_regex != '' }}
+        run: |
+          # 与 smoke 步同口径剔除 /usr/local（本 step 独立环境）。
+          if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            LD_LIBRARY_PATH="$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -vE '^/usr/local(/|$)' | paste -sd: -)"
+            export LD_LIBRARY_PATH
           fi
-          if ! grep -Eq '100% tests passed, 0 tests failed' "$BBT_BUILD_DIR/ctest.log"; then
-            echo "FATAL: 未达成 100% 全绿" >&2
-            exit 8
-          fi
-          exit "$rc"
+          bash scripts/ci/run_test_profile.sh \
+            --build-dir "$BBT_BUILD_DIR" \
+            --profile focused \
+            --regex '${{ needs.changes.outputs.focused_regex }}' \
+            --timeout 300
 
       - name: "Cleanup workspace"
         if: always()

@@ -8,7 +8,11 @@
 #   unit        纯语义/状态机断言，无 socket
 #   integration 真实 loopback 或多组件协作，不依赖外部服务
 #   live        需要真实 Redis/Mongo 等外部服务（本地不注册）
-#   smoke       构建后快速可用性子集（unit + 快速 integration）
+#   smoke       构建后快速可用性子集（unit + 快速 integration）——
+#               普通 PR CI 经 scripts/ci/run_test_profile.sh --profile smoke
+#               只跑本 label；长时 integration（如 framework.shutdown ~107s）
+#               与 examples.* 不标 smoke，归 full/focused 入口。
+#               profile/分层契约见 docs/guides/testing.md。
 
 # framework v2 最小核心切片：CoApp 唯一根与生命周期、Service/Component/
 # Actor 受控构造与 Install/Uninstall、BindComponent/Borrow/Unbind 与
