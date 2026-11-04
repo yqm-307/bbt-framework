@@ -73,3 +73,6 @@ Testing/
 
 # CI 临时依赖树（scripts/fetch_deps.sh 默认落到仓库外 ../deps）
 .deps/
+
+# VSCode 本地工作区文件（含本机绝对路径与个人配置，不入仓）
+*.code-workspace
