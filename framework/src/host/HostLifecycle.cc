@@ -91,18 +91,33 @@ void HostLifecycle::_WaitShutdownRequest() {
 
 int HostLifecycle::_ShutDown(const Hooks& hooks) {
     _SetPhase(Phase::Closing);
+    bool interrupted = false;
 
     if (m_host_created.load(std::memory_order_acquire)) {
         // 顺序：StopAccepting → 等 handler 结束 → 资源同步 Close 挂接点 →
         // 网络同步 Close。排空未被证实（预算耗尽后的无界续等仍失败，或排空
         // 返回非超时错误）时绝不进入后三步——保留 owner/资源、不释放、不返回。
         m_host->StopAccepting();
-        if (!_WaitHandlersDone())
+        switch (_WaitHandlersDone()) {
+        case DrainOutcome::Undrained:
             _ParkUndrained();  // 永不返回：fail-closed 保活 ShutdownIncomplete
-        _OnHandlersDrained(hooks);
+            break;
+        case DrainOutcome::Interrupted:
+            // Close 打断：handler 可能仍在借用业务对象，不发「已排空」信号
+            // （on_handlers_drained 跳过），只走网络关闭与 release 兜底。
+            interrupted = true;
+            _AddFailure("WaitHandlersDone: interrupted by host close");
+            break;
+        case DrainOutcome::Drained:
+            _OnHandlersDrained(hooks);
+            break;
+        }
         m_host->Close();   // noexcept：同步返回即物理资源已释放
     }
-    // 业务对象回收在网络 Close 之后、run 返回之前。
+    // 业务对象回收在网络 Close 之后、run 返回之前。关闭打断时 handlers
+    // 可能仍在运行：_ReleaseServices 放弃运行时状态对注册表/实例/方法表的
+    // 引用（见 CoApp::_ReleaseServices → AppRuntimeState::Release）；在途
+    // handler 闭包与分发表项强持有其访问的全部对象，不借用 CoApp 成员。
     if (hooks.on_release) {
         try {
             hooks.on_release();
@@ -113,18 +128,27 @@ int HostLifecycle::_ShutDown(const Hooks& hooks) {
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_failures.empty())
+        if (!m_failures.empty()) {
+            // 关闭打断不算「排空失败」：物理收束已完成，只是 handler 未证实
+            // 排空；曾耗尽预算时按迟到收尾报告，否则按失败项报告。
+            if (interrupted && m_exceeded_budget.load(std::memory_order_acquire))
+                return kExitShutdownLate;
             return kExitShutdownFailed;
+        }
     }
     return m_exceeded_budget.load(std::memory_order_acquire)
                ? kExitShutdownLate
                : kExitOk;
 }
 
-bool HostLifecycle::_WaitHandlersDone() {
+HostLifecycle::DrainOutcome HostLifecycle::_WaitHandlersDone() {
     auto r = m_host->WaitHandlersDone(_StepDeadline());
     if (r)
-        return true;   // 排空已被证实
+        return DrainOutcome::Drained;   // 排空已被证实
+    // 「宿主已 Close」是明确状态（CloseReason 已发布），不是靠错误码猜测：
+    // 自定义关闭原因可能是任意 code。被打断就不再 park，交由调用方收束。
+    if (m_host->CloseReason())
+        return DrainOutcome::Interrupted;
     // 非预算性排空错误同样是「排空未被证实」：保留原始错误可观察，绝不当作
     // 已排空（不得据此 Close/release）。预算耗尽（TimedOut）不算失败项。
     const bool timed_out = (r.error().code == ErrorCode::TimedOut);
@@ -138,12 +162,19 @@ bool HostLifecycle::_WaitHandlersDone() {
         _LeaveIncomplete("WaitHandlersDone");
         if (timed_out)
             m_exceeded_budget.store(true, std::memory_order_release);
-        return true;   // 迟到收尾完成 → 排空已证实，允许收束
+        return DrainOutcome::Drained;   // 迟到收尾完成 → 排空已证实
+    }
+    if (m_host->CloseReason()) {
+        // 续等期间被 Close：不按永久失败 park；预算耗尽过则仍记迟到收尾。
+        _LeaveIncomplete("WaitHandlersDone");
+        if (timed_out)
+            m_exceeded_budget.store(true, std::memory_order_release);
+        return DrainOutcome::Interrupted;
     }
     // 续等仍失败：永久性排空失败。保持 ShutdownIncomplete（保留 owner/资源），
-    // 返回 false 由调用方 fail-closed；不再次调用形成忙循环。
+    // 返回 Undrained 由调用方 fail-closed；不再次调用形成忙循环。
     _AddFailure("WaitHandlersDone: " + r.error().message);
-    return false;
+    return DrainOutcome::Undrained;
 }
 
 void HostLifecycle::_ParkUndrained() {

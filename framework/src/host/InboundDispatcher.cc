@@ -320,10 +320,10 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         }
         WaitOptions wo;
         wo.deadline = ctx->deadline;
-        // method 指向 CoApp::m_services 内的 RpcMethod；网络 handler
-        // 超时后，邮箱 drain 仍可能在 run 收束后继续执行，不能把该裸指针
-        // 带过 _ReleaseServices。方法描述是不可变且可复制的，按值封装进
-        // 任务，连同 inst 的 shared_ptr 一起保证迟到任务不悬空。
+        // method 指向分发表项共享的 RpcMethodTable（AppRuntimeState 持有）；
+        // 网络 handler 超时后，邮箱 drain 仍可能在 run 收束后继续执行，不能把
+        // 该裸指针带过 Release。方法描述是不可变且可复制的，按值封装进任务，
+        // 连同 inst 的 shared_ptr 一起保证迟到任务不悬空。
         RpcMethod method_copy = *method;
         const WaitStatus st = waiter->WaitWithCallback(wo, [&]() -> bool {
             auto enq = mailbox->TryEnqueue(

@@ -3,7 +3,7 @@
 //
 // 只用公开面：CoApp 装配的显式静态路由 + CoService + ICoService::call<Req,Resp>
 // （typed 出站 seam，schema 由生成物 descriptor 推导）。业务不接触 envelope/
-// codec/发送注入点/HttpClient。
+// codec/发送注入点/http::Client。
 //
 // 四个方法承载不同真实出站场景（供跨进程 driver 断言）：
 //   Forward          —— 正常 typed call（预算继承父请求，不放大）

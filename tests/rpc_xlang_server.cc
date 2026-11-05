@@ -1,7 +1,7 @@
 // RpcEnvelope wire profile 的跨语言互通 C++ 服务端。
 //
 // 消费 bbt::infra_rpc_net（正式 wire profile，新 bbt::infra::http
-// 栈绑定）+ 旧栈 bbt::infra_http（BBT_INFRA_LEGACY_STACK 保留的 ListenHttp），
+// 栈绑定）与 bbt::infra_http_net，
 // 提供多场景 RPC 端点供非 C++ 客户端（tests/rpc_xlang_client.py）经
 // 真实 HTTP loopback 调用。argv 分流：
 //   <bin> server <port_file>
@@ -16,10 +16,7 @@
 // 由 ParseRpcWireHttpRequest/DecodeRpcWireEnvelope 在 adapter 内拒绝，
 // 本服务把该 Error 原样装入 error envelope 返回，不让协议错误丢失。
 //
-// 移植说明：上游 RPC core 已迁到新 http 栈，wire 绑定类型是
-// http::IncomingRequest/http::Response；本服务继续使用旧栈 ListenHttp
-// （旧 HttpRequest/HttpResponse），在边界做逐字段值转换（method/target/
-// headers/body 一一对应；旧栈 server 侧 url 即 origin-form target）。
+// 入站直接使用新 HTTP 值类型与宿主的有序关闭序列。
 
 #include <chrono>
 #include <cstdio>
@@ -42,8 +39,8 @@
 #include <bbt/coroutine/io/IoExecutor.hpp>
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 
-#include <bbt/infra/HttpServer.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Server.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/http/Server.hpp>
@@ -57,8 +54,7 @@ namespace {
 
 constexpr std::size_t kTestMaxBody = 64 * 1024;
 
-std::shared_ptr<NetworkRuntime> g_runtime;
-std::shared_ptr<HttpServer>     g_server;
+std::shared_ptr<bbt::framework::InfraHttpHost> g_host;
 
 // 把 wire 层错误包成 error envelope 返回（HTTP 200 + protobuf body）。
 // request_id 不可知时保留空字符串以外的尽力回填：协议要求 request_id
@@ -66,20 +62,7 @@ std::shared_ptr<HttpServer>     g_server;
 // remaining_budget_ms=0 在 G5 冻结契约中是非法值（编码端显式拒绝），
 // 错误回填路径取 1 保证 envelope 可编码；正常路径回显入站预算。
 //
-// 新栈 http::Response → 旧栈 HttpResponse 的边界值转换（status_code→status；
-// headers/body 同名透传）。wire 生成物只在 bbt::infra::http 类型上提供，
-// 旧栈出参在此一次性转回，不扩散两套值类型。
-result<HttpResponse> ToLegacyResponse(result<http::Response> wire) {
-    if (!wire)
-        return result<HttpResponse>::err(std::move(wire.error()));
-    HttpResponse out;
-    out.status  = static_cast<unsigned>(wire.value().status_code);
-    out.headers = std::move(wire.value().headers);
-    out.body    = std::move(wire.value().body);
-    return result<HttpResponse>::ok(std::move(out));
-}
-
-result<HttpResponse> ErrorEnvelopeResponse(const Error& e,
+result<http::Response> ErrorEnvelopeResponse(const Error& e,
                                            const std::string& request_id) {
     RpcWireEnvelope err_env;
     err_env.request_id          = request_id.empty() ? "unparsed" : request_id;
@@ -88,19 +71,12 @@ result<HttpResponse> ErrorEnvelopeResponse(const Error& e,
     err_env.remaining_budget_ms = 1;
     err_env.success             = false;
     err_env.error               = e;
-    return ToLegacyResponse(MakeRpcWireHttpResponse(err_env));
+    return MakeRpcWireHttpResponse(err_env);
 }
 
-result<HttpResponse> XlangRpcHandler(IncomingCallContext ctx, HttpRequest req) {
+result<http::Response> XlangRpcHandler(IncomingCallContext ctx, http::IncomingRequest req) {
     (void)ctx;
-    // 旧栈 HttpRequest → 新栈 http::IncomingRequest（server 侧 url 即
-    // origin-form target；headers/body 同名透传）。
-    http::IncomingRequest incoming;
-    incoming.method  = req.method;
-    incoming.target  = req.url;
-    incoming.headers = req.headers;
-    incoming.body    = std::move(req.body);
-    auto parsed = ParseRpcWireHttpRequest(incoming);
+    auto parsed = ParseRpcWireHttpRequest(req);
     if (!parsed)
         return ErrorEnvelopeResponse(parsed.error(), "");
     const auto& in = parsed.value();
@@ -144,13 +120,13 @@ result<HttpResponse> XlangRpcHandler(IncomingCallContext ctx, HttpRequest req) {
 
     auto http = MakeRpcWireHttpResponse(out);
     if (!http)
-        return result<HttpResponse>::err(http.error());
-    return ToLegacyResponse(std::move(http));
+        return result<http::Response>::err(http.error());
+    return http;
 }
 
 void RuntimeSetup() {
     auto* cfg = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
-    cfg->m_cfg_static_thread_num = 2;
+    cfg->m_cfg_static_thread_num = 4;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
 
@@ -161,18 +137,23 @@ void RuntimeSetup() {
     limits.max_body_bytes   = kTestMaxBody;
     limits.incoming_timeout = std::chrono::milliseconds{5000};
 
-    auto rt = NetworkRuntime::Create(limits);
-    if (rt) {
-        g_runtime = std::move(rt).value();
-        g_runtime->Start();
+    g_host = std::make_shared<bbt::framework::InfraHttpHost>(limits, ListenAddress{"127.0.0.1", 0});
+    g_host->InstallHandler(XlangRpcHandler);
+    if (!g_host->Create() || !g_host->Start()) {
+        g_host->Close();
+        g_host.reset();
     }
 }
 
 void RuntimeTeardown() {
-    // infra 关闭是同步契约：Close() 返回即物理释放；runtime 是进程寿命
-    // 单例，无 Stop/restart。
-    if (g_server)  { g_server->Close(); g_server.reset(); }
-    if (g_runtime) { g_runtime->Close(); g_runtime.reset(); }
+    if (g_host) {
+        g_host->StopAccepting();
+        if (!g_host->WaitHandlersDone(std::chrono::steady_clock::now() + std::chrono::seconds{5}))
+            std::abort();
+        g_host->Close();
+        if (g_host->close_error()) std::abort();
+        g_host.reset();
+    }
 }
 
 } // namespace
@@ -181,13 +162,10 @@ int main(int argc, char* argv[]) {
     if (argc < 3 || std::strcmp(argv[1], "server") != 0)
         return 90;
     RuntimeSetup();
-    if (!g_runtime) return 3;
-    auto srv = g_runtime->ListenHttp({"127.0.0.1", 0}, XlangRpcHandler);
-    if (!srv) { RuntimeTeardown(); return 5; }
-    g_server = std::move(srv).value();
+    if (!g_host) return 3;
     {
         std::ofstream f(argv[2], std::ios::trunc);
-        f << g_server->LocalAddress().port;
+        f << g_host->bound_address()->port;
     }
     char buf[8];
     while (::read(STDIN_FILENO, buf, sizeof(buf)) > 0) {}

@@ -30,7 +30,7 @@
 //
 // 进程内单例 Scheduler 约束：同一时刻至多一个 CoApp 在 run 内（装配用例已冻结
 // 口径），故「在途 handler 出站」的对端不是第二个 CoApp，而是独立
-// NetworkRuntime 上的裸 HTTP echo peer——出站能力本身是证据对象，对端实现
+// net::Engine 上的裸 HTTP echo peer——出站能力本身是证据对象，对端实现
 // 形态无关。测试客户端同样使用独立 runtime。
 //
 // 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
@@ -59,14 +59,14 @@
 #include <bbt/coroutine/object/CoObject.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
-#include <bbt/infra/HttpClient.hpp>
-#include <bbt/infra/HttpServer.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Client.hpp>
+#include <bbt/infra/http/Server.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
 // T7(b)/T7c 的 raw-wire 回复解析边界值类型（ParseRpcWireHttpResponse 只接
-// 新栈 http::Response；发送仍走共享 HttpClient，仅做值转换）。
+// 新栈 http::Response；发送仍走共享 http::Client，仅做值转换）。
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/rpc/HttpTransport.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
@@ -447,7 +447,7 @@ struct RunHandle {
     int               rc{-1};
 };
 
-// 路由 endpoint 逻辑标记 → 对端真实地址的解析槽：NetworkRuntime::Create
+// 路由 endpoint 逻辑标记 → 对端真实地址的解析槽：InfraHttpHost::Create
 // 依赖已 Start 的调度器，echo peer 只能在 app 起来之后创建，其真实
 // endpoint 无法写进 run 前固定的 static_routes——路由白名单仍由
 // find_route 把关，发送闭包在发送时刻经此槽解析标记（同入站用例的
@@ -467,7 +467,7 @@ struct EndpointSlot {
 
 struct AppBox {
     std::shared_ptr<fw::InfraHttpHost>          host;
-    std::shared_ptr<std::shared_ptr<inf::HttpClient>> egress_slot;
+    std::shared_ptr<std::shared_ptr<inf::http::Client>> egress_slot;
     std::shared_ptr<EndpointSlot>               peer_ep;
     std::unique_ptr<fw::CoApp>                  app;
     std::unique_ptr<RunHandle>                  run;
@@ -499,7 +499,7 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
     box.host = std::make_shared<fw::InfraHttpHost>(
         limits, inf::ListenAddress{"127.0.0.1", 0});
     box.egress_slot =
-        std::make_shared<std::shared_ptr<inf::HttpClient>>();
+        std::make_shared<std::shared_ptr<inf::http::Client>>();
     box.peer_ep = std::make_shared<EndpointSlot>();
 
     fw::CoAppOptions opts;
@@ -530,8 +530,9 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
             return fw::result<inf::RpcEnvelope>::err(fw::MakeError(
                 fw::ErrorCode::RuntimeUnavailable,
                 "egress peer endpoint not installed"));
-        auto res = client->Request(
-            Wire::ToHttpRequest(env, "http://" + ep + "/rpc"), o);
+        auto prepared = Wire::ToHttpRequest(*client, env, "http://" + ep + "/rpc");
+        if (!prepared) return fw::result<inf::RpcEnvelope>::err(std::move(prepared.error()));
+        auto res = bbt_co_await client->Send(prepared.value(), o);
         if (!res)
             return fw::result<inf::RpcEnvelope>::err(
                 std::move(res.error()));
@@ -552,7 +553,8 @@ std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
     // Engine 槽（三仓迁移后 ProtoWireV1/TcpV1 出站经 rpc::Client + net::Engine
     // ——无 server Engine 可借的纯出站宿主无法再免槽）。进程内单例已在场时
     // 该配置只复用，故本设置必须在 Scheduler 首次 Start 前生效。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    // Registered driver capacity: app server 2 + app egress 1 + echo server 2 + echo egress 1 + test client 1 + runnable worker 1.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 8;
     // 受管 handler 的嵌套出站链（入站派发 → this->call → 出站适配 →
     // client->Request → 信号等待）在 12KB 默认栈触底（入站用例实测）；
     // 本文件同样含嵌套出站，沿用 64KB。
@@ -582,13 +584,9 @@ void LaunchApp(AppBox& box) {
         std::this_thread::yield();
     }
     BOOST_REQUIRE(box.app->shutdown_state() == fw::ShutdownState::Running);
-    auto egress = box.host->network_runtime()->CreateHttpClient();
-    if (!egress)
-        BOOST_TEST_MESSAGE("CreateHttpClient failed code="
-            << static_cast<int>(egress.error().code)
-            << " msg=" << egress.error().message);
-    BOOST_REQUIRE(egress);
-    *box.egress_slot = egress.value();
+    auto egress = box.host->http_client();
+    BOOST_REQUIRE_MESSAGE(egress, "host HTTP client unavailable");
+    *box.egress_slot = egress;
 }
 
 AppBox StartApp(std::chrono::milliseconds incoming_timeout,
@@ -601,11 +599,11 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
     return box;
 }
 
-// ── 测试客户端：独立 runtime + HttpClient（发往被测 app）──
+// ── 测试客户端：独立 runtime + http::Client（发往被测 app）──
 
 struct TestClient {
-    std::shared_ptr<inf::NetworkRuntime> rt;
-    std::shared_ptr<inf::HttpClient>     client;
+    std::shared_ptr<fw::InfraHttpHost> rt;
+    std::shared_ptr<inf::http::Client>     client;
 
     void Stop() {
         // infra 关闭是同步契约：Close() 返回即物理释放，无需等待收束。
@@ -616,13 +614,14 @@ struct TestClient {
 
 TestClient StartClient(inf::NetworkLimits limits) {
     TestClient c;
-    auto rt = inf::NetworkRuntime::Create(limits);
+    auto rt = std::make_shared<fw::InfraHttpHost>(limits, inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(rt);
-    c.rt = rt.value();
+    c.rt = rt;
+    BOOST_REQUIRE(c.rt->Create());
     BOOST_REQUIRE(c.rt->Start());
-    auto cl = c.rt->CreateHttpClient();
+    auto cl = c.rt->http_client();
     BOOST_REQUIRE(cl);
-    c.client = cl.value();
+    c.client = cl;
     return c;
 }
 
@@ -630,8 +629,8 @@ TestClient StartClient(inf::NetworkLimits limits) {
 //    （+100 证明回复确由对端处理产生，非本地伪造）。──
 
 struct EchoPeer {
-    std::shared_ptr<inf::NetworkRuntime> rt;
-    std::shared_ptr<inf::HttpServer>     server;
+    std::shared_ptr<fw::InfraHttpHost> rt;
+    std::shared_ptr<inf::http::Server>     server;
     std::string                          endpoint;
     std::atomic<int>                     hits{0};
 
@@ -643,33 +642,31 @@ struct EchoPeer {
 
 std::unique_ptr<EchoPeer> StartEchoPeer(inf::NetworkLimits limits) {
     auto p = std::make_unique<EchoPeer>();
-    auto rt = inf::NetworkRuntime::Create(limits);
+    auto rt = std::make_shared<fw::InfraHttpHost>(limits, inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(rt);
-    p->rt = rt.value();
-    BOOST_REQUIRE(p->rt->Start());
+    p->rt = rt;
     EchoPeer* pp = p.get();
-    auto srv = p->rt->ListenHttp(
-        inf::ListenAddress{"127.0.0.1", 0},
-        [pp](inf::IncomingCallContext, inf::HttpRequest req)
-            -> fw::result<inf::HttpResponse> {
+    p->rt->InstallHandler(
+        [pp](inf::IncomingCallContext, inf::http::IncomingRequest req)
+            -> fw::result<inf::http::Response> {
             pp->hits.fetch_add(1, std::memory_order_acq_rel);
             auto env = Wire::EnvelopeFromRequest(req);
             if (!env)
-                return fw::result<inf::HttpResponse>::ok(
+                return fw::result<inf::http::Response>::ok(
                     Wire::ToHttpResponse(
                         fw::result<inf::RpcEnvelope>::err(
                             std::move(env.error()))));
             auto decoded =
                 fw::CoRpcReq(env.value().payload).Parse<std::int32_t>();
             if (!decoded)
-                return fw::result<inf::HttpResponse>::ok(
+                return fw::result<inf::http::Response>::ok(
                     Wire::ToHttpResponse(
                         fw::result<inf::RpcEnvelope>::err(
                             std::move(decoded.error()))));
             auto encoded = fw::CoRpcResp::From(
                 decoded.value() + 100);
             if (!encoded.ok())
-                return fw::result<inf::HttpResponse>::ok(
+                return fw::result<inf::http::Response>::ok(
                     Wire::ToHttpResponse(
                         fw::result<inf::RpcEnvelope>::err(encoded.error())));
             inf::RpcEnvelope reply;
@@ -678,13 +675,15 @@ std::unique_ptr<EchoPeer> StartEchoPeer(inf::NetworkLimits limits) {
             reply.request_id      = env.value().request_id;
             reply.response_schema = env.value().response_schema;
             reply.payload         = encoded.payload();
-            return fw::result<inf::HttpResponse>::ok(
+            return fw::result<inf::http::Response>::ok(
                 Wire::ToHttpResponse(
                     fw::result<inf::RpcEnvelope>::ok(std::move(reply))));
         });
-    BOOST_REQUIRE(srv);
-    p->server = srv.value();
-    const auto bound = p->server->LocalAddress();
+    BOOST_REQUIRE(p->rt->Create());
+    BOOST_REQUIRE(p->rt->Start());
+    p->server = p->rt->http_server();
+    BOOST_REQUIRE(p->server);
+    const auto bound = *p->rt->bound_address();
     p->endpoint = bound.host + ":" + std::to_string(bound.port);
     return p;
 }
@@ -726,14 +725,15 @@ fw::result<std::int32_t> DecodeReply(
 
 // 在协程内向被测 app 发一条 envelope（client->Request 是协程阻塞调用）。
 fw::result<inf::RpcEnvelope> SendRpc(
-    const std::shared_ptr<inf::HttpClient>& client,
+    const std::shared_ptr<inf::http::Client>& client,
     const std::string& endpoint,
     const inf::RpcEnvelope& env,
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    auto res = client->Request(
-        Wire::ToHttpRequest(env, "http://" + endpoint + "/rpc"), o);
+    auto prepared = Wire::ToHttpRequest(*client, env, "http://" + endpoint + "/rpc");
+        if (!prepared) return fw::result<inf::RpcEnvelope>::err(std::move(prepared.error()));
+        auto res = bbt_co_await client->Send(prepared.value(), o);
     if (!res)
         return fw::result<inf::RpcEnvelope>::err(std::move(res.error()));
     return Wire::EnvelopeFromResponse(res.value());
@@ -785,7 +785,7 @@ fw::result<inf::RpcEnvelope> CallRpc(const TestClient& tc, const std::string& en
 }
 
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-// 经框架默认出站（ProtoWireV1 → HttpEgress::Send 共享 HttpClient + 公开
+// 经框架默认出站（ProtoWireV1 → HttpEgress::Send 共享 http::Client + 公开
 // RpcWire 编解码）真实 POST /rpc 到被测
 // app 的 RpcServer；在协程内调用（Send 是协程阻塞调用）。状态经 shared_ptr
 // 自持，超时不产生栈悬垂。
@@ -823,7 +823,7 @@ fw::result<inf::RpcEnvelope> SendWire(const std::shared_ptr<fw::InfraHttpHost>& 
 
 // T7(b) 紧**远端**预算负例：把「客户端整段等待期限」与「wire
 // remaining_budget_ms」解耦。经 infra 公开 wire 面（RpcWireEnvelope +
-// EncodeRpcWireEnvelope）手工构造 body，用真实 HttpClient::Request 直发被测
+// EncodeRpcWireEnvelope）手工构造 body，用真实 http::Client::Request 直发被测
 // app 的 RpcServer——仍是真实 socket + 真实 RPC 入站（HandleRpcRequest
 // 的接收端 local-min），但**明确不是框架出站**（框架出站正例见 T7(a) 的
 // SendWire → HttpEgress::Send ProtoWireV1）。client 期限取长（等得起、
@@ -831,31 +831,22 @@ fw::result<inf::RpcEnvelope> SendWire(const std::shared_ptr<fw::InfraHttpHost>& 
 // 扣减后即过期）。上游新栈（bbt::infra::http）没有
 // MakeRpcWireHttpRequest 工厂：手工 raw 发送只须编码 body + 显式 POST
 // /rpc + 固定 Content-Type——与 wire profile 同一线路，不伪造第二条
-// 通道；发送复用宿主的 NetworkRuntime::CreateHttpClient（共享限额 owner）。
+// 通道；发送复用宿主的 InfraHttpHost::http_client（共享限额 owner）。
 struct RawWireCall {
-    std::shared_ptr<inf::HttpClient> client;
-    std::optional<fw::result<inf::HttpResponse>> out;
+    std::shared_ptr<inf::http::Client> client;
+    std::optional<fw::result<inf::http::Response>> out;
     TestLatch done{1};
 };
 
-// 旧栈 HttpResponse → 新栈 http::Response 的边界值转换（status→status_code；
-// headers/body 同名透传）。wire 解析面只接新类型。
-inf::http::Response ToWireResponse(const inf::HttpResponse& res) {
-    inf::http::Response out;
-    out.status_code = static_cast<int>(res.status);
-    out.headers     = res.headers;
-    out.body        = res.body;
-    return out;
-}
 
-fw::result<inf::HttpResponse> SendRawWire(const std::shared_ptr<inf::HttpClient>& client,
+fw::result<inf::http::Response> SendRawWire(const std::shared_ptr<inf::http::Client>& client,
                                         const std::string& endpoint,
                                         const inf::rpc::RpcWireEnvelope& wire,
                                         std::chrono::milliseconds client_budget)
 {
     auto body = inf::rpc::EncodeRpcWireEnvelope(wire, /*is_response=*/false);
     if (!body)
-        return fw::result<inf::HttpResponse>::err(body.error());
+        return fw::result<inf::http::Response>::err(body.error());
     inf::HttpRequest req;
     req.method  = "POST";
     req.url     = "http://" + endpoint + inf::rpc::kRpcWireHttpPath;
@@ -869,12 +860,12 @@ fw::result<inf::HttpResponse> SendRawWire(const std::shared_ptr<inf::HttpClient>
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [st, r = std::move(req), opt]() mutable {
-            st->out.emplace(st->client->Request(std::move(r), opt));
+            st->out.emplace(bbt_co_await st->client->Post(r.url, {r.body, {}}, {r.headers, {}, std::nullopt}, opt));
             st->done.CountDown();
         },
         succ);
     if (!succ || !st->done.WaitFor(kWait))
-        return fw::result<inf::HttpResponse>::err(
+        return fw::result<inf::http::Response>::err(
             fw::MakeError(fw::ErrorCode::InternalError, "SendRawWire did not complete"));
     return std::move(*st->out);
 }
@@ -1105,12 +1096,12 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     BOOST_CHECK(pending[0] == "WaitHandlersDone");
 
     // 契约要求：控制线程仍在 run 内；App 持续强持有未收束
-    // Service/Actor/NetworkRuntime；I/O 驱动与 Scheduler 保留（未被强停）。
+    // Service/Actor/net::Engine；I/O 驱动与 Scheduler 保留（未被强停）。
     BOOST_CHECK(!box.run->done.load());
     BOOST_CHECK(g_scheduler->IsInitialized());
-    auto rt = box.host->network_runtime();
+    auto rt = box.host->egress_engine();
     BOOST_REQUIRE(rt);
-    BOOST_CHECK(!rt->IsClosed());                     // I/O 驱动仍在
+    BOOST_CHECK(rt->Phase() == inf::net::EnginePhase::Running);                     // I/O 驱动仍在
     BOOST_REQUIRE(box.host->http_server());           // 网络对象未释放
     auto* reg = box.app->actor_registry();
     BOOST_REQUIRE(reg != nullptr);                    // 注册表仍强持有
@@ -1188,8 +1179,8 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
         WaitState(*box.app, fw::ShutdownState::ShutdownIncomplete, kWait));
     BOOST_CHECK(!box.run->done.load());
     BOOST_CHECK(g_scheduler->IsInitialized());
-    BOOST_CHECK(box.host->network_runtime() &&
-                !box.host->network_runtime()->IsClosed());
+    BOOST_CHECK(box.host->egress_engine() &&
+                box.host->egress_engine()->Phase() == inf::net::EnginePhase::Running);
     // 服务实例仍强持有（迟到回调稍后还要访问它）。
     auto svc = box.app->find_service("relay");
     BOOST_REQUIRE(svc);
@@ -1426,7 +1417,7 @@ BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_exact)
     //     预算）；wire remaining_budget_ms=10
     //     → 服务端 local-min 取 10ms，framework 入站扣减 20ms 后过期 →
     //     服务端 TimedOut、业务 handler 不执行。经 infra 公开 wire 面手工
-    //     构造 + 真实 HttpClient::Request 直发：真实 socket + 真实 RpcServer
+    //     构造 + 真实 http::Client::Request 直发：真实 socket + 真实 RpcServer
     //     入站，但明确不是框架出站（框架出站正例见 (a) 的 SendWire）。
     auto wire_b = inf::rpc::ToWireEnvelope(MakeEnv("budget", "probe", "t7-b", 12), /*remaining_budget_ms*/ 10);
     BOOST_REQUIRE(wire_b);
@@ -1437,8 +1428,8 @@ BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_exact)
         BOOST_TEST_MESSAGE("t7-b transport error code=" << static_cast<int>(r_b.error().code)
                                                         << " msg=" << r_b.error().message);
     BOOST_REQUIRE(r_b);
-    BOOST_CHECK(r_b.value().status == 200);
-    auto reply_b = inf::rpc::ParseRpcWireHttpResponse(ToWireResponse(r_b.value()));
+    BOOST_CHECK(r_b.value().status_code == 200);
+    auto reply_b = inf::rpc::ParseRpcWireHttpResponse(r_b.value());
     BOOST_REQUIRE(reply_b);
     BOOST_CHECK(!reply_b.value().success);
     BOOST_CHECK(static_cast<int>(reply_b.value().error.code) == static_cast<int>(fw::ErrorCode::TimedOut));
@@ -1493,7 +1484,7 @@ BOOST_AUTO_TEST_CASE(wire_inbound_bridge_success_five_fields)
 // 由同一 CoApp 的两个方法相扣，而不是三个 CoApp。两跳都真实经 infra
 // RpcServer/HandleRpcRequest（接收端 local-min）+ 真实 framework
 // InboundDispatcher（每跳恰扣一次 kReplyDeliveryReserve）；hop1 的出站用生产
-// HttpEgress(ProtoWireV1) → 共享 HttpClient + 公开 RpcWire 出站，只把逻辑 endpoint "self" 在
+// HttpEgress(ProtoWireV1) → 共享 http::Client + 公开 RpcWire 出站，只把逻辑 endpoint "self" 在
 // 发送时刻解析到本进程自身的监听地址（端口 0 只能 run 后得知；路由白名单仍由
 // find_route 按 service 名把关，解析只替换地址文本）。
 
@@ -1692,7 +1683,7 @@ AppBox PrepareHopApp(std::chrono::milliseconds incoming_timeout, std::chrono::mi
     AppBox box;
     const auto limits = Limits(incoming_timeout);
     box.host = std::make_shared<fw::InfraHttpHost>(limits, inf::ListenAddress{"127.0.0.1", 0});
-    box.egress_slot = std::make_shared<std::shared_ptr<inf::HttpClient>>();
+    box.egress_slot = std::make_shared<std::shared_ptr<inf::http::Client>>();
     box.peer_ep = std::make_shared<EndpointSlot>(); // 本夹具承载「自身 endpoint」
 
     fw::CoAppOptions opts;
@@ -1858,8 +1849,8 @@ BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_boundary_20ms)
     if (!r_a)
         BOOST_TEST_MESSAGE("t7c-eq transport error code=" << static_cast<int>(r_a.error().code));
     BOOST_REQUIRE(r_a);
-    BOOST_CHECK(r_a.value().status == 200);
-    auto reply_a = inf::rpc::ParseRpcWireHttpResponse(ToWireResponse(r_a.value()));
+    BOOST_CHECK(r_a.value().status_code == 200);
+    auto reply_a = inf::rpc::ParseRpcWireHttpResponse(r_a.value());
     BOOST_REQUIRE(reply_a);
     BOOST_CHECK(!reply_a.value().success);
     BOOST_CHECK(static_cast<int>(reply_a.value().error.code) == static_cast<int>(fw::ErrorCode::TimedOut));
@@ -1878,8 +1869,8 @@ BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_boundary_20ms)
     BOOST_REQUIRE(wire_b);
     auto r_b = SendRawWire(*box.egress_slot, box.endpoint, wire_b.value(), milliseconds{5000});
     BOOST_REQUIRE(r_b);
-    BOOST_CHECK(r_b.value().status == 200);
-    auto reply_b = inf::rpc::ParseRpcWireHttpResponse(ToWireResponse(r_b.value()));
+    BOOST_CHECK(r_b.value().status_code == 200);
+    auto reply_b = inf::rpc::ParseRpcWireHttpResponse(r_b.value());
     BOOST_REQUIRE(reply_b);
     BOOST_CHECK(reply_b.value().success);
     auto rep_b = fw::CoRpcReq(reply_b.value().payload).Parse<std::int32_t>();
@@ -1901,8 +1892,8 @@ BOOST_AUTO_TEST_CASE(wire_inbound_reply_reserve_boundary_20ms)
     auto r_c = SendRawWire(*box.egress_slot, box.endpoint, wire_c.value(), milliseconds{5000});
     g_inbound_hold_until_deadline.store(false);
     BOOST_REQUIRE(r_c);
-    BOOST_CHECK(r_c.value().status == 200);
-    auto reply_c = inf::rpc::ParseRpcWireHttpResponse(ToWireResponse(r_c.value()));
+    BOOST_CHECK(r_c.value().status_code == 200);
+    auto reply_c = inf::rpc::ParseRpcWireHttpResponse(r_c.value());
     BOOST_REQUIRE(reply_c);
     BOOST_CHECK(!reply_c.value().success);
     BOOST_CHECK(static_cast<int>(reply_c.value().error.code) == static_cast<int>(fw::ErrorCode::TimedOut));
@@ -1925,7 +1916,7 @@ BOOST_AUTO_TEST_CASE(wire_host_small_header_two_workers_start)
 {
     // 2 workers 前提必须显式成立（单测单独运行时同样成立）——不通过提高
     // 线程数隐藏回退；进程内单例已在场时该配置只复用。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 8;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -1970,7 +1961,7 @@ BOOST_AUTO_TEST_CASE(wire_host_small_header_two_workers_start)
 // 即刻可见。修复前读按值复制的过期快照，必然等满 5s。
 BOOST_AUTO_TEST_CASE(wire_engine_start_occupied_port_fails_fast)
 {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 8;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -2016,12 +2007,9 @@ BOOST_AUTO_TEST_CASE(wire_engine_start_occupied_port_fails_fast)
 // http::ClientOptions（body=8MiB），超限请求实际进入远端 handler。
 BOOST_AUTO_TEST_CASE(wire_egress_body_limit_rejected_remote_untouched)
 {
-    // 3 workers：被测 app 的 ProtoWireV1 server Engine 占 1 main+1 sub；独立
-    // 纯出站 caller 宿主自带 client-only egress Engine 再占 1 sub。三仓迁移
-    // 后 ProtoWireV1/TcpV1 出站经 rpc::Client + net::Engine（不再走
-    // NetworkRuntime::CreateHttpClient），无 server Engine 可借的纯出站宿主
-    // 需要这 +1 驱动槽——这是真实资源需求，不是可隐藏的时序。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    // App server needs two drivers; each host also owns one client-only driver.
+    // Use the suite's fixed capacity, including echo peer and test client owners.
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 8;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -2037,8 +2025,8 @@ BOOST_AUTO_TEST_CASE(wire_egress_body_limit_rejected_remote_untouched)
     LaunchApp(box);
     BOOST_REQUIRE(box.host->rpc_server() != nullptr);
 
-    // 出站宿主：把 max_body_bytes 压到 128——network_limits 的请求字节校验
-    // 必须在发起任何 I/O 前拒绝 2048B 的 wire body（旧链同一语义）。
+    // 出站宿主：把 max_body_bytes 压到 128。payload 本身保持很小，
+    // 但完整 ProtoWire envelope 超过 128B，必须在发起任何 I/O 前拒绝。
     inf::NetworkLimits caller_limits{
         /*max_connections*/ 16,
         /*max_inflight*/ 16,
@@ -2051,7 +2039,8 @@ BOOST_AUTO_TEST_CASE(wire_egress_body_limit_rejected_remote_untouched)
     BOOST_REQUIRE(caller->Start());   // 纯出站宿主：不监听
 
     auto env = MakeEnv("budget", "probe", "t12-big", 7);
-    env.payload.assign(2048, 0x42);   // wire body 远超 128B 上限
+    env.payload.assign(8, 0x42);
+    env.metadata = {{"trace.quota", std::string(96, 'm')}};
     auto r = SendWire(caller, box.endpoint, env, std::chrono::milliseconds{5000});
     BOOST_REQUIRE(!r);
     BOOST_CHECK(r.error().code == fw::ErrorCode::InvalidArgument);

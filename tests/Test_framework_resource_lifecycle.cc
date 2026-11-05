@@ -266,7 +266,7 @@ struct RunHandle {
 };
 
 std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
     auto h = std::make_unique<RunHandle>();
     RunHandle* p = h.get();
     h->th = std::thread([p, &app] {

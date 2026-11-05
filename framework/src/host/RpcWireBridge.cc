@@ -34,16 +34,24 @@ bbt::infra::Error SafeBoundaryError(const bbt::infra::Error& error)
 
 } // namespace
 
-void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app) {
-    host.InstallRpcHandler([&app](bbt::infra::IncomingCallContext ctx,
-                                  bbt::infra::RpcEnvelope env) -> bbt::infra::result<bbt::infra::RpcEnvelope> {
+void InstallRpcWireBridge(InfraHttpHost& host,
+                          std::shared_ptr<AppRuntimeState> state) {
+    host.InstallRpcHandler([state = std::move(state)](
+                               bbt::infra::IncomingCallContext ctx,
+                               bbt::infra::RpcEnvelope env)
+                               -> bbt::infra::result<bbt::infra::RpcEnvelope> {
         // 关联字段（含 request_schema）由 InboundDispatcher 在源头回填，
         // 本桥只做转发，不再回显/补丁任何关联字段。
-        auto reply = app.dispatch_inbound(ctx, std::move(env));
+        auto reply = state->Dispatch(ctx, std::move(env));
         if (!reply)
-            return bbt::infra::result<bbt::infra::RpcEnvelope>::err(SafeBoundaryError(reply.error()));
+            return bbt::infra::result<bbt::infra::RpcEnvelope>::err(
+                SafeBoundaryError(reply.error()));
         return reply;
     });
+}
+
+void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app) {
+    InstallRpcWireBridge(host, app.m_state);
 }
 
 } // namespace bbt::framework

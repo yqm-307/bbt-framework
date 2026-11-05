@@ -41,6 +41,7 @@ class InfraHttpHost;
 class OrderedIngress;
 class INetworkHost;
 class RpcPolicy;
+struct AppRuntimeState;
 struct CoAppOptions;
 struct CoAppSeam;
 
@@ -403,13 +404,6 @@ private:
         return result<void>::ok();
     }
 
-    // 测试缝出站签名（internal/CoAppSeam.hpp 的 RpcSendAppFn）；
-    // 本头不复述机器面签名，私有别名保持公共面干净。
-    using SeamEgressFn = std::function<result<bbt::infra::RpcEnvelope>(
-        const bbt::infra::RpcAddress&,
-        const bbt::infra::RpcEnvelope&,
-        const bbt::infra::CallOptions&)>;
-
     // 测试缝构造：显式注入宿主与出站发送；仅 MakeCoAppForTest 可达。
     CoApp(CoAppOptions options, CoAppSeam seam);
 
@@ -435,11 +429,9 @@ private:
 
     const CoAppOptions              m_options;
     std::shared_ptr<INetworkHost>   m_network_host;
-    // 默认装配路径的具体宿主（弱持有观察；生命周期归 m_network_host）
-    // 与默认出站实现；测试缝注入路径两者皆空。
+    // 默认装配路径的具体宿主（弱持有观察；生命周期归 m_network_host）。
+    // 测试缝注入路径为空。
     std::shared_ptr<InfraHttpHost>  m_default_host;
-    std::shared_ptr<HttpEgress>     m_default_egress;
-    SeamEgressFn                    m_seam_send;
 
     mutable std::mutex              m_mtx;
     std::map<std::string, ServiceEntry>   m_services;
@@ -451,9 +443,10 @@ private:
     ResourceSpecMap                 m_resource_specs;
     bool                            m_registration_open{true};
 
-    // 运行期持有的受管对象（ShutdownIncomplete 期间仍强持有）。
-    std::map<std::string, std::shared_ptr<ICoService>> m_instances;
-    std::unique_ptr<ActorRegistry>  m_actor_registry;
+    // 运行期持有的受管对象放进 m_state（AppRuntimeState）：入站 handler
+    // 闭包与出站回调复制该 shared_ptr，不借用本对象成员、不捕获 this。
+    // ShutdownIncomplete 期间仍由 m_state 强持有。
+    std::shared_ptr<AppRuntimeState> m_state;
 
     std::atomic_bool                m_ran_once{false};
     std::atomic_bool                m_shutdown_req{false};
@@ -467,9 +460,6 @@ private:
     HostLifecycle* m_lifecycle{nullptr};
     std::atomic<ShutdownState> m_parked_state{ShutdownState::Running};
     std::vector<std::string> m_early_failures; // run 前校验失败原因
-    // 入站分发器：_BindServices 建立、_ReleaseServices 先于
-    // 注册表/实例销毁；指针在 m_mtx 下读写。
-    std::unique_ptr<InboundDispatcher> m_dispatcher;
 };
 
 } // namespace bbt::framework

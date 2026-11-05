@@ -34,7 +34,7 @@ driver ──wire──> svc_b(gateway) ──wire──> svc_a(storage)
   （本示例只用 `UpdateOne`/`FindOne`/`DeleteOne` 的 upsert/find/delete）。
 - `svc_b` 托管 `gateway` 服务，`static_routes` 把 `storage` 显式指到
   `svc_a` 的真实 `host:port`——未配置目标一律 `NotFound`，无自动发现。
-- `driver` 是第三个进程：`NetworkRuntime + HttpClient`，用 infra 公开头
+- `driver` 是第三个进程：`net::Engine + http::Client`，用 infra 公开头
   `<bbt/infra/rpc/RpcWire.hpp>` 直接组/解正式 wire 请求（不引用 framework
   internal 头，也不读 `x-bbt-*` header）。
 

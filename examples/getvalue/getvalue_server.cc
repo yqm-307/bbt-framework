@@ -67,6 +67,8 @@ int main(int argc, char* argv[]) {
     //   - 这是运行期资源配置，不是业务/协议语义。
     // 见 README「已知限制」：512KB 只覆盖本示例负载规模；框架默认 12KB 栈对
     // 任意 protobuf 业务不保证安全（栈上编解码开销随 payload/嵌套增长）。
+    // Two server drivers + one client-only driver + one application worker.
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 
     getvalue::SetServedHook(&AppendHandlerEntry);

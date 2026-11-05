@@ -17,9 +17,8 @@
 #include <string_view>
 #include <vector>
 
-#include <bbt/infra/HttpClient.hpp>
-#include <bbt/infra/HttpServer.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Client.hpp>
+#include <bbt/infra/http/Server.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
@@ -27,49 +26,54 @@
 #endif
 
 #include <bbt/framework/Result.hpp>
+#include <bbt/framework/internal/AppRuntimeState.hpp>
 
 namespace bbt::framework {
 
 class CoApp;
 class InfraHttpHost;
 
+// 把默认 HTTP 桥安装到真实宿主：入站 handler 闭包按值复制运行时状态的
+// shared_ptr，不借用宿主/CoApp 成员、不捕获 CoApp this——CoApp 先析构
+// 也不影响在途请求；已收束的状态如实 RuntimeUnavailable。
+void InstallRpcHttpBridge(InfraHttpHost& host,
+                          std::shared_ptr<AppRuntimeState> state);
+
 namespace http_bridge {
 
 // envelope → 出站 HttpRequest（url 形如 http://host:port/rpc）。
-bbt::infra::HttpRequest ToHttpRequest(
-    const bbt::infra::RpcEnvelope& env, std::string url);
+result<bbt::infra::http::PreparedRequest> ToHttpRequest(
+    bbt::infra::http::Client& client, const bbt::infra::RpcEnvelope& env, std::string url);
 
 // 入站 HttpRequest → envelope；header 不完整 → err(InvalidArgument)。
 result<bbt::infra::RpcEnvelope> EnvelopeFromRequest(
-    const bbt::infra::HttpRequest& req);
+    const bbt::infra::http::IncomingRequest& req);
 
 // 分发结果（envelope 或错误）→ HttpResponse。
-bbt::infra::HttpResponse ToHttpResponse(
+bbt::infra::http::Response ToHttpResponse(
     const result<bbt::infra::RpcEnvelope>& r);
 
 // 回复 HttpResponse → envelope/错误（状态 200 → envelope；否则
 // x-bbt-err-* 还原 Error）。
 result<bbt::infra::RpcEnvelope> EnvelopeFromResponse(
-    const bbt::infra::HttpResponse& res);
+    const bbt::infra::http::Response& res);
 
 } // namespace http_bridge
 
-// 把默认桥安装到真实 HTTP 宿主：入站请求 → EnvelopeFromRequest →
-// app.dispatch_inbound → ToHttpResponse。测试缝与业务默认路径共用。
+// 兼容入口（测试缝与默认装配共用）：取 CoApp 持有的同一运行时状态。
 void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
 
 // 默认出站：transport 选择 infra 公开 rpc::Client + adapter seam；
-// 宿主执行底座（Engine/NetworkRuntime）不可得 → RuntimeUnavailable。
+// 宿主 client-only Engine 不可得 → RuntimeUnavailable。
 // Issue #4 + 三仓 §5/§6 迁移后的 profile 语义：
-//  - LegacyHeaders 走 x-bbt-* header 迁移期桥（旧栈 HttpClient；
+//  - LegacyHeaders 保留 x-bbt-* header 编解码（新 http::Client；
 //    http_bridge::ToHttpRequest/EnvelopeFromResponse），仅 HTTP。
 //  - ProtoWireV1 走 infra 公开 rpc::Client + HttpRpcTransport：wire
 //    编解码/关联/预算换算全部由 infra 承担（POST /rpc 固定 profile）。
 //  - TcpV1 走 infra 公开 rpc::Client + TcpRpcTransport：u32be 长度前缀
 //    帧（architecture §6），endpoint 必须 numeric-ip:port。
-// 后两者共用同一份懒建 rpc::Client 缓存与同一个 client-only Engine
-// （InfraHttpHost::egress_engine()）；LegacyHeaders 仍用旧栈
-// NetworkRuntime::CreateHttpClient，不占用新栈 Engine。
+// HTTP profiles 共用 InfraHttpHost::http_client() 的一个池与 client-only
+// Engine；RPC profiles 另缓存 rpc::Client，不另建 HTTP pool。
 enum class RpcEgressProfile { LegacyHeaders, ProtoWireV1, TcpV1 };
 
 class HttpEgress {
@@ -99,10 +103,6 @@ private:
     std::weak_ptr<InfraHttpHost> m_host;
     RpcEgressProfile m_profile;
     std::mutex m_mtx;
-    // 懒建共享出站通道：LegacyHeaders 用旧栈 HttpClient（runtime 限额 owner
-    // 共享 max_connections/max_inflight 与请求/响应字节校验）；新栈
-    // profile 共用同一个 client-only Engine 上的 rpc::Client。
-    std::shared_ptr<bbt::infra::HttpClient> m_client;
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
     std::shared_ptr<bbt::infra::rpc::Client> m_rpc_client;
 #endif

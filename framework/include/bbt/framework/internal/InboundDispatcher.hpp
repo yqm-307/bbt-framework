@@ -47,11 +47,13 @@ class InboundDispatcher {
 public:
     // 每个已注册服务的分发表项：Concurrent 给启动期单实例；
     // ActorSerial 给激活注册表（实例按 key 经 GetOrCreate 激活）。
+    // 表项强持有其引用的全部对象（方法表/实例/注册表/有序入口），
+    // 在途分发自持，不依赖宿主对象继续存活。
     struct ServiceEntry {
         ServiceOptions          options;
-        const RpcMethodTable*   table;
+        std::shared_ptr<const RpcMethodTable> table;
         std::shared_ptr<ICoService> instance;      // 仅 Concurrent
-        ActorRegistry*              registry = nullptr; // 仅 ActorSerial
+        std::shared_ptr<ActorRegistry> registry;   // 仅 ActorSerial
         std::shared_ptr<OrderedIngress> ordered_ingress; // 仅 ordered ActorSerial
     };
 

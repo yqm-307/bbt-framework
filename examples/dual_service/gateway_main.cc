@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
 
     // handler 内嵌套出站调用（入站 → this->call → HTTP client →
     // 等回包），协程栈按实测放大到 64KB。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 
     fw::CoAppOptions opts;

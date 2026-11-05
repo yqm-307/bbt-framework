@@ -9,7 +9,7 @@
 //
 // 3-2 下沉后：wire 编解码、接收端 local-min 预算、成功/错误信封回显、五字段
 // 关联与 remaining 回填**全部**由 infra 承担（rpc::Server →
-// HandleWireRequest；上游 NetworkRuntime::ListenRpc 已删除）。本桥的 handler
+// HandleWireRequest；上游 rpc::Server 已删除）。本桥的 handler
 // 只是把 infra 已解析的 IncomingCallContext +
 // RpcEnvelope 交给公开的 app.dispatch_inbound，并在错误返回给 infra 之前过一遍
 // framework 错误边界（ValidateErrorAtBoundary）——infra 无 framework.actor 保留
@@ -18,6 +18,7 @@
 // 依赖 bbt::infra_rpc_net（仅在 BBT_INFRA_RPC_NET + protobuf 前缀锁定可用时编译）。
 
 #include <bbt/framework/Result.hpp>
+#include <bbt/framework/internal/AppRuntimeState.hpp>
 
 namespace bbt::framework {
 
@@ -25,9 +26,14 @@ class CoApp;
 class InfraHttpHost;
 
 // 把正式 wire bridge 安装到真实宿主：宿主以 RpcHandler 模式监听（transport
-// 由 SetRpcInboundTransport 选定），入站 RpcEnvelope 经 app.dispatch_inbound
-// 走真实分发链，回复/错误交回 infra 封包。仅填标准传输字段，不设置任何
-// x-bbt-* 头。
+// 由 SetRpcInboundTransport 选定），入站 RpcEnvelope 经运行时状态走真实分发链，
+// 回复/错误交回 infra 封包。仅填标准传输字段，不设置任何 x-bbt-* 头。
+// handler 闭包按值复制运行时状态的 shared_ptr，不借用宿主/CoApp 成员、
+// 不捕获 CoApp this——CoApp 先析构也不影响在途请求。
+void InstallRpcWireBridge(InfraHttpHost& host,
+                          std::shared_ptr<AppRuntimeState> state);
+
+// 兼容入口（测试缝与默认装配共用）：取 CoApp 持有的同一运行时状态。
 void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app);
 
 } // namespace bbt::framework

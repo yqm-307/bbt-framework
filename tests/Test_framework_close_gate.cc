@@ -68,9 +68,9 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 
-#include <bbt/infra/HttpClient.hpp>
-#include <bbt/infra/HttpServer.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Client.hpp>
+#include <bbt/infra/http/Server.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
 #if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
@@ -181,6 +181,46 @@ struct CloseProbe {
     std::atomic<int> calls{0};
 };
 
+// Close 打断排空用的宿主桩：第一次/第二次 WaitHandlersDone 的分支由
+// fail_first_with_timeout 选定；owner_closed 置位后 CloseReason 可观察。
+struct InterruptStubHost final : fw::INetworkHost {
+    std::atomic<int> wait_calls{0};
+    std::atomic<int> close_calls{0};
+    mutable std::atomic<int> close_reason_calls{0};
+    std::atomic<bool> owner_closed{false};
+    std::atomic<bool> fail_first_with_timeout{false};
+
+    fw::result<void> Create() override { return fw::result<void>::ok(); }
+    fw::result<void> Start() override { return fw::result<void>::ok(); }
+    void StopAccepting() noexcept override {}
+    fw::result<void> WaitHandlersDone(co::Deadline) override
+    {
+        ++wait_calls;
+        if (fail_first_with_timeout.load() && wait_calls.load() == 1)
+            return fw::result<void>::err(
+                fw::MakeError(fw::ErrorCode::TimedOut, "budget"));
+        owner_closed.store(true);
+        return fw::result<void>::err(
+            fw::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
+    }
+    void Close() noexcept override { ++close_calls; }
+    std::optional<bbt::infra::Error> CloseReason() const noexcept override
+    {
+        ++close_reason_calls;
+        if (!owner_closed.load()) return std::nullopt;
+        return fw::MakeError(fw::ErrorCode::Unavailable, "owner abort");
+    }
+};
+
+// 真实 loopback 暂停 handler 的共享状态：handler 进入即报闩，放行后报完成。
+struct PauseState {
+    Latch entered{1};
+    Latch done{1};
+    Gate gate;
+    std::atomic<int> calls{0};
+    std::atomic<bool> returned{false};
+};
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(framework_rpc_close_gate)
@@ -263,7 +303,7 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant)
     auto late2 = host->InvokeRpcForTest(ctx2, inf::RpcEnvelope{"svc", "m", "rid-3", "", "", {}, {}});
     BOOST_CHECK_MESSAGE(!late2, "entrant after Close must be refused");
     if (!late2)
-        BOOST_CHECK(late2.error().code == fw::ErrorCode::RuntimeUnavailable);
+        BOOST_CHECK(late2.error().code == fw::ErrorCode::Closed);
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
 }
 
@@ -288,7 +328,7 @@ BOOST_AUTO_TEST_CASE(direct_close_without_stop_accepting_refuses_entrant)
     auto late = host.InvokeRpcForTest(ctx, inf::RpcEnvelope{"svc", "m", "rid-direct", "", "", {}, {}});
     BOOST_CHECK_MESSAGE(!late, "direct Close must refuse entrant without StopAccepting");
     if (!late)
-        BOOST_CHECK(late.error().code == fw::ErrorCode::RuntimeUnavailable);
+        BOOST_CHECK(late.error().code == fw::ErrorCode::Closed);
     BOOST_CHECK_EQUAL(probe->calls.load(), 0);
 }
 
@@ -299,7 +339,7 @@ struct LoopbackState {
     Gate handler_gate;                                // 已过门 handler 挂此门（T5 不用：handler 立即抛）
     Latch entered{1};                                 // handler 已进入包装
     std::atomic<bool> returned{false};                // handler 已返回（未被抢占的观测，T5 不用）
-    std::optional<fw::result<inf::HttpResponse>> out; // 客户端协程结果槽
+    std::optional<fw::result<inf::http::Response>> out; // 客户端协程结果槽
     Latch done{1};                                    // 客户端协程已收尾
 };
 
@@ -307,8 +347,8 @@ struct LoopbackState {
 struct LoopbackHarness {
     std::shared_ptr<LoopbackState> st = std::make_shared<LoopbackState>();
     std::shared_ptr<fw::InfraHttpHost> host;
-    std::shared_ptr<inf::NetworkRuntime> rt;
-    std::shared_ptr<inf::HttpClient> client;
+    std::shared_ptr<fw::InfraHttpHost> rt;
+    std::shared_ptr<inf::http::Client> client;
     std::string endpoint;
 
     LoopbackHarness() : host(std::make_shared<fw::InfraHttpHost>(Limits(), inf::ListenAddress{"127.0.0.1", 0}))
@@ -343,19 +383,20 @@ struct LoopbackHarness {
 BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
 {
     if (!g_scheduler->IsInitialized()) {
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         g_scheduler->Start();
     }
 
     LoopbackHarness h;
     const auto st = h.st;
-    h.host->InstallHandler([st](inf::IncomingCallContext, inf::HttpRequest) -> fw::result<inf::HttpResponse> {
+    h.host->InstallHandler([st](inf::IncomingCallContext, inf::http::IncomingRequest) -> fw::result<inf::http::Response> {
         st->calls.fetch_add(1);
         st->entered.Down();
         st->handler_gate.Wait(); // 已过门：挂起，等测试放行
         st->returned.store(true);
-        return fw::result<inf::HttpResponse>::ok(inf::HttpResponse{200, {}, "ok"});
+        return fw::result<inf::http::Response>::ok(inf::http::Response{200, {}, "ok"});
     });
 
     BOOST_REQUIRE(h.host->Create());
@@ -363,13 +404,14 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
     h.endpoint = h.host->bound_endpoint();
     BOOST_REQUIRE(!h.endpoint.empty());
 
-    auto rtr = inf::NetworkRuntime::Create(Limits());
+    auto rtr = std::make_shared<fw::InfraHttpHost>(Limits(), inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(rtr);
-    h.rt = rtr.value();
+    h.rt = rtr;
+    BOOST_REQUIRE(h.rt->Create());
     BOOST_REQUIRE(h.rt->Start());
-    auto cl = h.rt->CreateHttpClient();
+    auto cl = h.rt->http_client();
     BOOST_REQUIRE(cl);
-    h.client = cl.value();
+    h.client = cl;
 
     // 协程闭包按值捕获 shared_ptr 状态、client 与 endpoint：测试帧退出后
     // 仍在途的客户端请求不会解引用已析构的栈对象。
@@ -381,7 +423,7 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
             req.url = "http://" + endpoint + "/probe";
             inf::CallOptions opt;
             opt.deadline = Clock::now() + 5s;
-            st->out.emplace(client->Request(std::move(req), opt));
+            st->out.emplace(bbt_co_await client->Get(req.url, {req.headers, {}, std::nullopt}, opt));
             st->done.Down();
         },
         succ);
@@ -456,21 +498,21 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_propagates_and_releases_inflight)
 }
 
 // T5：handler 抛异常的框架侧判别（真实 infra loopback，HTTP）。
-// infra 契约（`HttpServer.hpp`：异常由边界捕获转 InternalError；实现
-// `HttpServerImpl::RunHandler`）把 handler 异常在协程边界内吞掉 → 客户端收到 500
+// infra 契约（`http/Server.hpp`：异常由边界捕获转 InternalError；实现
+// `http::Server`）把 handler 异常在协程边界内吞掉 → 客户端收到 500
 // 终态回复、进程不抛异常。但框架自己的在途记账仍必须归零——修前 inflight 永久 +1，
 // 下面的排空断言会真实失败（TimedOut）。
 BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight)
 {
     if (!g_scheduler->IsInitialized()) {
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         g_scheduler->Start();
     }
 
     LoopbackHarness h;
     const auto st = h.st;
-    h.host->InstallHandler([st](inf::IncomingCallContext, inf::HttpRequest) -> fw::result<inf::HttpResponse> {
+    h.host->InstallHandler([st](inf::IncomingCallContext, inf::http::IncomingRequest) -> fw::result<inf::http::Response> {
         st->calls.fetch_add(1);
         st->entered.Down();
         throw std::runtime_error("http handler boom"); // 越过 _InvokeHttp 调用点
@@ -481,13 +523,14 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight)
     h.endpoint = h.host->bound_endpoint();
     BOOST_REQUIRE(!h.endpoint.empty());
 
-    auto rtr = inf::NetworkRuntime::Create(Limits());
+    auto rtr = std::make_shared<fw::InfraHttpHost>(Limits(), inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(rtr);
-    h.rt = rtr.value();
+    h.rt = rtr;
+    BOOST_REQUIRE(h.rt->Create());
     BOOST_REQUIRE(h.rt->Start());
-    auto cl = h.rt->CreateHttpClient();
+    auto cl = h.rt->http_client();
     BOOST_REQUIRE(cl);
-    h.client = cl.value();
+    h.client = cl;
 
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
@@ -497,7 +540,7 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight)
             req.url = "http://" + endpoint + "/probe";
             inf::CallOptions opt;
             opt.deadline = Clock::now() + 5s;
-            st->out.emplace(client->Request(std::move(req), opt));
+            st->out.emplace(bbt_co_await client->Get(req.url, {req.headers, {}, std::nullopt}, opt));
             st->done.Down();
         },
         succ);
@@ -510,7 +553,7 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight)
     BOOST_REQUIRE(st->out.has_value());
     BOOST_REQUIRE_MESSAGE(bool(st->out.value()),
                           "handler exception must yield a terminal reply, not an aborted connection");
-    BOOST_CHECK_EQUAL(static_cast<int>(st->out.value().value().status), 500);
+    BOOST_CHECK_EQUAL(static_cast<int>(st->out.value().value().status_code), 500);
 
     // 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
     auto drained = h.host->WaitHandlersDone(Clock::now() + 2s);
@@ -538,7 +581,7 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight)
 BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
 {
     if (!g_scheduler->IsInitialized()) {
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         g_scheduler->Start();
     }
@@ -548,7 +591,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
         std::atomic<int> calls{0};
         Gate handler_gate;
         Latch entered{1};
-        std::optional<inf::result<inf::HttpResponse>> out;
+        std::optional<inf::result<inf::http::Response>> out;
         Latch done{1};
     };
     auto st = std::make_shared<Shared>();
@@ -569,11 +612,12 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
     BOOST_REQUIRE(bound.has_value());
     BOOST_REQUIRE(host->rpc_server() != nullptr);
 
-    // 真实 loopback 请求：独立 runtime + HttpClient → 被测 server。
-    auto rt = inf::NetworkRuntime::Create(Limits());
+    // 真实 loopback 请求：独立 runtime + http::Client → 被测 server。
+    auto rt = std::make_shared<fw::InfraHttpHost>(Limits(), inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(rt);
-    BOOST_REQUIRE(rt.value()->Start());
-    auto client = rt.value()->CreateHttpClient();
+    BOOST_REQUIRE(rt->Create());
+    BOOST_REQUIRE(rt->Start());
+    auto client = rt->http_client();
     BOOST_REQUIRE(client);
 
     bool succ = false;
@@ -590,7 +634,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
     auto body = inf::rpc::EncodeRpcWireEnvelope(wire, /*is_response=*/false);
     BOOST_REQUIRE(body);
     g_scheduler->RegistCoroutineTask(
-        [st, client = client.value(), endpoint, body = std::move(body.value())] {
+        [st, client = client, endpoint, body = std::move(body.value())] {
             inf::HttpRequest req;
             req.method = "POST";
             req.url = "http://" + endpoint + "/rpc";
@@ -599,7 +643,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
             req.body.assign(body.begin(), body.end());
             inf::CallOptions opt;
             opt.deadline = Clock::now() + 5s;
-            st->out.emplace(client->Request(std::move(req), opt));
+            st->out.emplace(bbt_co_await client->Post(req.url, {req.body, {}}, {req.headers, {}, std::nullopt}, opt));
             st->done.Down();
         },
         succ);
@@ -639,8 +683,8 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
     BOOST_CHECK(!host->close_error().has_value());
     BOOST_CHECK(host->rpc_server() == nullptr);   // owner 已释放
 
-    client.value()->Close();
-    rt.value()->Close();
+    client->Close();
+    rt->Close();
 }
 
 // T7（直接 Close 兜底路径）：不经 StopAccepting/WaitHandlersDone 的裸
@@ -649,7 +693,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
 BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
 {
     if (!g_scheduler->IsInitialized()) {
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         g_scheduler->Start();
     }
@@ -675,6 +719,170 @@ BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
     BOOST_CHECK(host->rpc_server() == nullptr);
     // 幂等重入安全（不重复 join/get）。
     host->Close();
+}
+
+// T8：Close 立即返回（不等暂停的 handler），析构不因 joinable 线程 terminate，
+// 迟到进入者得到已发布的关闭原因；handler 放行后安全返回（HandlerState 自持）。
+BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
+{
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
+        g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+        g_scheduler->Start();
+    }
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
+
+    auto st = std::make_shared<PauseState>();
+    auto host = std::make_shared<fw::InfraHttpHost>(
+        Limits(), inf::ListenAddress{"127.0.0.1", 0});
+    host->InstallRpcHandler(
+        [st](inf::IncomingCallContext, inf::RpcEnvelope req)
+            -> fw::result<inf::RpcEnvelope> {
+            st->calls.fetch_add(1);
+            st->entered.Down();
+            st->gate.Wait();
+            st->returned.store(true);
+            st->done.Down();
+            return fw::result<inf::RpcEnvelope>::ok(std::move(req));
+        });
+    BOOST_REQUIRE(host->Create());
+    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(host->bound_address().has_value());
+
+    auto rt = std::make_shared<fw::InfraHttpHost>(
+        Limits(), inf::ListenAddress{"127.0.0.1", 0});
+    BOOST_REQUIRE(rt->Create());
+    BOOST_REQUIRE(rt->Start());
+    auto client = rt->http_client();
+    BOOST_REQUIRE(client);
+
+    const auto endpoint = host->bound_endpoint();
+    inf::rpc::RpcWireEnvelope wire;
+    auto wire_r = inf::rpc::ToWireEnvelope(
+        inf::RpcEnvelope{"probe", "hold", "t8-1", "", "", {}, {}},
+        /*remaining_budget_ms*/ 30000);
+    BOOST_REQUIRE(wire_r);
+    wire = wire_r.value();
+    auto body = inf::rpc::EncodeRpcWireEnvelope(wire, /*is_response=*/false);
+    BOOST_REQUIRE(body);
+    // 跨帧状态自我持有：协程闭包按值捕获 shared_ptr（不捕获测试栈引用）。
+    struct RequestDone {
+        Latch done{1};
+    };
+    auto request_done = std::make_shared<RequestDone>();
+    bool registered = false;
+    g_scheduler->RegistCoroutineTask(
+        [client = client, endpoint, body = std::move(body.value()), request_done] {
+            inf::HttpRequest req;
+            req.method = "POST";
+            req.url = "http://" + endpoint + "/rpc";
+            req.headers = {{std::string(inf::rpc::kRpcWireContentTypeKey),
+                            std::string(inf::rpc::kRpcWireContentType)}};
+            req.body.assign(body.begin(), body.end());
+            inf::CallOptions opt;
+            opt.deadline = Clock::now() + 5s;
+            auto ignored = bbt_co_await client->Post(
+                req.url, {req.body, {}}, {req.headers, {}, std::nullopt}, opt);
+            (void)ignored;
+            request_done->done.Down();
+        },
+        registered);
+    BOOST_REQUIRE(registered);
+    BOOST_REQUIRE(st->entered.WaitFor(5s));
+    BOOST_CHECK_EQUAL(st->calls.load(), 1);
+
+    const auto begin = Clock::now();
+    host->Close(fw::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
+    const auto close_cost = Clock::now() - begin;
+    // handler 仍暂停：Close 的返回不得依赖它完成。
+    BOOST_CHECK(!st->returned.load());
+    BOOST_CHECK_MESSAGE(close_cost < 2s, "Close must not wait for paused handler");
+    auto reason = host->CloseReason();
+    BOOST_REQUIRE(reason.has_value());
+    BOOST_CHECK(reason->code == fw::ErrorCode::Unavailable);
+    BOOST_CHECK_EQUAL(reason->message, "owner abort");
+
+    // 迟到进入者失败且携带同一原因（不是硬编码文案）。
+    inf::IncomingCallContext ctx;
+    ctx.deadline = Clock::now() + 30s;
+    auto late = host->InvokeRpcForTest(
+        ctx, inf::RpcEnvelope{"svc", "m", "rid", "", "", {}, {}});
+    BOOST_CHECK(!late);
+    if (!late) {
+        BOOST_CHECK(late.error().code == fw::ErrorCode::Unavailable);
+        BOOST_CHECK_EQUAL(late.error().message, "owner abort");
+    }
+
+    // 析构安全：业务未完成时释放宿主，析构必须 join 而不是 terminate/detach；
+    // handler 由 HandlerState 保活，放行后安全返回（不访问已析构宿主）。
+    std::atomic<bool> destroy_started{false};
+    std::thread destroy([&host, &destroy_started] {
+        destroy_started.store(true);
+        host.reset();
+    });
+    while (!destroy_started.load()) { std::this_thread::yield(); }
+    st->gate.Open();
+    destroy.join();
+    BOOST_CHECK(st->done.WaitFor(5s));
+    BOOST_CHECK(st->returned.load());
+
+    client->Close();
+    rt->Close();
+}
+
+// T9：HostLifecycle 用明确状态（CloseReason）识别「排空被 Close 打断」，
+// 不再 park：跳过 on_handlers_drained（handler 可能仍借业务对象），走
+// on_release，返回 kExitShutdownFailed。
+BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
+{
+    auto host = std::make_shared<InterruptStubHost>();
+    fw::HostLifecycle lifecycle(host, 100ms);
+    lifecycle.RequestShutdown();
+    int drained = 0;
+    int released = 0;
+    fw::HostLifecycle::Hooks hooks;
+    hooks.on_handlers_drained = [&drained] { ++drained; };
+    hooks.on_release = [&released] { ++released; };
+
+    int rc = -1;
+    std::thread runner([&] { rc = lifecycle.Run(hooks); });
+    runner.join();
+
+    BOOST_CHECK_EQUAL(rc, fw::HostLifecycle::kExitShutdownFailed);
+    BOOST_CHECK_EQUAL(drained, 0);
+    BOOST_CHECK_EQUAL(released, 1);
+    BOOST_CHECK_EQUAL(host->close_calls.load(), 1);
+    const auto failures = lifecycle.Failures();
+    bool interrupted = false;
+    for (const auto& failure : failures)
+        if (failure.find("interrupted by host close") != std::string::npos)
+            interrupted = true;
+    BOOST_CHECK_MESSAGE(interrupted, "failure list must record the close interrupt");
+}
+
+// T10：第一次排空超时、无界续等期间被 Close 打断——迟到收尾按 kExitShutdownLate
+// 报告，而不是因失败项改报 Failed，也不是 park。
+BOOST_AUTO_TEST_CASE(lifecycle_close_during_unbounded_retry_reports_late)
+{
+    auto host = std::make_shared<InterruptStubHost>();
+    host->fail_first_with_timeout.store(true);
+    fw::HostLifecycle lifecycle(host, 50ms);
+    lifecycle.RequestShutdown();
+    int drained = 0;
+    int released = 0;
+    fw::HostLifecycle::Hooks hooks;
+    hooks.on_handlers_drained = [&drained] { ++drained; };
+    hooks.on_release = [&released] { ++released; };
+
+    int rc = -1;
+    std::thread runner([&] { rc = lifecycle.Run(hooks); });
+    runner.join();
+
+    BOOST_CHECK_EQUAL(rc, fw::HostLifecycle::kExitShutdownLate);
+    BOOST_CHECK_EQUAL(drained, 0);
+    BOOST_CHECK_EQUAL(released, 1);
+    BOOST_CHECK(host->wait_calls.load() >= 2);
+    BOOST_CHECK(lifecycle.IncompleteSteps().empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

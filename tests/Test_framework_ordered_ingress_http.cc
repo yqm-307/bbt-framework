@@ -1,6 +1,6 @@
 // OrderedIngress 真实 HTTP loopback 接线验收。
 // 覆盖无票拒绝、grant、成功执行、重复重放、内容冲突与序号缺口；
-// 通过真实 InfraHttpHost + HttpClient，不直接调用 InboundDispatcher。
+// 通过真实 InfraHttpHost + http::Client，不直接调用 InboundDispatcher。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -17,8 +17,8 @@
 #include <utility>
 
 #include <bbt/coroutine/coroutine.hpp>
-#include <bbt/infra/HttpClient.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Client.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/internal/ActorRegistry.hpp>
@@ -103,8 +103,8 @@ struct Fixture {
     inf::NetworkLimits limits{64, 64, 16384, 65536,
                                std::chrono::milliseconds{30000}};
     std::shared_ptr<fw::InfraHttpHost> host;
-    std::shared_ptr<inf::NetworkRuntime> client_runtime;
-    std::shared_ptr<inf::HttpClient> client;
+    std::shared_ptr<fw::InfraHttpHost> client_runtime;
+    std::shared_ptr<inf::http::Client> client;
     std::unique_ptr<fw::CoApp> app;
     std::thread run_thread;
     std::atomic<bool> run_done{false};
@@ -151,7 +151,8 @@ struct Fixture {
         BOOST_REQUIRE(app->grant_ordered_stream(std::move(grant)));
         fw::InstallRpcHttpBridge(*host, *app);
 
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         run_thread = std::thread([this] {
             run_rc = app->run();
@@ -166,13 +167,14 @@ struct Fixture {
         }
         BOOST_REQUIRE_MESSAGE(!endpoint.empty(), "HTTP loopback did not bind");
 
-        auto runtime = inf::NetworkRuntime::Create(limits);
+        auto runtime = std::make_shared<fw::InfraHttpHost>(limits, inf::ListenAddress{"127.0.0.1", 0});
         BOOST_REQUIRE(runtime);
-        client_runtime = runtime.value();
-        BOOST_REQUIRE(client_runtime->Start());
-        auto created = client_runtime->CreateHttpClient();
+        client_runtime = runtime;
+        BOOST_REQUIRE(client_runtime->Create());
+    BOOST_REQUIRE(client_runtime->Start());
+        auto created = client_runtime->http_client();
         BOOST_REQUIRE(created);
-        client = created.value();
+        client = created;
     }
 
     fw::result<inf::RpcEnvelope> Call(const inf::RpcEnvelope& env) {
@@ -183,9 +185,11 @@ struct Fixture {
             [this, state, request] {
                 inf::CallOptions options;
                 options.deadline = Clock::now() + std::chrono::seconds{10};
-                auto response = client->Request(
-                    fw::http_bridge::ToHttpRequest(
-                        request, "http://" + endpoint + "/rpc"), options);
+                auto prepared = fw::http_bridge::ToHttpRequest(
+                    *client, request, "http://" + endpoint + "/rpc");
+                auto response = prepared
+                    ? bbt_co_await client->Send(prepared.value(), options)
+                    : inf::result<inf::http::Response>::err(std::move(prepared.error()));
                 if (!response)
                     state->out.emplace(fw::result<inf::RpcEnvelope>::err(
                         std::move(response.error())));
@@ -292,10 +296,11 @@ BOOST_AUTO_TEST_CASE(ordered_direct_error_boundary_matches_replay) {
     Fixture fixture;
     fixture.Start(hits);
 
-    fw::ActorRegistry registry;
-    BOOST_REQUIRE(registry.RegisterFactory(
+    auto registry = std::make_shared<fw::ActorRegistry>();
+    BOOST_REQUIRE(registry->RegisterFactory(
         "ordered", [] { return std::make_shared<OrderedSvc>(); }, 16));
-    auto table = fw::BuildMethodTable<OrderedSvc>();
+    auto table = std::make_shared<const fw::RpcMethodTable>(
+        fw::BuildMethodTable<OrderedSvc>());
     auto created = fw::OrderedIngress::Create(
         fw::OrderedIngressConfig{"ordered", 8, 64, 65536});
     BOOST_REQUIRE(created);
@@ -312,7 +317,7 @@ BOOST_AUTO_TEST_CASE(ordered_direct_error_boundary_matches_replay) {
         true, 8, 64, 65536};
     std::map<std::string, fw::InboundDispatcher::ServiceEntry> services;
     services.emplace("ordered", fw::InboundDispatcher::ServiceEntry{
-        opts, &table, nullptr, &registry, ingress});
+        opts, table, nullptr, registry, ingress});
     fw::InboundDispatcher dispatcher(std::move(services));
 
     const auto invalid = MakeEnvelope("invalid-1", "acct-1", -2, 1);

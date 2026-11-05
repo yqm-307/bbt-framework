@@ -8,7 +8,7 @@
 #          owner Close 同步物理收口），无 KvStore 替身）
 #   svc_b  gateway（handler 内 this->call 跨进程到 svc_a；static_routes 显式
 #          白名单唯一出口）
-#   driver 演示客户端（NetworkRuntime + HttpClient，按 infra 正式 RpcWire
+#   driver 演示客户端（net::Engine + http::Client，按 infra 正式 RpcWire
 #          （ProtoWireV1，POST /rpc + application/x-protobuf）收发——不引用
 #          framework internal 头）
 #

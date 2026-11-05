@@ -7,6 +7,7 @@
 #include <bbt/coroutine/object/CoObject.hpp>
 
 #include <bbt/framework/internal/ActorRegistry.hpp>
+#include <bbt/framework/internal/AppRuntimeState.hpp>
 #include <bbt/framework/internal/CoAppSeam.hpp>
 #include <bbt/framework/internal/HostLifecycle.hpp>
 #include <bbt/framework/internal/InboundDispatcher.hpp>
@@ -44,10 +45,12 @@ result<void> FailInvalid(std::string what) {
 } // namespace
 
 CoApp::CoApp(CoAppOptions options)
-    : m_options(std::move(options)) {
+    : m_options(std::move(options)),
+      m_state(std::make_shared<AppRuntimeState>()) {
     // 默认装配：真实网络宿主 + 入站线桥 + 默认出站。InstallHandler/
     // InstallRpcHandler 只存 handler（Start 在 run 内），此处安装是安全的；
-    // handler 闭包自持状态、不按裸指针捕获宿主（见 InfraHttpHost 文件头寿命边界）。
+    // handler 闭包按值复制运行时状态的 shared_ptr，不借用宿主/CoApp 成员、
+    // 不捕获 this（见 internal/AppRuntimeState.hpp 的寿命契约）。
     m_default_host = std::make_shared<InfraHttpHost>(
         m_options.network_limits, m_options.listen);
     m_network_host = m_default_host;
@@ -72,19 +75,26 @@ CoApp::CoApp(CoAppOptions options)
             : m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1
                   ? RpcEgressProfile::ProtoWireV1
                   : RpcEgressProfile::LegacyHeaders;
-    m_default_egress = std::make_shared<HttpEgress>(m_default_host,
-                                                    egress_profile);
-    for (const auto& r : m_options.static_routes)
+    m_state->default_egress =
+        std::make_shared<HttpEgress>(m_default_host, egress_profile);
+    m_state->rpc_policy = m_options.rpc_policy;
+    for (const auto& r : m_options.static_routes) {
         m_routes.emplace(r.service_name, r.address);   // 重复名保先见，run 校验拒绝
+        m_state->routes.emplace(r.service_name, r.address);
+    }
 }
 
 // 测试缝构造：显式注入宿主与出站发送（private，经 MakeCoAppForTest）。
 CoApp::CoApp(CoAppOptions options, CoAppSeam seam)
     : m_options(std::move(options)),
       m_network_host(std::move(seam.host)),
-      m_seam_send(std::move(seam.rpc_send)) {
-    for (const auto& r : m_options.static_routes)
+      m_state(std::make_shared<AppRuntimeState>()) {
+    m_state->seam_send = std::move(seam.rpc_send);
+    m_state->rpc_policy = m_options.rpc_policy;
+    for (const auto& r : m_options.static_routes) {
         m_routes.emplace(r.service_name, r.address);
+        m_state->routes.emplace(r.service_name, r.address);
+    }
 }
 
 CoApp::~CoApp() = default;
@@ -266,8 +276,8 @@ result<std::shared_ptr<ICoService>> CoApp::find_service(
             "find_service: actor-keyed service '" +
                 std::string(service_name) +
                 "'; use actor_registry()"));
-    const auto inst = m_instances.find(std::string(service_name));
-    if (inst == m_instances.end())
+    const auto inst = m_state->instances.find(std::string(service_name));
+    if (inst == m_state->instances.end())
         return result<std::shared_ptr<ICoService>>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "find_service: service '" + std::string(service_name) +
@@ -277,7 +287,8 @@ result<std::shared_ptr<ICoService>> CoApp::find_service(
 
 ActorRegistry* CoApp::actor_registry() const noexcept {
     std::lock_guard<std::mutex> lk(m_mtx);
-    return m_actor_registry.get();
+    std::lock_guard<std::mutex> sl(m_state->mtx);
+    return m_state->registry.get();
 }
 
 std::string CoApp::bound_endpoint() const {
@@ -324,9 +335,12 @@ result<void> CoApp::_BindServices() {
     // 绑定；ActorSerial → 注册表工厂在激活时绑定身份，actor key 由注册表
     // 经 _bind_actor_key 绑定。所有实例共享同一出站注入点（经路由门）
     // 与同一应用级资源表（context().resource<R>() 的数据源）。
+    // 出站回调复制 m_state 的 shared_ptr（不捕获 this）：服务实例经
+    // m_send 发出的调用只访问状态内的 routes/policy/egress/seam_send。
     const ICoService::RpcSendFn egress = _MakeEgress();
-    decltype(m_instances) instances;
-    auto registry = std::make_unique<ActorRegistry>();
+    std::map<std::string, std::shared_ptr<ICoService>> instances;
+    auto registry = std::make_shared<ActorRegistry>();
+    std::map<std::string, std::shared_ptr<const RpcMethodTable>> tables;
     std::map<std::string, InboundDispatcher::ServiceEntry> dispatch;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -342,6 +356,10 @@ result<void> CoApp::_BindServices() {
                         return result<void>::err(std::move(created.error()));
                     entry.ordered_ingress = std::move(created.value());
                 }
+                // 方法表移入运行时状态，分发表项强持有同一 shared_ptr：
+                // 在途分发不再借用 CoApp 成员的地址。
+                auto table =
+                    std::make_shared<RpcMethodTable>(std::move(entry.table));
                 if (entry.options.execution == ExecutionPolicy::Concurrent) {
                     auto inst = entry.factory();
                     inst->_bind_runtime(
@@ -350,7 +368,7 @@ result<void> CoApp::_BindServices() {
                     instances.emplace(name, inst);
                     dispatch.emplace(name,
                         InboundDispatcher::ServiceEntry{
-                            entry.options, &entry.table,
+                            entry.options, table,
                             std::move(inst), nullptr, entry.ordered_ingress});
                 } else {
                     const auto factory = entry.factory;
@@ -372,18 +390,18 @@ result<void> CoApp::_BindServices() {
                         return r;
                     dispatch.emplace(name,
                         InboundDispatcher::ServiceEntry{
-                            entry.options, &entry.table,
-                            nullptr, registry.get(), entry.ordered_ingress});
+                            entry.options, table,
+                            nullptr, registry, entry.ordered_ingress});
                 }
+                tables.emplace(name, std::move(table));
             } catch (const std::exception& e) {
                 return result<void>::err(MakeError(ErrorCode::InternalError,
                     "CoApp bind '" + name + "': " + e.what()));
             }
         }
-        m_instances      = std::move(instances);
-        m_actor_registry = std::move(registry);
-        m_dispatcher = std::make_unique<InboundDispatcher>(
-            std::move(dispatch));
+        m_state->Publish(
+            std::make_shared<InboundDispatcher>(std::move(dispatch)),
+            std::move(tables), std::move(instances), std::move(registry));
     }
     return result<void>::ok();
 }
@@ -467,72 +485,27 @@ void CoApp::_CloseResources() noexcept {
 }
 
 void CoApp::_ReleaseServices() noexcept {
+    // 收回运行时状态持有的全部业务对象引用：新分发立即拒绝，在途分发靠
+    // 本地强引用与自持表项收尾，本对象随后可完全回收。
     std::lock_guard<std::mutex> lk(m_mtx);
-    // 分发器先于注册表/实例销毁：不再接受的入站才不再有执行入口。
-    m_dispatcher.reset();
-    m_instances.clear();
-    m_actor_registry.reset();
+    m_state->Release();
 }
 
 ICoService::RpcSendFn CoApp::_MakeEgress() {
-    // 路由门在宿主侧：业务只给逻辑 service 名，实际目标必须命中显式
-    // 静态路由；发送实现 = 默认 HttpEgress（业务路径）或测试缝注入的
-    // rpc_send。两者都缺失 → 如实 RuntimeUnavailable。
-    return [this](const bbt::infra::RpcEnvelope& env,
-                  const bbt::infra::CallOptions& options)
+    // 出站回调复制运行时状态的 shared_ptr——不捕获 this、不借用 CoApp
+    // 成员；路由门/策略/发送实现全部在状态内（见 AppRuntimeState::Send）。
+    auto state = m_state;
+    return [state = std::move(state)](const bbt::infra::RpcEnvelope& env,
+                                      const bbt::infra::CallOptions& options)
         -> result<bbt::infra::RpcEnvelope> {
-        auto addr = find_route(env.service);
-        if (!addr)
-            return result<bbt::infra::RpcEnvelope>::err(addr.error());
-
-        // 公开出站策略在路由授权之后、发送之前调用一次。策略只见
-        // 只读事实（已解析目标 + 不可改写 envelope + 已适配绝对期限），只能
-        // Allow/Reject 或收紧期限；无策略（nullptr）时逐字保持今天的行为。
-        bbt::infra::CallOptions opt = options;
-        if (m_options.rpc_policy) {
-            RpcPolicyDecision decision;
-            auto d = m_options.rpc_policy->Preflight(RpcCallView{addr.value(), env, opt.deadline});
-            if (!d)
-                return result<bbt::infra::RpcEnvelope>::err(d.error());
-            decision = d.value();
-
-            if (decision.kind == RpcPolicyDecision::Kind::Reject)
-                return result<bbt::infra::RpcEnvelope>::err(decision.reject_error);
-
-            // 只收紧：框架取 min(原期限, 收紧值)，绝不放大的策略结果。
-            if (decision.tightened_deadline.has_value() && *decision.tightened_deadline < opt.deadline)
-                opt.deadline = *decision.tightened_deadline;
-
-            // 收紧到已过期（或不晚于 now）→ 发起任何 I/O 之前按 TimedOut 拒绝，
-            // 与 AdaptCallOptions 的过期门同语义。
-            if (opt.deadline <= std::chrono::steady_clock::now())
-                return result<bbt::infra::RpcEnvelope>::err(
-                    MakeError(ErrorCode::TimedOut, "rpc policy tightened deadline already expired"));
-        }
-
-        if (m_default_egress)
-            return m_default_egress->Send(addr.value(), env, opt);
-        if (!m_seam_send)
-            return result<bbt::infra::RpcEnvelope>::err(MakeError(
-                ErrorCode::RuntimeUnavailable,
-                "CoApp: rpc_send egress not configured"));
-        return m_seam_send(addr.value(), env, opt);
+        return state->Send(env, options);
     };
 }
 
 result<bbt::infra::RpcEnvelope> CoApp::dispatch_inbound(
     const bbt::infra::IncomingCallContext& incoming,
     bbt::infra::RpcEnvelope request) {
-    InboundDispatcher* dispatcher;
-    {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        dispatcher = m_dispatcher.get();
-    }
-    if (dispatcher == nullptr)
-        return result<bbt::infra::RpcEnvelope>::err(MakeError(
-            ErrorCode::RuntimeUnavailable,
-            "dispatch_inbound: app not running"));
-    return dispatcher->Dispatch(incoming, std::move(request));
+    return m_state->Dispatch(incoming, std::move(request));
 }
 
 result<bbt::infra::RpcEnvelope> DispatchInboundForTest(

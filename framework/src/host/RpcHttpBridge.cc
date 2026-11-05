@@ -34,26 +34,27 @@ std::optional<std::string> HeaderOf(
 
 } // namespace
 
-bbt::infra::HttpRequest ToHttpRequest(
-    const bbt::infra::RpcEnvelope& env, std::string url) {
-    bbt::infra::HttpRequest r;
-    r.method = "POST";
-    r.url    = std::move(url);
-    r.headers = {
-        {"x-bbt-service",         env.service},
-        {"x-bbt-method",          env.method},
-        {"x-bbt-request-id",      env.request_id},
-        {"x-bbt-request-schema",  env.request_schema},
+result<bbt::infra::http::PreparedRequest> ToHttpRequest(
+    bbt::infra::http::Client& client, const bbt::infra::RpcEnvelope& env, std::string url) {
+    bbt::infra::http::RequestOptions options;
+    options.headers = {
+        {"x-bbt-service", env.service},
+        {"x-bbt-method", env.method},
+        {"x-bbt-request-id", env.request_id},
+        {"x-bbt-request-schema", env.request_schema},
         {"x-bbt-response-schema", env.response_schema},
     };
     for (const auto& [k, v] : env.metadata)
-        r.headers.emplace_back(std::string(kMetaPrefix) + k, v);
-    r.body.assign(env.payload.begin(), env.payload.end());
-    return r;
+        options.headers.emplace_back(std::string(kMetaPrefix) + k, v);
+    auto prepared = client.BuildRequest("POST", url, options);
+    if (!prepared)
+        return prepared;
+    prepared.value().body.assign(env.payload.begin(), env.payload.end());
+    return prepared;
 }
 
 result<bbt::infra::RpcEnvelope> EnvelopeFromRequest(
-    const bbt::infra::HttpRequest& req) {
+    const bbt::infra::http::IncomingRequest& req) {
     bbt::infra::RpcEnvelope env;
     auto need = [&](const char* n, std::string& dst) -> bool {
         auto v = HeaderOf(req.headers, n);
@@ -77,11 +78,11 @@ result<bbt::infra::RpcEnvelope> EnvelopeFromRequest(
     return result<bbt::infra::RpcEnvelope>::ok(std::move(env));
 }
 
-bbt::infra::HttpResponse ToHttpResponse(
+bbt::infra::http::Response ToHttpResponse(
     const result<bbt::infra::RpcEnvelope>& r) {
-    bbt::infra::HttpResponse res;
+    bbt::infra::http::Response res;
     if (r) {
-        res.status  = 200;
+        res.status_code = 200;
         res.headers = {
             {"x-bbt-request-id",      r.value().request_id},
             {"x-bbt-response-schema", r.value().response_schema},
@@ -99,7 +100,7 @@ bbt::infra::HttpResponse ToHttpResponse(
         ep = &downgraded;
     }
     const Error& e = *ep;
-    res.status = 400;
+    res.status_code = 400;
     res.headers = {
         {"x-bbt-err-code",        std::to_string(static_cast<int>(e.code))},
         {"x-bbt-err-domain",      e.domain},
@@ -110,8 +111,8 @@ bbt::infra::HttpResponse ToHttpResponse(
 }
 
 result<bbt::infra::RpcEnvelope> EnvelopeFromResponse(
-    const bbt::infra::HttpResponse& res) {
-    if (res.status == 200) {
+    const bbt::infra::http::Response& res) {
+    if (res.status_code == 200) {
         bbt::infra::RpcEnvelope env;
         env.request_id =
             HeaderOf(res.headers, "x-bbt-request-id").value_or("");
@@ -138,21 +139,26 @@ result<bbt::infra::RpcEnvelope> EnvelopeFromResponse(
 
 namespace bbt::framework {
 
-void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app) {
+void InstallRpcHttpBridge(InfraHttpHost& host,
+                          std::shared_ptr<AppRuntimeState> state) {
     host.InstallHandler(
-        [&app](bbt::infra::IncomingCallContext ctx,
-               bbt::infra::HttpRequest req)
-            -> result<bbt::infra::HttpResponse> {
+        [state = std::move(state)](bbt::infra::IncomingCallContext ctx,
+                                   bbt::infra::http::IncomingRequest req)
+            -> result<bbt::infra::http::Response> {
             auto env = http_bridge::EnvelopeFromRequest(req);
             if (!env)
-                return result<bbt::infra::HttpResponse>::ok(
+                return result<bbt::infra::http::Response>::ok(
                     http_bridge::ToHttpResponse(
                         result<bbt::infra::RpcEnvelope>::err(
                             std::move(env.error()))));
-            return result<bbt::infra::HttpResponse>::ok(
+            return result<bbt::infra::http::Response>::ok(
                 http_bridge::ToHttpResponse(
-                    app.dispatch_inbound(ctx, std::move(env.value()))));
+                    state->Dispatch(ctx, std::move(env.value()))));
         });
+}
+
+void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app) {
+    InstallRpcHttpBridge(host, app.m_state);
 }
 
 HttpEgress::HttpEgress(std::weak_ptr<InfraHttpHost> host,
@@ -169,23 +175,18 @@ result<bbt::infra::RpcEnvelope> HttpEgress::_SendRpcProfile(const bbt::infra::Rp
     // Client::Call 承担；HTTP/TCP transport adapter 按 profile 选择：
     //   ProtoWireV1 → HttpRpcTransport（底座 http::Client，POST /rpc 固定 profile）
     //   TcpV1       → TcpRpcTransport（底座 client-only Engine，u32be 帧）
-    // 两者共用同一份懒建 rpc::Client 缓存；底座是宿主 egress_engine()
-    // （client-only Engine，Start 时已 Run）。LegacyHeaders 不经本路径。
+    // HTTP RPC client 由宿主持有，TCP client 由本桥懒建；两者使用宿主
+    // client-only egress Engine。LegacyHeaders 不经 RPC core，但共享 HTTP pool。
     std::shared_ptr<bbt::infra::rpc::Client> client;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         client = m_rpc_client;
     }
-    // 请求侧 body 限额在发起任何 I/O 之前校验（与旧
-    // NetworkRuntime::CreateHttpClient → ValidateRequest 的同一语义）：
-    // wire body 为 envelope 编码大小，超限 → InvalidArgument，远端零触达。
-    // host 已释放且 client 已缓存时按宿主生前限额无法读取——交由 adapter/
-    // Engine 状态如实结算（旧链路同此窗口）。
-    if (auto host = m_host.lock()) {
-        if (env.payload.size() > host->network_limits().max_body_bytes)
-            return result<bbt::infra::RpcEnvelope>::err(MakeError(
-                ErrorCode::InvalidArgument,
-                "rpc egress: request payload exceeds host max_body_bytes"));
+    if (m_profile == RpcEgressProfile::ProtoWireV1) {
+        auto host = m_host.lock();
+        client = host ? host->rpc_http_client() : nullptr;
+        if (!client) return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::RuntimeUnavailable, "host RPC HTTP client unavailable"));
     }
     if (!client) {
         auto host = m_host.lock();
@@ -200,9 +201,9 @@ result<bbt::infra::RpcEnvelope> HttpEgress::_SendRpcProfile(const bbt::infra::Rp
         bbt::infra::result<std::shared_ptr<bbt::infra::rpc::IRpcTransport>>
             transport{bbt::infra::result<std::shared_ptr<bbt::infra::rpc::IRpcTransport>>::err(
                 MakeError(ErrorCode::InvalidArgument, "unset"))};
-        const auto& limits = host->network_limits();
         if (m_profile == RpcEgressProfile::TcpV1) {
 #if defined(BBT_FRAMEWORK_HAS_RPC_TCP)
+            const auto& limits = host->network_limits();
             // 帧上限按宿主 NetworkLimits.max_body_bytes 收敛（与入站同一限额
             // owner 语义）；连接/inflight 由 adapter 自带默认（64），宿主
             // 限额不放大 adapter 上限——取 min 保留旧链路的较小者生效语义。
@@ -223,29 +224,6 @@ result<bbt::infra::RpcEnvelope> HttpEgress::_SendRpcProfile(const bbt::infra::Rp
                 "rpc egress: TcpV1 profile requires bbt::infra_rpc_tcp "
                 "(BBT_INFRA_RPC_TCP not configured)"));
 #endif
-        } else {
-            // http::Client 选项按宿主 NetworkLimits 收敛：连接池上限取
-            // max_connections 与默认池上限的较小者（不放大），排队上界取
-            // max_inflight；单响应体上限 = max_body_bytes（请求侧 body 校验
-            // 在下方显式执行，与旧 CreateHttpClient 链路同语义）。
-            bbt::infra::http::ClientOptions client_options;
-            client_options.limits.max_connections = std::min<std::size_t>(
-                client_options.limits.max_connections,
-                limits.max_connections);
-            client_options.limits.max_queue = std::min<std::size_t>(
-                client_options.limits.max_queue, limits.max_inflight);
-            client_options.max_body_bytes = limits.max_body_bytes;
-            auto http_client = bbt::infra::http::Client::Create(
-                engine, client_options);
-            if (!http_client)
-                return result<bbt::infra::RpcEnvelope>::err(
-                    std::move(http_client.error()));
-            auto made = bbt::infra::rpc::HttpRpcTransport::Create(
-                std::move(http_client).value());
-            if (!made)
-                return result<bbt::infra::RpcEnvelope>::err(std::move(made.error()));
-            transport = bbt::infra::result<std::shared_ptr<bbt::infra::rpc::IRpcTransport>>::ok(
-                std::move(made).value());
         }
 
         auto created = bbt::infra::rpc::Client::Create(
@@ -302,38 +280,34 @@ result<bbt::infra::RpcEnvelope> HttpEgress::Send(
             ErrorCode::InvalidArgument,
             "rpc egress: LegacyHeaders profile only supports http transport"));
 
-    std::shared_ptr<bbt::infra::HttpClient> client;
-    {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        client = m_client;
-    }
-    if (!client) {
-        auto host = m_host.lock();
-        std::shared_ptr<bbt::infra::NetworkRuntime> rt;
-        if (host)
-            rt = host->network_runtime();
-        if (!rt)
-            return result<bbt::infra::RpcEnvelope>::err(MakeError(
-                ErrorCode::RuntimeUnavailable,
-                "http egress: network runtime unavailable"));
-        auto created = rt->CreateHttpClient();
-        if (!created)
-            return result<bbt::infra::RpcEnvelope>::err(
-                std::move(created.error()));
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_client)
-            m_client = std::move(created.value());
-        client = m_client;
-    }
-
-    auto res = client->Request(
-        http_bridge::ToHttpRequest(
-            env, addr.transport + "://" + addr.endpoint + "/rpc"),
-        opt);
-    if (!res)
-        return result<bbt::infra::RpcEnvelope>::err(
-            std::move(res.error()));
-    return http_bridge::EnvelopeFromResponse(res.value());
+    auto host = m_host.lock();
+    auto client = host ? host->http_client() : nullptr;
+    if (!client)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::RuntimeUnavailable, "http egress: host client unavailable"));
+    const auto& limits = host->network_limits();
+    if (env.payload.size() > limits.max_body_bytes)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::InvalidArgument, "http egress: request body exceeds host limit"));
+    auto request = http_bridge::ToHttpRequest(*client, env, "http://" + addr.endpoint + "/rpc");
+    if (!request)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(request.error()));
+    std::size_t header_bytes = 0;
+    for (const auto& header : request.value().headers)
+        header_bytes += header.first.size() + header.second.size();
+    if (header_bytes > limits.max_header_bytes)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::InvalidArgument, "http egress: request headers exceed host limit"));
+    auto response = bbt_co_await client->Send(request.value(), opt);
+    if (!response)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(response.error()));
+    header_bytes = 0;
+    for (const auto& header : response.value().headers)
+        header_bytes += header.first.size() + header.second.size();
+    if (header_bytes > limits.max_header_bytes)
+        return result<bbt::infra::RpcEnvelope>::err(MakeError(
+            ErrorCode::ProtocolError, "http egress: response headers exceed host limit"));
+    return http_bridge::EnvelopeFromResponse(response.value());
 }
 
 } // namespace bbt::framework

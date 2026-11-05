@@ -1,6 +1,6 @@
 // examples/dual_service/driver_main.cc — driver：演示客户端进程。
 //
-// 独立进程：自起 Scheduler + NetworkRuntime + HttpClient，按 infra 正式
+// 独立进程：自起 Scheduler + net::Engine + http::Client，按 infra 正式
 // RpcWire（ProtoWireV1，POST /rpc + application/x-protobuf）向 gateway 发真实
 // RPC。只依赖 infra 公开头 <bbt/infra/rpc/RpcWire.hpp>、<bbt/infra/rpc/HttpTransport.hpp> 与 framework 公开面
 // （CoRpc 位置参数 codec）——不引用 framework internal 头，也不读 x-bbt-* header。
@@ -43,8 +43,8 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 
-#include <bbt/infra/HttpClient.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Client.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/http/Client.hpp>      // wire 回复解析的新值类型边界
 #include <bbt/infra/rpc/RpcWire.hpp>       // 公开 wire profile 契约（非 framework internal）
@@ -97,11 +97,11 @@ const char* CodeName(fw::ErrorCode c) {
 }
 
 // 全局运行态：main 建立；协程里执行 Send。
-// 必须是可显式释放的全局：若留在静态析构阶段，HttpClient/NetworkRuntime
+// 必须是可显式释放的全局：若留在静态析构阶段，http::Client/net::Engine
 // 的析构会发生在 g_scheduler->Stop() 之后，访问已停调度器导致崩溃。
 // main 返回前 reset()（见 main 收尾）。
-std::shared_ptr<inf::NetworkRuntime> g_rt;
-std::shared_ptr<inf::HttpClient>     g_client;
+std::shared_ptr<fw::InfraHttpHost> g_rt;
+std::shared_ptr<inf::http::Client>     g_client;
 std::string                          g_endpoint;
 std::uint32_t                        g_seq = 0;
 
@@ -156,16 +156,14 @@ Reply Send(const std::string& service, const std::string& method,
            want_request_id]() mutable {
         inf::CallOptions o;
         o.deadline = Clock::now() + budget;
-        auto res = g_client->Request(http_req, o);
+        auto res = bbt_co_await g_client->Post(http_req.url, {http_req.body, {}}, {http_req.headers, {}, std::nullopt}, o);
         Reply r;
         if (!res) {
             r.ok    = false;
             r.error = std::move(res.error());
         } else {
-            // 旧栈 HttpResponse → 新栈 http::Response 的边界值转换
-            // （status→status_code；headers/body 同名透传）。
             inf::http::Response wire_resp;
-            wire_resp.status_code = static_cast<int>(res.value().status);
+            wire_resp.status_code = static_cast<int>(res.value().status_code);
             wire_resp.headers     = res.value().headers;
             wire_resp.body        = std::move(res.value().body);
             auto parsed = rpcw::ParseRpcWireHttpResponse(wire_resp);
@@ -247,33 +245,29 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("BBT_DEMO_KEY_PREFIX"))
         g_key_prefix = p;
 
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 1;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
     g_scheduler->Start();
 
-    auto rt = inf::NetworkRuntime::Create(inf::NetworkLimits{
+    auto rt = std::make_shared<fw::InfraHttpHost>(inf::NetworkLimits{
         /*max_connections*/ 32, /*max_inflight*/ 32,
         /*max_header_bytes*/ 16384, /*max_body_bytes*/ 65536,
-        /*incoming_timeout*/ std::chrono::milliseconds{5000}});
-    if (!rt) {
-        std::fprintf(stderr, "[driver] NetworkRuntime::Create failed: %s\n",
-                     rt.error().message.c_str());
-        return 70;
-    }
-    g_rt = rt.value();
+        /*incoming_timeout*/ std::chrono::milliseconds{5000}}, inf::ListenAddress{"127.0.0.1", 0});
+    g_rt = rt;
+    if (auto r = g_rt->Create(); !r) { g_rt->Close(); return 70; }
     if (auto r = g_rt->Start(); !r) {
         std::fprintf(stderr, "[driver] runtime start failed: %s\n",
                      r.error().message.c_str());
         g_rt->Close();
         return 70;
     }
-    auto cl = g_rt->CreateHttpClient();
+    auto cl = g_rt->http_client();
     if (!cl) {
-        std::fprintf(stderr, "[driver] CreateHttpClient failed\n");
+        std::fprintf(stderr, "[driver] host HTTP client unavailable\n");
         g_rt->Close();
         return 70;
     }
-    g_client = cl.value();
+    g_client = cl;
 
     std::printf("[driver] gateway=%s key_prefix=\"%s\"\n\n",
                 g_endpoint.c_str(), g_key_prefix.c_str());
