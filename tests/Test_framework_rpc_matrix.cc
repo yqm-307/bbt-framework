@@ -6,8 +6,8 @@
 //     * 服务端：公开 `fw::CoApp app(opts)`（opts.inbound_bridge=ProtoWireV1），
 //       真实 InfraHttpHost 监听 127.0.0.1:0，业务服务经公开 ProtoMethod 注册
 //       测试专用 Hold/Fast（只读 GetValue 语义，无写副作用）；
-//     * 客户端：infra 公开 `NetworkRuntime::Create → Start → CreateHttpClient`
-//       得真实 HttpClient，经 rpc::ToWireEnvelope + MakeRpcWireHttpRequest 组真实
+//     * 客户端：infra 公开 `InfraHttpHost::Create → Start → Createhttp::Client`
+//       得真实 http::Client，经 rpc::ToWireEnvelope + MakeRpcWireHttpRequest 组真实
 //       POST /rpc protobuf body，走真实 socket loopback（非注入 rpc_send、非直接
 //       dispatch、非私有身份）。
 //   未认证 principal 来自真实 transport（loopback 无认证 → 空串），测试不手造
@@ -51,9 +51,9 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
 
-#include <bbt/infra/HttpClient.hpp>
+#include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/ICoCloseable.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/rpc/HttpTransport.hpp>
@@ -357,7 +357,8 @@ std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
     // HostLifecycle 只在未初始化时 Start，运行时为进程寿命单例（无 Stop），
     // 故 T2+ 调用时调度器已初始化，跳过写入以规避运行期数据竞争。
     if (!g_scheduler->IsInitialized()) {
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
+        // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         // handler 在协程内做 proto wire 编解码 + 分发栈，默认 12KB 栈触底；
         // 按示例口径放大到 512KB（仅覆盖本测试负载规模）。
         g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
@@ -392,11 +393,11 @@ bool WaitShutdownState(fw::CoApp& app, fw::ShutdownState want,
     return app.shutdown_state() == want;
 }
 
-// ── 客户端：infra 公开 NetworkRuntime + HttpClient（真实 socket）───────
+// ── 客户端：infra 公开 net::Engine + http::Client（真实 socket）───────
 
 struct ClientEnv {
-    std::shared_ptr<inf::NetworkRuntime> rt;
-    std::shared_ptr<inf::HttpClient>     client;
+    std::shared_ptr<fw::InfraHttpHost> rt;
+    std::shared_ptr<inf::http::Client>     client;
 
     bool Start() {
         inf::NetworkLimits lim{};
@@ -405,13 +406,14 @@ struct ClientEnv {
         lim.max_header_bytes = 16 * 1024;
         lim.max_body_bytes   = 64 * 1024;
         lim.incoming_timeout = std::chrono::milliseconds{30000};
-        auto r = inf::NetworkRuntime::Create(lim);
+        auto r = std::make_shared<fw::InfraHttpHost>(lim, inf::ListenAddress{"127.0.0.1", 0});
         if (!r) return false;
-        rt = r.value();
+        rt = r;
+        if (auto s = rt->Create(); !s) return false;
         if (auto s = rt->Start(); !s) return false;
-        auto c = rt->CreateHttpClient();
+        auto c = rt->http_client();
         if (!c) return false;
-        client = c.value();
+        client = c;
         return true;
     }
     void Stop() { if (rt) rt->Close(); }
@@ -422,12 +424,12 @@ struct ClientStopOnExit {
 };
 
 struct ClientCallOut {
-    std::optional<inf::result<inf::HttpResponse>> r;
+    std::optional<inf::result<inf::http::Response>> r;
     TestLatch                                     done{1};
 };
 
 std::shared_ptr<ClientCallOut> CallAsync(
-    const std::shared_ptr<inf::HttpClient>& client,
+    const std::shared_ptr<inf::http::Client>& client,
     const std::string& endpoint,
     const std::string& method,
     const std::string& rid,
@@ -454,7 +456,7 @@ std::shared_ptr<ClientCallOut> CallAsync(
 
     auto wire = rpcw::ToWireEnvelope(env, budget_ms);
     if (!wire) {
-        out->r.emplace(inf::result<inf::HttpResponse>::err(wire.error()));
+        out->r.emplace(inf::result<inf::http::Response>::err(wire.error()));
         out->done.CountDown();
         return out;
     }
@@ -462,7 +464,7 @@ std::shared_ptr<ClientCallOut> CallAsync(
     // 显式 POST /rpc + 固定 Content-Type（与 wire profile 同一线路）。
     auto wire_body = rpcw::EncodeRpcWireEnvelope(wire.value(), /*is_response=*/false);
     if (!wire_body) {
-        out->r.emplace(inf::result<inf::HttpResponse>::err(wire_body.error()));
+        out->r.emplace(inf::result<inf::http::Response>::err(wire_body.error()));
         out->done.CountDown();
         return out;
     }
@@ -477,22 +479,13 @@ std::shared_ptr<ClientCallOut> CallAsync(
         [out, client, r = std::move(r), deadline]() mutable {
             inf::CallOptions opt;
             opt.deadline = deadline;
-            out->r.emplace(client->Request(std::move(r), opt));
+            out->r.emplace(bbt_co_await client->Post(r.url, {r.body, {}}, {r.headers, {}, std::nullopt}, opt));
             out->done.CountDown();
         },
         succ);
     return succ ? out : nullptr;
 }
 
-// 旧栈 HttpResponse → 新栈 http::Response 的边界值转换（status→status_code；
-// headers/body 同名透传）。wire 解析面只接新类型。
-inf::http::Response ToWireResponse(const inf::HttpResponse& res) {
-    inf::http::Response out;
-    out.status_code = static_cast<int>(res.status);
-    out.headers     = res.headers;
-    out.body        = res.body;
-    return out;
-}
 
 bool WaitCall(const std::shared_ptr<ClientCallOut>& out,
               std::chrono::milliseconds ms = kWait) {
@@ -504,7 +497,7 @@ bool GetWireReply(const std::shared_ptr<ClientCallOut>& out,
     if (!out || !out->r.has_value()) return false;
     if (!out->r.value()) return false;                      // transport 失败
     auto parsed = rpcw::ParseRpcWireHttpResponse(
-        ToWireResponse(out->r.value().value()));
+        out->r.value().value());
     if (!parsed) return false;
     w = std::move(parsed.value());
     return true;
@@ -554,7 +547,7 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
                     msg += " msg=" + outs[i]->r.value().error().message;
                 } else {
                     auto pr = rpcw::ParseRpcWireHttpResponse(
-                        ToWireResponse(outs[i]->r.value().value()));
+                        outs[i]->r.value().value());
                     if (pr) {
                         msg += " wire_success=" + std::string(
                             pr.value().success ? "true" : "false");

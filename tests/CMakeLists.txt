@@ -251,7 +251,7 @@ else()
 endif()
 
 # RpcEnvelope wire profile 的跨语言互通验证：C++ 服务端消费
-# bbt::infra_rpc_net + bbt::infra_http；Python 客户端经 http.client
+# bbt::infra_rpc_net + bbt::infra_http_net；Python 客户端经 http.client
 # 真实 POST /rpc 收发 protobuf body。
 # fail-closed：本测试是 wire 契约验收的强制项。infra 未注册
 # bbt_infra_rpc_net 目标（例如接入时漏给 BBT_PROTOBUF_PREFIX）时必须在
@@ -270,7 +270,7 @@ find_package(Threads REQUIRED)
 
 add_executable(rpc_xlang_server rpc_xlang_server.cc)
 target_link_libraries(rpc_xlang_server PRIVATE
-    bbt::infra_rpc_net bbt::infra_http Boost::boost Threads::Threads)
+    bbt::framework bbt::infra_rpc_net bbt::infra_http_net Boost::boost Threads::Threads)
 target_compile_options(rpc_xlang_server PRIVATE -Wall -Wextra)
 
 # Python 客户端零依赖（手写 proto3 wire format），仅需解释器本体；
@@ -318,7 +318,7 @@ endif()
 
 # 正式 wire 路径上的并发隔离/容量/迟到寿命与关闭矩阵。
 # 服务端：公开 CoApp（inbound_bridge=ProtoWireV1）+ 真实 InfraHttpHost 监听
-# 127.0.0.1 动态端口；客户端：infra 公开 NetworkRuntime/HttpClient + rpc::RpcWire
+# 127.0.0.1 动态端口；客户端：infra 公开 net::Engine/http::Client + rpc::RpcWire
 # 构造真实 POST /rpc protobuf body，走真实 socket loopback。不使用
 # MakeCoAppForTest / DispatchInboundForTest / INetworkHost 桩 / LegacyHeaders。
 # 不覆盖跨 hop 预算与跨进程 supervisor 硬停。

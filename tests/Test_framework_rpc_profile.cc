@@ -14,7 +14,7 @@
 //                             §5.1：未提交调用落 Closed），同一 host 上 client
 //                             不可重开。
 //  legacy_headers_stays       LegacyHeaders 出站仍走 x-bbt-* header 桥（默认
-//                             路径不回归；对端用旧栈 HttpClient 断言 header 形态）。
+//                             路径不回归；对端用新 http::Client 断言 header 形态）。
 //
 // 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
 #define BOOST_TEST_MAIN
@@ -39,7 +39,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 
-#include <bbt/infra/HttpClient.hpp>
+#include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 
@@ -223,7 +223,8 @@ std::uint32_t TcpReadPrefix(const char in[4]) {
 
 // TcpV1 入站 + TcpV1 出站：真实 TCP loopback roundtrip。
 BOOST_AUTO_TEST_CASE(tcp_loopback_roundtrip) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    // Registered driver capacity: two hosts: 2 server + 1 egress each, plus one runnable worker.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -257,7 +258,7 @@ BOOST_AUTO_TEST_CASE(tcp_loopback_roundtrip) {
 // 默认 HTTP profile 回归：ProtoWireV1 出站（HttpRpcTransport）→ ProtoWireV1
 // 入站（HttpRpcInboundTransport），wire body 全保真。
 BOOST_AUTO_TEST_CASE(tcp_default_http_fallback) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -292,7 +293,7 @@ BOOST_AUTO_TEST_CASE(tcp_default_http_fallback) {
 
 // TcpV1 出站 committed 后断连 → OutcomeUnknown + request_phase 事实。
 BOOST_AUTO_TEST_CASE(tcp_outcome_unknown) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -366,7 +367,7 @@ BOOST_AUTO_TEST_CASE(tcp_outcome_unknown) {
 
 // egress rpc::Client Close 后调用 → Closed（不发起 I/O）；client 不可重开。
 BOOST_AUTO_TEST_CASE(tcp_close_mid_dial) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -401,7 +402,7 @@ BOOST_AUTO_TEST_CASE(tcp_close_mid_dial) {
 // （SetRpcInboundTransport + InstallRpcWireBridge + TcpV1 出站 profile），
 // 真实 dispatch → EchoSvc 方法表 → reply；外部 TcpV1 egress 打 loopback。
 BOOST_AUTO_TEST_CASE(tcp_coapp_end_to_end) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
@@ -450,25 +451,25 @@ BOOST_AUTO_TEST_CASE(tcp_coapp_end_to_end) {
 
 // LegacyHeaders 出站不回归：x-bbt-* header 桥逐字段映射（默认路径证据）。
 BOOST_AUTO_TEST_CASE(legacy_headers_stays) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
     if (!g_scheduler->IsInitialized())
         g_scheduler->Start();
     BOOST_REQUIRE(g_scheduler->IsInitialized());
 
-    // LegacyHeaders 入站宿主（旧栈 ListenHttp）。
+    // LegacyHeaders 入站宿主（新栈 http::Server）。
     auto host = std::make_shared<fw::InfraHttpHost>(
         Limits(std::chrono::milliseconds{30000}),
         inf::ListenAddress{"127.0.0.1", 0});
     host->InstallHandler(
-        [](inf::IncomingCallContext, inf::HttpRequest req)
-            -> fw::result<inf::HttpResponse> {
+        [](inf::IncomingCallContext, inf::http::IncomingRequest req)
+            -> fw::result<inf::http::Response> {
             auto env = fw::http_bridge::EnvelopeFromRequest(req);
             if (!env)
-                return fw::result<inf::HttpResponse>::ok(
+                return fw::result<inf::http::Response>::ok(
                     fw::http_bridge::ToHttpResponse(
                         fw::result<inf::RpcEnvelope>::err(
                             std::move(env.error()))));
-            return fw::result<inf::HttpResponse>::ok(
+            return fw::result<inf::http::Response>::ok(
                 fw::http_bridge::ToHttpResponse(
                     fw::result<inf::RpcEnvelope>::ok(
                         std::move(env.value()))));

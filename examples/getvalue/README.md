@@ -199,7 +199,7 @@ fail 并回收自有进程）。
   protobuf 业务（更大/更深嵌套 payload）不保证安全，属框架层待办。本切片未新增
   CoApp 栈配置层、未改默认 runtime。
 - **出站正式化**：`inbound_bridge=ProtoWireV1` 现在让**入站与出站同
-  profile**：`HttpEgress` 增加 `ProtoWireV1` 分支（同一 HttpClient 发送 root，
+  profile**：`HttpEgress` 增加 `ProtoWireV1` 分支（同一 http::Client 发送 root，
   只换 wire 编解码；`ToWireEnvelope`/`FromWireEnvelope` helper），egress 发起
   I/O 前再次按本地 deadline 换算 remaining_budget_ms（过期 → TimedOut 无 I/O），
   回复校验 request_id/response_schema 并保留 Error（含 `OutcomeUnknown`）。

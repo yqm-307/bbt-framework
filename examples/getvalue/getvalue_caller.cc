@@ -182,6 +182,8 @@ int main(int argc, char* argv[]) {
 
     // caller handler 内做 typed 出站（protobuf 编解码 + 框架分发），显式把
     // 协程栈调大（公开配置宏，须在调度器 Start 前设置；process-global）。
+    // Two server drivers + one client-only driver + one application worker.
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 
     bbt::framework::CoAppOptions options = BaseOptions();

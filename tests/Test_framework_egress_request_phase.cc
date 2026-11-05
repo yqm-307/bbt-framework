@@ -42,7 +42,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/http/Server.hpp>
@@ -60,11 +60,12 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 // 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测；
-// ProtoWireV1 出站经共享 NetworkRuntime::CreateHttpClient，不另占 Engine
+// ProtoWireV1 使用宿主共享 HTTP pool 与独立 client-only Engine
 // 驱动槽）。runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
 struct SchedulerFixture {
     SchedulerFixture() {
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        // Registered driver capacity: app server 2 + app egress 1 + raw peer driver 1 + runnable worker 1.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         // 用例在协程内做 proto wire 编解码与嵌套调用；默认 12KB 栈在
         // 同仓 inbound_http 用例的同一条出站链上已实测触底（guard 页
         // SIGSEGV）。按同口径在 Start() 前放大到 64 KiB。
@@ -359,7 +360,7 @@ BOOST_AUTO_TEST_CASE(connection_refused_is_transport_not_unknown) {
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(!static_cast<bool>(*res));
         const inf::Error& e = res->error();
-        // 共享 HttpClient（runtime 限额 owner）出站：连接被拒是「未提交」的
+        // 共享 http::Client（runtime 限额 owner）出站：连接被拒是「未提交」的
         // 确定失败——判别点是「非 OutcomeUnknown、非已提交」。request_phase
         // 在新栈契约下允许为空（NetToError 无阶段事实）；有值时必为未提交。
         BOOST_TEST(static_cast<int>(e.code) ==

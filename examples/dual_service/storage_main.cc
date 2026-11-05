@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
     // 从 static worker 绑定。本进程：RedisNetResource 的 client-only Engine
     // 1 槽 + RPC server Engine 2 槽（1 sub + 1 main）= 3；2 worker 时 bind 报
     // no_buffer_space，InfraHttpHost::Start 失败。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 
     fw::CoAppOptions opts;

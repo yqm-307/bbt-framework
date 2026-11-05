@@ -89,9 +89,9 @@
 #include <bbt/coroutine/object/CoObject.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
-#include <bbt/infra/HttpClient.hpp>
-#include <bbt/infra/HttpServer.hpp>
-#include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/http/Client.hpp>
+#include <bbt/infra/http/Server.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
 #include <bbt/framework/Framework.hpp>
@@ -386,6 +386,7 @@ public:
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(WaitErr(st, "wait_echo gate"));
         p->Snapshot(p->after, rid, SnapCtx(*ctx.value()));
+        p->Event("resumed:" + rid);
         return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
@@ -594,7 +595,8 @@ struct RunHandle {
 };
 
 std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    // Registered driver capacity: app server 2 + app egress 1 + test client 1 + extra host egress 1 + runnable worker 1.
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
     // 受管 handler 会在协程内做嵌套出站调用（入站派发 →
     // this->call → 出站适配 → 发送闭包 → client->Request → 信号等待），
     // 链上各帧携带 Error/result/envelope 等值类型；12KB 默认栈在首个
@@ -640,10 +642,10 @@ std::vector<std::shared_ptr<Spinner>> g_spinners;
 // 成员声明顺序即析构逆序：run 先于 app/host 收尾。
 struct AppBox {
     std::shared_ptr<fw::InfraHttpHost>          host;
-    // 出站闭包使用的 HttpClient 插槽：Start 后由 app 自身 runtime 建立。
-    std::shared_ptr<std::shared_ptr<inf::HttpClient>> egress_slot;
-    std::shared_ptr<inf::NetworkRuntime>        client_rt;
-    std::shared_ptr<inf::HttpClient>            client;
+    // 出站闭包使用的 http::Client 插槽：Start 后由 app 自身 runtime 建立。
+    std::shared_ptr<std::shared_ptr<inf::http::Client>> egress_slot;
+    std::shared_ptr<fw::InfraHttpHost>        client_rt;
+    std::shared_ptr<inf::http::Client>            client;
     std::string                                 endpoint;
     // CoApp 由夹具与在途派发任务共享强持有：DispatchDirect 超预算返回后
     // 任务仍可能迟到，app 由任务的 shared_ptr 保活，窗口内不悬垂。
@@ -682,7 +684,7 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
     box.host = std::make_shared<fw::InfraHttpHost>(
         limits, inf::ListenAddress{"127.0.0.1", 0});
     box.egress_slot =
-        std::make_shared<std::shared_ptr<inf::HttpClient>>();
+        std::make_shared<std::shared_ptr<inf::http::Client>>();
 
     fw::CoAppOptions opts;
     opts.network_limits = limits;
@@ -711,10 +713,10 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
             return fw::result<inf::RpcEnvelope>::err(fw::MakeError(
                 fw::ErrorCode::RuntimeUnavailable,
                 "egress client not installed"));
-        auto res = client->Request(
-            Wire::ToHttpRequest(
-                env, "http://" + host->bound_endpoint() + "/rpc"),
-            o);
+        auto prepared = Wire::ToHttpRequest(*client,
+                env, "http://" + host->bound_endpoint() + "/rpc");
+        if (!prepared) return fw::result<inf::RpcEnvelope>::err(std::move(prepared.error()));
+        auto res = bbt_co_await client->Send(prepared.value(), o);
         if (!res)
             return fw::result<inf::RpcEnvelope>::err(
                 std::move(res.error()));
@@ -741,17 +743,18 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
     BOOST_REQUIRE(box.app->shutdown_state() ==
                   fw::ShutdownState::Running);
 
-    auto egress = box.host->network_runtime()->CreateHttpClient();
+    auto egress = box.host->http_client();
     BOOST_REQUIRE(egress);
-    *box.egress_slot = egress.value();
+    *box.egress_slot = egress;
 
-    auto crt = inf::NetworkRuntime::Create(limits);
+    auto crt = std::make_shared<fw::InfraHttpHost>(limits, inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(crt);
-    box.client_rt = crt.value();
+    box.client_rt = crt;
+    BOOST_REQUIRE(box.client_rt->Create());
     BOOST_REQUIRE(box.client_rt->Start());
-    auto cl = box.client_rt->CreateHttpClient();
+    auto cl = box.client_rt->http_client();
     BOOST_REQUIRE(cl);
-    box.client = cl.value();
+    box.client = cl;
     return box;
 }
 
@@ -759,14 +762,15 @@ void StopApp(AppBox& box) { box.Stop(); }
 
 // 客户端发送一条 envelope 并等回包；在协程内调用。
 fw::result<inf::RpcEnvelope> SendRpc(
-    const std::shared_ptr<inf::HttpClient>& client,
+    const std::shared_ptr<inf::http::Client>& client,
     const std::string& endpoint,
     const inf::RpcEnvelope& env,
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    auto res = client->Request(
-        Wire::ToHttpRequest(env, "http://" + endpoint + "/rpc"), o);
+    auto prepared = Wire::ToHttpRequest(*client, env, "http://" + endpoint + "/rpc");
+        if (!prepared) return fw::result<inf::RpcEnvelope>::err(std::move(prepared.error()));
+        auto res = bbt_co_await client->Send(prepared.value(), o);
     if (!res)
         return fw::result<inf::RpcEnvelope>::err(std::move(res.error()));
     return Wire::EnvelopeFromResponse(res.value());
@@ -1033,6 +1037,13 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
     // 放行所有请求：恢复在被占 worker 上无法发生，目标请求必然
     // 由另一 worker 拉起重入——这是确定性的跨 worker 恢复。
     g_probe->CompleteAll();
+    // The occupied worker may also drive net I/O. Keep it blocked until the
+    // target's after-snapshot proves migration, then release it before asking
+    // the reactor to deliver replies. Do not require network progress from a
+    // deliberately non-yielding driver.
+    const bool resumed_elsewhere = g_probe->WaitEvent("resumed:" + target, kWait);
+    held->release.store(true, std::memory_order_release);
+    BOOST_REQUIRE(resumed_elsewhere);
     BOOST_REQUIRE(done.WaitFor(kWait));
 
     int switched = 0;
@@ -1178,10 +1189,10 @@ BOOST_AUTO_TEST_CASE(sync_close_on_control_thread) {
                         [](fw::CoApp& app) {
         BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts()));
     });
-    // 应用运行中的默认宿主已有真实 NetworkRuntime。
-    auto runtime = box.host->network_runtime();
+    // 应用运行中的默认宿主已有真实 net::Engine。
+    auto runtime = box.host->egress_engine();
     BOOST_REQUIRE(runtime);
-    BOOST_CHECK(!runtime->IsClosed());
+    BOOST_CHECK(runtime->Phase() == inf::net::EnginePhase::Running);
 
     // 第二个独立宿主：控制线程 Create/Start/Close 同步收口——Close 返回即
     // 物理释放（无协程等待桥接、无 InvalidContext 约束），重复 Close 幂等。
@@ -1190,13 +1201,13 @@ BOOST_AUTO_TEST_CASE(sync_close_on_control_thread) {
         inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(host2->Create());
     BOOST_REQUIRE(host2->Start());
-    auto rt2 = host2->network_runtime();
+    auto rt2 = host2->egress_engine();
     BOOST_REQUIRE(rt2);
-    BOOST_CHECK(!rt2->IsClosed());
+    BOOST_CHECK(rt2->Phase() == inf::net::EnginePhase::Running);
 
     host2->Close();                                    // 同步
-    BOOST_CHECK(rt2->IsClosed());                      // 返回即已释放
-    BOOST_CHECK(host2->network_runtime() == nullptr);  // 句柄已释放
+    BOOST_CHECK(rt2->Phase() == inf::net::EnginePhase::Stopped);                      // 返回即已释放
+    BOOST_CHECK(host2->egress_engine() == nullptr);  // 句柄已释放
     BOOST_CHECK(host2->http_server() == nullptr);
     host2->Close();                                    // 幂等
 
@@ -1742,7 +1753,7 @@ public:
 
 BOOST_AUTO_TEST_CASE(lifecycle_publish_revoked_on_run_exception)
 {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 
     fw::CoAppOptions opts{inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,

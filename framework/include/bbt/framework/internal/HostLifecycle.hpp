@@ -18,6 +18,12 @@
 // （on_handlers_drained → 网络 Close → on_release）只在「排空被证实」
 // （WaitHandlersDone 返回 ok）之后发生。
 //
+// 例外是宿主 Close 打断排空：INetworkHost::CloseReason() 已发布原因时，
+// 排空等待立即结束，**不再 park**——这不是「排空被证实」，所以资源收束
+// 挂接点 on_handlers_drained 不执行（业务 handler 可能仍借用业务对象），
+// 只走网络 Close 与 on_release，记失败项并返回 kExitShutdownFailed
+// （预算曾耗尽则按 kExitShutdownLate 报告迟到收尾）。
+//
 // coroutine runtime 是进程寿命单例：没有 Stop/restart，也不改代际；本
 // 状态机只在未初始化时 Start 一次，已初始化（他人启动或上一次 run 复用）
 // 直接复用，不叠加 Start。
@@ -32,6 +38,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,7 +52,7 @@ namespace bbt::framework {
 // INetworkHost：CoApp 的网络依赖组件（Server/Client/连接池由它拥有，
 // 不是 Service 的父类）。全部方法在宿主控制线程（Run 所在线程）
 // 调用；实现不得依赖「运行在协程内」。真实实现在内部桥接 infra
-// NetworkRuntime/HttpServer 的同步关闭语义；桩实现用于断言顺序与异常路径。
+// net::Engine/http::Server 的同步关闭语义；桩实现用于断言顺序与异常路径。
 //
 // 实现约束：
 //  - Create 成功后，无论 Start 是否成功，关闭序列（StopAccepting →
@@ -56,22 +63,36 @@ namespace bbt::framework {
 //    不得把任何错误当作「已排空」；
 //  - StopAccepting/Close 幂等、noexcept。Close 同步完成物理释放
 //    （对应 infra ICoCloseable::Close：返回即资源已释放、后端不再访问）。
+//  - Close(reason) 是「立即关闭、不先排空」的同义入口：默认丢弃原因转
+//    Close()，需要把原因发布给排空等待者的实现覆盖。
 class INetworkHost {
 public:
     virtual ~INetworkHost() = default;
 
-    // 创建网络组件（真实实现对应 NetworkRuntime::Create + 监听装配）。
+    // 创建网络组件（真实实现对应 InfraHttpHost::Create + 监听装配）。
     virtual result<void> Create() = 0;
     // 启动组件并开始接纳。同一实例至多成功一次。
     virtual result<void> Start() = 0;
     // 停止新入站接纳；不取消已接纳 handler、不断开其回复路径。
     virtual void StopAccepting() noexcept = 0;
-    // 等已接纳 handler 结束（排空）。超时 → err(TimedOut)。
+    // 等已接纳 handler 结束（排空）。超时 → err(TimedOut)；宿主已被
+    // Close 打断 → 立即返回关闭原因，不无限等。
     virtual result<void> WaitHandlersDone(
         bbt::coroutine::Deadline deadline) = 0;
     // 同步关闭并释放网络组件：返回即物理资源已释放、后端不再访问。
-    // 幂等、noexcept；在控制线程调用（真实实现对应 NetworkRuntime::Close）。
+    // 幂等、noexcept；在控制线程调用（真实实现对应 InfraHttpHost::Close）。
     virtual void Close() noexcept = 0;
+    // 带原因的立即关闭；默认丢弃原因转 Close()，既有桩实现保持源兼容。
+    virtual void Close(bbt::infra::Error reason) noexcept {
+        (void)reason;
+        Close();
+    }
+    // Close 发布的原因；未 Close 为空。HostLifecycle 用「原因是否存在」这个
+    // 明确状态判断「排空被关闭打断」，不按具体 ErrorCode 猜测（自定义原因
+    // 也可能是任意 code）。
+    virtual std::optional<bbt::infra::Error> CloseReason() const noexcept {
+        return std::nullopt;
+    }
 };
 
 // HostLifecycle：把启动/关闭顺序实现为可断言状态机。单实例、单线程使用
@@ -136,12 +157,18 @@ public:
     std::vector<std::string> Failures() const;
 
 private:
+    // 排空等待结果：Drained 才允许 Close/release；Interrupted 表示宿主已被
+    // Close（明确状态，不看错误码），照常收束但业务资源排空未获证实；
+    // Undrained 是永久失败，调用方 fail-closed。
+    enum class DrainOutcome { Drained, Interrupted, Undrained };
+
     result<void> _StartUp(const Hooks& hooks);
     void         _WaitShutdownRequest();
     int          _ShutDown(const Hooks& hooks);   // 返回 kExit*，固定顺序收束
-    // 预算内等待 + 一次无界续等；返回 true 表示排空已被证实（此时才允许
-    // Close/release），false 表示排空未被证实（调用方须 fail-closed）。
-    bool         _WaitHandlersDone();
+    // 预算内等待 + 一次无界续等；Drained 表示排空已被证实（此时才允许
+    // Close/release），Interrupted 表示 Close 打断（不 park），Undrained 表示
+    // 排空未被证实（调用方须 fail-closed）。
+    DrainOutcome _WaitHandlersDone();
     // 排空未被证实时的 fail-closed 保活：不 Close/release、Run 永不返回，
     // 保持 ShutdownIncomplete 与 owner/资源；无公共恢复 API、不 busy retry。
     void         _ParkUndrained();

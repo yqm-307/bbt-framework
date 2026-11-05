@@ -141,6 +141,7 @@ endif()
 # 但仍要求独立可编译）。CoApp.hpp 因 add_service 展开方法表而包含
 # MethodTable.hpp，属宿主头而非本汇总头。
 set(BBT_FRAMEWORK_INTERNAL_HEADERS
+    internal/AppRuntimeState.hpp
     internal/MethodTable.hpp
     internal/RequestScope.hpp
     internal/CallOptionsAdapter.hpp

@@ -83,6 +83,7 @@
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/ShutdownState.hpp>
 #include <bbt/framework/internal/HostLifecycle.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/internal/RpcHttpBridge.hpp>
 
 namespace fw  = bbt::framework;
@@ -230,8 +231,8 @@ struct RunHandle {
 struct CombinedBox {
     std::unique_ptr<fw::CoApp>           app;
     std::unique_ptr<RunHandle>           run;
-    std::shared_ptr<inf::NetworkRuntime> client_rt;
-    std::shared_ptr<inf::HttpClient>     client;
+    std::shared_ptr<fw::InfraHttpHost> client_rt;
+    std::shared_ptr<inf::http::Client>     client;
     std::string                          endpoint;
 
     CombinedBox() = default;
@@ -334,7 +335,7 @@ CombinedBox StartCombined(std::chrono::milliseconds incoming_timeout,
         fw::ExecutionPolicy::Concurrent, 64, 0, 0, false, 0, 0, 0}));
     RegisterResources(*box.app);
 
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
     auto run = std::make_unique<RunHandle>();
     run->app = box.app.get();
@@ -355,13 +356,14 @@ CombinedBox StartCombined(std::chrono::milliseconds incoming_timeout,
     }
     BOOST_REQUIRE(box.app->shutdown_state() == fw::ShutdownState::Running);
 
-    auto crt = inf::NetworkRuntime::Create(Limits(incoming_timeout));
+    auto crt = std::make_shared<fw::InfraHttpHost>(Limits(incoming_timeout), inf::ListenAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(crt);
-    box.client_rt = crt.value();
+    box.client_rt = crt;
+    BOOST_REQUIRE(box.client_rt->Create());
     BOOST_REQUIRE(box.client_rt->Start());
-    auto cl = box.client_rt->CreateHttpClient();
+    auto cl = box.client_rt->http_client();
     BOOST_REQUIRE(cl);
-    box.client = cl.value();
+    box.client = cl;
     return box;
 }
 
@@ -380,13 +382,14 @@ inf::RpcEnvelope MakeEnv(const char* service, const char* method,
 }
 
 fw::result<inf::RpcEnvelope> SendRpc(
-    const std::shared_ptr<inf::HttpClient>& client,
+    const std::shared_ptr<inf::http::Client>& client,
     const std::string& endpoint, const inf::RpcEnvelope& env,
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    auto res = client->Request(
-        Wire::ToHttpRequest(env, "http://" + endpoint + "/rpc"), o);
+    auto prepared = Wire::ToHttpRequest(*client, env, "http://" + endpoint + "/rpc");
+        if (!prepared) return fw::result<inf::RpcEnvelope>::err(std::move(prepared.error()));
+        auto res = bbt_co_await client->Send(prepared.value(), o);
     if (!res) return fw::result<inf::RpcEnvelope>::err(std::move(res.error()));
     return Wire::EnvelopeFromResponse(res.value());
 }
@@ -804,7 +807,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     // 该请求 incoming 预算 10000ms、关闭步预算 300ms：放行发生在 incoming 到期
     // 之前。但「未过期」不等于「Close 后必达」：InfraHttpHost.hpp:9-11 明文规定
     // 「Close 开始后仍在途且尚未交给传输层的回复不承诺送达原客户端」；infra
-    // HttpServer Close 亦明确丢弃未发送数据。故客户端结果只接受契约允许的两种：
+    // http::Server Close 亦明确丢弃未发送数据。故客户端结果只接受契约允许的两种：
     //   (a) 完整 HELD —— 回复在 Close 生效前已交给传输层送达；
     //   (b) TransportError(code=8) —— Close 开始后在途、尚未交给传输层而被截断。
     // 空结果或其它未知错误仍判失败（不静默、不放宽为任意错误）。

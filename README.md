@@ -87,14 +87,11 @@ ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
   `BBT_INFRA_HTTP_NET=ON` + `BBT_PROTOBUF_PREFIX`，三者缺一在 infra
   configure 阶段 fail-closed；NEED_TEST=ON 的本仓验收（
   `framework.rpc_xlang` 等强制用例）同样要求该目标在场。不显式选择
-  ProtoWireV1 的普通库构建可不配这组开关（仅迁移期 header 桥）。
-- ProtoWireV1 装配要求宿主进程 coroutine 已登记 worker ≥2：server
-  `net::Engine` 绑 1 main+1 sub 驱动槽；正式 wire 出站由同一
-  `NetworkRuntime::CreateHttpClient` 通道承载（runtime 限额 owner 共享
-  `max_connections`/`max_inflight` 与请求/响应字节校验），不另占
-  Engine/driver 槽。`g_bbt_coroutine_config->m_cfg_static_thread_num`
-  不足会在 Engine::Run 绑定时以 `no_buffer_space` 失败（`Engine::Run` 另占
-  宿主专用 native 线程，不是协程/P 线程）。
+  ProtoWireV1 的普通库构建仍必须开启 HTTP_NET；RPC_NET/protobuf 可选。
+- HTTP 消费统一到 `bbt::infra_http_net`，保留 LegacyHeaders 请求协议。
+  执行槽、共享池、`Close` 与优雅排空的区别、运行时状态 shared_ptr 寿命
+  模型（`AppRuntimeState`）、客户端字节限额及无 DNS/TLS 的边界见
+  [HTTP 宿主指南](docs/guides/http-host.md)。
 - 构建产物只进已忽略的 `build/`。
 
 ## 跨语言 RPC 示例：GetValue

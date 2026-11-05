@@ -367,7 +367,7 @@ BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
     namespace Wire = fw::http_bridge;
     using inf::RpcEnvelope;
 
-    auto header_of = [](const inf::HttpResponse& r,
+    auto header_of = [](const inf::http::Response& r,
                         std::string_view name) -> std::optional<std::string> {
         for (const auto& [k, v] : r.headers)
             if (k == name) return v;
@@ -385,7 +385,7 @@ BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
         const auto res = Wire::ToHttpResponse(
             fw::result<RpcEnvelope>::err(std::move(e)));
 
-        BOOST_REQUIRE_EQUAL(res.status, 400u);
+        BOOST_REQUIRE_EQUAL(res.status_code, 400u);
         const auto code = header_of(res, "x-bbt-err-code");
         BOOST_REQUIRE(code);
         BOOST_CHECK_EQUAL(*code,
@@ -412,7 +412,7 @@ BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
         const auto res = Wire::ToHttpResponse(
             fw::result<RpcEnvelope>::err(std::move(e)));
 
-        BOOST_REQUIRE_EQUAL(res.status, 400u);
+        BOOST_REQUIRE_EQUAL(res.status_code, 400u);
         const auto code = header_of(res, "x-bbt-err-code");
         BOOST_REQUIRE(code);
         BOOST_CHECK_EQUAL(*code,
@@ -432,7 +432,7 @@ BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
         const auto res = Wire::ToHttpResponse(
             fw::result<RpcEnvelope>::err(std::move(e)));
 
-        BOOST_REQUIRE_EQUAL(res.status, 400u);
+        BOOST_REQUIRE_EQUAL(res.status_code, 400u);
         BOOST_CHECK_EQUAL(
             header_of(res, "x-bbt-err-code").value_or(""),
             std::to_string(static_cast<int>(fw::ErrorCode::RemoteError)));

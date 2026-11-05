@@ -10,6 +10,7 @@ add_library(bbt_framework STATIC
     actor/OrderedSession.cc
     actor/OrderedIngress.cc
     host/App.cc
+    host/AppRuntimeState.cc
     host/CallOptionsAdapter.cc
     host/CoApp.cc
     host/CoServiceCall.cc
@@ -26,7 +27,10 @@ add_library(bbt::framework ALIAS bbt_framework)
 target_include_directories(bbt_framework PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(bbt_framework PUBLIC bbt::infra_common bbt::infra_http)
+if(NOT TARGET bbt::infra_http_net)
+    message(FATAL_ERROR "bbt-framework requires bbt::infra_http_net (BBT_INFRA_HTTP_NET=ON)")
+endif()
+target_link_libraries(bbt_framework PUBLIC bbt::infra_common bbt::infra_http_net)
 target_compile_features(bbt_framework PUBLIC cxx_std_17)
 target_compile_options(bbt_framework PRIVATE -Wall -Wextra)
 
