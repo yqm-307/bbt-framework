@@ -24,6 +24,16 @@ add_test(NAME framework.v2_core COMMAND Test_framework_v2_core)
 set_tests_properties(framework.v2_core PROPERTIES
     TIMEOUT 30 LABELS "smoke;unit")
 
+# 动态路由表：完整替换/round-robin/去重/空视图/陈旧边界/revision 回退与
+# find_route 的动态优先（不联网、不启 Scheduler）。真实注册中心链路见
+# examples.ecommerce_cluster。
+add_executable(Test_framework_dynamic_routes Test_framework_dynamic_routes.cc)
+target_link_libraries(Test_framework_dynamic_routes PRIVATE bbt::framework)
+target_compile_options(Test_framework_dynamic_routes PRIVATE -Wall -Wextra)
+add_test(NAME framework.dynamic_routes COMMAND Test_framework_dynamic_routes)
+set_tests_properties(framework.dynamic_routes PROPERTIES
+    TIMEOUT 30 LABELS "smoke;unit")
+
 # CoRpc 公共面、声明式方法表、错误边界、actor key、路由与资源缝；
 # 不联网、不起真实 I/O、不启动 Scheduler。
 add_executable(Test_framework_rpc_surface Test_framework_rpc_surface.cc)

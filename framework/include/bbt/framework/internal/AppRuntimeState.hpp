@@ -21,10 +21,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 #include <bbt/infra/NetworkTypes.hpp>
 
 #include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/DynamicRouteTable.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
 #include <bbt/framework/internal/CoAppSeam.hpp>
@@ -39,6 +41,8 @@ class InboundDispatcher;
 struct AppRuntimeState {
     // 装配期写入（构造/Publish，先于接纳），此后只读：出站依赖。
     std::map<std::string, bbt::infra::RpcAddress> routes;
+    // 出站回调强持有同一动态表，不借用 CoApp；表内同步保护后续快照更新。
+    std::shared_ptr<DynamicRouteTable>           dynamic_routes;
     std::shared_ptr<RpcPolicy>                    rpc_policy;
     std::shared_ptr<HttpEgress>                   default_egress;
     RpcSendAppFn                                  seam_send;
@@ -49,6 +53,9 @@ struct AppRuntimeState {
     std::map<std::string, std::shared_ptr<const RpcMethodTable>> tables;
     std::map<std::string, std::shared_ptr<ICoService>>           instances;
     std::shared_ptr<ActorRegistry>                              registry;
+
+    // 查询与真实出站共用路由门：动态已配置服务不回退静态地址。
+    result<bbt::infra::RpcAddress> FindRoute(std::string_view service) const;
 
     // 出站发送（机器面）：路由门 → 公开策略 Preflight → 默认 HttpEgress 或
     // 测试缝发送。回调复制本对象的 shared_ptr，不捕获 CoApp this。

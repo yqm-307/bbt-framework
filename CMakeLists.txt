@@ -95,6 +95,7 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     CoService.hpp
     CoRpc.hpp
     CoApp.hpp
+    DynamicRouteTable.hpp
     Object.hpp
     Address.hpp
     Service.hpp

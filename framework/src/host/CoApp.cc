@@ -78,6 +78,7 @@ CoApp::CoApp(CoAppOptions options)
     m_state->default_egress =
         std::make_shared<HttpEgress>(m_default_host, egress_profile);
     m_state->rpc_policy = m_options.rpc_policy;
+    m_state->dynamic_routes = m_options.dynamic_routes;
     for (const auto& r : m_options.static_routes) {
         m_routes.emplace(r.service_name, r.address);   // 重复名保先见，run 校验拒绝
         m_state->routes.emplace(r.service_name, r.address);
@@ -91,6 +92,7 @@ CoApp::CoApp(CoAppOptions options, CoAppSeam seam)
       m_state(std::make_shared<AppRuntimeState>()) {
     m_state->seam_send = std::move(seam.rpc_send);
     m_state->rpc_policy = m_options.rpc_policy;
+    m_state->dynamic_routes = m_options.dynamic_routes;
     for (const auto& r : m_options.static_routes) {
         m_routes.emplace(r.service_name, r.address);
         m_state->routes.emplace(r.service_name, r.address);
@@ -218,14 +220,7 @@ std::vector<std::string> CoApp::lifecycle_failures() const {
 
 result<bbt::infra::RpcAddress> CoApp::find_route(
     std::string_view service_name) const {
-    std::lock_guard<std::mutex> lk(m_mtx);
-    const auto it = m_routes.find(std::string(service_name));
-    if (it == m_routes.end())
-        return result<bbt::infra::RpcAddress>::err(MakeError(
-            ErrorCode::NotFound,
-            "find_route: no configured target for service '" +
-                std::string(service_name) + "'"));
-    return result<bbt::infra::RpcAddress>::ok(it->second);
+    return m_state->FindRoute(service_name);
 }
 
 result<void> CoApp::grant_ordered_stream(OrderedGrant grant) {

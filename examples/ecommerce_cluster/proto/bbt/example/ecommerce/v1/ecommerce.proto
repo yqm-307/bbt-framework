@@ -1,0 +1,76 @@
+// 电商集群示例的唯一业务 schema 真源。
+//
+// 三个服务构成 gateway → order → catalog 的真实出站链；每个响应回带「实际处理
+// 该跳的实例身份」，供验收断言落点（不是靠日志推断）。
+syntax = "proto3";
+
+package bbt.example.ecommerce.v1;
+
+// 目录服务：按 sku 取单价。
+message PriceRequest {
+  string sku = 1;
+  string order_id = 2;
+}
+
+// 业务关联键稳定；框架 envelope 的 request_id 各跳独立。
+message OrderRequest {
+  string order_id = 1;
+  string sku = 2;
+  int64 qty = 3;
+  int64 discount_cents = 4;
+}
+message LookupRequest { string order_id = 1; }
+message BillRequest {
+  OrderRequest order = 1;
+  int64 total_cents = 2;
+}
+message Record {
+  string order_id = 1;
+  string sku = 2;
+  int64 qty = 3;
+  int64 total_cents = 4;
+  int64 discount_cents = 5;
+  int64 payable_cents = 6;
+  string state = 7;
+  string catalog_instance = 8;
+  string order_instance = 9;
+  string settlement_instance = 10;
+}
+
+message PriceResponse {
+  string sku = 1;
+  int64 unit_cents = 2;
+  // 实际处理本次请求的 catalog 实例身份（<service>-<pid>-<incarnation>）。
+  string instance_id = 3;
+  string process_id = 4;
+}
+
+// 订单服务：按 sku/qty 向 catalog 取单价并计算总额。
+message QuoteRequest {
+  string sku = 1;
+  int32 qty = 2;
+}
+
+message QuoteResponse {
+  string sku = 1;
+  int32 qty = 2;
+  int64 total_cents = 3;
+  // 下游 catalog 实例身份：证明 order 经动态发现真正到了某个实例。
+  string catalog_instance = 4;
+  string order_instance = 5;
+}
+
+// 网关服务：对外唯一入口，把结算请求转给 order。
+message CheckoutRequest {
+  string sku = 1;
+  int32 qty = 2;
+}
+
+message CheckoutResponse {
+  string sku = 1;
+  int32 qty = 2;
+  int64 total_cents = 3;
+  string catalog_instance = 4;
+  string order_instance = 5;
+  string gateway_instance = 6;
+}

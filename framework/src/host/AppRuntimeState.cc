@@ -8,16 +8,26 @@
 
 namespace bbt::framework {
 
+result<bbt::infra::RpcAddress> AppRuntimeState::FindRoute(
+    std::string_view service) const {
+    if (dynamic_routes && dynamic_routes->HasService(service))
+        return dynamic_routes->Resolve(service);
+
+    const auto it = routes.find(std::string(service));
+    if (it == routes.end())
+        return result<bbt::infra::RpcAddress>::err(MakeError(
+            ErrorCode::NotFound,
+            "find_route: no configured target for service '" +
+                std::string(service) + "'"));
+    return result<bbt::infra::RpcAddress>::ok(it->second);
+}
+
 result<bbt::infra::RpcEnvelope> AppRuntimeState::Send(
     const bbt::infra::RpcEnvelope& env,
     const bbt::infra::CallOptions& options) const {
-    // 路由门：业务只给逻辑 service 名，目标必须命中显式静态路由。
-    const auto it = routes.find(env.service);
-    if (it == routes.end())
-        return result<bbt::infra::RpcEnvelope>::err(MakeError(
-            ErrorCode::NotFound,
-            "find_route: no configured target for service '" +
-                env.service + "'"));
+    auto target = FindRoute(env.service);
+    if (!target)
+        return result<bbt::infra::RpcEnvelope>::err(std::move(target.error()));
 
     // 公开出站策略在路由授权之后、发送之前调用一次。策略只见只读事实
     // （已解析目标 + 不可改写 envelope + 已适配绝对期限），只能 Allow/Reject
@@ -26,7 +36,7 @@ result<bbt::infra::RpcEnvelope> AppRuntimeState::Send(
     if (rpc_policy) {
         RpcPolicyDecision decision;
         auto d = rpc_policy->Preflight(
-            RpcCallView{it->second, env, opt.deadline});
+            RpcCallView{target.value(), env, opt.deadline});
         if (!d)
             return result<bbt::infra::RpcEnvelope>::err(d.error());
         decision = d.value();
@@ -48,12 +58,12 @@ result<bbt::infra::RpcEnvelope> AppRuntimeState::Send(
     }
 
     if (default_egress)
-        return default_egress->Send(it->second, env, opt);
+        return default_egress->Send(target.value(), env, opt);
     if (!seam_send)
         return result<bbt::infra::RpcEnvelope>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "CoApp: rpc_send egress not configured"));
-    return seam_send(it->second, env, opt);
+    return seam_send(target.value(), env, opt);
 }
 
 void AppRuntimeState::Publish(

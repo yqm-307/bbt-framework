@@ -24,6 +24,7 @@
 #include <bbt/infra/NetworkTypes.hpp>
 
 #include <bbt/framework/ExecutionPolicy.hpp>
+#include <bbt/framework/DynamicRouteTable.hpp>
 #include <bbt/framework/ICoService.hpp>
 #include <bbt/framework/OrderedTypes.hpp>
 #include <bbt/framework/Result.hpp>
@@ -80,6 +81,10 @@ struct CoAppOptions {
     RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
     // 策略在构造时提供；nullptr 使用默认策略。m_options 持有策略至 CoApp 析构。
     std::shared_ptr<RpcPolicy> rpc_policy{};
+    // 可选动态路由表：发现提供方（应用侧组件）发布快照，出站按逻辑服务名解析。
+    // 放在既有字段之后，保持旧版位置聚合初始化的顺序与含义。
+    // 非空时其已配置的服务名优先于 static_routes，且不回退静态 endpoint。
+    std::shared_ptr<DynamicRouteTable> dynamic_routes{};
 };
 
 /**
@@ -89,7 +94,7 @@ struct CoAppOptions {
  * loopback 传输）；测试替换经 internal/CoAppSeam.hpp。
  *
  * 启动前校验：运行时配置与静态路由在 run 前校验；find_route 只认显式配置
- * 的静态路由，不存在「自动连任意服务」。
+ * 的静态路由与已装配动态路由表，不存在「自动连任意服务」。
  *
  * 生命周期约束：进程内同一时刻至多一个活跃 CoApp。通过单活跃宿主检查后，
  * 同一 CoApp 的 run() 只执行一次；若因已有活跃宿主被拒绝，该次调用不消耗实例的 run 次数。
@@ -233,8 +238,11 @@ public:
     /**
      * @brief 出站目标解析。
      *
-     * 只认显式配置的静态路由；未配置目标 → err(NotFound)。
-     * run 前后均可调用；出站分发必须经此门，不允许绕过。
+     * 先查 CoAppOptions::dynamic_routes：该表已配置此服务名时只返回其解析
+     * 结果（空集合 NotFound / 陈旧 RuntimeUnavailable），不回退静态项——否则
+     * 已配置动态服务的全空状态会被静态地址掩盖。未配置时回退 static_routes；
+     * 两者都没有 → err(NotFound)。run 前后均可调用；出站分发必须经此门，
+     * 不允许绕过。
      */
     result<bbt::infra::RpcAddress> find_route(
         std::string_view service_name) const;
