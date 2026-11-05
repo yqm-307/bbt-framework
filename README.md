@@ -67,13 +67,17 @@ cmake --build build --parallel 2 --target \
   Test_framework_shutdown Test_framework_rpc_codec Test_framework_close_gate \
   Test_framework_resource_lifecycle Test_framework_egress_request_phase \
   Test_framework_getvalue_codec Test_framework_rpc_matrix rpc_xlang_server \
-  getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture
+  getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture \
+  component_services Test_framework_dynamic_routes
 
 # 测试一律经统一 profile 入口（run_test_profile.sh，内部 ctest -j1）；
 # 本地 smoke/focused 快速集，全量走发布/手动入口；PR CI 为 smoke + 必要 focused。
 ctest --test-dir build -j1 -L smoke --output-on-failure
 ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
 ```
+
+真实 Consul 电商集群示例为可选目标，需单独启用 infra Consul 支持；构建与运行说明见
+[集群示例入口](examples/ecommerce_cluster/README.md)。
 
 说明：
 
@@ -149,11 +153,14 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
 
 - 架构基调（设计真源）：[`docs/architecture/distributed-framework-baseline.md`](docs/architecture/distributed-framework-baseline.md)
 - 验收矩阵（测试设计，非实测结果）：[`docs/architecture/distributed-framework-validation-matrix.md`](docs/architecture/distributed-framework-validation-matrix.md)
+- 示例总览（需求→例程→公开 API/边界）：[`examples/README.md`](examples/README.md)
 - 示例：[`examples/getvalue/README.md`](examples/getvalue/README.md)、
   [`examples/two_service/README.md`](examples/two_service/README.md)、
   [`examples/dual_service/README.md`](examples/dual_service/README.md)、
   [`examples/lifecycle_matrix/README.md`](examples/lifecycle_matrix/README.md)、
-  [`examples/rpc_policy/README.md`](examples/rpc_policy/README.md)
+  [`examples/rpc_policy/README.md`](examples/rpc_policy/README.md)、
+  [`examples/component_services/README.md`](examples/component_services/README.md)、
+  [`examples/ecommerce_cluster/README.md`](examples/ecommerce_cluster/README.md)
 - Agent 协作与门禁：[`AGENTS.md`](AGENTS.md)
 - CI 说明：[`docs/guides/ci.md`](docs/guides/ci.md)
 - 测试规范：[`docs/guides/testing.md`](docs/guides/testing.md)

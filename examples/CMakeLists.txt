@@ -15,6 +15,20 @@ add_subdirectory(rpc_policy)
 # 与 getvalue/two_service 同一前置（NEED_TEST=ON 且 bbt_infra_rpc_net 已注册）。
 add_subdirectory(lifecycle_matrix)
 
+# 组件例程本身不使用 RPC，但当前示例构建仍共用强制 wire 验收的前置条件。
+add_subdirectory(component_services)
+
+# 真实注册中心 + 多进程动态发现的电商集群：需要 infra 的 Consul adapter
+# （BBT_INFRA_CONSUL=ON 才注册 bbt::infra_consul）。开关显式为 ON 却拿不到
+# target 时 configure 失败，不静默跳过。
+if(TARGET bbt::infra_consul)
+    add_subdirectory(ecommerce_cluster)
+elseif(BBT_INFRA_CONSUL)
+    message(FATAL_ERROR
+        "BBT_INFRA_CONSUL=ON 但 bbt::infra_consul 未注册："
+        "examples/ecommerce_cluster 需要 infra 的 Consul adapter 目标。")
+endif()
+
 # 双服务资源示例（svc_a/svc_b/driver）。只在显式
 # BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 时加入——默认 OFF 时本仓不引入
 # hiredis/mongo-cxx-driver。四项前置条件（NEED_TEST、bbt_infra_rpc_net、

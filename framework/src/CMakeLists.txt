@@ -14,6 +14,7 @@ add_library(bbt_framework STATIC
     host/CallOptionsAdapter.cc
     host/CoApp.cc
     host/CoServiceCall.cc
+    host/DynamicRouteTable.cc
     host/HostLifecycle.cc
     host/InboundDispatcher.cc
     host/InfraHttpHost.cc
