@@ -119,7 +119,7 @@ cmake -S . -B build-deps/project-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DBBT_MONGOC_PREFIX=/path/to/mongoc \
   -DBBT_MONGOCXX_PREFIX=/path/to/mongocxx \
   -DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON
-cmake --build build-deps/project-build -j"$JOBS" --target svc_a svc_b driver
+flock /tmp/bbt-build.lock cmake --build build-deps/project-build --target svc_a svc_b driver --parallel 2
 # 产物：build-deps/project-build/examples/dual_service/{svc_a,svc_b,driver}
 ```
 
