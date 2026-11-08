@@ -718,6 +718,13 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
                        'examples/dual_service', 'if [ "$rc" -eq 0 ]; then'):
             with self.subTest(needle=needle):
                 self.assertIn(needle, gate)
+        negative_configure = gate[
+            gate.index('cmake -S "$repo_dir" -B "$work_dir/ds-gate-negative"'):
+            gate.index('local rc=$?')]
+        for prerequisite in ('-DBBT_INFRA_RPC_NET=ON',
+                             '-DBBT_PROTOBUF_PREFIX="$protobuf_prefix"'):
+            with self.subTest(prerequisite=prerequisite):
+                self.assertIn(prerequisite, negative_configure)
 
     def test_build_and_test_link_source_evidence_preserved(self):
         for source in (self.stripped, body(GATE)):

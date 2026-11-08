@@ -92,6 +92,7 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
 - **dual-service 负向门禁**：默认构建树必须保持
   `BBT_ENABLE_DUAL_SERVICE_EXAMPLE=OFF` 且不含 `examples/dual_service`；显式 ON 且缺
   hiredis/mongo 前缀必须 configure 失败，且失败原因来自前置条件门禁。
+  负向配置仍启用框架必需的 RPC 并传入锁定 protobuf 前缀，确保失败来自缺失的后端依赖。
 - **ldd**：`Test_framework_*` 与 `rpc_xlang_server` 不得有 `not found`；不得链接
   `/usr/local` 下的 bbt 旧产物；`libboost_context` 必须解析到锁定 Boost 前缀；
   零命中可执行产物即失败。
