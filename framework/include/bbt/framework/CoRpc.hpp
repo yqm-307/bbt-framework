@@ -3,7 +3,7 @@
 //
 // CoRpcReq/CoRpcResp 只拥有 payload 与错误结果；线格式不暴露给业务。
 // 通用位置参数 codec（字节规则/schema/错误码）的唯一实现下沉到
-// bbt::infra::rpc（bbt/infra/rpc/RpcPayload.hpp）；本头 rpc_detail 只保留
+// bbt::infra::rpc（bbt/infra/rpc/codec/PositionalCodec.hpp）；本头 rpc_detail 只保留
 // 兼容薄层转发，不复制第二套字节规则。ProtoCodec<T> 继承 infra 默认
 // trait seam，既有 `bbt::framework::rpc_detail::ProtoCodec<X>` 特化继续
 // 有效，仍不引入 protobuf 头。
@@ -19,7 +19,7 @@
 #include <vector>
 
 #include <bbt/framework/Result.hpp>
-#include <bbt/infra/rpc/RpcPayload.hpp>
+#include <bbt/infra/rpc/codec/PositionalCodec.hpp>
 
 namespace bbt::framework {
 

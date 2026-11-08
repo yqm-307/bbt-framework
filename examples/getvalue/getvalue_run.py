@@ -139,9 +139,8 @@ def main():
         # 业务/负载校验在 handler 内，故这些请求会进 handler；
         # budget/schema/路由/wire 层被拒的请求不得进 handler。
         expect_entered = {"sc-known", "sc-miss", "sc-empty",
-                          "sc-badpayload", "sc-fwd", "sc-v2", "sc-budgetlarge"}
-        must_not_enter = {"sc-budget0", "sc-budget1", "sc-schema", "sc-nomethod",
-                          "sc-trunc", "sc-ctype"}
+                          "sc-badpayload", "sc-fwd", "sc-v2"}
+        must_not_enter = {"sc-budget0", "sc-budget1", "sc-schema", "sc-nomethod"}
         missing = expect_entered - entered
         leaked = must_not_enter & entered
         if missing:

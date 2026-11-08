@@ -1,12 +1,13 @@
 # GetValue 示例：首个业务 RPC 切片（Issue #4 / P0-A）
 
 这是 bbt-framework 第一个**真实业务**跨语言 RPC 切片，也是 #5 消费的业务
-schema / bridge 接口。它由三部分构成：
+schema / 服务实现接口。它由三部分构成：
 
 1. 业务 `.proto`（唯一 schema 真源）；
-2. C++ framework 服务端：公开 `CoApp`/`CoService` + **正式 infra body wire
-   bridge**（不走 `x-bbt-*` header 旁路、不用测试缝/Binder 伪造结果）；
-3. Python **标准库**客户端：手写 proto3 wire 编解码，零依赖（无
+2. C++ framework 服务端：公开 `CoApp`/`CoService` + **真实 infra V2 会话**
+   （`SessionFrame` + u32be + Hello/HelloAck；不用测试缝/Binder 伪造结果）；
+3. Python **标准库**客户端：手写 proto3 业务编解码 + 复用
+   `tests/rpc_v2_wire.py`（唯一 V2 会话 codec），零依赖（无
    `google.protobuf` runtime）。
 
 > `auth_state=unauthenticated_loopback`：本路径只证明业务/传输行为，**不证明
@@ -26,21 +27,26 @@ schema / bridge 接口。它由三部分构成：
 - **无双写漂移**：C++ 方法表从生成物 descriptor `full_name()` 推导 schema
   字符串（`bbt::framework::ProtoMethod` + `internal::MethodTable`），业务不手写
   schema。生成头只落构建目录。
-- 兼容升级样例（V2，不建第二套真源）：V2 客户端在请求追加可选
-  `client_note = 2`，V1 服务端按 proto3 忽略未知字段照常处理。
+- 兼容升级样例（不建第二套真源）：客户端在请求追加未知业务字段
+  `client_note = 2`，服务端按 proto3 忽略未知字段照常处理。
 
-## 2. wire（envelope 归 infra）
+## 2. wire（V2 会话归 infra）
 
-传输信封是 bbtools-infra Issue #8 冻结的版本化 profile（**不是**本示例的
-`.proto`）：HTTP `POST /rpc`、`Content-Type: application/x-protobuf`、body 为
-`RpcEnvelopeMsg`（`service`/`method`/`request_id`/`request_schema`/
-`response_schema`/`remaining_budget_ms`/`payload`/`metadata`/`outcome`）。
+传输信封是 bbtools-infra 的唯一 V2 会话 profile（**不是**本示例的 `.proto`）：
+一次 TCP 会话先经 Hello/HelloAck 交换 identity 并协商 `session_epoch`，
+之后所有帧都是 `SessionFrame`（`proto/bbt/infra/rpc/v2/session_frame.proto`）
+以 u32be 大端长度前缀分帧。
 
+- `SessionFrame` 字段：`kind` / `traffic` / `session_epoch` / `request_id` /
+  `service` / `method` / `reply` / `remaining_budget_ms` / `request_schema` /
+  `response_schema` / `payload` / `metadata` / `outcome` / `error`。
 - 服务名：`bbt.example.v1.GetValueService`；方法名：`GetValue`。
 - `request_schema` / `response_schema` = 上表 message 的 `full_name`。
 - 接收端 local-min 预算：`min(入站传输 deadline, now + remaining_budget_ms)`；
-  `remaining_budget_ms == 0` 由 wire 解码期拒绝（不进 handler）。
-- 身份：`peer_principal` 只来自 infra 入站上下文，不被 envelope `metadata` 升级。
+  `remaining_budget_ms == 0` 违反字段矩阵（合法范围 1..86400000），在解码期
+  以 `SESSION_ERROR(ProtocolError)` 拒绝并退役 link（不进 handler）。
+- 身份：`peer_principal` 只来自会话握手上下文，不被帧 `metadata` 升级；
+  self-connection（peer identity 与本端相同）在握手期拒绝。
 
 ## 3. C++ 侧最小 typed codec / 装配
 
@@ -69,26 +75,27 @@ class GetValueService final : public fw::CoService<GetValueService> {
 ```
 
 服务端装配（[`getvalue_server.cc`](getvalue_server.cc)）：公开 `CoAppOptions`
-选择正式桥——
+显式声明会话身份，V2 入站由框架默认装配——
 
 ```cpp
 fw::CoAppOptions options;
 options.listen = {"127.0.0.1", 0};               // 动态端口，仅 loopback
-options.inbound_bridge = fw::RpcInboundBridge::ProtoWireV1;
+options.local_identity = "getvalue-server";      // V2 会话身份必填
 fw::CoApp app(options);
 app.add_service<getvalue::GetValueService>({ExecutionPolicy::Concurrent, 64, 0,0,false,0,0,0});
 app.run();
 ```
 
-框架侧（本仓改动）：
-- `framework/.../CoApp.hpp`：新增 `RpcInboundBridge{LegacyHeaders,ProtoWireV1}`
-  与 `CoAppOptions::inbound_bridge`（默认 `LegacyHeaders`，保留既有行为）；
-- `framework/.../internal/RpcWireBridge.{hpp,cc}`：正式 body bridge（入站
-  `ParseRpcWireHttpRequest → local-min → dispatch_inbound → MakeRpcWireHttpResponse`）；
-- `framework/.../RpcMethods.hpp` + `internal/MethodTable.hpp`：`ProtoMethod`
-  声明糖，schema 取自 descriptor；
-- `framework/src/CMakeLists.txt`：仅当 `bbt_infra_rpc_net` 可用时编译本桥（未配置
-  protobuf 前缀时框架只有迁移期 header 桥，显式选择 ProtoWireV1 会 fail-closed）。
+框架侧（V2 唯一消费面）：
+- `framework/include/bbt/framework/CoApp.hpp`：`CoAppOptions::local_identity`
+  （必填，映射 `rpc::ClientOptions::SetLocalIdentity`）；无 profile/旧桥选择；
+- `framework/include/bbt/framework/internal/RpcBridge.hpp`：
+  `InstallRpcAdmission`（`rpc::AdmissionHandler` → 框架有界队列/worker）与
+  `RpcEgress`（`rpc::CoRpcClient::Call/Send`）；
+- `framework/include/bbt/framework/RpcMethods.hpp` + `internal/MethodTable.hpp`：
+  `ProtoMethod` 声明糖，schema 取自 descriptor；
+- `framework/src/CMakeLists.txt`：`bbt::infra_rpc_net`（V2 单一 target）是
+  框架必需前置，缺失时 configure fail-closed。
 
 ## 4. 构建 / 运行 / 验收入口
 
@@ -111,7 +118,7 @@ ctest --test-dir build-deps/project-build -j1 --output-on-failure \
   （driver 动态端口/readiness/有限等待/finally 清理，并做 protoc 重复生成无漂移
   与 journal 断言）。
 - `examples.getvalue.s2s`：`getvalue_server`（callee）+ `getvalue_caller`（caller）
-  两个独立 CoApp 进程 + 真实黑障端点的正式出站验收，并含 #5 EX-T3 的四类非法
+  两个独立 CoApp 进程 + 真实黑障端点的 V2 出站验收，并含 #5 EX-T3 的三类非法
   静态路由启动拒绝负例（见 §5.1）。
 - `framework.getvalue_codec`：descriptor/字段号/类型、方法表 schema 推导、
   golden vectors、handler 分支（Boost.Test 内嵌）。
@@ -123,15 +130,14 @@ ctest --test-dir build-deps/project-build -j1 --output-on-failure \
 
 known / miss / empty-key(InvalidArgument) / unknown-method(NotFound) /
 schema-mismatch(TypeMismatch) / malformed-payload(ProtocolError) /
-malformed-envelope(ProtocolError) / wrong-content-type(InvalidArgument) /
-unknown-field-envelope(前向兼容) / v2-compat(未知字段) / budget-zero(0 预算拒绝且未进
-handler) / **budget-expired（budget=1ms 可解码但 handler 可见期限已过 → TimedOut
-且未进 handler，非用 0 预算冒替）** / **budget-clamped（声明 2400000ms 超本地
-incoming_timeout 30s → 响应剩余预算被 clamp ≤ 30000，不原值回显）** /
-disconnect-unknown / unknown-error-code / schema-drift-guard / golden vectors。
+unknown-field-frame(帧级未知字段前向兼容) / v2-compat(未知业务字段) /
+**budget-expired（budget=1ms 可解码但 handler 可见期限已过 → TimedOut
+且未进 handler，非用 0 预算冒替）** / unknown-error-code(本地解码) /
+**budget-zero（0 预算违反字段矩阵 → SESSION_ERROR(ProtocolError) 且未进
+handler，独立会话）** / disconnect-unknown / schema-drift-guard / golden vectors。
 
-journal 断言：`budget0/budget1/schema/route/wire` 被拒请求**未进 handler**；
-`budgetlarge` 等真正处理的请求 `handler_entered` 存在（正反对照）；
+journal 断言：`budget1/schema/route` 被拒请求**未进 handler**；
+`known/miss/v2` 等真正处理的请求 `handler_entered` 存在（正反对照）；
 所有记录 `auth_state=unauthenticated_loopback`；`peer_principal` 未被 metadata 升级。
 
 ## 5.1 跨进程 Service→Service 与 #5 EX-T3 静态路由负例（复用本路径）
@@ -151,20 +157,21 @@ journal 断言：`budget0/budget1/schema/route/wire` 被拒请求**未进 handle
 
 ### 非法静态路由：公开入口，run 启动任何组件前拒绝
 
-`getvalue_caller` 增加一个公开验收子命令，构造四类**非法**静态路由后经公开
+`getvalue_caller` 增加一个公开验收子命令，构造三类**非法**静态路由后经公开
 `CoApp`/`add_service`/`add_resource`/`run` 装配（不使用任何测试缝）：
 
 ```
 getvalue_caller badroute <kind> <result_file>
-  kind ∈ {empty-service, empty-transport, empty-endpoint, duplicate}
+  kind ∈ {empty-service, empty-endpoint, duplicate}
 ```
 
 | kind | 非法输入 | `_ValidateConfig` 拒绝原因（`lifecycle_failures` 恰 1 条） |
 |---|---|---|
 | `empty-service` | 空 `service_name` | `CoApp: static route with empty service_name` |
-| `empty-transport` | 空 `transport`（`endpoint` 非空） | `CoApp: static route '<name>' has empty transport/endpoint` |
-| `empty-endpoint` | 空 `endpoint`（`transport` 非空） | 同上 |
+| `empty-endpoint` | 空 `endpoint` | `CoApp: static route '<name>' has empty endpoint` |
 | `duplicate` | 两条相同 `service_name` | `CoApp: duplicate static route service_name` |
+
+（V2 的 endpoint 是单一字符串，`transport` 维度与旧 profile 选择已随 V1 删除。）
 
 机器可读观测（进程自写 `<result_file>` JSON；断言由驱动器独立核对，不信任自报
 `status`）：`rc==1`（`HostLifecycle::kExitRejected`，启动任何组件前返回）、
@@ -172,7 +179,7 @@ getvalue_caller badroute <kind> <result_file>
 端口）、`resource_factory_calls==0`（经公开 `add_resource` 注册的延迟工厂未被调用，
 证明拒绝发生在资源/网络/服务启动之前）。四项均带
 `auth_state=unauthenticated_loopback`。`getvalue_s2s_run.py` 以四个**有界**子进程
-运行上述四例，并入 `RESULTS`/`_FAILURES` 与清理后的总判定（超时/异常/崩溃一律记
+运行上述三例，并入 `RESULTS`/`_FAILURES` 与清理后的总判定（超时/异常/崩溃一律记
 fail 并回收自有进程）。
 
 **语义边界（勿混淆）**：
@@ -180,8 +187,8 @@ fail 并回收自有进程）。
 - **空路由列表合法**：`static_routes` 为空表示「不允许任何出站目标」，配置本身合法；
   此时**未配置目标**的出站调用在运行期由 `find_route` 门拒绝为 `NotFound`
   （`s2s-noroute` 场景）——这是运行期路由未命中，**不是**启动期配置拒绝。
-- **空字段 / 重复 `service_name` 非法**：`service_name`/`transport`/`endpoint` 任一
-  为空，或两条路由同名，都在 `run()` 启动任何组件前被拒绝（本子命令四例）。
+- **空字段 / 重复 `service_name` 非法**：`service_name`/`endpoint` 任一
+  为空，或两条路由同名，都在 `run()` 启动任何组件前被拒绝（本子命令三例）。
 - **端点格式检查未纳入该断言**：当前 `_ValidateConfig` 只判空，不做 endpoint 结构
   （如缺端口）或 transport 白名单语义校验；本切片**不新增**这些语义，也不声称它们
   被拒绝。
@@ -198,21 +205,13 @@ fail 并回收自有进程）。
   process-global。**512KB 只范围化覆盖本示例负载**；框架默认 12KB 栈对任意
   protobuf 业务（更大/更深嵌套 payload）不保证安全，属框架层待办。本切片未新增
   CoApp 栈配置层、未改默认 runtime。
-- **出站正式化**：`inbound_bridge=ProtoWireV1` 现在让**入站与出站同
-  profile**：`HttpEgress` 增加 `ProtoWireV1` 分支（同一 http::Client 发送 root，
-  只换 wire 编解码；`ToWireEnvelope`/`FromWireEnvelope` helper），egress 发起
-  I/O 前再次按本地 deadline 换算 remaining_budget_ms（过期 → TimedOut 无 I/O），
-  回复校验 request_id/response_schema 并保留 Error（含 `OutcomeUnknown`）。
-  「Release 构建下 7 个耦合场景 caller/callee 均 rc=0」完成于较早候选（infra
-  `162bb5fd…` 轮次，结果均带 `auth_state=unauthenticated_loopback`，且未在
-  ASan/UBSan 构建下重跑）；当前 deps.lock 已固定 infra
-  `d254c10a8a660057a85784b1155a7260460548e4` + coroutine
-  `206772b821ce6bd5ffc3afe547e11d21f5794b5a`，新 pin 下完成的是注册用例验证：
-  `examples.getvalue.s2s`（callee+caller 真实双进程）等 examples 4 项、受影响
-  RPC/HTTP 路径 11 项在 Release 候选构建全部通过；7 场景人工 caller/callee 在
-  新 pin 下未复跑。
-- **R2/R4 部分**：已覆盖接收端 local-min、0 预算与「可解码但过期」不进 handler、
-  预算回显 clamp；driver 已覆盖发送前过期、非法路由和断连，但**跨 hop 预算不放大、
+- **出站**：`RpcEgress` 经 `rpc::CoRpcClient::Call` 走同一条 V2 会话
+  （`SessionFrame`），发起 I/O 前按本地 deadline 收紧
+  `remaining_budget_ms`（过期 → TimedOut 无 I/O），回复校验
+  `request_id`/`response_schema` 并保留 Error（含 `OutcomeUnknown`）；
+  无 HTTP egress 或旧 envelope 分支。
+- **R2/R4 部分**：已覆盖接收端 local-min、0 预算拒绝与「可解码但过期」不进
+  handler；driver 已覆盖发送前过期、非法路由和断连，但**跨 hop 预算不放大、
   排队耗预算的发送端观察**未在专门矩阵中重验。
 - **R5**：客户端断连→unknown 为真实观测；「已提交后丢 reply → 远端
   OutcomeUnknown」已在本切片产生，证据 = `framework.egress_request_phase` 的 T3
@@ -236,8 +235,9 @@ fail 并回收自有进程）。
 | C++ typed codec seam | `bbt::framework::rpc_detail::ProtoCodec<T>` 特化 |
 | C++ 声明 | `fw::ProtoMethod<&Svc::GetValue, Req, Resp>("GetValue")` |
 | 业务 API | `CoRpcReq::ParseProto<T>()` / `CoRpcResp::FromProto(msg)` |
-| 正式入站桥 | `CoAppOptions::inbound_bridge = RpcInboundBridge::ProtoWireV1` |
-| 正式出站 profile | 选 `ProtoWireV1` 时 `HttpEgress` 自动走正式 body 信封（与入站同 profile） |
+| 会话身份 | `CoAppOptions::local_identity`（必填，peer 必须互异） |
+| 入站装配 | 框架默认 `InstallRpcAdmission`（`rpc::AdmissionHandler` → 分发器） |
+| 出站 | `RpcEgress::Call/Send`（`rpc::CoRpcClient`，同一 V2 会话） |
 | typed 出站调用 | `service.call<Req, Resp>(service_name, method, req, ...)`（schema 由 descriptor 推导） |
-| wire | infra `POST /rpc` + `application/x-protobuf` + `RpcEnvelopeMsg` |
+| wire | infra V2 `SessionFrame`（`session_frame.proto`）+ u32be 分帧 + Hello/HelloAck |
 | 运行/验收 | ctest `examples.getvalue.xlang`、`framework.getvalue_codec` |

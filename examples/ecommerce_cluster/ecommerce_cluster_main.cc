@@ -216,7 +216,8 @@ int main(int argc, char* argv[]) {
         64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{8000};
-    options.inbound_bridge       = RpcInboundBridge::ProtoWireV1;
+    // V2 会话身份必填；每个进程角色使用自己的身份。
+    options.local_identity = std::string("ecommerce-") + args.mode;
     options.dynamic_routes       = table;
 
     CoApp app(options);

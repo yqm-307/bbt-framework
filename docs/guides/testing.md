@@ -18,14 +18,13 @@ label 表达测试性质（`unit`/`integration`/`live`/`perf`），profile 表�
 | 真实服务 | `live` | Redis/Mongo 等真实外部服务 | 发布 Gate / 专门手动任务 |
 | 性能 | `perf` | 基线、压力、疲劳 | 性能相关改动、定时、发布 |
 
-当前注册面（`-DNEED_TEST=ON` + `bbt_infra_rpc_net` 在场，22 项）：
+当前注册面（`-DNEED_TEST=ON` + `bbt_infra_rpc_net` 在场，25 项）：
 
-- `smoke` 15 项：全部 `unit` 用例 + 快速 `integration`（`framework.close_gate`、
-  `framework.inbound_http`、`framework.ordered_ingress_http`、`framework.rpc_xlang`、
+- `smoke` 18 项：12 个 `unit` 用例 + 6 个快速 `integration`（`framework.close_gate`、
+  `framework.inbound_http`、`framework.ordered_ingress_rpc`、`framework.rpc_xlang`、
   `framework.egress_request_phase`、`framework.rpc_matrix`）。
 - 非 smoke `integration` 7 项：`framework.shutdown`（真实 runtime 排空，
-  全套实测 ~107s）、`framework.rpc_profile`、5 个 `examples.*`（跨进程真实
-  协作）——不进普通 CI smoke。
+  全套实测 ~107s）、6 个 `examples.*`（跨进程真实协作）——不进普通 CI smoke。
 - `live` 条件注册：`framework.resource_live_{redis,mongo,combined}` 仅在
   `bbt::infra_redis_net`/`bbt::infra_mongo` 目标在场时注册；环境缺后端时进程
   以 77 退出配合 `SKIP_RETURN_CODE` 标 Skipped，不伪装通过。
@@ -69,7 +68,7 @@ live 这类主动 SKIP 在选集阶段（`-LE live`）就排除，不靠事后�
   flock /tmp/bbt-build.lock bash scripts/build_stack.sh   # 或 local_build.sh（BBT_SKIP_CTEST=1）
   bash scripts/ci/run_test_profile.sh --build-dir <build-dir> --profile smoke
   bash scripts/ci/run_test_profile.sh --build-dir <build-dir> --profile focused \
-    --regex '^framework\.(shutdown|rpc_profile)$'
+    --regex '^framework\.(shutdown|rpc_surface)$'
   ```
 
   本地不跑全量；完整回归走 CI 手动/定时入口。
@@ -94,7 +93,7 @@ live 这类主动 SKIP 在选集阶段（`-LE live`）就排除，不靠事后�
 公共 API 面（`framework.rpc_surface`/`rpc_codec`）、生命周期与关闭门
 （`framework.coapp_lifecycle`/`close_gate`）、并发与邮箱语义
 （`framework.actor_mailbox`）、真实 loopback 接线（`framework.inbound_http`/
-`ordered_ingress_http`/`rpc_xlang`/`rpc_matrix`）、资源装配与关闭收束
+`ordered_ingress_rpc`/`rpc_xlang`/`rpc_matrix`）、资源装配与关闭收束
 （`framework.resource_lifecycle`）。`framework.shutdown` 的长时排空语义
 属 integration 层，由 full profile/发布入口承担，不由 smoke 承担。
 

@@ -251,7 +251,8 @@ fw::CoAppOptions AppOpts() {
                                   std::chrono::milliseconds{30000}},
         bbt::infra::ListenAddress{"127.0.0.1", 0},
         {},
-        std::chrono::milliseconds{1500}};
+        std::chrono::milliseconds{1500},
+        /*local_identity*/ std::string{"resource-lifecycle-test"}};
 }
 
 std::unique_ptr<fw::CoApp> MakeApp(const fw::CoAppOptions& opts,

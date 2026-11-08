@@ -60,10 +60,11 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DNEED_TEST=ON \
 # （tests/ 与 examples/ 各自 add_executable，ctest 不负责构建）。
 cmake --build build --parallel 2 --target \
   bbt_framework \
-  Test_framework_rpc_surface Test_framework_request_context \
+  Test_framework_v2_core Test_framework_rpc_surface Test_framework_request_context \
   Test_framework_coapp_lifecycle Test_framework_inbound_http \
   Test_framework_actor_mailbox Test_framework_ordered_egress \
-  Test_framework_ordered_ingress Test_framework_ordered_ingress_http \
+  Test_framework_ordered_ingress Test_framework_ordered_ingress_rpc \
+  Test_framework_v1_absent \
   Test_framework_shutdown Test_framework_rpc_codec Test_framework_close_gate \
   Test_framework_resource_lifecycle Test_framework_egress_request_phase \
   Test_framework_getvalue_codec Test_framework_rpc_matrix rpc_xlang_server \
@@ -86,33 +87,35 @@ ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
   仍无 `bbt::infra_common` 目标则 `FATAL_ERROR` 并指明两条路径选项。
 - `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名
   `NEED_TEST`、`BUILD_TESTING` 开关在接入时被局部屏蔽。
-- 上游 infra RPC core 已迁到新 `bbt::infra::http` 栈：正式 wire 由
-  `bbt::infra_rpc_net` 目标承载，需要 `BBT_INFRA_RPC_NET=ON` +
-  `BBT_INFRA_HTTP_NET=ON` + `BBT_PROTOBUF_PREFIX`，三者缺一在 infra
-  configure 阶段 fail-closed；NEED_TEST=ON 的本仓验收（
-  `framework.rpc_xlang` 等强制用例）同样要求该目标在场。不显式选择
-  ProtoWireV1 的普通库构建仍必须开启 HTTP_NET；RPC_NET/protobuf 可选。
-- HTTP 消费统一到 `bbt::infra_http_net`，保留 LegacyHeaders 请求协议。
-  执行槽、共享池、`Close` 与优雅排空的区别、运行时状态 shared_ptr 寿命
-  模型（`AppRuntimeState`）、客户端字节限额及无 DNS/TLS 的边界见
-  [HTTP 宿主指南](docs/guides/http-host.md)。
+- 上游 infra RPC 只保留 V2 会话：`bbt::infra_rpc_net` 目标承载
+  `SessionFrame`（proto 2）+ u32be 分帧 + Hello/HelloAck；需要
+  `BBT_INFRA_RPC_NET=ON` + `BBT_PROTOBUF_PREFIX`。框架默认宿主
+  `InfraHttpHost` 仍消费 `bbt::infra_http_net`（`BBT_INFRA_HTTP_NET=ON`），
+  两个目标都是 `bbt::framework` 的必需前置，缺失时 configure fail-closed。
+  NEED_TEST=ON 的本仓验收（`framework.rpc_xlang` 等强制用例）同样要求
+  RPC target 在场；不存在 HTTP header 或旧 wire 的降级路径。
+- HTTP 宿主装配与执行槽、共享池、`Close` 与优雅排空的区别、运行时状态
+  shared_ptr 寿命模型（`AppRuntimeState`）、客户端字节限额及无 DNS/TLS 的
+  边界见 [HTTP 宿主指南](docs/guides/http-host.md)；RPC 只经 V2 会话消费，
+  映射见 [框架契约 §7.1](docs/architecture/framework-contract.md)。
 - 构建产物只进已忽略的 `build/`。
 
 ## 跨语言 RPC 示例：GetValue
 
 `examples/getvalue/` 是首个真实业务切片：业务 `.proto`（唯一 schema 真源）
-+ C++ framework 服务端（正式 infra body wire bridge）+ Python 标准库客户端。
++ C++ framework 服务端（V2 会话入站）+ Python 标准库客户端。
 详见 [`examples/getvalue/README.md`](examples/getvalue/README.md)。
 
 - 业务 schema：`examples/getvalue/proto/bbt/example/v1/get_value.proto`
   （`bbt.example.v1.GetValueRequest/Response`；`GetValue(key) -> {found, value}`）。
-- 正式 wire：`CoAppOptions::inbound_bridge = RpcInboundBridge::ProtoWireV1`
-  → HTTP `POST /rpc`、`Content-Type: application/x-protobuf`、body 为 infra
-  版本化 `RpcEnvelope`；不使用 `x-bbt-*` header 旁路。选择该桥需配置锁定
-  protobuf 前缀 `-DBBT_PROTOBUF_PREFIX=<prefix>`（未配置时框架只提供迁移期
-  header 桥，选择 ProtoWireV1 会在启动前显式失败）。
-- 运行/验收（ctest 名 `examples.getvalue.xlang` 与 `framework.getvalue_codec`）；
-  Python 客户端零依赖（手写 proto3 wire 编解码）。所有结构化结果带
+- V2 会话 wire：`SessionFrame`（`session_frame.proto`，profile 2）+ u32be
+  分帧 + Hello/HelloAck 身份协商；`CoAppOptions::local_identity` 必填且与
+  peer 互异（拒绝 self-connection）。`remaining_budget_ms` 由 CALL 帧携带，
+  接收端按 local-min 收紧；0 预算在解码期以 `SESSION_ERROR(ProtocolError)`
+  拒绝。没有 HTTP header 旁路或版本化 envelope。
+- 跨语言客户端共用 `tests/rpc_v2_wire.py`（SessionFrame 编解码 + 分帧 +
+  握手），运行/验收（ctest 名 `examples.getvalue.xlang` 与
+  `framework.getvalue_codec`）。所有结构化结果带
   `auth_state=unauthenticated_loopback`。
 
 ## 双服务资源示例：dual_service（默认不构建）
@@ -132,8 +135,9 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
   （`bbt::infra_redis_net`）、
   `BBT_MONGOC_PREFIX`+`BBT_MONGOCXX_PREFIX`（`bbt::infra_mongo`）；
   任一缺失都在 configure 阶段 `FATAL_ERROR`，不静默跳过。
-- 协议：三个进程统一 ProtoWireV1（infra 正式 body wire），只有它携带
-  `remaining_budget_ms`，服务端才能真正继承调用方预算（示例含可判定证据）。
+- 协议：三个进程统一 V2 会话（`SessionFrame` + u32be + Hello/HelloAck，
+  `local_identity` 互异）；CALL 帧携带 `remaining_budget_ms`，服务端按
+  local-min 继承调用方预算（示例含可判定证据）。
 - 覆盖边界：默认 CI 不传该开关，所以它的绿灯**不**覆盖本示例；真实资源
   验收入口是 `examples/dual_service/run_acceptance.sh`（临时 Redis/Mongo
   容器 + 全场景 + 残留复核），当前仅本地/受控环境运行。资源验收 CI job

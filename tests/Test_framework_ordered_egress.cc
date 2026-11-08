@@ -18,7 +18,6 @@
 #include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/OrderedTypes.hpp>
 #include <bbt/framework/internal/ErrorDomainRule.hpp>
-#include <bbt/framework/internal/RpcHttpBridge.hpp>
 
 namespace fw = bbt::framework;
 namespace inf = bbt::infra;
@@ -355,26 +354,19 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
     }
 }
 
-// 用例 9：真实 ToHttpResponse 出站边界的降级回归。
-// 不走 helper 直连——构造 result<RpcEnvelope>::err(...) 喂给
-// http_bridge::ToHttpResponse，断言 wire 输出本身：
-//   a) actor 域非法 expected_sequence → 降级为 ProtocolError，且
-//      原始非法值/保留键不出现在任何 header；
+// 用例 9：V2 回复边界的错误降级回归。
+//
+// V2 没有 HTTP 头通道：错误随 RESPONSE 帧的 error 分支（RpcError）传输，
+// 边界处唯一的降级判定是 ValidateErrorAtBoundary——framework 的入站回复
+// 边界（RpcBridge/InfraHttpHost）在发布终态前调用同一函数。因此这里直接
+// 断言该边界的产出，不再伪造 header 映射：
+//   a) actor 域非法 expected_sequence → 降级为 ProtocolError，且降级后的
+//      错误体不携带原始非法值/保留键/原 domain_code；
 //   b) 跨域携带保留键 → 同样降级；
-//   c) 合法 actor 错误 → 既有 code/domain/domain_code/message 映射不变；
-//   d) 合法错误的 details 不上 wire（现有 wire 未实现 details 传递，不得宣称传递）。
-BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
-    namespace Wire = fw::http_bridge;
-    using inf::RpcEnvelope;
-
-    auto header_of = [](const inf::http::Response& r,
-                        std::string_view name) -> std::optional<std::string> {
-        for (const auto& [k, v] : r.headers)
-            if (k == name) return v;
-        return std::nullopt;
-    };
-
-    // a) actor 域非法 expected_sequence：真实出站必须降级且不泄露原值
+//   c) 合法 actor 错误 → code/domain/domain_code/message/details 原样通过
+//      （V2 error 分支承载 details，与 V1 header 通道不同）。
+BOOST_AUTO_TEST_CASE(reply_boundary_downgrades_invalid_error) {
+    // a) actor 域非法 expected_sequence：边界必须降级且不泄露原值
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError,
                                     "actor gap detail");
@@ -382,72 +374,50 @@ BOOST_AUTO_TEST_CASE(to_http_response_boundary_downgrades_invalid_error) {
         e.domain_code = fw::ordered_domain_code::kSequenceGap;
         e.details = {{std::string(fw::kErrorDetailExpectedSequence), "x7"}};
 
-        const auto res = Wire::ToHttpResponse(
-            fw::result<RpcEnvelope>::err(std::move(e)));
-
-        BOOST_REQUIRE_EQUAL(res.status_code, 400u);
-        const auto code = header_of(res, "x-bbt-err-code");
-        BOOST_REQUIRE(code);
-        BOOST_CHECK_EQUAL(*code,
-            std::to_string(static_cast<int>(fw::ErrorCode::ProtocolError)));
-        // 降级后是通用 ProtocolError：不保留原 domain/domain_code/message
-        BOOST_CHECK(header_of(res, "x-bbt-err-domain"));
-        BOOST_CHECK(!header_of(res, "x-bbt-err-domain-code") ||
-                    header_of(res, "x-bbt-err-domain-code")->empty());
-        // 原始非法值 "x7" 与保留键名不得出现在任何 header 值/键中
-        for (const auto& [k, v] : res.headers) {
-            BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
-            BOOST_CHECK(v.find("x7") == std::string::npos);
-            BOOST_CHECK(v.find("SequenceGap") == std::string::npos);
-            BOOST_CHECK(v.find("actor gap detail") == std::string::npos);
-        }
+        const auto valid = fw::ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!valid);
+        const auto& downgraded = valid.error();
+        BOOST_CHECK(downgraded.code == fw::ErrorCode::ProtocolError);
+        // 降级后是通用 ProtocolError：不保留原 domain/domain_code/details
+        BOOST_CHECK(downgraded.details.empty());
+        BOOST_CHECK(downgraded.domain_code.empty());
+        BOOST_CHECK(downgraded.message.find("x7") == std::string::npos);
+        BOOST_CHECK(downgraded.message.find("expected_sequence") ==
+                    std::string::npos);
+        BOOST_CHECK(downgraded.message.find("actor gap detail") ==
+                    std::string::npos);
+        // 原始错误对象不被就地改写（降级是返回值语义）。
+        BOOST_CHECK_EQUAL(e.domain_code, fw::ordered_domain_code::kSequenceGap);
+        BOOST_CHECK_EQUAL(e.details.size(), 1u);
     }
 
-    // b) 跨域携带保留键：infra 域错误带 expected_sequence → 出站降级
+    // b) 跨域携带保留键：infra 域错误带 expected_sequence → 边界降级
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::ProtocolError, "x");
         e.domain = std::string(bbt::infra::kErrorDomainInfra);
         e.details = {{std::string(fw::kErrorDetailExpectedSequence), "7"}};
 
-        const auto res = Wire::ToHttpResponse(
-            fw::result<RpcEnvelope>::err(std::move(e)));
-
-        BOOST_REQUIRE_EQUAL(res.status_code, 400u);
-        const auto code = header_of(res, "x-bbt-err-code");
-        BOOST_REQUIRE(code);
-        BOOST_CHECK_EQUAL(*code,
-            std::to_string(static_cast<int>(fw::ErrorCode::ProtocolError)));
-        for (const auto& [k, v] : res.headers)
-            BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
+        const auto valid = fw::ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(!valid);
+        BOOST_CHECK(valid.error().code == fw::ErrorCode::ProtocolError);
+        BOOST_CHECK(valid.error().details.empty());
     }
 
-    // c) 合法 actor 错误：既有 wire 映射不回归——code/domain/domain_code/
-    //    message 原样落 header，details 本身不上 wire
+    // c) 合法 actor 错误：边界不回归——字段与 details 原样通过
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap msg");
         e.domain = std::string(fw::kErrorDomainFrameworkActor);
         e.domain_code = fw::ordered_domain_code::kSequenceGap;
         e.details = {{std::string(fw::kErrorDetailExpectedSequence), "42"}};
 
-        const auto res = Wire::ToHttpResponse(
-            fw::result<RpcEnvelope>::err(std::move(e)));
-
-        BOOST_REQUIRE_EQUAL(res.status_code, 400u);
-        BOOST_CHECK_EQUAL(
-            header_of(res, "x-bbt-err-code").value_or(""),
-            std::to_string(static_cast<int>(fw::ErrorCode::RemoteError)));
-        BOOST_CHECK_EQUAL(header_of(res, "x-bbt-err-domain").value_or(""),
-                          "framework.actor");
-        BOOST_CHECK_EQUAL(
-            header_of(res, "x-bbt-err-domain-code").value_or(""),
-            "SequenceGap");
-        BOOST_CHECK_EQUAL(header_of(res, "x-bbt-err-message").value_or(""),
-                          "gap msg");
-        // details 不经现有 wire 传递：无 header 携带 42
-        for (const auto& [k, v] : res.headers) {
-            BOOST_CHECK(k.find("expected_sequence") == std::string::npos);
-            BOOST_CHECK(v != "42");
-        }
+        const auto valid = fw::ValidateErrorAtBoundary(e);
+        BOOST_REQUIRE(valid);
+        BOOST_CHECK(e.code == fw::ErrorCode::RemoteError);
+        BOOST_CHECK_EQUAL(e.domain, "framework.actor");
+        BOOST_CHECK_EQUAL(e.domain_code, "SequenceGap");
+        BOOST_CHECK_EQUAL(e.message, "gap msg");
+        BOOST_REQUIRE_EQUAL(e.details.size(), 1u);
+        BOOST_CHECK_EQUAL(e.details[0].second, "42");
     }
 }
 

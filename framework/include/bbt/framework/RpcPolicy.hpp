@@ -19,9 +19,10 @@
 //  - 失败：返回 err → 按框架既有错误边界上报，与今天的 egress 失败同形。
 
 #include <optional>
+#include <string>
 
 #include <bbt/coroutine/sync/WaitTypes.hpp>
-#include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/rpc/Request.hpp>
 
 #include <bbt/framework/Result.hpp>
 
@@ -30,8 +31,8 @@ namespace bbt::framework {
 // 受管出站调用的只读事实视图：已解析目标、请求 envelope（五字段 + payload +
 // metadata 只读）、已适配的绝对期限（父预算取 min 后的有效值，循环上界）。
 struct RpcCallView {
-    const bbt::infra::RpcAddress& target;
-    const bbt::infra::RpcEnvelope& request;
+    const std::string& target;
+    const bbt::infra::rpc::Request& request;
     bbt::coroutine::Deadline deadline;
 };
 

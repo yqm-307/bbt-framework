@@ -1,12 +1,12 @@
 #pragma once
 // 入站适配器（机器面，internal/）：把 infra 的入站调用事实
-// （IncomingCallContext + RpcEnvelope）落成受管请求上下文并分发到
+// （rpc::Request + Request::Context()）落成受管请求上下文并分发到
 // 已托管 Service/Actor 实例。
 //
 // 字段来源纪律（不得伪造）：
 //  - deadline/peer_principal 只取 infra 已换算/已验证的
-//    IncomingCallContext；request_id 与受限系统字段（fw.*）只取
-//    RpcEnvelope；业务 custom 只允许出现在 route.* 键下。
+//    Request::Context()；request_id 与受限系统字段（fw.*）只取
+//    rpc::Request；业务 custom 只允许出现在 route.* 键下。
 //  - metadata 中 route.* 与受限 fw.* 白名单之外的键一律拒绝
 //    （err(InvalidArgument)），不静默忽略、不转写进上下文。
 //  - 白名单 fw.*：fw.trace_id 落入上下文 trace_id；有序流四元组
@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,8 @@
 #include <unordered_map>
 
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
 #include <bbt/framework/internal/ActorMailbox.hpp>
 #include <bbt/framework/internal/ActorRegistry.hpp>
@@ -64,9 +67,9 @@ public:
     // 校验 → 上下文落地 → 执行策略分发 → 回复封包。ActorSerial 路径
     // 的 CoWaiter::WaitWithCallback 要求协程上下文；非协程调用在 actor
     // 路径返回 InvalidContext 错误而不是未定义行为。
-    result<bbt::infra::RpcEnvelope> Dispatch(
-        const bbt::infra::IncomingCallContext& incoming,
-        bbt::infra::RpcEnvelope request);
+    result<bbt::infra::rpc::Response> Dispatch(
+        const bbt::infra::rpc::Request& request,
+        const std::function<void()>& on_dispatched = {});
 
 private:
     struct PerService {

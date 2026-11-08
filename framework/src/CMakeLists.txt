@@ -22,7 +22,7 @@ add_library(bbt_framework STATIC
     host/Registry.cc
     host/RequestScope.cc
     host/ResourceClose.cc
-    host/RpcHttpBridge.cc
+    host/RpcBridge.cc
     host/Service.cc)
 add_library(bbt::framework ALIAS bbt_framework)
 target_include_directories(bbt_framework PUBLIC
@@ -35,25 +35,8 @@ target_link_libraries(bbt_framework PUBLIC bbt::infra_common bbt::infra_http_net
 target_compile_features(bbt_framework PUBLIC cxx_std_17)
 target_compile_options(bbt_framework PRIVATE -Wall -Wextra)
 
-# 正式 RPC body bridge 只在 protobuf 前缀锁定、infra 注册
-# bbt_infra_rpc_net 目标时编译。未配置时框架仅提供迁移期 header 桥；显式选择
-# ProtoWireV1 在 run 前校验期非零失败（不静默降级）。
-if(TARGET bbt_infra_rpc_net)
-    target_sources(bbt_framework PRIVATE host/RpcWireBridge.cc)
-    target_link_libraries(bbt_framework PUBLIC bbt::infra_rpc_net)
-    target_compile_definitions(bbt_framework PUBLIC BBT_FRAMEWORK_HAS_RPC_WIRE=1)
-    message(STATUS "bbt-framework: 启用正式 RPC wire bridge (bbt::infra_rpc_net)")
-else()
-    message(STATUS
-        "bbt-framework: 未注册 bbt_infra_rpc_net（缺 BBT_PROTOBUF_PREFIX）："
-        "只有迁移期 header 入站桥")
+# RPC 是框架必需能力：只有公开 V2 target，没有 header 或旧传输降级。
+if(NOT TARGET bbt::infra_rpc_net)
+    message(FATAL_ERROR "bbt-framework requires bbt::infra_rpc_net (BBT_INFRA_RPC_NET=ON and pinned protobuf prefix)")
 endif()
-
-# 三仓 §6 迁移：TCP profile（TcpRpcTransport/TcpRpcInboundTransport）只在
-# infra 注册 bbt_infra_rpc_tcp 时编译；未注册时 TcpV1 选择 fail-closed
-# （Create/_ValidateConfig 显式失败，不降级为 HTTP）。
-if(TARGET bbt_infra_rpc_tcp)
-    target_link_libraries(bbt_framework PUBLIC bbt::infra_rpc_tcp)
-    target_compile_definitions(bbt_framework PUBLIC BBT_FRAMEWORK_HAS_RPC_TCP=1)
-    message(STATUS "bbt-framework: 启用 RPC TCP profile (bbt::infra_rpc_tcp)")
-endif()
+target_link_libraries(bbt_framework PUBLIC bbt::infra_rpc_net)

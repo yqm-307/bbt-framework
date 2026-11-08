@@ -22,6 +22,8 @@
 
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
 #include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/DynamicRouteTable.hpp>
@@ -36,7 +38,7 @@ namespace bbt::framework {
 
 class ActorRegistry;
 class HostLifecycle;
-class HttpEgress;
+class RpcEgress;
 class InboundDispatcher;
 class InfraHttpHost;
 class OrderedIngress;
@@ -49,23 +51,13 @@ struct CoAppSeam;
 // 内部入口友元（internal/** 声明）：测试缝构造与默认入站线桥安装。
 std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
                                         CoAppSeam seam);
-void InstallRpcHttpBridge(InfraHttpHost& host, CoApp& app);
-void InstallRpcWireBridge(InfraHttpHost& host, CoApp& app);
+void InstallRpcAdmission(InfraHttpHost& host, CoApp& app);
 
 /** @brief 将服务名映射到显式配置的出站地址。 */
 struct StaticRoute {
     std::string              service_name;
-    bbt::infra::RpcAddress   address;
+    std::string address;
 };
-
-/**
- * @brief 选择入站 RPC 的线格式与传输适配。
- *
- * LegacyHeaders 将 envelope 字段映射到 x-bbt-* HTTP headers；ProtoWireV1
- * 使用 protobuf body 经 HTTP；TcpV1 使用 protobuf body 经 infra TCP adapter。
- * 所选传输或 protobuf 支持不可用时，CoApp 在启动校验中报告错误。
- */
-enum class RpcInboundBridge { LegacyHeaders, ProtoWireV1, TcpV1 };
 
 /**
  * @brief CoApp 默认宿主的网络、路由与关闭预算配置。
@@ -77,12 +69,11 @@ struct CoAppOptions {
     bbt::infra::ListenAddress listen;
     std::vector<StaticRoute>  static_routes;
     std::chrono::milliseconds shutdown_step_budget;
-    // 默认使用 x-bbt-* header 线格式。
-    RpcInboundBridge          inbound_bridge = RpcInboundBridge::LegacyHeaders;
+    // 会话身份必填；trusted-network identity 不是认证凭据。
+    std::string local_identity;
     // 策略在构造时提供；nullptr 使用默认策略。m_options 持有策略至 CoApp 析构。
     std::shared_ptr<RpcPolicy> rpc_policy{};
     // 可选动态路由表：发现提供方（应用侧组件）发布快照，出站按逻辑服务名解析。
-    // 放在既有字段之后，保持旧版位置聚合初始化的顺序与含义。
     // 非空时其已配置的服务名优先于 static_routes，且不回退静态 endpoint。
     std::shared_ptr<DynamicRouteTable> dynamic_routes{};
 };
@@ -90,8 +81,7 @@ struct CoAppOptions {
 /**
  * @brief 业务宿主装配根（service-actor/v2）。
  *
- * 默认装配使用 InfraHttpHost + RpcHttpBridge + HttpEgress（真实 infra HTTP
- * loopback 传输）；测试替换经 internal/CoAppSeam.hpp。
+ * 默认装配使用 InfraHttpHost + RPC admission + RpcEgress（V2 双向会话）；测试替换经 internal/CoAppSeam.hpp。
  *
  * 启动前校验：运行时配置与静态路由在 run 前校验；find_route 只认显式配置
  * 的静态路由与已装配动态路由表，不存在「自动连任意服务」。
@@ -101,16 +91,14 @@ struct CoAppOptions {
  */
 class CoApp {
     // 测试缝构造仅经 internal MakeCoAppForTest 到达；默认入站线桥
-    // 经 InstallRpcHttpBridge 安装，两者均在 internal/** 声明。
+    // 经 InstallRpcAdmission 安装，两者均在 internal/** 声明。
     friend std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions,
                                                    CoAppSeam);
-    friend void InstallRpcHttpBridge(InfraHttpHost&, CoApp&);
-    friend void InstallRpcWireBridge(InfraHttpHost&, CoApp&);
+    friend void InstallRpcAdmission(InfraHttpHost&, CoApp&);
     // 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
     // dispatch_inbound，不新增业务可见面。
-    friend result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
-        CoApp&, const bbt::infra::IncomingCallContext&,
-        bbt::infra::RpcEnvelope);
+    friend result<bbt::infra::rpc::Response> DispatchInboundForTest(
+        CoApp&, const bbt::infra::rpc::Request&);
 
 public:
     /**
@@ -244,7 +232,7 @@ public:
      * 两者都没有 → err(NotFound)。run 前后均可调用；出站分发必须经此门，
      * 不允许绕过。
      */
-    result<bbt::infra::RpcAddress> find_route(
+    result<std::string> find_route(
         std::string_view service_name) const;
 
     /**
@@ -415,12 +403,11 @@ private:
     // 测试缝构造：显式注入宿主与出站发送；仅 MakeCoAppForTest 可达。
     CoApp(CoAppOptions options, CoAppSeam seam);
 
-    // 入站分发入口（机器面）：由入站线桥（InstallRpcHttpBridge）在
+    // 入站分发入口（机器面）：由入站线桥（InstallRpcAdmission）在
     // 受管协程内调用；未启动/已收束 → err(RuntimeUnavailable)。
     // 业务不直接调用本入口。
-    result<bbt::infra::RpcEnvelope> dispatch_inbound(
-        const bbt::infra::IncomingCallContext& incoming,
-        bbt::infra::RpcEnvelope request);
+    result<bbt::infra::rpc::Response> dispatch_inbound(
+        const bbt::infra::rpc::Request& request);
 
     result<void> _ValidateConfig() const;   // run 前校验，不启动任何组件
     result<void> _BindServices();           // Scheduler::Start 后建立对象身份
@@ -443,7 +430,7 @@ private:
 
     mutable std::mutex              m_mtx;
     std::map<std::string, ServiceEntry>   m_services;
-    std::map<std::string, bbt::infra::RpcAddress> m_routes;
+    std::map<std::string, std::string> m_routes;
     std::shared_ptr<ResourceMap>    m_resources{
         std::make_shared<ResourceMap>()};
     // 资源装配记录表（登记期写入，启动期消费 factory、关闭期消费

@@ -1,14 +1,14 @@
 // examples/dual_service/driver_main.cc — driver：演示客户端进程。
 //
-// 独立进程：自起 Scheduler + net::Engine + http::Client，按 infra 正式
-// RpcWire（ProtoWireV1，POST /rpc + application/x-protobuf）向 gateway 发真实
-// RPC。只依赖 infra 公开头 <bbt/infra/rpc/RpcWire.hpp>、<bbt/infra/rpc/HttpTransport.hpp> 与 framework 公开面
-// （CoRpc 位置参数 codec）——不引用 framework internal 头，也不读 x-bbt-* header。
+// 独立进程：自起 Scheduler + net::Engine + infra 公开的 V2 会话客户端
+// (bbt::infra::rpc::CoRpcClient)，向 gateway 发真实 RPC。只依赖 infra 公开头
+// （net/Engine、rpc/CoRpcClient、rpc/Request、rpc/Response）与 framework 公开面
+// （CoRpc 位置参数 codec）——不引用 framework internal 头，也不手写第二套
+// SessionFrame/u32be/Hello 编解码：wire 的唯一实现是 infra 的 V2 会话。
 //
-// 为什么必须是 ProtoWireV1 而非迁移期 header 桥：只有正式 wire body 携带
-// remaining_budget_ms，服务端才能在 handler 可见前把入站预算收敛为
-// min(传输硬看门, now+budget)；header 桥没有任何预算字段，服务端只能吃
-// 传输层 incoming_timeout，做不到真正继承调用方预算。见场景 5 的断言口径。
+// V2 会话的预算语义：CallOptions.deadline 同时是客户端等待上限与 wire
+// remaining_budget_ms 的来源，服务端据此把入站预算收敛为
+// min(传输硬看门, now+budget) 并在 handler 可见前扣掉回包预留。见场景 5。
 //
 // 场景（按序执行，各自打印 PASS/FAIL + 实际结果）：
 //   1. store+fetch 正常回路（经 gateway → storage 真实跨进程）
@@ -35,32 +35,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include <bbt/coroutine/coroutine.hpp>
 
-#include <bbt/infra/http/Client.hpp>
-#include <bbt/framework/internal/InfraHttpHost.hpp>
-#include <bbt/infra/NetworkTypes.hpp>
-#include <bbt/infra/http/Client.hpp>      // wire 回复解析的新值类型边界
-#include <bbt/infra/rpc/RpcWire.hpp>       // 公开 wire profile 契约（非 framework internal）
-#include <bbt/infra/rpc/HttpTransport.hpp> // ParseRpcWireHttpResponse（公开 HTTP adapter 头）
+#include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/rpc/CoRpcClient.hpp>
+#include <bbt/infra/rpc/Options.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
-#include <bbt/framework/Framework.hpp>     // CoRpcReq/位置参数 codec
+#include <bbt/framework/Framework.hpp> // CoRpcReq/位置参数 codec（公开面）
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
-namespace rpcw = bbt::infra::rpc;
+namespace net = bbt::infra::net;
+namespace rpc = bbt::infra::rpc;
 using Clock = std::chrono::steady_clock;
 
 namespace {
 
-std::string g_key_prefix;   // 本轮 key 命名空间（见 main）
+std::string g_key_prefix; // 本轮 key 命名空间（见 main）
 
 std::string Key(std::string_view bare) {
     return g_key_prefix + std::string(bare);
@@ -70,7 +72,6 @@ struct Reply {
     bool         ok = false;
     fw::Error    error{};                 // ok=false 时有效
     std::vector<std::uint8_t> payload;    // ok=true 时有效
-    std::uint32_t remaining_ms = 0;       // 服务端回填的生效剩余预算（wire）
     std::chrono::milliseconds elapsed{0}; // 本次调用墙钟耗时
 };
 
@@ -96,55 +97,109 @@ const char* CodeName(fw::ErrorCode c) {
     return "?";
 }
 
-// 全局运行态：main 建立；协程里执行 Send。
-// 必须是可显式释放的全局：若留在静态析构阶段，http::Client/net::Engine
-// 的析构会发生在 g_scheduler->Stop() 之后，访问已停调度器导致崩溃。
-// main 返回前 reset()（见 main 收尾）。
-std::shared_ptr<fw::InfraHttpHost> g_rt;
-std::shared_ptr<inf::http::Client>     g_client;
-std::string                          g_endpoint;
-std::uint32_t                        g_seq = 0;
+// 全局运行态：main 建立；协程里执行 Call。
+// 必须是可显式释放的全局：若留在静态析构阶段，Engine/Client 的析构会发生在
+// g_scheduler->Stop() 之后，访问已停调度器导致崩溃。main 返回前 reset()。
+struct DriverRuntime {
+    std::shared_ptr<net::Engine> engine;
+    std::shared_ptr<rpc::CoRpcClient> client;
+    std::thread runner;
+    std::shared_future<std::error_code> finished;
+};
+std::shared_ptr<DriverRuntime> g_runtime;
+std::string g_endpoint;
+std::uint32_t g_seq = 0;
+
+// 启动 client-only Engine（本代网络资源）并装配 V2 会话客户端。
+bool StartRuntime() {
+    auto rt = std::make_shared<DriverRuntime>();
+    rt->engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+    if (!rt->engine)
+        return false;
+
+    net::EngineConfig config;
+    config.runtime_progress = net::RuntimeProgress::Independent;
+    config.options.num_event_loop = 1;
+    auto done = std::make_shared<std::promise<std::error_code>>();
+    rt->finished = done->get_future().share();
+    rt->runner = std::thread([engine = rt->engine, config, done]() mutable {
+        try {
+            done->set_value(engine->Run(config));
+        } catch (...) {
+            done->set_value(std::make_error_code(std::errc::io_error));
+        }
+    });
+
+    const auto until = Clock::now() + std::chrono::seconds{5};
+    while (rt->engine->Phase() != net::EnginePhase::Running) {
+        if (rt->finished.wait_for(std::chrono::milliseconds{0}) ==
+            std::future_status::ready) {
+            std::fprintf(stderr, "[driver] engine Run failed before Running\n");
+            rt->runner.join();
+            return false;
+        }
+        if (Clock::now() >= until) {
+            std::fprintf(stderr, "[driver] engine startup timed out\n");
+            rt->engine->RequestClose();
+            rt->runner.join();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+
+    rpc::ClientOptions options;
+    options.SetLocalIdentity("dual-service-driver")
+        .SetTrustedNetworkPlaintext(true)
+        .SetMaxSessions(8)
+        .SetMaxFrameBytes(65536);
+    auto client = rpc::CoRpcClient::Create(rt->engine, std::move(options));
+    if (!client) {
+        std::fprintf(stderr, "[driver] rpc client create failed: %s\n",
+                     client.error().message.c_str());
+        rt->engine->RequestClose();
+        rt->runner.join();
+        return false;
+    }
+    rt->client = std::move(client).value();
+    g_runtime = std::move(rt);
+    return true;
+}
+
+void StopRuntime() {
+    if (!g_runtime)
+        return;
+    // 控制线程不在协程域：统一关闭入口的协程 Close 不可直接消费，用同步
+    // Shutdown 立即封口；连接物理回收由 Engine RequestClose 后 Run 返回收口。
+    if (g_runtime->client)
+        g_runtime->client->Shutdown();
+    if (g_runtime->engine)
+        g_runtime->engine->RequestClose();
+    if (g_runtime->runner.joinable())
+        g_runtime->runner.join();
+    g_runtime->client.reset();
+    g_runtime->engine.reset();
+    g_runtime.reset();
+}
 
 Reply Send(const std::string& service, const std::string& method,
            const fw::CoRpcReq& req, std::chrono::milliseconds budget) {
     Reply out;
     const auto t0 = Clock::now();
 
-    // 组正式 wire 信封：remaining_budget_ms 由本地预算换算并 clamp 到 wire 合法
-    // 区间（[1, kMaxRemainingBudgetMs]）；request_id 用于回显关联校验。
-    rpcw::RpcWireEnvelope w;
-    w.profile_version     = rpcw::kRpcWireProfileVersion;
-    w.request_id          = "drv-" + std::to_string(++g_seq);
-    w.service             = service;
-    w.method              = method;
-    const auto budget_ms  = static_cast<long long>(budget.count());
-    w.remaining_budget_ms = static_cast<std::uint32_t>(std::clamp<long long>(
-        budget_ms, 1, static_cast<long long>(rpcw::kMaxRemainingBudgetMs)));
-    w.request_schema      = std::string(fw::kCoRpcPositionalSchema);
-    w.response_schema     = std::string(fw::kCoRpcPositionalSchema);
-    w.payload             = req.payload();
-    w.success             = true;
+    // V2 请求：五关联字段 + Required/Service；预算只经 CallOptions.deadline
+    // 承载（同时是客户端等待上限与 wire remaining_budget_ms 来源）。
+    rpc::Request request;
+    request.SetService(service)
+        .SetMethod(method)
+        .SetRequestId("drv-" + std::to_string(++g_seq))
+        .SetRequestSchema(std::string(fw::kCoRpcPositionalSchema))
+        .SetResponseSchema(std::string(fw::kCoRpcPositionalSchema))
+        .SetReply(rpc::ReplyMode::Required)
+        .SetTraffic(rpc::TrafficClass::Service)
+        .SetPayload(req.payload());
+    const std::string want_request_id = request.RequestId();
 
-    // 上游新栈删去旧 MakeRpcWireHttpRequest：客户端出站归 rpc::Client，
-    // 手工发送自行编码 body + 显式 POST /rpc + 固定 Content-Type（与 wire
-    // profile 同一线路）。
-    auto wire_body = rpcw::EncodeRpcWireEnvelope(w, /*is_response=*/false);
-    if (!wire_body) {
-        out.error = std::move(wire_body.error());
-        out.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            Clock::now() - t0);
-        return out;
-    }
-    inf::HttpRequest http_req;
-    http_req.method  = "POST";
-    http_req.url     = "http://" + g_endpoint + rpcw::kRpcWireHttpPath;
-    http_req.headers = {{std::string(rpcw::kRpcWireContentTypeKey),
-                         std::string(rpcw::kRpcWireContentType)}};
-    http_req.body.assign(wire_body.value().begin(), wire_body.value().end());
-    const std::string want_request_id = w.request_id;
-
-    // client->Request 只在协程内合法；控制线程这边用 latch（mutex+CV）
-    // 收协程结果。
+    // Client::Call 只在协程内合法；控制线程这边用 latch（mutex+CV）收协程结果。
     struct Slot {
         std::mutex              m;
         std::condition_variable cv;
@@ -152,38 +207,21 @@ Reply Send(const std::string& service, const std::string& method,
         Reply                   reply;
     };
     auto slot = std::make_shared<Slot>();
-    bbtco [http_req = std::move(http_req), slot, budget,
-           want_request_id]() mutable {
+    bbtco[request, slot, budget, want_request_id]() mutable {
         inf::CallOptions o;
         o.deadline = Clock::now() + budget;
-        auto res = bbt_co_await g_client->Post(http_req.url, {http_req.body, {}}, {http_req.headers, {}, std::nullopt}, o);
+        auto res = bbt_co_await g_runtime->client->Call(
+            "tcp://" + g_endpoint, std::move(request), o);
         Reply r;
         if (!res) {
             r.ok    = false;
             r.error = std::move(res.error());
+        } else if (res.value().RequestId() != want_request_id) {
+            r.error = fw::MakeError(fw::ErrorCode::ProtocolError,
+                                    "v2 reply: request_id mismatch");
         } else {
-            inf::http::Response wire_resp;
-            wire_resp.status_code = static_cast<int>(res.value().status_code);
-            wire_resp.headers     = res.value().headers;
-            wire_resp.body        = std::move(res.value().body);
-            auto parsed = rpcw::ParseRpcWireHttpResponse(wire_resp);
-            if (!parsed) {
-                r.error = std::move(parsed.error());   // 非法 wire body
-            } else {
-                const auto& w2 = parsed.value();
-                if (w2.request_id != want_request_id) {
-                    r.error = fw::MakeError(
-                        fw::ErrorCode::ProtocolError,
-                        "wire reply: request_id mismatch");
-                } else if (!w2.success) {
-                    r.ok    = false;
-                    r.error = w2.error;                 // 远端（含服务端自产）错误
-                } else {
-                    r.ok           = true;
-                    r.payload      = w2.payload;
-                    r.remaining_ms = w2.remaining_budget_ms;
-                }
-            }
+            r.ok = true;
+            r.payload = res.value().Payload();
         }
         std::lock_guard<std::mutex> lk(slot->m);
         slot->reply = std::move(r);
@@ -245,29 +283,12 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("BBT_DEMO_KEY_PREFIX"))
         g_key_prefix = p;
 
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
     g_scheduler->Start();
 
-    auto rt = std::make_shared<fw::InfraHttpHost>(inf::NetworkLimits{
-        /*max_connections*/ 32, /*max_inflight*/ 32,
-        /*max_header_bytes*/ 16384, /*max_body_bytes*/ 65536,
-        /*incoming_timeout*/ std::chrono::milliseconds{5000}}, inf::ListenAddress{"127.0.0.1", 0});
-    g_rt = rt;
-    if (auto r = g_rt->Create(); !r) { g_rt->Close(); return 70; }
-    if (auto r = g_rt->Start(); !r) {
-        std::fprintf(stderr, "[driver] runtime start failed: %s\n",
-                     r.error().message.c_str());
-        g_rt->Close();
+    if (!StartRuntime())
         return 70;
-    }
-    auto cl = g_rt->http_client();
-    if (!cl) {
-        std::fprintf(stderr, "[driver] host HTTP client unavailable\n");
-        g_rt->Close();
-        return 70;
-    }
-    g_client = cl;
 
     std::printf("[driver] gateway=%s key_prefix=\"%s\"\n\n",
                 g_endpoint.c_str(), g_key_prefix.c_str());
@@ -378,12 +399,8 @@ int main(int argc, char** argv) {
     std::printf("\n[driver] %d passed, %d failed\n", g_pass, g_fail);
     std::fflush(stdout);
 
-    // 收口：ICoCloseable::Close() 同步幂等（返回即物理释放）；先关客户端再关
-    // runtime。显式 reset 后于 Close 即可——不再依赖已删除的调度器停机入口
-    //（coroutine Scheduler 无 Stop，进程寿命单例）。
-    g_client->Close();
-    g_rt->Close();
-    g_client.reset();
-    g_rt.reset();
+    // 收口：Client Shutdown 后 Engine RequestClose，Run 返回才表示本代网络资源
+    // 收口；显式 reset 后于 Close 即可（coroutine Scheduler 无 Stop）。
+    StopRuntime();
     return g_fail == 0 ? 0 : 1;
 }

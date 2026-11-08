@@ -314,6 +314,7 @@ BOOST_AUTO_TEST_CASE(resource_seam_unbound_and_registration) {
         64, 64, 16384, 65536, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{2000};
+    options.local_identity = "rpc-surface-test";
     fw::CoApp app(options);
 
     auto resource = std::make_shared<DummyResource>();
@@ -335,6 +336,7 @@ BOOST_AUTO_TEST_CASE(named_resource_registration_and_lookup) {
         64, 64, 16384, 65536, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{2000};
+    options.local_identity = "rpc-surface-test";
     fw::CoApp app(options);
 
     auto primary = std::make_shared<DummyResource>();

@@ -1,14 +1,15 @@
-// bbt-framework C++ framework 服务端（正式 body wire bridge）。
+// bbt-framework C++ framework 服务端（V2 会话入站）。
 //
-// 装配路径与业务一致：公开 CoApp（inbound_bridge=ProtoWireV1）+ 公开 CoService，
-// 不使用测试缝、不提供 Binder、不伪造结果。监听 loopback 动态端口，启动后写
+// 装配路径与业务一致：公开 CoApp（local_identity 显式、V2 入站经
+// InstallRpcAdmission）+ 公开 CoService，不使用测试缝、不提供 Binder、
+// 不伪造结果。监听 loopback 动态端口，启动后写
 // 端口/元数据文件，阻塞等待 stdin EOF 后按序优雅关闭。
 //
 // argv: getvalue_server server <port_file> <meta_file> <journal_file>
 //
-// 版本/来源：链接 deps.lock 固定的 bbtools-infra（当前
-// d254c10a8a660057a85784b1155a7260460548e4）之 bbt::infra_rpc_net（protobuf
-// 3.21.12），bbt::framework 经 BBT_FRAMEWORK_HAS_RPC_WIRE 启用正式桥。
+// 版本/来源：链接 deps.lock 固定的 bbtools-infra 之 bbt::infra_rpc_net
+// （V2 SessionFrame profile 2 + protobuf 3.21.12）；bbt::framework 以 V2 为
+// 必需依赖，不再有条件编译开关。
 
 #include <chrono>
 #include <cstdio>
@@ -78,7 +79,8 @@ int main(int argc, char* argv[]) {
         64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    options.inbound_bridge = bbt::framework::RpcInboundBridge::ProtoWireV1;
+    // V2 会话身份必填；进程内每个会话 owner 使用明确身份。
+    options.local_identity = "getvalue-server";
 
     bbt::framework::CoApp app(options);
     if (auto r = app.add_service<getvalue::GetValueService>(
@@ -123,7 +125,7 @@ int main(int argc, char* argv[]) {
           << bbt::example::v1::GetValueRequest::descriptor()->full_name() << "\n";
         f << "response_schema="
           << bbt::example::v1::GetValueResponse::descriptor()->full_name() << "\n";
-        f << "inbound_bridge=proto_wire_v1\n";
+        f << "local_identity=getvalue-server\n";
         f << "auth_state=unauthenticated_loopback\n";
     }
     std::fprintf(stderr, "getvalue server up endpoint=%s\n", endpoint.c_str());

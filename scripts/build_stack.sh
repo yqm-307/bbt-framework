@@ -105,11 +105,13 @@ _need "$BBT_COROUTINE_SOURCE_DIR/bbt/coroutine/object/interface/ICoObject.hpp" "
 # ---- 2) 目标工程配置/构建 ---------------------------------------------------
 # coroutine/infra 经 add_subdirectory 源码接入；产物链接到 build 树内的真实
 # target，不写 /usr/local。
-# 上游 infra RPC core 已迁到新 http 栈（BBT_INFRA_RPC_NET 闭包，需
-# BBT_INFRA_HTTP_NET + BBT_PROTOBUF_PREFIX，缺一 configure fail-closed）。
+# 上游 infra RPC 已收敛到 V2 会话：单一 bbt_infra_rpc_net（proto 2 SessionFrame），
+# 需 BBT_INFRA_RPC_NET=ON + BBT_PROTOBUF_PREFIX；HTTP 宿主仍由
+# BBT_INFRA_HTTP_NET=ON 提供，两者都是框架构建的必需目标。
 # 调用方经 BBT_CMAKE_ARGS 显式锁定 protobuf 前缀时（如 CI gate），配方补齐
-# RPC 开关使 bbt_infra_rpc_net 注册；HTTP 是所有框架构建的必要依赖。
-# 未锁 protobuf 前缀时仍提供 LegacyHeaders 协议，但不提供正式 RPC wire。
+# RPC 开关使 bbt_infra_rpc_net 注册。
+# 未锁 protobuf 前缀时不会注册 RPC target，框架 configure 会 fail-closed，
+# 不提供降级协议。
 if [[ "$BBT_CMAKE_ARGS" =~ (^|[[:space:]])-DBBT_PROTOBUF_PREFIX=([^[:space:]]+) ]]; then
     protobuf_prefix_arg="${BASH_REMATCH[2]}"
     if [[ "$protobuf_prefix_arg" != '""' && "$protobuf_prefix_arg" != "''" ]]; then

@@ -107,14 +107,14 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
 
 ## 6. 测试数（当前注册面）
 
-`-DNEED_TEST=ON` 且 `bbt_infra_rpc_net` 注册时的默认配置共注册 **22** 个 CTest：
+`-DNEED_TEST=ON` 且 `bbt_infra_rpc_net` 注册时的默认配置共注册 **25** 个 CTest：
 
-`tests/`（17）与 `examples/`（5）。ctest 名均为 `<module>.<行为>` 形式
+`tests/`（19）与 `examples/`（6）。ctest 名均为 `<module>.<行为>` 形式
 （`framework.*`、`examples.*`）。普通 CI 固定跑 **smoke profile**（`-L smoke`，
-15 项：unit + 快速 integration）+ **必要 focused**（`focused_regex` 命中的
+18 项：12 个 unit + 6 个快速 integration）+ **必要 focused**（`focused_regex` 命中的
 直接耦合用例，可含非 smoke 项）；`framework.shutdown`（单用例实测 ~30s、
-全套 ~107s）与 `framework.rpc_profile` 只标 `integration`，5 个 `examples.*`
-用例标 `integration`（跨进程真实协作，非冒烟）——均不进普通 smoke。
+全套 ~107s）与 6 个 `examples.*` 用例只标 `integration`（跨进程真实协作，
+非冒烟）——均不进普通 smoke。
 `framework.resource_live_{redis,mongo,combined}` 仅在 infra 相应目标在场时
 注册（`live` label，默认配置不产生）。
 测试命名、label 语义与条件 target 的完整契约以 `tests/CMakeLists.txt` 与

@@ -63,7 +63,7 @@ set_tests_properties(framework.ordered_egress PROPERTIES
 
 # 有序入口接收侧：授权流校验、每流序号状态机与去重终态缓存；
 # 缺口/在途/冲突/淘汰/epoch 切换/无票据均由组件语义核直接断言，
-# 不依赖入站接线（接线见 framework.ordered_ingress_http）。
+# 不依赖入站接线（接线见 framework.ordered_ingress_rpc）。
 add_executable(Test_framework_ordered_ingress Test_framework_ordered_ingress.cc)
 target_link_libraries(Test_framework_ordered_ingress PRIVATE bbt::framework)
 target_compile_options(Test_framework_ordered_ingress PRIVATE -Wall -Wextra)
@@ -71,15 +71,27 @@ add_test(NAME framework.ordered_ingress COMMAND Test_framework_ordered_ingress)
 set_tests_properties(framework.ordered_ingress PROPERTIES
     TIMEOUT 30 LABELS "smoke;unit")
 
-# 有序入口真实 HTTP loopback 接线验收。
-add_executable(Test_framework_ordered_ingress_http
-    Test_framework_ordered_ingress_http.cc)
-target_link_libraries(Test_framework_ordered_ingress_http PRIVATE bbt::framework)
-target_compile_options(Test_framework_ordered_ingress_http PRIVATE -Wall -Wextra)
-add_test(NAME framework.ordered_ingress_http
-    COMMAND Test_framework_ordered_ingress_http)
-set_tests_properties(framework.ordered_ingress_http PROPERTIES
+# 有序入口真实 V2 会话接线验收（InstallRpcAdmission + 真实 TCP loopback）。
+add_executable(Test_framework_ordered_ingress_rpc
+    Test_framework_ordered_ingress_rpc.cc)
+target_link_libraries(Test_framework_ordered_ingress_rpc PRIVATE bbt::framework)
+target_compile_options(Test_framework_ordered_ingress_rpc PRIVATE -Wall -Wextra)
+add_test(NAME framework.ordered_ingress_rpc
+    COMMAND Test_framework_ordered_ingress_rpc)
+set_tests_properties(framework.ordered_ingress_rpc PROPERTIES
     TIMEOUT 60 LABELS "smoke;integration")
+
+# framework 侧 V1 面缺席的负向检查：编译层正向对照（V2 面可用）+ 文本层
+# 扫描 framework/include、framework/src 与其 CMake，断言旧桥/旧值类型/
+# x-bbt 信封头族/旧能力宏零命中。源码根以编译定义注入，不靠相对 cwd。
+add_executable(Test_framework_v1_absent Test_framework_v1_absent.cc)
+target_link_libraries(Test_framework_v1_absent PRIVATE bbt::framework)
+target_compile_options(Test_framework_v1_absent PRIVATE -Wall -Wextra)
+target_compile_definitions(Test_framework_v1_absent PRIVATE
+    BBT_FRAMEWORK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+add_test(NAME framework.v1_absent COMMAND Test_framework_v1_absent)
+set_tests_properties(framework.v1_absent PROPERTIES
+    TIMEOUT 30 LABELS "smoke;unit")
 
 # deadline 继承与受管请求上下文（RequestContext/RequestScope/
 # CallOptionsAdapter）；真实协程调度器 + 注入点断言。
@@ -98,7 +110,7 @@ add_test(NAME framework.coapp_lifecycle COMMAND Test_framework_coapp_lifecycle)
 set_tests_properties(framework.coapp_lifecycle PROPERTIES
     TIMEOUT 30 LABELS "smoke;unit")
 
-# 真实 HTTP loopback 入站→上下文落地→分发→回复；
+# 真实 V2 会话入站→上下文落地→分发→回复；
 # InvalidContext 端到端、同步 Close、跨 worker 不串扰。
 add_executable(Test_framework_inbound_http Test_framework_inbound_http.cc)
 target_link_libraries(Test_framework_inbound_http PRIVATE bbt::framework)
@@ -118,10 +130,10 @@ add_test(NAME framework.shutdown COMMAND Test_framework_shutdown)
 set_tests_properties(framework.shutdown PROPERTIES
     TIMEOUT 180 LABELS "integration")
 
-# 关闭门回归：StopAccepting 闭门——「infra 已接纳、尚未进入入站包装」
-# 的迟到进入者被拒且不触达业务、WaitHandlersDone 不漏记、已过门者不被
-# 抢占；另有独立宿主的直接 Close 兼容小断言。一组用例走 internal 测试缝
-# （确定性、无 socket），一组走真实 HTTP loopback，失败路径由 RAII 夹具收尾。
+# 关闭门回归：StopAccepting 闭门——已建立 V2 会话上的迟到 CALL 被同步
+# 派发门拒绝且不触达业务、WaitHandlersDone 不漏记、已过门者不被抢占；
+# 另有直接 Close 的终态断言。V2 组走真实会话 loopback，HTTP 组保留
+# HTTP 侧对照，失败路径由 RAII 夹具收尾。
 add_executable(Test_framework_close_gate Test_framework_close_gate.cc)
 target_link_libraries(Test_framework_close_gate PRIVATE bbt::framework)
 target_compile_options(Test_framework_close_gate PRIVATE -Wall -Wextra)
@@ -138,16 +150,10 @@ add_test(NAME framework.rpc_codec COMMAND Test_framework_rpc_codec)
 set_tests_properties(framework.rpc_codec PROPERTIES
     TIMEOUT 15 LABELS "smoke;unit")
 
-# 三仓迁移 impl-framework-rpc：RPC profile 契约测试——TCP loopback roundtrip、
-# 默认 HTTP 回归、OutcomeUnknown/request_phase、Close 与 LegacyHeaders 保持。
-# TCP 用例仅在 bbt_infra_rpc_tcp 注册时编译进目标（否则文件内 TCP 段为空，
-# 只剩 legacy 用例——TCP 证据由 infra rpc.net.tcp_* 与本测试 TCP 段共同提供）。
-add_executable(Test_framework_rpc_profile Test_framework_rpc_profile.cc)
-target_link_libraries(Test_framework_rpc_profile PRIVATE bbt::framework)
-target_compile_options(Test_framework_rpc_profile PRIVATE -Wall -Wextra)
-add_test(NAME framework.rpc_profile COMMAND Test_framework_rpc_profile)
-set_tests_properties(framework.rpc_profile PROPERTIES
-    TIMEOUT 60 LABELS "integration")
+# RPC profile 用例已随 V1 wire/HTTP profile 删除（ADR 0022 §5）：
+# 其 roundtrip 断言由 framework.rpc_matrix / framework.inbound_http 承担，
+# request_phase/OutcomeUnknown 由 framework.egress_request_phase 承担，
+# Close/排空由 framework.shutdown 与 framework.close_gate 承担。
 
 # 命名资源 Registry：工厂装配、Create/Start 相位、失败回滚与
 # 关闭序列下的同步 Close 收束（INetworkHost 桩驱动）。
@@ -231,7 +237,7 @@ else()
         "(BBT_MONGOC_PREFIX+BBT_MONGOCXX_PREFIX)，本配置无 Mongo live 门禁")
 endif()
 
-# 联合 live 验收：真实 HTTP loopback → 框架入站 → 业务 Service →
+# 联合 live 验收：真实 V2 会话 → 框架入站 → 业务 Service →
 # 真实 Redis + Mongo 联合消费。要求两个 infra 资源模块都在场（任一缺失
 # 即不注册本 target——单资源 live 不能替代联合验收），缺环境时进程 77
 # 退出配合 SKIP_RETURN_CODE 标 Skipped。
@@ -260,9 +266,9 @@ else()
         "bbt::infra_mongo 同时在场，本配置无联合 live 门禁")
 endif()
 
-# RpcEnvelope wire profile 的跨语言互通验证：C++ 服务端消费
-# bbt::infra_rpc_net + bbt::infra_http_net；Python 客户端经 http.client
-# 真实 POST /rpc 收发 protobuf body。
+# V2 SessionFrame 的跨语言互通验证：C++ 服务端消费 bbt::infra_rpc_net +
+# bbt::infra_http_net；Python 客户端经 tests/rpc_v2_wire.py（唯一 codec）
+# 走真实 TCP + u32be 分帧 + Hello/HelloAck 收发 SessionFrame。
 # fail-closed：本测试是 wire 契约验收的强制项。infra 未注册
 # bbt_infra_rpc_net 目标（例如接入时漏给 BBT_PROTOBUF_PREFIX）时必须在
 # configure 阶段非零失败，不允许静默跳过导致验收证据缺口。
@@ -283,8 +289,9 @@ target_link_libraries(rpc_xlang_server PRIVATE
     bbt::framework bbt::infra_rpc_net bbt::infra_http_net Boost::boost Threads::Threads)
 target_compile_options(rpc_xlang_server PRIVATE -Wall -Wextra)
 
-# Python 客户端零依赖（手写 proto3 wire format），仅需解释器本体；
-# 该手写解码同时验证了 wire 字段的字节级布局，不依赖同一 protobuf 库。
+# Python 客户端零依赖（tests/rpc_v2_wire.py 手写 proto3 wire format），仅需
+# 解释器本体；该手写解码同时验证了 wire 字段的字节级布局，不依赖同一
+# protobuf 库。
 add_test(
     NAME framework.rpc_xlang
     COMMAND "${Python3_EXECUTABLE}"
@@ -294,11 +301,11 @@ add_test(
 set_tests_properties(framework.rpc_xlang PROPERTIES
     TIMEOUT 60 LABELS "smoke;integration")
 
-# 下游 request-phase/OutcomeUnknown 消费验收：在真实 framework
-# ProtoWireV1 egress 上消费 bbtools-infra 的公开 request-phase/
-# OutcomeUnknown 契约（RequestPhase / IsRequestCommitted /
-# Error::request_phase）。覆盖 committed→OutcomeUnknown；另覆盖发送前过期、
-# 未提交失败、remaining budget 换算与 clamp。不覆盖并发/容量/关闭矩阵。
+# 下游 request-phase/OutcomeUnknown 消费验收：在真实 framework V2 egress
+# 上消费 bbtools-infra 的公开 request-phase/OutcomeUnknown 契约
+# （RequestPhase / IsRequestCommitted / Error::request_phase）。覆盖
+# committed→OutcomeUnknown；另覆盖发送前过期、未提交失败与预算收敛。
+# 不覆盖并发/容量/关闭矩阵。
 # 需要 bbt::infra_rpc_net 与 protobuf 前缀——上方已 fail-closed 保证该目标在场。
 # 对端是测试自有裸 TCP loopback，不依赖实例。
 add_executable(Test_framework_egress_request_phase
@@ -326,12 +333,12 @@ if(TARGET getvalue_proto)
         TIMEOUT 30 LABELS "smoke;unit")
 endif()
 
-# 正式 wire 路径上的并发隔离/容量/迟到寿命与关闭矩阵。
-# 服务端：公开 CoApp（inbound_bridge=ProtoWireV1）+ 真实 InfraHttpHost 监听
-# 127.0.0.1 动态端口；客户端：infra 公开 net::Engine/http::Client + rpc::RpcWire
-# 构造真实 POST /rpc protobuf body，走真实 socket loopback。不使用
-# MakeCoAppForTest / DispatchInboundForTest / INetworkHost 桩 / LegacyHeaders。
-# 不覆盖跨 hop 预算与跨进程 supervisor 硬停。
+# V2 正式会话路径上的并发隔离/容量/迟到寿命与关闭矩阵。
+# 服务端：公开 CoApp（local_identity 必填）+ 真实 InfraHttpHost 监听
+# 127.0.0.1 动态端口；客户端：第二个 InfraHttpHost（互异 identity）的
+# rpc_client owner + RpcEgress::Call，走真实 TCP loopback 的 SessionFrame +
+# Hello/HelloAck。不使用 MakeCoAppForTest / DispatchInboundForTest /
+# INetworkHost 桩。不覆盖跨 hop 预算与跨进程 supervisor 硬停。
 if(TARGET getvalue_proto)
     add_executable(Test_framework_rpc_matrix Test_framework_rpc_matrix.cc)
     target_link_libraries(Test_framework_rpc_matrix PRIVATE

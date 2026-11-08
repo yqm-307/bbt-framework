@@ -12,7 +12,7 @@
 //    协程返回值自行决定（if/return/继续下一调用），框架不提供单操作业务取消。
 //  - 「发起 I/O」与「消耗序号」经注入点执行，测试可断言动作未发生。
 //    ordered 不属于 infra::CallOptions；票据字段只由可信适配器填入
-//    RpcEnvelope 的 fw.* 系统元数据。
+//    rpc::Request 的 fw.* 系统元数据。
 
 #include <functional>
 

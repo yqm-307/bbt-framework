@@ -15,9 +15,9 @@ namespace {
 
 std::string RouteKey(std::string_view service) { return std::string(service); }
 
-bool SameEndpoint(const bbt::infra::RpcAddress& a,
-                  const bbt::infra::RpcAddress& b) {
-    return a.transport == b.transport && a.endpoint == b.endpoint;
+bool SameEndpoint(const std::string& a,
+                  const std::string& b) {
+    return a == b;
 }
 
 } // namespace
@@ -27,25 +27,25 @@ DynamicRouteTable::DynamicRouteTable(std::chrono::milliseconds stale_limit)
 
 result<void> DynamicRouteTable::Replace(
     std::string service, std::uint64_t revision,
-    std::vector<bbt::infra::RpcAddress> endpoints) {
+    std::vector<std::string> endpoints) {
     if (service.empty())
         return result<void>::err(
             MakeError(ErrorCode::InvalidArgument,
                       "DynamicRouteTable::Replace: empty service name"));
     for (const auto& ep : endpoints) {
-        if (ep.transport.empty() || ep.endpoint.empty())
+        if (ep.empty())
             return result<void>::err(MakeError(
                 ErrorCode::InvalidArgument,
                 "DynamicRouteTable::Replace: service '" + service +
-                    "' has endpoint with empty transport/endpoint"));
+                    "' has endpoint with empty endpoint"));
     }
     // 去重保序：同一 endpoint 重复出现只保留一份，否则 round-robin 会偏向它。
-    std::vector<bbt::infra::RpcAddress> unique;
+    std::vector<std::string> unique;
     unique.reserve(endpoints.size());
     for (auto& ep : endpoints) {
         const bool seen = std::any_of(
             unique.begin(), unique.end(),
-            [&ep](const bbt::infra::RpcAddress& known) {
+            [&ep](const std::string& known) {
                 return SameEndpoint(known, ep);
             });
         if (!seen)
@@ -69,37 +69,37 @@ result<void> DynamicRouteTable::Replace(
     return result<void>::ok();
 }
 
-result<bbt::infra::RpcAddress> DynamicRouteTable::Resolve(
+result<std::string> DynamicRouteTable::Resolve(
     std::string_view service) const {
     const std::string key = RouteKey(service);
     std::lock_guard<std::mutex> lk(m_mtx);
     const auto it = m_entries.find(key);
     if (it == m_entries.end())
-        return result<bbt::infra::RpcAddress>::err(MakeError(
+        return result<std::string>::err(MakeError(
             ErrorCode::NotFound,
             "DynamicRouteTable::Resolve: service '" + key +
                 "' is not published by any provider"));
     Entry& entry = it->second;
     if (entry.unavailable)
-        return result<bbt::infra::RpcAddress>::err(MakeError(
+        return result<std::string>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "DynamicRouteTable::Resolve: service '" + key +
                 "' view was marked unavailable"));
     if (entry.snapshot.endpoints.empty())
-        return result<bbt::infra::RpcAddress>::err(MakeError(
+        return result<std::string>::err(MakeError(
             ErrorCode::NotFound,
             "DynamicRouteTable::Resolve: service '" + key +
                 "' currently has no healthy instance"));
     const auto age =
         std::chrono::steady_clock::now() - entry.snapshot.observed_at;
     if (age > m_stale_limit)
-        return result<bbt::infra::RpcAddress>::err(MakeError(
+        return result<std::string>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "DynamicRouteTable::Resolve: service '" + key +
                 "' view is stale (no successful discovery within " +
                 std::to_string(m_stale_limit.count()) + "ms)"));
     const std::size_t index = entry.next++ % entry.snapshot.endpoints.size();
-    return result<bbt::infra::RpcAddress>::ok(
+    return result<std::string>::ok(
         entry.snapshot.endpoints[index]);
 }
 

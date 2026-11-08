@@ -8,9 +8,9 @@
 #          owner Close 同步物理收口），无 KvStore 替身）
 #   svc_b  gateway（handler 内 this->call 跨进程到 svc_a；static_routes 显式
 #          白名单唯一出口）
-#   driver 演示客户端（net::Engine + http::Client，按 infra 正式 RpcWire
-#          （ProtoWireV1，POST /rpc + application/x-protobuf）收发——不引用
-#          framework internal 头）
+#   driver 演示客户端（net::Engine + infra 公开 V2 会话客户端 CoRpcClient：
+#          SessionFrame + u32be + Hello/HelloAck 的唯一实现，不复制 codec，
+#          也不引用 framework internal 头）
 #
 # 本目录只在 BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON 且根 CMakeLists 的 fail-closed
 # 门禁通过时被加入：NEED_TEST、bbt_infra_rpc_net、bbt::infra_redis_net、

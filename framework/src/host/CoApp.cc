@@ -14,11 +14,8 @@
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/framework/internal/ResourceClose.hpp>
-#include <bbt/framework/internal/RpcHttpBridge.hpp>
+#include <bbt/framework/internal/RpcBridge.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
-#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-#include <bbt/framework/internal/RpcWireBridge.hpp>
-#endif
 
 namespace bbt::framework {
 
@@ -48,35 +45,14 @@ CoApp::CoApp(CoAppOptions options)
     : m_options(std::move(options)),
       m_state(std::make_shared<AppRuntimeState>()) {
     // 默认装配：真实网络宿主 + 入站线桥 + 默认出站。InstallHandler/
-    // InstallRpcHandler 只存 handler（Start 在 run 内），此处安装是安全的；
+    // InstallRpcHandler 只存业务入口（Start 在 run 内），此处安装是安全的；
     // handler 闭包按值复制运行时状态的 shared_ptr，不借用宿主/CoApp 成员、
     // 不捕获 this（见 internal/AppRuntimeState.hpp 的寿命契约）。
     m_default_host = std::make_shared<InfraHttpHost>(
-        m_options.network_limits, m_options.listen);
+        m_options.network_limits, m_options.listen, m_options.local_identity);
     m_network_host = m_default_host;
-#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-    if (m_options.inbound_bridge != RpcInboundBridge::LegacyHeaders) {
-        m_default_host->SetRpcInboundTransport(m_options.inbound_bridge);
-        InstallRpcWireBridge(*m_default_host, *this);
-    } else {
-        InstallRpcHttpBridge(*m_default_host, *this);
-    }
-#else
-    // 无 protobuf 支持时，显式选择 ProtoWireV1/TcpV1 会在 _ValidateConfig
-    // 被拒绝，不会静默降级为另一协议。
-    InstallRpcHttpBridge(*m_default_host, *this);
-#endif
-    // 出站 profile 与入站一致：ProtoWireV1/TcpV1 时出站走 infra 公开
-    // rpc::Client + 对应 adapter（wire 编解码由 infra 承担，不与入站协议分叉）；
-    // LegacyHeaders 使用 header 线格式。
-    const auto egress_profile =
-        m_options.inbound_bridge == RpcInboundBridge::TcpV1
-            ? RpcEgressProfile::TcpV1
-            : m_options.inbound_bridge == RpcInboundBridge::ProtoWireV1
-                  ? RpcEgressProfile::ProtoWireV1
-                  : RpcEgressProfile::LegacyHeaders;
-    m_state->default_egress =
-        std::make_shared<HttpEgress>(m_default_host, egress_profile);
+    InstallRpcAdmission(*m_default_host, *this);
+    m_state->default_egress = std::make_shared<RpcEgress>(m_default_host);
     m_state->rpc_policy = m_options.rpc_policy;
     m_state->dynamic_routes = m_options.dynamic_routes;
     for (const auto& r : m_options.static_routes) {
@@ -218,7 +194,7 @@ std::vector<std::string> CoApp::lifecycle_failures() const {
     return m_early_failures;
 }
 
-result<bbt::infra::RpcAddress> CoApp::find_route(
+result<std::string> CoApp::find_route(
     std::string_view service_name) const {
     return m_state->FindRoute(service_name);
 }
@@ -300,24 +276,16 @@ result<void> CoApp::_ValidateConfig() const {
         return FailInvalid("CoApp: listen host is empty");
     if (m_options.shutdown_step_budget <= std::chrono::milliseconds{0})
         return FailInvalid("CoApp: shutdown_step_budget must be > 0");
-#if !defined(BBT_FRAMEWORK_HAS_RPC_WIRE)
-    if (m_options.inbound_bridge != RpcInboundBridge::LegacyHeaders)
-        return FailInvalid(
-            "CoApp: ProtoWireV1/TcpV1 inbound bridge requires bbt::infra_rpc_net "
-            "(BBT_INFRA_RPC_NET + protobuf prefix not configured); refusing to silently fall back");
-#endif
-#if defined(BBT_FRAMEWORK_HAS_RPC_WIRE) && !defined(BBT_FRAMEWORK_HAS_RPC_TCP)
-    if (m_options.inbound_bridge == RpcInboundBridge::TcpV1)
-        return FailInvalid(
-            "CoApp: TcpV1 inbound bridge requires bbt::infra_rpc_tcp "
-            "(BBT_INFRA_RPC_TCP not configured); refusing to silently fall back");
-#endif
+    bbt::infra::rpc::ClientOptions client_options;
+    client_options.SetLocalIdentity(m_options.local_identity).SetTrustedNetworkPlaintext(true);
+    if (auto valid = client_options.Validate(); !valid)
+        return valid;
     for (const auto& r : m_options.static_routes) {
         if (r.service_name.empty())
             return FailInvalid("CoApp: static route with empty service_name");
-        if (r.address.transport.empty() || r.address.endpoint.empty())
+        if (r.address.empty())
             return FailInvalid("CoApp: static route '" + r.service_name +
-                               "' has empty transport/endpoint");
+                               "' has empty endpoint");
     }
     // 重复 service_name 的静态路由 → 拒绝（map 已保先见，此处显式计数）。
     if (m_routes.size() != m_options.static_routes.size())
@@ -490,27 +458,25 @@ ICoService::RpcSendFn CoApp::_MakeEgress() {
     // 出站回调复制运行时状态的 shared_ptr——不捕获 this、不借用 CoApp
     // 成员；路由门/策略/发送实现全部在状态内（见 AppRuntimeState::Send）。
     auto state = m_state;
-    return [state = std::move(state)](const bbt::infra::RpcEnvelope& env,
+    return [state = std::move(state)](const bbt::infra::rpc::Request& env,
                                       const bbt::infra::CallOptions& options)
-        -> result<bbt::infra::RpcEnvelope> {
+               -> result<bbt::infra::rpc::Response> {
         return state->Send(env, options);
     };
 }
 
-result<bbt::infra::RpcEnvelope> CoApp::dispatch_inbound(
-    const bbt::infra::IncomingCallContext& incoming,
-    bbt::infra::RpcEnvelope request) {
-    return m_state->Dispatch(incoming, std::move(request));
+result<bbt::infra::rpc::Response> CoApp::dispatch_inbound(
+    const bbt::infra::rpc::Request& request) {
+    return m_state->Dispatch(request);
 }
 
-result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
+result<bbt::infra::rpc::Response> DispatchInboundForTest(
     CoApp& app,
-    const bbt::infra::IncomingCallContext& incoming,
-    bbt::infra::RpcEnvelope request) {
+    const bbt::infra::rpc::Request& request) {
     // 转发私有 dispatch_inbound：测试侧拿到真实 Dispatcher/RequestContext
     // 链路（envelope 校验 → 上下文落地 → 执行策略分发 → 回复封包），
     // 不绕过 InboundDispatcher 直接触 handler。
-    return app.dispatch_inbound(incoming, std::move(request));
+    return app.dispatch_inbound(request);
 }
 
 } // namespace bbt::framework

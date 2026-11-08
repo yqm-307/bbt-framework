@@ -2,14 +2,16 @@
 """bbt-framework 正式 Service→Service 出站跨进程验收驱动器。
 
 两个真实 framework CoApp，各自独立进程：
-  - callee 进程（getvalue_server）：宿主 GetValueService（正式 ProtoWireV1 入站）
+  - callee 进程（getvalue_server）：宿主 GetValueService（真实 V2 会话入站）
   - caller 进程（getvalue_caller）：宿主 GetValueCallerService，其 handler 内
-    经 IWorkerService::call<Req,Resp>（typed seam）向 callee 发起真实正式 body
-    出站（HTTP loopback + application/x-protobuf）
-外加一个「完整读下请求后断开（丢 reply）」的真实 TCP 端点作为黑障目标。
+    经 IWorkerService::call<Req,Resp>（typed seam）向 callee 发起真实 V2 Call
+    出站（SessionFrame + u32be + Hello/HelloAck）
+外加一个「完成握手、完整读下一帧 CALL 后断开（丢 reply）」的真实 TCP 端点
+作为黑障目标。
 
-本驱动器只用 Python 标准库手写 proto3 编解码（不依赖 google.protobuf），
-既做输入又做字节级断言。
+本驱动器只用 Python 标准库手写业务 proto3 编解码（不依赖 google.protobuf），
+既做输入又做字节级断言；会话/分帧/握手/错误信封复用唯一 V2 codec
+(tests/rpc_v2_wire.py)，不复制第二套 wire 实现。
 
 断言（结构化结果均带 auth_state=unauthenticated_loopback）：
   - s2s-known / s2s-miss / s2s-empty：出站 typed 调用成功 / miss / 业务错误透传
@@ -18,7 +20,7 @@
   - s2s-blackhole-unknown：请求已完整写出后对端丢 reply（读完整个请求再断开）
     → caller 得到 OutcomeUnknown(14)，非未提交传输错误；对端只被连接一次（无 retry），
     callee journal 无新 handler
-  - s2s-badroute-{empty-service,empty-transport,empty-endpoint,duplicate}：
+  - s2s-badroute-{empty-service,empty-endpoint,duplicate}：
     caller 以公开入口载入四类非法静态路由 → run 启动任何组件前拒绝
     （rc=1=kExitRejected），lifecycle_failures 恰 1 条且为对应原因，bound_endpoint
     为空，资源工厂计数 0（拒绝断言由驱动器独立核对进程观测，不信任自报结论）
@@ -34,7 +36,6 @@
 """
 
 import argparse
-import http.client
 import json
 import os
 import signal
@@ -45,26 +46,33 @@ import threading
 import time
 import traceback
 
-RPC_PATH = "/rpc"
-CONTENT_TYPE = "application/x-protobuf"
+# 唯一 V2 codec 在 tests/；示例目录用明确相对路径定位，不依赖 cwd。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_TESTS_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "tests"))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+import rpc_v2_wire as v2  # noqa: E402
+
 AUTH_STATE = "unauthenticated_loopback"
 
 CALLER_SERVICE = "bbt.example.v1.GetValueCallerService"
 REQUEST_SCHEMA = "bbt.example.v1.GetValueRequest"
 RESPONSE_SCHEMA = "bbt.example.v1.GetValueResponse"
 
-# RpcErrorCode（infra rpc_envelope.proto enum）
-INVALID_ARGUMENT = 1
-TIMED_OUT = 6
-NOT_FOUND = 11
-OUTCOME_UNKNOWN = 14   # RpcErrorCode.RPC_ERROR_CODE_OUTCOME_UNKNOWN
+# 会话身份：驱动器客户端与 caller 进程互异（V2 拒绝 self-connection）。
+DRIVER_IDENTITY = "getvalue-s2s-driver"
 
-# 四类非法静态路由 → 公开入口 run 前拒绝。期望的 lifecycle_failures
+# RpcErrorCode（session_frame.proto enum，与 infra ErrorCode 同序）
+INVALID_ARGUMENT = v2.ERR_INVALID_ARGUMENT
+TIMED_OUT = v2.ERR_TIMED_OUT
+NOT_FOUND = v2.ERR_NOT_FOUND
+OUTCOME_UNKNOWN = v2.ERR_OUTCOME_UNKNOWN
+
+# 三类非法静态路由 → 公开入口 run 前拒绝。期望的 lifecycle_failures
 # 单条子串来自 CoApp::_ValidateConfig 的对应校验分支。
 BADROUTE_CASES = [
     ("empty-service", "empty service_name"),
-    ("empty-transport", "has empty transport/endpoint"),
-    ("empty-endpoint", "has empty transport/endpoint"),
+    ("empty-endpoint", "has empty endpoint"),
     ("duplicate", "duplicate static route service_name"),
 ]
 
@@ -155,79 +163,19 @@ def dec_get_value_response(buf):
     return found, value
 
 
-def enc_envelope(*, request_id, service, method, budget_ms, request_schema,
-                 response_schema, payload):
-    out = _f_varint(1, 1)
-    out += _f_len(2, request_id)
-    out += _f_len(3, service)
-    out += _f_len(4, method)
-    out += _f_varint(5, budget_ms)
-    out += _f_len(6, request_schema)
-    out += _f_len(7, response_schema)
-    out += _f_len(8, payload)
-    return out
+def call(client, *, request_id, method, key, budget_ms=3000):
+    """经唯一 V2 codec 向 caller 进程发一次真实 Call；返回响应帧。
 
-
-def dec_error(buf):
-    err = {"details": []}
-    for f, w, v in _parse_fields(buf):
-        if w == WIRE_VARINT and f == 1:
-            err["code"] = v
-        elif w == WIRE_LEN and f == 2:
-            err["domain"] = v.decode("utf-8")
-        elif w == WIRE_LEN and f == 3:
-            err["domain_code"] = v.decode("utf-8")
-        elif w == WIRE_LEN and f == 4:
-            err["message"] = v.decode("utf-8")
-    return err
-
-
-def dec_envelope(buf):
-    env = {"metadata": []}
-    for f, w, v in _parse_fields(buf):
-        if w == WIRE_VARINT:
-            if f == 1:
-                env["profile_version"] = v
-            elif f == 5:
-                env["remaining_budget_ms"] = v
-            elif f == 10:
-                env["success"] = bool(v)
-        elif w == WIRE_LEN:
-            if f == 2:
-                env["request_id"] = v.decode("utf-8")
-            elif f == 3:
-                env["service"] = v.decode("utf-8")
-            elif f == 4:
-                env["method"] = v.decode("utf-8")
-            elif f == 6:
-                env["request_schema"] = v.decode("utf-8")
-            elif f == 7:
-                env["response_schema"] = v.decode("utf-8")
-            elif f == 8:
-                env["payload"] = bytes(v)
-            elif f == 11:
-                env["error"] = dec_error(v)
-    return env
-
-
-def post_raw(port, body):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    conn.request("POST", RPC_PATH, body=body,
-                 headers={"Content-Type": CONTENT_TYPE})
-    resp = conn.getresponse()
-    data = resp.read()
-    status = resp.status
-    conn.close()
-    return status, dec_envelope(data)
-
-
-def call(port, *, request_id, method, key, budget_ms=3000):
-    payload = enc_get_value_request(key)
-    body = enc_envelope(request_id=request_id, service=CALLER_SERVICE,
-                        method=method, budget_ms=budget_ms,
-                        request_schema=REQUEST_SCHEMA,
-                        response_schema=RESPONSE_SCHEMA, payload=payload)
-    return post_raw(port, body)
+    整个驱动器共用一个已握手会话（V2 一个 peer identity 对应一条活跃
+    link；逐次重连会在旧 link 退役前被同一 identity 的 fencing 规则拒绝）。
+    """
+    return client.call(
+        CALLER_SERVICE, method,
+        payload=enc_get_value_request(key),
+        request_id=request_id,
+        request_schema=REQUEST_SCHEMA,
+        response_schema=RESPONSE_SCHEMA,
+        budget_ms=budget_ms)
 
 
 _FAILURES = []
@@ -295,13 +243,15 @@ def wait_port(path, proc, timeout):
 
 
 class Blackhole:
-    """真实 TCP「完整读完请求后不回复直接断开」端点（丢 reply）。
+    """真实 TCP「完成握手、完整读下一帧 CALL 后不回复直接断开」端点（丢 reply）。
 
-    与「accept 后立即 close」不同：本端点先完整收下 HTTP 请求（头 + Content-Length
-    body）再断开，使客户端请求字节已完整写出（RequestCommitted）后才失去可信回复，
-    得到 OutcomeUnknown（wire 错误码 14），而不是未提交的确定传输错误。记录被连接
-    次数，供「一次终态、无 retry」断言。
+    与「accept 后立即 close」不同：本端点先完成 Hello/HelloAck 握手，再完整收下
+    一帧 CALL（u32be 前缀 + body）后断开，使客户端请求字节已完整写出
+    （RequestCommitted）后才失去可信回复，得到 OutcomeUnknown（wire 错误码 14），
+    而不是未提交的确定传输错误。记录被连接次数，供「一次终态、无 retry」断言。
     """
+
+    IDENTITY = "getvalue-blackhole"
 
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -332,40 +282,28 @@ class Blackhole:
             with self._lock:
                 self._accepts += 1
             try:
-                self._read_full_request(conn)
+                self._serve_one(conn)
             finally:
                 try:
-                    conn.close()   # 已完整收下请求 → 不回复直接断开
+                    conn.close()   # 已完整收下 CALL → 不回复直接断开
                 except OSError:
                     pass
 
-    @staticmethod
-    def _read_full_request(conn):
-        """读到完整 HTTP 请求（头 + Content-Length body）为止；超时/中断即返回。"""
+    @classmethod
+    def _serve_one(cls, conn):
+        """完成 V2 握手后读到一帧 CALL 即返回（调用方随即断开）。"""
         conn.settimeout(5)
-        buf = bytearray()
-        header_end = -1
-        content_length = -1
-        while True:
-            if header_end < 0:
-                header_end = buf.find(b"\r\n\r\n")
-                if header_end >= 0:
-                    head = bytes(buf[:header_end]).lower()
-                    cl = -1
-                    for line in head.split(b"\r\n"):
-                        if line.startswith(b"content-length:"):
-                            cl = int(line.split(b":", 1)[1].strip())
-                    content_length = cl if cl >= 0 else 0
-            if header_end >= 0 and content_length >= 0:
-                if len(buf) - (header_end + 4) >= content_length:
-                    return
-            try:
-                chunk = conn.recv(4096)
-            except (socket.timeout, OSError):
-                return
-            if not chunk:
-                return
-            buf.extend(chunk)
+        stream = v2.FrameStream(conn)
+        try:
+            v2.server_handshake(stream, cls.IDENTITY,
+                                int(time.time() * 1000),
+                                v2.nonce_for(cls.IDENTITY))
+        except (v2.WireError, OSError):
+            return
+        try:
+            stream.read()
+        except (v2.WireError, OSError):
+            return
 
     def close(self):
         self._stop = True
@@ -488,6 +426,7 @@ def main():
     blackhole = None
     callee = None
     caller = None
+    driver = None
     try:
         os.makedirs(wd, exist_ok=True)
         for p in (callee_port_f, callee_meta_f, callee_jrnl_f, caller_port_f,
@@ -497,7 +436,7 @@ def main():
             except OSError:
                 pass
 
-        # 0) 四类非法静态路由 → 公开入口 run 前拒绝（四个独立进程）。
+        # 0) 三类非法静态路由 → 公开入口 run 前拒绝（三个独立进程）。
         for kind, expect in BADROUTE_CASES:
             run_badroute(args.caller_bin, wd, kind, expect, args.timeout)
 
@@ -522,10 +461,15 @@ def main():
         print(f"caller up port={caller_port} blackhole={black_ep}",
               file=sys.stderr)
 
+        # 整个场景序列共用一条真实 V2 会话；同一 identity 的并发 link 归
+        # 会话 fencing 规则管理，驱动器不逐次重连。
+        driver = v2.V2Client(caller_port, identity=DRIVER_IDENTITY)
+        driver.handshake(expected_peer="getvalue-caller")
+
         # 3) 出站 typed 调用场景：经 caller 进程转发到 callee（真实 S2S）。
-        st, env = call(caller_port, request_id="sc-known", method="Forward",
-                       key="alpha")
-        ok = (st == 200 and env.get("success") is True
+        env = call(driver, request_id="sc-known", method="Forward",
+                   key="alpha")
+        ok = (v2.error_of(env) is None
               and env.get("request_id") == "sc-known"
               and env.get("response_schema") == RESPONSE_SCHEMA
               and dec_get_value_response(env.get("payload", b"")) ==
@@ -533,22 +477,21 @@ def main():
         check(ok, f"got {env}", "s2s-known")
         finish("s2s-known", ok)
 
-        st, env = call(caller_port, request_id="sc-miss", method="Forward",
-                       key="no-such-key")
-        ok = (env.get("success") is True
+        env = call(driver, request_id="sc-miss", method="Forward",
+                   key="no-such-key")
+        ok = (v2.error_of(env) is None
               and dec_get_value_response(env.get("payload", b"")) == (False, ""))
         check(ok, f"got {env}", "s2s-miss")
         finish("s2s-miss", ok)
 
-        st, env = call(caller_port, request_id="sc-empty", method="Forward",
-                       key="")
-        code = env.get("error", {}).get("code")
+        env = call(driver, request_id="sc-empty", method="Forward",
+                   key="")
+        code = (v2.error_of(env) or {}).get("code")
         # proto3 省略默认 false：错误用例以 error 字段存在判定，不读 success。
-        ok = ("error" in env and code == INVALID_ARGUMENT)
+        ok = (v2.error_of(env) is not None and code == INVALID_ARGUMENT)
         check(ok, f"expected InvalidArgument via S2S, got {env}", "s2s-empty")
         RESULTS["s2s-empty-error"] = {"code": code,
-                                      "message": env.get("error", {}).get(
-                                          "message", ""),
+                                      "message": (v2.error_of(env) or {}).get("message", ""),
                                       "auth_state": AUTH_STATE}
         finish("s2s-empty", ok)
 
@@ -560,11 +503,11 @@ def main():
                                            "auth_state": AUTH_STATE}
 
         # 4) 发送前已过期：caller 侧 TimedOut，且 callee 不得收到任何请求。
-        st, env = call(caller_port, request_id="sc-expired",
-                       method="ForwardExpired", key="alpha")
-        code = env.get("error", {}).get("code")
+        env = call(driver, request_id="sc-expired",
+                   method="ForwardExpired", key="alpha")
+        code = (v2.error_of(env) or {}).get("code")
         n_expired = len(read_journal(callee_jrnl_f))
-        ok = ("error" in env and code == TIMED_OUT
+        ok = (v2.error_of(env) is not None and code == TIMED_OUT
               and n_expired == n_after_business)
         check(ok, f"expected TimedOut + no callee IO, got code={code} "
                   f"callee_handler={n_expired}", "s2s-expired")
@@ -574,11 +517,11 @@ def main():
         finish("s2s-expired", ok)
 
         # 5) 无静态路由：find_route 门拒绝，不做 I/O。
-        st, env = call(caller_port, request_id="sc-noroute",
-                       method="ForwardNoRoute", key="alpha")
-        code = env.get("error", {}).get("code")
+        env = call(driver, request_id="sc-noroute",
+                   method="ForwardNoRoute", key="alpha")
+        code = (v2.error_of(env) or {}).get("code")
         n_noroute = len(read_journal(callee_jrnl_f))
-        ok = ("error" in env and code == NOT_FOUND
+        ok = (v2.error_of(env) is not None and code == NOT_FOUND
               and n_noroute == n_after_business)
         check(ok, f"expected NotFound + no IO, got code={code} "
                   f"callee_handler={n_noroute}", "s2s-noroute")
@@ -590,12 +533,12 @@ def main():
         # 6) 请求已完整写出后丢 reply（真 OutcomeUnknown）：对端读完整个请求后
         #    断开，客户端请求已提交；一次终态、无 retry（对端只被连接一次）。
         accepts_before = blackhole.accepts
-        st, env = call(caller_port, request_id="sc-blackhole",
-                       method="ForwardBlackhole", key="alpha")
-        code = env.get("error", {}).get("code")
+        env = call(driver, request_id="sc-blackhole",
+                   method="ForwardBlackhole", key="alpha")
+        code = (v2.error_of(env) or {}).get("code")
         n_black = len(read_journal(callee_jrnl_f))
         black_accepts = blackhole.accepts - accepts_before
-        ok = ("error" in env and code == OUTCOME_UNKNOWN
+        ok = (v2.error_of(env) is not None and code == OUTCOME_UNKNOWN
               and n_black == n_after_business and black_accepts == 1)
         check(ok, f"expected OutcomeUnknown(14) after committed reply loss + "
                   f"exactly one connection, got code={code} "
@@ -605,8 +548,8 @@ def main():
         # 指标在 finish() 之后写入（finish 会重置该场景条目），保留 status/auth_state。
         RESULTS["s2s-blackhole-unknown"].update({
             "error_code": code,
-            "error_domain": env.get("error", {}).get("domain", ""),
-            "error_message": env.get("error", {}).get("message", ""),
+            "error_domain": (v2.error_of(env) or {}).get("domain", ""),
+            "error_message": (v2.error_of(env) or {}).get("message", ""),
             "blackhole_accepts": black_accepts,
             "callee_handler_after": n_black})
 
@@ -629,7 +572,9 @@ def main():
         print(f"DRIVER-ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
     finally:
-        # 清理所有自有的 caller/callee/blackhole，退出检查先于总体结论。
+        # 清理所有自有的 driver/caller/callee/blackhole，退出检查先于总体结论。
+        if driver is not None:
+            driver.close()
         _reap("caller", caller, _FAILURES)
         _reap("callee", callee, _FAILURES)
         if blackhole is not None:

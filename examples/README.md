@@ -8,10 +8,10 @@
 | 组件式业务复用：两个 Service 共享一个受管组件实例 | [`component_services/`](component_services/README.md) | `v2::CoApp::CoInstallComponent/CoInstallService`、`ServiceOptions::BindComponent`、`CoService<C>::GetComponent`、`ComponentHandle::Borrow` | 同进程、同一 App/Registry 内共享实例；跨进程只能复用代码/协议 |
 | 组件热拔插与 hook | 同上 | `CoBindComponent/CoUnbindComponent`、`CoUninstallComponent/CoInstallComponent`、`CoComponent` 生命周期/`OnBindingChanged`、`CoObserve`/`ObserverToken`、`App::LifecycleFailures` | 换的是受管组件实例，不是 dlopen/代码热更新；不跨进程热共享 |
 | 跨进程模块复用（代码层） | 同上（`node` 模式） | 同一业务头 `store.hpp` 在独立进程各自装配 | 两个进程各有独立组件实例，不是 RPC、不是集群、不是服务发现 |
-| 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `CoApp::add_service`、`kRpcMethods`、`ProtoWireV1` + `ProtoCodec` | 需要 protobuf 前缀与 `bbt_infra_rpc_net`；单服务 |
-| 单进程双 Service 调用 | [`two_service/`](two_service/README.md) | `this->call<Req,Resp>`、`find_route` 静态路由、真实 loopback 出站 | 路由是静态自指，不证明发现或跨进程 |
-| 出站调用策略 | [`rpc_policy/`](rpc_policy/README.md) | `RpcPolicy`、`CoRpcReq/Resp` | 复用 getvalue 业务，无外部服务 |
-| 容量 / 并发上下文 / 关闭生命周期 | [`lifecycle_matrix/`](lifecycle_matrix/README.md) | `ExecutionPolicy::Concurrent`、`max_inflight`、`ShutdownIncomplete`、`request_shutdown` | 真实 loopback HTTP，不代表生产部署 |
+| 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `CoApp::add_service`、`kRpcMethods`、V2 会话（`SessionFrame`）+ `ProtoCodec` | 需要 protobuf 前缀与 `bbt_infra_rpc_net`；单服务 |
+| 双进程 Service→Service 调用 | [`two_service/`](two_service/README.md) | `this->call<Req,Resp>`、`find_route` 静态路由、真实 V2 会话 | 两个互异 identity 的 CoApp 进程；不证明发现或认证 |
+| 出站调用策略 | [`rpc_policy/`](rpc_policy/README.md) | `RpcPolicy`、`CoRpcReq/Resp` | 复用 getvalue 业务，callee 为独立 CoApp 进程 |
+| 容量 / 并发上下文 / 关闭生命周期 | [`lifecycle_matrix/`](lifecycle_matrix/README.md) | `ExecutionPolicy::Concurrent`、`max_inflight`、`ShutdownIncomplete`、`request_shutdown` | 真实 loopback V2 会话，不代表生产部署 |
 | 多进程 + 真实 Redis/Mongo 资源 | [`dual_service/`](dual_service/README.md) | `add_resource` 工厂/`ICoCloseable`、真实 Redis/Mongo 客户端 | 显式 opt-in（`BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON`）；资源示例，不是注册中心 |
 | 真实注册中心 + 多进程动态发现（gateway→order→catalog，catalog 双实例） | [`ecommerce_cluster/`](ecommerce_cluster/README.md) | `DynamicRouteTable`/`CoAppOptions::dynamic_routes`、`CoApp::find_route` 动态优先、`bbt::infra_consul`、`add_resource` 工厂 | 需真实 Consul 二进制与 `BBT_INFRA_CONSUL=ON`；TCP check 健康、5s 陈旧边界、每服务 round-robin、无重试/权重 |
 

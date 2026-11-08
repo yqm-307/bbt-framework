@@ -1,17 +1,16 @@
-// 正式 wire 路径上的并发隔离 / 容量 / 迟到寿命 / 关闭矩阵。
+// V2 正式会话路径上的并发隔离 / 容量 / 迟到寿命 / 关闭矩阵。
 //
-// 修正要点（相对旧候选 4207772d…）：
-//   早期草案曾走 MakeCoAppForTest + DispatchInboundForTest + StubNetHost（INetworkHost
-//   桩）+ LegacyHeaders/positional，未走正式 wire 路径。本文件固定为：
-//     * 服务端：公开 `fw::CoApp app(opts)`（opts.inbound_bridge=ProtoWireV1），
-//       真实 InfraHttpHost 监听 127.0.0.1:0，业务服务经公开 ProtoMethod 注册
-//       测试专用 Hold/Fast（只读 GetValue 语义，无写副作用）；
-//     * 客户端：infra 公开 `InfraHttpHost::Create → Start → Createhttp::Client`
-//       得真实 http::Client，经 rpc::ToWireEnvelope + MakeRpcWireHttpRequest 组真实
-//       POST /rpc protobuf body，走真实 socket loopback（非注入 rpc_send、非直接
-//       dispatch、非私有身份）。
+// 装配固定为两个互异身份的 V2 会话 owner：
+//   * 服务端：公开 `fw::CoApp app(opts)`（opts.local_identity 必填），真实
+//     InfraHttpHost 监听 127.0.0.1:0，业务服务经公开 ProtoMethod 注册测试
+//     专用 Hold/Fast（只读 GetValue 语义，无写副作用）；
+//   * 客户端：独立 `fw::InfraHttpHost`（互异 local_identity）的 `rpc_client()`
+//     owner，经公开 `RpcEgress::Call("tcp://<ep>", Request, CallOptions)` 走
+//     真实 TCP loopback 的 SessionFrame + Hello/HelloAck（非注入 rpc_send、
+//     非直接 dispatch、非私有身份）。
 //   未认证 principal 来自真实 transport（loopback 无认证 → 空串），测试不手造
-//   IncomingCallContext。
+//   入站上下文；deadline 由 infra 按 remaining_budget_ms 与 incoming_timeout
+//   的 local-min 填入 Request::Context()。
 //
 // 用例：
 //   T1 r6_concurrent_context_not_crossed        并发挂起/逆序恢复；上下文不串。
@@ -51,13 +50,12 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
 
-#include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
+#include <bbt/framework/internal/RpcBridge.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
-#include <bbt/infra/http/Client.hpp>
-#include <bbt/infra/rpc/HttpTransport.hpp>
-#include <bbt/infra/rpc/RpcWire.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
 #include <bbt/example/v1/get_value.pb.h>
 
@@ -320,7 +318,7 @@ fw::ServiceOptions ConcurrentOpts(std::size_t max_inflight) {
         /*max_cached_results*/ 0, /*max_cached_result_bytes*/ 0};
 }
 
-// 正式装配：inbound_bridge=ProtoWireV1（proto body wire profile）。
+// 正式装配：V2 会话（local_identity 必填；入站走 admission，无 bridge 选择）。
 fw::CoAppOptions AppOpts(std::chrono::milliseconds shutdown_step_budget) {
     fw::CoAppOptions o{};
     o.network_limits = inf::NetworkLimits{
@@ -330,7 +328,7 @@ fw::CoAppOptions AppOpts(std::chrono::milliseconds shutdown_step_budget) {
     o.listen = inf::ListenAddress{"127.0.0.1", 0};
     o.static_routes = {};
     o.shutdown_step_budget = shutdown_step_budget;
-    o.inbound_bridge = fw::RpcInboundBridge::ProtoWireV1;
+    o.local_identity = "matrix-server";
     return o;
 }
 
@@ -393,11 +391,11 @@ bool WaitShutdownState(fw::CoApp& app, fw::ShutdownState want,
     return app.shutdown_state() == want;
 }
 
-// ── 客户端：infra 公开 net::Engine + http::Client（真实 socket）───────
+// ── 客户端：独立 V2 会话 owner（互异 identity，真实 TCP loopback）──────
 
 struct ClientEnv {
     std::shared_ptr<fw::InfraHttpHost> rt;
-    std::shared_ptr<inf::http::Client>     client;
+    std::shared_ptr<fw::RpcEgress> egress;
 
     bool Start() {
         inf::NetworkLimits lim{};
@@ -406,14 +404,15 @@ struct ClientEnv {
         lim.max_header_bytes = 16 * 1024;
         lim.max_body_bytes   = 64 * 1024;
         lim.incoming_timeout = std::chrono::milliseconds{30000};
-        auto r = std::make_shared<fw::InfraHttpHost>(lim, inf::ListenAddress{"127.0.0.1", 0});
+        auto r = std::make_shared<fw::InfraHttpHost>(
+            lim, inf::ListenAddress{"127.0.0.1", 0}, "matrix-client");
         if (!r) return false;
         rt = r;
         if (auto s = rt->Create(); !s) return false;
         if (auto s = rt->Start(); !s) return false;
-        auto c = rt->http_client();
-        if (!c) return false;
-        client = c;
+        if (!rt->rpc_client())
+            return false;
+        egress = std::make_shared<fw::RpcEgress>(rt);
         return true;
     }
     void Stop() { if (rt) rt->Close(); }
@@ -424,82 +423,65 @@ struct ClientStopOnExit {
 };
 
 struct ClientCallOut {
-    std::optional<inf::result<inf::http::Response>> r;
+    std::optional<fw::result<inf::rpc::Response>> r;
     TestLatch                                     done{1};
 };
 
+// 一次真实 V2 Call：预算由 CallOptions.deadline 承载（session 换算成 wire
+// remaining_budget_ms），服务端 Context().deadline 取它与 incoming_timeout
+// 的 local-min——因此各请求的 handler 期限相互独立。
 std::shared_ptr<ClientCallOut> CallAsync(
-    const std::shared_ptr<inf::http::Client>& client,
+    const std::shared_ptr<fw::RpcEgress>& egress,
     const std::string& endpoint,
     const std::string& method,
     const std::string& rid,
     const std::string& key,
-    std::uint32_t      budget_ms,
-    co::Deadline       deadline) {
+    std::chrono::milliseconds budget) {
     auto out = std::make_shared<ClientCallOut>();
-    inf::RpcEnvelope env;
-    env.service         = std::string(NetMatrixSvc::kServiceName);
-    env.method          = method;
-    env.request_id      = rid;
-    env.request_schema  =
-        bbt::example::v1::GetValueRequest::descriptor()->full_name();
-    env.response_schema =
-        bbt::example::v1::GetValueResponse::descriptor()->full_name();
+    inf::rpc::Request env;
+    env.SetService(std::string(NetMatrixSvc::kServiceName))
+        .SetMethod(method)
+        .SetRequestId(rid)
+        .SetRequestSchema(
+            bbt::example::v1::GetValueRequest::descriptor()->full_name())
+        .SetResponseSchema(
+            bbt::example::v1::GetValueResponse::descriptor()->full_name())
+        .SetReply(inf::rpc::ReplyMode::Required)
+        .SetTraffic(inf::rpc::TrafficClass::Service);
     // 合法元数据（framework 入站接受的 route.* 前缀）：证明 metadata 不升级
-    // peer_principal。（注：framework 入站仅接受 route.* 前缀，trace.* 被拒。）
-    env.metadata = {{"route.rid", rid}};
+    // peer_principal。
+    env.SetMetadata({{"route.rid", rid}});
     bbt::example::v1::GetValueRequest q;
     q.set_key(key);
     std::string bytes;
     q.SerializeToString(&bytes);
-    env.payload.assign(bytes.begin(), bytes.end());
+    env.SetPayload(std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
 
-    auto wire = rpcw::ToWireEnvelope(env, budget_ms);
-    if (!wire) {
-        out->r.emplace(inf::result<inf::http::Response>::err(wire.error()));
-        out->done.CountDown();
-        return out;
-    }
-    // 上游新栈删去旧 MakeRpcWireHttpRequest：手工发送自行编码 body +
-    // 显式 POST /rpc + 固定 Content-Type（与 wire profile 同一线路）。
-    auto wire_body = rpcw::EncodeRpcWireEnvelope(wire.value(), /*is_response=*/false);
-    if (!wire_body) {
-        out->r.emplace(inf::result<inf::http::Response>::err(wire_body.error()));
-        out->done.CountDown();
-        return out;
-    }
-    inf::HttpRequest r;
-    r.method  = "POST";
-    r.url     = "http://" + endpoint + rpcw::kRpcWireHttpPath;
-    r.headers = {{std::string(rpcw::kRpcWireContentTypeKey),
-                  std::string(rpcw::kRpcWireContentType)}};
-    r.body.assign(wire_body.value().begin(), wire_body.value().end());
+    const std::string target = "tcp://" + endpoint;
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
-        [out, client, r = std::move(r), deadline]() mutable {
+        [out, egress, target, env = std::move(env), budget]() mutable {
             inf::CallOptions opt;
-            opt.deadline = deadline;
-            out->r.emplace(bbt_co_await client->Post(r.url, {r.body, {}}, {r.headers, {}, std::nullopt}, opt));
+            opt.deadline = Clock::now() + budget;
+            out->r.emplace(egress->Call(target, env, opt));
             out->done.CountDown();
         },
         succ);
     return succ ? out : nullptr;
 }
 
-
 bool WaitCall(const std::shared_ptr<ClientCallOut>& out,
               std::chrono::milliseconds ms = kWait) {
     return out && out->done.WaitFor(ms);
 }
 
-bool GetWireReply(const std::shared_ptr<ClientCallOut>& out,
-                  rpcw::RpcWireEnvelope& w) {
+// 成功回复：ok + 五关联字段回显由 infra 会话校验，这里只取业务 payload。
+bool GetReply(const std::shared_ptr<ClientCallOut>& out,
+              inf::rpc::Response& reply) {
     if (!out || !out->r.has_value()) return false;
-    if (!out->r.value()) return false;                      // transport 失败
-    auto parsed = rpcw::ParseRpcWireHttpResponse(
-        out->r.value().value());
-    if (!parsed) return false;
-    w = std::move(parsed.value());
+    if (!out->r.value())
+        return false; // 业务/协议错误分支
+    reply = out->r.value().value();
     return true;
 }
 
@@ -530,9 +512,8 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
     std::vector<std::shared_ptr<ClientCallOut>> outs;
     for (int i = 0; i < 3; ++i) {
         outs.push_back(CallAsync(
-            cl.client, ep, "Hold", rids[i], "k" + std::to_string(i),
-            static_cast<std::uint32_t>(15000 + i * 5000),
-            Clock::now() + std::chrono::seconds{60}));
+            cl.egress, ep, "Hold", rids[i], "k" + std::to_string(i),
+            std::chrono::milliseconds{15000 + i * 5000}));
         BOOST_REQUIRE(outs.back() != nullptr);
     }
     if (!g_probe->arrived.WaitFor(std::chrono::milliseconds{6000})) {
@@ -542,23 +523,12 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
                 "t1-diag rid=" + rids[i] + " call_done=" + (d ? "1" : "0");
             if (d && outs[i]->r.has_value()) {
                 if (!outs[i]->r.value()) {
-                    msg += " transport_err_code=" + std::to_string(
-                        static_cast<int>(outs[i]->r.value().error().code));
+                    msg += " err_code=" + std::to_string(
+                                              static_cast<int>(outs[i]->r.value().error().code));
                     msg += " msg=" + outs[i]->r.value().error().message;
                 } else {
-                    auto pr = rpcw::ParseRpcWireHttpResponse(
-                        outs[i]->r.value().value());
-                    if (pr) {
-                        msg += " wire_success=" + std::string(
-                            pr.value().success ? "true" : "false");
-                        if (!pr.value().success) {
-                            msg += " wire_code=" + std::to_string(
-                                static_cast<int>(pr.value().error.code));
-                            msg += " wire_msg=" + pr.value().error.message;
-                        }
-                    } else {
-                        msg += " wire_parse_failed";
-                    }
+                    msg += " reply_payload_bytes=" + std::to_string(
+                                                         outs[i]->r.value().value().Payload().size());
                 }
             }
             BOOST_TEST_MESSAGE(msg);
@@ -572,13 +542,12 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
         BOOST_REQUIRE(WaitCall(outs[i]));
         // 成功响应须解出正式业务 wire 信封（非仅 transport 层 200）：
         // success 与 request_id 精确匹配，且 payload 为 held:<rid> 业务值。
-        rpcw::RpcWireEnvelope w;
-        BOOST_REQUIRE(GetWireReply(outs[i], w));
-        BOOST_REQUIRE(w.success);
-        BOOST_TEST(w.request_id == rids[i]);
+        inf::rpc::Response reply;
+        BOOST_REQUIRE(GetReply(outs[i], reply));
+        BOOST_TEST(reply.RequestId() == rids[i]);
         bbt::example::v1::GetValueResponse resp;
-        BOOST_REQUIRE(resp.ParseFromArray(w.payload.data(),
-                                          static_cast<int>(w.payload.size())));
+        BOOST_REQUIRE(resp.ParseFromArray(
+            reply.Payload().data(), static_cast<int>(reply.Payload().size())));
         BOOST_TEST(resp.value() == std::string("held:") + rids[i]);
     }
 
@@ -641,8 +610,8 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     BOOST_CHECK(owner->IsClosed() == false);
 
     // A：client deadline 1.5s、预算 30s → handler 在 gate 上物理在途（不依 ctx.deadline）。
-    auto a = CallAsync(cl.client, ep, "Hold", "t2-a", "ka", 30000u,
-                       Clock::now() + std::chrono::milliseconds{1500});
+    auto a = CallAsync(cl.egress, ep, "Hold", "t2-a", "ka",
+                       std::chrono::milliseconds{1500});
     BOOST_REQUIRE(a != nullptr);
     BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // handler 已挂起
     BOOST_REQUIRE(WaitCall(a));
@@ -660,29 +629,28 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     BOOST_CHECK(owner->IsClosed() == false);
 
     // 容量仍被占：新请求 Fast → 精确 Overloaded（只尝试一次）。
-    auto b = CallAsync(cl.client, ep, "Fast", "t2-b", "kb", 30000u,
-                       Clock::now() + std::chrono::seconds{30});
+    auto b = CallAsync(cl.egress, ep, "Fast", "t2-b", "kb",
+                       std::chrono::seconds{30});
     BOOST_REQUIRE(b != nullptr);
     BOOST_REQUIRE(WaitCall(b));
-    rpcw::RpcWireEnvelope wb;
-    BOOST_REQUIRE(GetWireReply(b, wb));
-    BOOST_CHECK(wb.success == false);
-    BOOST_TEST(static_cast<int>(wb.error.code) == CodeOf(fw::ErrorCode::Overloaded));
-    BOOST_TEST(wb.request_id == std::string("t2-b"));
+    BOOST_REQUIRE(b->r.has_value());
+    BOOST_REQUIRE(!b->r.value()); // 服务级容量拒绝走错误分支
+    BOOST_TEST(static_cast<int>(b->r.value().error().code) ==
+               CodeOf(fw::ErrorCode::Overloaded));
 
     // release 原 handler → 迟到完成。
     g_probe->GateFor("t2-a")->Open();
     BOOST_REQUIRE(g_probe->handler_done.WaitFor(kWait));
     BOOST_CHECK(!g_probe->Active("t2-a"));
 
-    // 容量恢复：新探测请求（非原调用 retry）成功。
-    auto c = CallAsync(cl.client, ep, "Fast", "t2-c", "kc", 30000u,
-                       Clock::now() + std::chrono::seconds{30});
+    // 容量恢复：新探测请求（非原调用 retry）成功。迟到回复已过写窗口，
+    // infra 只发布本条终态、不写入共享 link，因此会话仍可复用。
+    auto c = CallAsync(cl.egress, ep, "Fast", "t2-c", "kc",
+                       std::chrono::seconds{30});
     BOOST_REQUIRE(c != nullptr);
     BOOST_REQUIRE(WaitCall(c));
-    rpcw::RpcWireEnvelope wc;
-    BOOST_REQUIRE(GetWireReply(c, wc));
-    BOOST_CHECK(wc.success);
+    inf::rpc::Response rc;
+    BOOST_REQUIRE(GetReply(c, rc));
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 
     app.request_shutdown();
@@ -709,22 +677,21 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     std::vector<std::shared_ptr<ClientCallOut>> held;
     for (int i = 0; i < 2; ++i) {
         held.push_back(CallAsync(
-            cl.client, ep, "Hold", "t3-h" + std::to_string(i),
-            "kh" + std::to_string(i), 30000u,
-            Clock::now() + std::chrono::seconds{60}));
+            cl.egress, ep, "Hold", "t3-h" + std::to_string(i),
+            "kh" + std::to_string(i), std::chrono::seconds{60}));
         BOOST_REQUIRE(held.back() != nullptr);
     }
     BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // 两条都挂起 → 容量满
     BOOST_CHECK(g_probe->Peak() == 2);                // 真实峰值 = 声明 limit
 
-    auto over = CallAsync(cl.client, ep, "Fast", "t3-over", "ko", 30000u,
-                          Clock::now() + std::chrono::seconds{30});
+    auto over = CallAsync(cl.egress, ep, "Fast", "t3-over", "ko",
+                          std::chrono::seconds{30});
     BOOST_REQUIRE(over != nullptr);
     BOOST_REQUIRE(WaitCall(over));
-    rpcw::RpcWireEnvelope wo;
-    BOOST_REQUIRE(GetWireReply(over, wo));
-    BOOST_CHECK(wo.success == false);
-    BOOST_TEST(static_cast<int>(wo.error.code) == CodeOf(fw::ErrorCode::Overloaded));
+    BOOST_REQUIRE(over->r.has_value());
+    BOOST_REQUIRE(!over->r.value());
+    BOOST_TEST(static_cast<int>(over->r.value().error().code) ==
+               CodeOf(fw::ErrorCode::Overloaded));
     BOOST_CHECK(g_probe->Peak() == 2);                // 拒绝路径不进 handler，峰值不越界
 
     g_probe->CompleteAll();
@@ -732,19 +699,17 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
         auto& o = held[i];
         BOOST_REQUIRE(WaitCall(o));
         // held 回复须为正式业务成功信封（success + request_id 对应）。
-        rpcw::RpcWireEnvelope wh;
-        BOOST_REQUIRE(GetWireReply(o, wh));
-        BOOST_REQUIRE(wh.success);
-        BOOST_TEST(wh.request_id == std::string("t3-h") + std::to_string(i));
+        inf::rpc::Response rh;
+        BOOST_REQUIRE(GetReply(o, rh));
+        BOOST_TEST(rh.RequestId() == std::string("t3-h") + std::to_string(i));
     }
 
-    auto again = CallAsync(cl.client, ep, "Fast", "t3-again", "ka", 30000u,
-                           Clock::now() + std::chrono::seconds{30});
+    auto again = CallAsync(cl.egress, ep, "Fast", "t3-again", "ka",
+                           std::chrono::seconds{30});
     BOOST_REQUIRE(again != nullptr);
     BOOST_REQUIRE(WaitCall(again));
-    rpcw::RpcWireEnvelope wa;
-    BOOST_REQUIRE(GetWireReply(again, wa));
-    BOOST_CHECK(wa.success);
+    inf::rpc::Response ra;
+    BOOST_REQUIRE(GetReply(again, ra));
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 
     app.request_shutdown();
@@ -771,13 +736,12 @@ BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
     ClientStopOnExit cl_guard{&cl};
 
     BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Running);
-    auto ok = CallAsync(cl.client, ep, "Fast", "t4-ok", "k", 30000u,
-                        Clock::now() + std::chrono::seconds{30});
+    auto ok = CallAsync(cl.egress, ep, "Fast", "t4-ok", "k",
+                        std::chrono::seconds{30});
     BOOST_REQUIRE(ok != nullptr);
     BOOST_REQUIRE(WaitCall(ok));
-    rpcw::RpcWireEnvelope wk;
-    BOOST_REQUIRE(GetWireReply(ok, wk));
-    BOOST_REQUIRE(wk.success);
+    inf::rpc::Response rk;
+    BOOST_REQUIRE(GetReply(ok, rk));
 
     app.request_shutdown();
     join_guard.JoinNow();
@@ -809,8 +773,8 @@ BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
     BOOST_REQUIRE(cl.Start());
     ClientStopOnExit cl_guard{&cl};
 
-    auto a = CallAsync(cl.client, ep, "Hold", "t5-a", "ka", 30000u,
-                       Clock::now() + std::chrono::seconds{60});
+    auto a = CallAsync(cl.egress, ep, "Hold", "t5-a", "ka",
+                       std::chrono::seconds{60});
     BOOST_REQUIRE(a != nullptr);
     BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // handler 在途
     BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Running);

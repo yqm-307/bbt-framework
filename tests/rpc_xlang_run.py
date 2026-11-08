@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""跨语言 round-trip 驱动器。
+"""跨语言 round-trip 驱动器（V2 SessionFrame wire profile）。
 
 由 ctest 调用：
-  rpc_xlang_run.py --server-bin <path> --client-py <path> --pb2-dir <dir>
+  rpc_xlang_run.py --server-bin <path> --client-py <path>
 
 流程：spawn 服务端（stdin 管道保持）、等 port_file、跑 python 客户端、
 断言退出码与输出、关闭服务端 stdin 让其按序 teardown，最后清理临时文件。
+客户端只消费 tests/rpc_v2_wire.py 的 V2 编解码与握手；本驱动器不解析 wire。
 """
 
 import argparse

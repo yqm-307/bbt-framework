@@ -1,13 +1,14 @@
-// 联合 live 验收：真实 HTTP loopback → 框架入站 → 命名资源业务 Service
+// 联合 live 验收：真实 TCP V2 会话 → 框架入站 → 命名资源业务 Service
 // → 真实 Redis + MongoDB 联合消费。
 //
 // 与单资源 live 的差别（不得以单资源 live 替代联合验收）：
 //  - 宿主是框架公开构造 CoApp(CoAppOptions) 默认装配的真实 InfraHttpHost +
-//    默认入站线桥（RpcHttpBridge），不是 NullNetHost/DispatchInboundForTest
-//    测试缝；请求经真实 TCP/HTTP POST /rpc 进入框架再分发到 Service。
+//    InstallRpcAdmission 入站接线，不是 NullNetHost/DispatchInboundForTest
+//    测试缝；请求经真实 TCP V2 会话（SessionFrame + Hello/HelloAck）进入
+//    框架再分发到 Service。
 //  - 业务 Service（KvSvc）在独立 TU framework_resource_service.{hpp,cc} 中实现，
 //    只 include framework/infra/coroutine 公开头；本文件只作为**测试宿主**另持
-//    internal（线桥编码 + 返回码常量）。业务实现与宿主分属不同编译单元——不靠
+//    internal（V2 出站接线 + 返回码常量）。业务实现与宿主分属不同编译单元——不靠
 //    「同一 TU 先 include 公共头」的标签声称隔离。
 //
 // 覆盖（最小业务链路）：
@@ -19,7 +20,7 @@
 //  C2 有限 deadline（派发前过期）：handler 取 context().request()->deadline
 //     下传 infra::CallOptions；父预算耗尽后发起资源调用 → infra 在发起 I/O
 //     前返回 TimedOut，且后端无副作用（键未写入，可观察），连接保持健康。
-//  C3 关闭中在途请求：真实 HTTP handler 停在宿主注入的闸门上 → request_shutdown
+//  C3 关闭中在途请求：真实 V2 handler 停在宿主注入的闸门上 → request_shutdown
 //     预算耗尽 → ShutdownIncomplete + pending=WaitHandlersDone、资源尚未 Close
 //     → 放行后 handler 在 ShutdownIncomplete 期间经 ServiceContext 取 Redis/Mongo
 //     执行真实操作成功（owner 仍活跃）→ 同步等客户端明确结果 → 完整排空 →
@@ -76,7 +77,7 @@
 // ── 业务 Service：独立 TU，仅 framework/infra/coroutine 公开头 ──
 #include "framework_resource_service.hpp"
 
-// ── 测试宿主面（internal 允许）：线桥编码 + 返回码常量 ──
+// ── 测试宿主面（internal 允许）：V2 出站接线 + 返回码常量 ──
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/CoRpc.hpp>
@@ -84,7 +85,7 @@
 #include <bbt/framework/ShutdownState.hpp>
 #include <bbt/framework/internal/HostLifecycle.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
-#include <bbt/framework/internal/RpcHttpBridge.hpp>
+#include <bbt/framework/internal/RpcBridge.hpp>
 
 namespace fw  = bbt::framework;
 namespace co  = bbt::coroutine;
@@ -210,7 +211,7 @@ CliResult RunRedisCli(const std::vector<std::string>& args) {
     return res;
 }
 
-// ── 宿主 + 测试侧 HTTP 客户端 runtime。CoApp 用公开构造（默认真实 HTTP
+// ── 宿主 + 测试侧 V2 客户端 runtime。CoApp 用公开构造（默认真实 V2
 //    装配）；测试进程内同刻至多一个 run 内 CoApp，用例串行。──
 inf::NetworkLimits Limits(std::chrono::milliseconds incoming_timeout) {
     return inf::NetworkLimits{64, 64, 16384, 65536, incoming_timeout};
@@ -232,7 +233,7 @@ struct CombinedBox {
     std::unique_ptr<fw::CoApp>           app;
     std::unique_ptr<RunHandle>           run;
     std::shared_ptr<fw::InfraHttpHost> client_rt;
-    std::shared_ptr<inf::http::Client>     client;
+    std::shared_ptr<fw::RpcEgress> client;
     std::string                          endpoint;
 
     CombinedBox() = default;
@@ -243,7 +244,6 @@ struct CombinedBox {
     CombinedBox& operator=(const CombinedBox&) = delete;
 
     void Stop() {
-        if (client)    client->Close();
         if (client_rt) client_rt->Close();
         if (app)       app->request_shutdown();
         if (run && run->th.joinable()) run->th.join();
@@ -321,7 +321,7 @@ void RegisterResources(fw::CoApp& app) {
         }));
 }
 
-// 起真实 HTTP app：公开 CoApp 构造 + 资源装配 + KV service，等 bound_endpoint
+// 起真实 V2 app：公开 CoApp 构造 + 资源装配 + KV service，等 bound_endpoint
 // 就绪，再建测试侧 client runtime。
 CombinedBox StartCombined(std::chrono::milliseconds incoming_timeout,
                           std::chrono::milliseconds shutdown_budget) {
@@ -330,6 +330,7 @@ CombinedBox StartCombined(std::chrono::milliseconds incoming_timeout,
     opts.network_limits       = Limits(incoming_timeout);
     opts.listen               = inf::ListenAddress{"127.0.0.1", 0};
     opts.shutdown_step_budget = shutdown_budget;
+    opts.local_identity = "combined-server";
     box.app = std::make_unique<fw::CoApp>(opts);
     BOOST_REQUIRE(box.app->add_service<KvSvc>(fw::ServiceOptions{
         fw::ExecutionPolicy::Concurrent, 64, 0, 0, false, 0, 0, 0}));
@@ -356,50 +357,51 @@ CombinedBox StartCombined(std::chrono::milliseconds incoming_timeout,
     }
     BOOST_REQUIRE(box.app->shutdown_state() == fw::ShutdownState::Running);
 
-    auto crt = std::make_shared<fw::InfraHttpHost>(Limits(incoming_timeout), inf::ListenAddress{"127.0.0.1", 0});
+    // 测试客户端是互异 identity 的第二个会话 owner：复用目标服务自己的
+    // owner 会被 V2 self-connection 拒绝。
+    auto crt = std::make_shared<fw::InfraHttpHost>(
+        Limits(incoming_timeout), inf::ListenAddress{"127.0.0.1", 0},
+        "combined-client");
     BOOST_REQUIRE(crt);
     box.client_rt = crt;
     BOOST_REQUIRE(box.client_rt->Create());
     BOOST_REQUIRE(box.client_rt->Start());
-    auto cl = box.client_rt->http_client();
-    BOOST_REQUIRE(cl);
-    box.client = cl;
+    BOOST_REQUIRE(box.client_rt->rpc_client() != nullptr);
+    box.client = std::make_shared<fw::RpcEgress>(box.client_rt);
     return box;
 }
 
-namespace Wire = fw::http_bridge;
-
-inf::RpcEnvelope MakeEnv(const char* service, const char* method,
-                         std::string rid, const fw::CoRpcReq& req) {
-    inf::RpcEnvelope env;
-    env.service         = service;
-    env.method          = method;
-    env.request_id      = std::move(rid);
-    env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
-    env.response_schema = std::string(fw::kCoRpcPositionalSchema);
-    env.payload         = req.payload();
+inf::rpc::Request MakeEnv(const char* service, const char* method,
+                          std::string rid, const fw::CoRpcReq& req) {
+    inf::rpc::Request env;
+    env.SetService(service)
+        .SetMethod(method)
+        .SetRequestId(std::move(rid))
+        .SetRequestSchema(std::string(fw::kCoRpcPositionalSchema))
+        .SetResponseSchema(std::string(fw::kCoRpcPositionalSchema))
+        .SetReply(inf::rpc::ReplyMode::Required)
+        .SetTraffic(inf::rpc::TrafficClass::Service)
+        .SetPayload(req.payload());
     return env;
 }
 
-fw::result<inf::RpcEnvelope> SendRpc(
-    const std::shared_ptr<inf::http::Client>& client,
-    const std::string& endpoint, const inf::RpcEnvelope& env,
+// 真实 V2 Call：target 是完整 tcp://host:port，预算由 CallOptions.deadline
+// 唯一承载（同时是客户端等待上限与 wire remaining_budget_ms 来源）。
+fw::result<inf::rpc::Response> SendRpc(
+    const std::shared_ptr<fw::RpcEgress>& egress,
+    const std::string& endpoint, const inf::rpc::Request& env,
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    auto prepared = Wire::ToHttpRequest(*client, env, "http://" + endpoint + "/rpc");
-        if (!prepared) return fw::result<inf::RpcEnvelope>::err(std::move(prepared.error()));
-        auto res = bbt_co_await client->Send(prepared.value(), o);
-    if (!res) return fw::result<inf::RpcEnvelope>::err(std::move(res.error()));
-    return Wire::EnvelopeFromResponse(res.value());
+    return egress->Call("tcp://" + endpoint, env, o);
 }
 
-// 控制线程发起一次真实 HTTP RPC 并限时等待；协程内异常也通知等待者。
-fw::result<inf::RpcEnvelope> CallRpc(
-    const CombinedBox& box, const inf::RpcEnvelope& env,
+// 控制线程发起一次真实 V2 RPC 并限时等待；协程内异常也通知等待者。
+fw::result<inf::rpc::Response> CallRpc(
+    const CombinedBox& box, const inf::rpc::Request& env,
     std::chrono::milliseconds budget = kWait) {
     struct State {
-        std::optional<fw::result<inf::RpcEnvelope>> out;
+        std::optional<fw::result<inf::rpc::Response>> out;
         std::exception_ptr                          eptr;
         TestLatch                                   done{1};
     };
@@ -419,7 +421,7 @@ fw::result<inf::RpcEnvelope> CallRpc(
         },
         succ);
     if (!succ || !st->done.WaitFor(budget))
-        return fw::result<inf::RpcEnvelope>::err(fw::MakeError(
+        return fw::result<inf::rpc::Response>::err(fw::MakeError(
             fw::ErrorCode::InternalError, "CallRpc did not complete"));
     if (st->eptr) std::rethrow_exception(st->eptr);
     return std::move(*st->out);
@@ -455,9 +457,9 @@ struct Reply2 {
     std::int32_t status{0};
     std::string  value;
 };
-fw::result<Reply2> Decode2(const fw::result<inf::RpcEnvelope>& r) {
+fw::result<Reply2> Decode2(const fw::result<inf::rpc::Response>& r) {
     if (!r) return fw::result<Reply2>::err(r.error());
-    auto d = fw::CoRpcReq(r.value().payload).Parse<std::int32_t, std::string>();
+    auto d = fw::CoRpcReq(r.value().Payload()).Parse<std::int32_t, std::string>();
     if (!d) return fw::result<Reply2>::err(d.error());
     return fw::result<Reply2>::ok(Reply2{std::get<0>(d.value()),
                                          std::get<1>(d.value())});
@@ -482,7 +484,7 @@ KvSvc* SvcOf(fw::CoApp& app) {
 
 BOOST_AUTO_TEST_SUITE(framework_resource_combined)
 
-// C1：真实 HTTP→Service→Redis/Mongo 联合业务 + 持久化独立证明 + 错误原样传播。
+// C1：真实 V2→Service→Redis/Mongo 联合业务 + 持久化独立证明 + 错误原样传播。
 BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
     auto box = StartCombined(/*incoming*/std::chrono::milliseconds{30000},
                              /*shutdown*/std::chrono::milliseconds{2000});
@@ -491,7 +493,7 @@ BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
     auto* svc = SvcOf(*box.app);
 
     auto call = [&box](const char* method, const fw::CoRpcReq& req)
-        -> fw::result<inf::RpcEnvelope> {
+        -> fw::result<inf::rpc::Response> {
         return CallRpc(box, MakeEnv("kv", method,
             std::string("c1-") + method, req));
     };
@@ -679,7 +681,7 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
     BOOST_CHECK_EQUAL(box.run->rc, fw::HostLifecycle::kExitOk);
 }
 
-// C3：关闭中在途请求——真实 HTTP handler 未排空 → ShutdownIncomplete（资源尚未
+// C3：关闭中在途请求——真实 V2 handler 未排空 → ShutdownIncomplete（资源尚未
 // Close）→ 放行后 handler 在 ShutdownIncomplete 期间经 ServiceContext 取
 // Redis/Mongo 执行真实操作成功（Service owner 仍活跃）→ 同步等客户端明确回包
 // → 完整排空 → kExitShutdownLate；最终 Close/release 后 Service 弱指针过期。
@@ -728,7 +730,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
 
     // 在途响应 sink：显式等待并断言客户端得到**明确结果**（完整回包或契约允许
     // 的传输错误）——删掉发送/响应即失败，不能只发不等仍绿。
-    auto sink      = std::make_shared<std::optional<fw::result<inf::RpcEnvelope>>>();
+    auto sink = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
     auto sink_done = std::make_shared<TestLatch>(1);
     auto client    = box.client;
     auto endpoint  = box.endpoint;
@@ -746,7 +748,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
         },
         succ);
     BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(st->arrived.WaitFor(kWait));   // handler 已在闸门上（真实 HTTP 在途）
+    BOOST_REQUIRE(st->arrived.WaitFor(kWait)); // handler 已在闸门上（真实 V2 在途）
 
     auto cache = svc->Cache();
     auto docs  = svc->Docs();
@@ -807,7 +809,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     // 该请求 incoming 预算 10000ms、关闭步预算 300ms：放行发生在 incoming 到期
     // 之前。但「未过期」不等于「Close 后必达」：InfraHttpHost.hpp:9-11 明文规定
     // 「Close 开始后仍在途且尚未交给传输层的回复不承诺送达原客户端」；infra
-    // http::Server Close 亦明确丢弃未发送数据。故客户端结果只接受契约允许的两种：
+    // rpc::CoRpcServer 的 Shutdown 亦明确丢弃未发送数据。故客户端结果只接受契约允许的两种：
     //   (a) 完整 HELD —— 回复在 Close 生效前已交给传输层送达；
     //   (b) TransportError(code=8) —— Close 开始后在途、尚未交给传输层而被截断。
     // 空结果或其它未知错误仍判失败（不静默、不放宽为任意错误）。
@@ -841,7 +843,7 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
     auto* svc = SvcOf(*box.app);
     const std::string id = RunPrefix() + "inflight";
     auto call = [&box](const char* method, const fw::CoRpcReq& req)
-        -> fw::result<inf::RpcEnvelope> {
+        -> fw::result<inf::rpc::Response> {
         return CallRpc(box, MakeEnv("kv", method,
             std::string("c4a-") + method, req));
     };

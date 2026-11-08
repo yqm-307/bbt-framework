@@ -1,364 +1,228 @@
 #!/usr/bin/env python3
-"""G5 RpcEnvelope wire profile 的 Python 客户端（零依赖）。
+"""V2 SessionFrame wire profile 的 Python 客户端（零依赖）。
 
-不依赖 google.protobuf：按 proto3 wire format 手写
-proto/bbt/infra/rpc/v1/rpc_envelope.proto 的编解码，直接向 C++
-rpc_xlang_server 发起真实 HTTP POST /rpc 调用。手写 wire 编解码本身是
-更强的互通证据——双方只在字节流层面共享同一 schema。
+不依赖 google.protobuf：编解码、u32be 分帧与 Hello/HelloAck 握手全部来自
+同目录 tests/rpc_v2_wire.py（唯一手写 codec，跨语言测试与示例共用）。
+客户端向 C++ rpc_xlang_server 发起真实 TCP loopback 调用——双方只在字节流
+层面共享同一 schema，手写 wire 本身就是互通证据。
 
 覆盖场景：
-  1. round-trip：正常请求/响应 envelope 字段无损往返；
-  2. 业务错误 envelope（InvalidArgument + details）；
+  1. round-trip：Call/Response 五关联字段、payload、metadata 无损往返；
+  2. 业务错误分支（InvalidArgument + details + domain）；
   3. domain/domain_code/backend_* 错误字段透传；
   4. 未知路由 → RemoteError；
-  5. profile_version 不兼容 → ProtocolError envelope；
-  6. 截断 body → ProtocolError；
-  7. 空 body → ProtocolError；
-  8. 未知字段（proto3 前向兼容）被忽略。
+  5. 字段矩阵违规（Call 缺 request_id）→ 对端 SESSION_ERROR(ProtocolError)；
+  6. profile_version 不兼容 → 对端退役 link（无响应、连接关闭）；
+  7. 帧前缀为 0 → 对端退役 link；
+  8. 未知字段（proto3 前向兼容）被忽略，请求照常处理；
+  9. 单向 Send + SendAccepted（V2 能力，V1 无此面）；
+ 10. self-connection（Hello 身份与服务端相同）→ 对端拒绝并关闭。
 
-用法：python3 rpc_xlang_client.py --port <port>
+用法：python3 rpc_xlang_client.py --port <port> [--server-identity <id>]
 """
 
 import argparse
-import http.client
+import os
+import struct
 import sys
 
-RPC_PATH = "/rpc"
-CONTENT_TYPE = "application/x-protobuf"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# RpcErrorCode（与 rpc_envelope.proto enum 一致）
-INVALID_ARGUMENT = 1
-UNAVAILABLE = 8
-PROTOCOL_ERROR = 10
-REMOTE_ERROR = 15
+import rpc_v2_wire as wire  # noqa: E402
 
-WIRE_VARINT = 0
-WIRE_LEN = 2
+SERVER_IDENTITY = "cpp-xlang-server"
+CLIENT_IDENTITY = "py-xlang-client"
 
-
-# --- proto3 wire format 最小编解码 --------------------------------------------
-
-def _varint(n):
-    out = bytearray()
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            out.append(b | 0x80)
-        else:
-            out.append(b)
-            return bytes(out)
-
-
-def _tag(field, wire):
-    return _varint((field << 3) | wire)
-
-
-def _f_varint(field, n):
-    return _tag(field, WIRE_VARINT) + _varint(n)
-
-
-def _f_len(field, data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    return _tag(field, WIRE_LEN) + _varint(len(data)) + data
-
-
-def _read_varint(buf, pos):
-    shift = 0
-    result = 0
-    while True:
-        if pos >= len(buf):
-            raise ValueError("truncated varint")
-        b = buf[pos]
-        pos += 1
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result, pos
-        shift += 7
-        if shift >= 70:
-            raise ValueError("varint overflow")
-
-
-def _parse_fields(buf):
-    """产出 (field_no, wire_type, value)；LEN 字段 value=bytes。"""
-    pos = 0
-    out = []
-    while pos < len(buf):
-        key, pos = _read_varint(buf, pos)
-        field = key >> 3
-        wire = key & 7
-        if field == 0:
-            raise ValueError("field 0 invalid")
-        if wire == WIRE_VARINT:
-            v, pos = _read_varint(buf, pos)
-            out.append((field, wire, v))
-        elif wire == WIRE_LEN:
-            n, pos = _read_varint(buf, pos)
-            if pos + n > len(buf):
-                raise ValueError("truncated LEN field")
-            out.append((field, wire, buf[pos:pos + n]))
-            pos += n
-        elif wire == 5:  # fixed32，本 schema 不用但按 proto3 跳过
-            if pos + 4 > len(buf):
-                raise ValueError("truncated fixed32")
-            out.append((field, wire, buf[pos:pos + 4]))
-            pos += 4
-        elif wire == 1:  # fixed64
-            if pos + 8 > len(buf):
-                raise ValueError("truncated fixed64")
-            out.append((field, wire, buf[pos:pos + 8]))
-            pos += 8
-        else:
-            raise ValueError(f"unsupported wire type {wire}")
-    return out
-
-
-def encode_metadata_entry(key, value):
-    return _f_len(1, key) + _f_len(2, value)
-
-
-def encode_envelope(env):
-    """env: dict 表示 RpcEnvelopeMsg。"""
-    out = _f_varint(1, env["profile_version"])
-    out += _f_len(2, env["request_id"])
-    out += _f_len(3, env["service"])
-    out += _f_len(4, env["method"])
-    if env.get("remaining_budget_ms"):
-        out += _f_varint(5, env["remaining_budget_ms"])
-    if env.get("request_schema"):
-        out += _f_len(6, env["request_schema"])
-    if env.get("response_schema"):
-        out += _f_len(7, env["response_schema"])
-    if env.get("payload"):
-        out += _f_len(8, env["payload"])
-    for k, v in env.get("metadata", []):
-        out += _f_len(9, encode_metadata_entry(k, v))
-    if env.get("success"):
-        out += _f_varint(10, 1)
-    return out
-
-
-def decode_error(buf):
-    err = {}
-    details = []
-    for f, w, v in _parse_fields(buf):
-        if w == WIRE_VARINT:
-            if f == 1:
-                err["code"] = v
-            elif f == 6:
-                err["backend_code"] = v
-            elif f == 7:
-                err["transferred_bytes"] = v
-        elif w == WIRE_LEN:
-            if f == 2:
-                err["domain"] = v.decode("utf-8")
-            elif f == 3:
-                err["domain_code"] = v.decode("utf-8")
-            elif f == 4:
-                err["message"] = v.decode("utf-8")
-            elif f == 5:
-                err["backend_category"] = v.decode("utf-8")
-            elif f == 8:
-                det = {}
-                for df, dw, dv in _parse_fields(v):
-                    if dw == WIRE_LEN and df == 1:
-                        det["key"] = dv.decode("utf-8")
-                    elif dw == WIRE_LEN and df == 2:
-                        det["value"] = dv.decode("utf-8")
-                details.append((det.get("key", ""), det.get("value", "")))
-    err["details"] = details
-    return err
-
-
-def decode_envelope(buf):
-    env = {"metadata": [], "unknown_fields": []}
-    for f, w, v in _parse_fields(buf):
-        if w == WIRE_VARINT:
-            if f == 1:
-                env["profile_version"] = v
-            elif f == 5:
-                env["remaining_budget_ms"] = v
-            elif f == 10:
-                env["success"] = bool(v)
-            else:
-                env["unknown_fields"].append(f)
-        elif w == WIRE_LEN:
-            if f == 2:
-                env["request_id"] = v.decode("utf-8")
-            elif f == 3:
-                env["service"] = v.decode("utf-8")
-            elif f == 4:
-                env["method"] = v.decode("utf-8")
-            elif f == 6:
-                env["request_schema"] = v.decode("utf-8")
-            elif f == 7:
-                env["response_schema"] = v.decode("utf-8")
-            elif f == 8:
-                env["payload"] = bytes(v)
-            elif f == 9:
-                kv = {}
-                for mf, mw, mv in _parse_fields(v):
-                    if mw == WIRE_LEN and mf == 1:
-                        kv["key"] = mv.decode("utf-8")
-                    elif mw == WIRE_LEN and mf == 2:
-                        kv["value"] = mv.decode("utf-8")
-                env["metadata"].append((kv.get("key", ""), kv.get("value", "")))
-            elif f == 11:
-                env["error"] = decode_error(v)
-            else:
-                env["unknown_fields"].append(f)
-    return env
-
-
-def make_request(**over):
-    env = {
-        "profile_version": 1,
-        "request_id": "py-req-1",
-        "service": "svc.echo",
-        "method": "Echo",
-        "remaining_budget_ms": 3000,
-        "request_schema": "bbt.echo.EchoReq/v1",
-        "response_schema": "bbt.echo.EchoResp/v1",
-        "payload": b"ping-from-python",
-        "metadata": [("route.zone", "z1"), ("trace.id", "t-py")],
-    }
-    env.update(over)
-    return env
-
-
-def post_raw(port, body, path=RPC_PATH, content_type=CONTENT_TYPE):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    conn.request("POST", path, body=body,
-                 headers={"Content-Type": content_type})
-    resp = conn.getresponse()
-    data = resp.read()
-    status = resp.status
-    ctype = resp.getheader("Content-Type")
-    conn.close()
-    return status, ctype, data
+ECHO_REQ = "bbt.echo.EchoReq/v1"
+ECHO_RESP = "bbt.echo.EchoResp/v1"
 
 
 def fail(msg):
-    print(f"FAIL: {msg}", file=sys.stderr)
+    print("FAIL: %s" % msg, file=sys.stderr)
     sys.exit(1)
 
 
-def expect_error_envelope(port, req_bytes, expect_code, label):
-    status, ctype, body = post_raw(port, req_bytes)
-    if status != 200:
-        fail(f"{label}: http status={status}（错误也应以 envelope 返回）")
-    if ctype != CONTENT_TYPE:
-        fail(f"{label}: content-type={ctype!r}")
-    try:
-        env = decode_envelope(body)
-    except ValueError as e:
-        fail(f"{label}: response not decodable envelope: {e}")
-    if "error" not in env:
-        fail(f"{label}: response missing error outcome")
-    if env["error"].get("code") != expect_code:
-        fail(f"{label}: error.code={env['error'].get('code')} expect={expect_code}")
-    return env
+def expect_error(frame, code, label):
+    error = wire.error_of(frame)
+    if error is None:
+        fail("%s: response missing error outcome (kind=%s)"
+             % (label, wire.frame_kind_name(frame)))
+    if error.get("code") != code:
+        fail("%s: error.code=%r expect=%r (message=%r)"
+             % (label, error.get("code"), code, error.get("message")))
+    return error
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--server-identity", default=SERVER_IDENTITY)
     args = ap.parse_args()
     port = args.port
+    server_identity = args.server_identity
+
+    client = wire.V2Client(port, CLIENT_IDENTITY)
+    epoch = client.handshake(expected_peer=server_identity)
+    if epoch == 0:
+        fail("handshake: selected epoch is zero")
+    print("PASS scenario=handshake epoch=%d" % epoch)
 
     # ---- 场景 1：round-trip ------------------------------------------------
-    req = make_request()
-    status, ctype, body = post_raw(port, encode_envelope(req))
-    if status != 200 or ctype != CONTENT_TYPE:
-        fail(f"round-trip: status={status} ctype={ctype}")
-    resp = decode_envelope(body)
-    if "error" in resp:
-        fail(f"round-trip: error envelope code={resp['error'].get('code')}")
-    if not resp.get("success"):
+    request_id = "py-req-1"
+    metadata = [("route.zone", "z1"), ("trace.id", "t-py")]
+    payload = b"ping-from-python"
+    resp = client.call("svc.echo", "Echo", payload=payload,
+                       request_id=request_id, request_schema=ECHO_REQ,
+                       response_schema=ECHO_RESP, metadata=metadata)
+    if resp.get("kind") != wire.KIND_RESPONSE:
+        fail("round-trip: unexpected frame kind")
+    if resp.get("outcome") != "success":
         fail("round-trip: missing success outcome")
-    for field in ("request_id", "service", "method",
-                  "request_schema", "response_schema"):
-        if resp.get(field) != req[field]:
-            fail(f"round-trip: {field} mismatch "
-                 f"{resp.get(field)!r} != {req[field]!r}")
-    if resp.get("payload") != req["payload"]:
-        fail("round-trip: payload mismatch")
-    if sorted(resp.get("metadata", [])) != sorted(req["metadata"]):
-        fail(f"round-trip: metadata mismatch {resp.get('metadata')}")
+    for field, want in (("request_id", request_id),
+                        ("service", "svc.echo"),
+                        ("method", "Echo"),
+                        ("request_schema", ECHO_REQ),
+                        ("response_schema", ECHO_RESP)):
+        if resp.get(field) != want:
+            fail("round-trip: %s mismatch %r != %r"
+                 % (field, resp.get(field), want))
+    if resp.get("payload") != payload:
+        fail("round-trip: payload mismatch %r" % (resp.get("payload"),))
+    if sorted(resp.get("metadata", [])) != sorted(metadata):
+        fail("round-trip: metadata mismatch %r" % (resp.get("metadata"),))
+    if resp.get("session_epoch") != epoch:
+        fail("round-trip: response epoch mismatch")
     print("PASS scenario=round-trip")
 
-    # ---- 场景 2：业务错误 envelope（InvalidArgument + details） -------------
-    env = expect_error_envelope(
-        port,
-        encode_envelope(make_request(method="Fail", request_id="py-fail-1")),
-        INVALID_ARGUMENT, "error-envelope")
-    if env["error"].get("domain") != "framework.test":
-        fail(f"error-envelope: domain={env['error'].get('domain')!r}")
-    if "svc.echo/Fail" not in env["error"].get("message", ""):
-        fail(f"error-envelope: message={env['error'].get('message')!r}")
-    if ("reason", "explicit-fail") not in env["error"]["details"]:
-        fail(f"error-envelope: details={env['error']['details']}")
-    if env.get("request_id") != "py-fail-1":
-        fail("error-envelope: request_id not echoed")
-    print("PASS scenario=error-envelope")
+    # ---- 场景 2：业务错误分支（InvalidArgument + details + domain） ---------
+    err = expect_error(
+        client.call("svc.echo", "Fail", payload=b"x", request_id="py-fail-1",
+                    request_schema=ECHO_REQ, response_schema=ECHO_RESP),
+        wire.ERR_INVALID_ARGUMENT, "error-branch")
+    if err.get("domain") != "framework.test":
+        fail("error-branch: domain=%r" % (err.get("domain"),))
+    if "svc.echo/Fail" not in err.get("message", ""):
+        fail("error-branch: message=%r" % (err.get("message"),))
+    if ("reason", "explicit-fail") not in err["details"]:
+        fail("error-branch: details=%r" % (err["details"],))
+    print("PASS scenario=error-branch")
 
     # ---- 场景 3：domain_code/backend_* 错误字段透传 --------------------------
-    env = expect_error_envelope(
-        port,
-        encode_envelope(make_request(method="FailDomain",
-                                     request_id="py-faildom-1")),
-        UNAVAILABLE, "error-envelope-domain")
-    e = env["error"]
-    if e.get("domain") != "framework.test.backend":
-        fail(f"fail-domain: domain={e.get('domain')!r}")
-    if e.get("domain_code") != "E_BACKEND_DOWN":
-        fail(f"fail-domain: domain_code={e.get('domain_code')!r}")
-    if e.get("backend_category") != "tcp" or e.get("backend_code") != 111:
-        fail(f"fail-domain: backend_* mismatch {e}")
-    if ("backend", "127.0.0.1:9999") not in e["details"]:
-        fail(f"fail-domain: details={e['details']}")
-    print("PASS scenario=error-envelope-domain")
+    err = expect_error(
+        client.call("svc.echo", "FailDomain", request_id="py-faildom-1",
+                    request_schema=ECHO_REQ, response_schema=ECHO_RESP),
+        wire.ERR_UNAVAILABLE, "error-branch-domain")
+    if err.get("domain") != "framework.test.backend":
+        fail("error-branch-domain: domain=%r" % (err.get("domain"),))
+    if err.get("domain_code") != "E_BACKEND_DOWN":
+        fail("error-branch-domain: domain_code=%r" % (err.get("domain_code"),))
+    if err.get("backend_category") != "tcp" or err.get("backend_code") != 111:
+        fail("error-branch-domain: backend_* mismatch %r" % (err,))
+    if ("backend", "127.0.0.1:9999") not in err["details"]:
+        fail("error-branch-domain: details=%r" % (err["details"],))
+    print("PASS scenario=error-branch-domain")
 
-    # ---- 场景 4：未知路由 → RemoteError -------------------------------------
-    env = expect_error_envelope(
-        port,
-        encode_envelope(make_request(method="NoSuch",
-                                     request_id="py-nosuch-1")),
-        REMOTE_ERROR, "unknown-route")
+    # ---- 场景 4：未知路由 → RemoteError --------------------------------
+    expect_error(
+        client.call("svc.echo", "NoSuch", request_id="py-nosuch-1",
+                    request_schema=ECHO_REQ, response_schema=ECHO_RESP),
+        wire.ERR_REMOTE_ERROR, "unknown-route")
     print("PASS scenario=unknown-route")
 
-    # ---- 场景 5：profile_version 不兼容 → ProtocolError envelope ------------
-    badver = make_request(request_id="py-badver-1")
-    badver["profile_version"] = 99
-    env = expect_error_envelope(port, encode_envelope(badver),
-                                PROTOCOL_ERROR, "version-incompatible")
+    # ---- 场景 9：Send + SendAccepted（V2 单向面） ---------------------------
+    accepted = client.send("svc.echo", "Echo", payload=b"one-way",
+                           message_id="py-msg-1", request_schema=ECHO_REQ,
+                           response_schema=ECHO_RESP,
+                           require_acceptance=True)
+    if accepted.get("kind") != wire.KIND_SEND_ACCEPTED:
+        fail("send-accepted: unexpected kind")
+    if accepted.get("outcome") != "success":
+        fail("send-accepted: missing success outcome")
+    if accepted.get("message_id") != "py-msg-1":
+        fail("send-accepted: message_id=%r" % (accepted.get("message_id"),))
+    print("PASS scenario=send-accepted")
+
+    # ---- 场景 8：未知字段前向兼容 ------------------------------------------
+    fwd_frame = {
+        "kind": wire.KIND_CALL,
+        "traffic": wire.TRAFFIC_SERVICE,
+        "session_epoch": epoch,
+        "request_id": "py-fwd-1",
+        "service": "svc.echo",
+        "method": "Echo",
+        "reply": wire.REPLY_REQUIRED,
+        "remaining_budget_ms": 3000,
+        "request_schema": ECHO_REQ,
+        "response_schema": ECHO_RESP,
+        "payload": b"fwd",
+    }
+    # 在合法 body 尾部追加一个未知字段（field=200 varint 12345）。
+    body = wire.append_unknown_varint(wire.encode_frame(fwd_frame), 200, 12345)
+    client._stream.send_raw(struct.pack(">I", len(body)) + body)
+    fwd = client._await_response()
+    if fwd.get("outcome") != "success" or fwd.get("request_id") != "py-fwd-1":
+        fail("unknown-field-forward-compat: frame not processed normally")
+    print("PASS scenario=unknown-field-forward-compat")
+
+    # ---- 场景 5：字段矩阵违规 → SESSION_ERROR(ProtocolError) ----------------
+    bad = dict(fwd_frame)
+    bad["request_id"] = ""  # Call 必须有 request_id
+    try:
+        client._stream.send_unchecked(bad)
+        client._await_response()
+        fail("field-matrix: peer accepted an invalid Call frame")
+    except wire.ProtocolRejected as exc:
+        if "10" not in str(exc):
+            fail("field-matrix: expected ProtocolError(10), got %s" % exc)
+    print("PASS scenario=field-matrix-reject")
+    client.close()
+
+    # ---- 场景 6：profile_version 不兼容 → link 退役 --------------------------
+    bad_ver = wire.V2Client(port, "py-badver-client")
+    bad_ver.handshake(expected_peer=server_identity)
+    frame = dict(fwd_frame)
+    frame["session_epoch"] = bad_ver.epoch
+    body = bytearray(wire.encode_frame(frame))
+    body[0:2] = bytes([0x08, 99])  # field 1 varint = 99
+    bad_ver._stream.send_raw(struct.pack(">I", len(body)) + bytes(body))
+    try:
+        # 协议拒绝可以是 SESSION_ERROR(ProtocolError) 帧，也可以是直接退役
+        # link；两者都不允许出现正常 Response/SendAccepted。
+        frame = bad_ver._stream.read()
+        if frame is not None and frame.get("kind") != wire.KIND_SESSION_ERROR:
+            fail("version-incompatible: peer answered an unsupported profile")
+    except wire.ProtocolRejected:
+        pass
+    bad_ver.close()
     print("PASS scenario=version-incompatible")
 
-    # ---- 场景 6：截断 body → ProtocolError ----------------------------------
-    truncated = encode_envelope(req)[:8]
-    env = expect_error_envelope(port, truncated, PROTOCOL_ERROR,
-                                "truncated-body")
-    print("PASS scenario=truncated-body")
+    # ---- 场景 7：帧前缀为 0 → link 退役 -------------------------------------
+    zero = wire.V2Client(port, "py-zero-prefix")
+    zero.handshake(expected_peer=server_identity)
+    zero._stream.send_raw(struct.pack(">I", 0))
+    try:
+        # 同 version-incompatible：拒绝可以是 SESSION_ERROR 或 link 退役。
+        frame = zero._stream.read()
+        if frame is not None and frame.get("kind") != wire.KIND_SESSION_ERROR:
+            fail("zero-prefix: peer accepted payload_length 0")
+    except wire.ProtocolRejected:
+        pass
+    zero.close()
+    print("PASS scenario=zero-prefix-reject")
 
-    # ---- 场景 7：空 body → ProtocolError ------------------------------------
-    env = expect_error_envelope(port, b"", PROTOCOL_ERROR, "empty-body")
-    print("PASS scenario=empty-body")
-
-    # ---- 场景 8：未知字段前向兼容（proto3 忽略未知字段） ----------------------
-    # 手工在合法 envelope 尾部追加一个未知字段（field=200 varint）。
-    fwd = encode_envelope(make_request(request_id="py-fwd-1"))
-    fwd += _tag(200, WIRE_VARINT) + _varint(12345)
-    status, ctype, body = post_raw(port, fwd)
-    if status != 200:
-        fail(f"unknown-field-fwd: status={status}")
-    resp = decode_envelope(body)
-    if "error" in resp:
-        fail(f"unknown-field-fwd: rejected with "
-             f"code={resp['error'].get('code')}")
-    if resp.get("request_id") != "py-fwd-1" or not resp.get("success"):
-        fail("unknown-field-fwd: envelope not processed normally")
-    print("PASS scenario=unknown-field-forward-compat")
+    # ---- 场景 10：self-connection 被拒 --------------------------------------
+    self_conn = wire.V2Client(port, "py-self-client")
+    try:
+        # Hello 自称服务端身份 → 服务端按 self-connection 拒绝。
+        self_conn._stream.send(wire.hello_frame(server_identity,
+                                                self_conn.epoch,
+                                                wire.nonce_for("self")))
+        self_conn._stream.read()
+        fail("self-connection: peer did not reject duplicate identity")
+    except (wire.ProtocolRejected, wire.WireError):
+        pass
+    self_conn.close()
+    print("PASS scenario=self-connection-rejected")
 
     print("ALL-SCENARIOS-PASS")
 

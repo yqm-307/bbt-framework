@@ -21,7 +21,7 @@
 | F15 无鉴权公开监控示例 | HTTP/RPC 默认关闭；显式开启且具备授权检查才可暴露。仅绑定 HttpComponent 不等于开启 HTTP。 |
 | F2/F7 的 MongoComponent 与 F16 的 MongoDBComponent | 唯一 framework 名为 `MongoDBComponent`；infra 仍为 `mongo::Database`。 |
 
-本轮仅新增本文和 [app-monitor.schema.json](../schemas/app-monitor.schema.json)。现有 `CoApp::add_service`、`add_resource`、`RpcInboundBridge`、`IncomingCallContext` 等仍是基线实现，不是这里的 v2 接口。
+本轮仅新增本文和 [app-monitor.schema.json](../schemas/app-monitor.schema.json)。现有 `CoApp::add_service`、`add_resource` 等是基线实现；RPC 入站/出站已按 ADR 0022 收敛为 V2 会话（`InstallRpcAdmission` + `RpcEgress`），`RpcInboundBridge`/`IncomingCallContext` 旧面已删除，不属于这里的 v2 接口。
 
 ## 2. 对象职责与所有权
 
@@ -182,8 +182,8 @@ public:
 | CreateOptions | `SetDeadline(Deadline)` | 继承并收紧父预算，顶层必须有限。 |
 | CallOptions | `SetDeadline(Deadline)`；`SetRouteKey(string)`；`AddRouteField(string,string)`；`SetOrdered(OrderedStamp)` | 父子 min；顶层无预算拒绝；默认不重试。 |
 | TellOptions | `SetDeadline(Deadline)`；`RequireRemoteAcceptance(bool=true)` | 默认 false（仅本地接纳）；不提供 WaitReply。 |
-| AppOptions | `Listen(string uri)`；`AddRoute(string service,string uri)`；`SetNetworkOptions(AppNetworkOptions)`；`SetLimits(size_t max_objects,size_t max_bindings,size_t max_observers,size_t observer_queue_capacity)`；`SetShutdownBudget(milliseconds)`；`SetRpcPolicy(shared_ptr<RpcPolicy>)`；`SetResolver(shared_ptr<Resolver>)` | 只接受已支持的 tcp/http profile；默认无监听/静态路由，未配置目标 NotFound；SetShutdownBudget 必须为正有限值，未设则 Start/Run 校验失败；不自动安装资源或 Monitor。 |
-| AppNetworkOptions | `SetLocalAppId(string)`；`SetTrustedNetworkPlaintext(bool)`；`SetMaxSessions(size_t)`；`SetMaxFrameBytes(size_t)`；`SetSystemQueueBytes(size_t)`；`SetServiceQueueBytes(size_t)`；`SetActorQueueBytes(size_t)`；`SetServiceWeight(uint32_t)`；`SetActorWeight(uint32_t)`；`SetControlDataSplit(bool)` | 明文 trusted-network 默认 false；未有可信 adapter 且未显式启用时按 ADR 返回 UnsupportedRoute；split 默认 false，未实现不能忽略 true。 |
+| AppOptions | `Listen(string uri)`；`AddRoute(string service,string uri)`；`SetNetworkOptions(AppNetworkOptions)`；`SetLimits(size_t max_objects,size_t max_bindings,size_t max_observers,size_t observer_queue_capacity)`；`SetShutdownBudget(milliseconds)`；`SetRpcPolicy(shared_ptr<RpcPolicy>)`；`SetResolver(shared_ptr<Resolver>)` | 只有一种 RPC 通道（V2 `tcp://` 会话，见 §7.1），无 profile 选择；默认无监听/静态路由，未配置目标 NotFound；SetShutdownBudget 必须为正有限值，未设则 Start/Run 校验失败；不自动安装资源或 Monitor。 |
+| AppNetworkOptions | `SetLocalAppId(string)`；`SetTrustedNetworkPlaintext(bool)`；`SetMaxSessions(size_t)`；`SetMaxFrameBytes(size_t)`；`SetSystemQueueBytes(size_t)`；`SetServiceQueueBytes(size_t)`；`SetActorQueueBytes(size_t)`；`SetServiceWeight(uint32_t)`；`SetActorWeight(uint32_t)`；`SetControlDataSplit(bool)` | `SetLocalAppId` 即 infra `rpc::ClientOptions::LocalIdentity`（非空 ≤256 UTF-8，同值自连被拒）；明文 trusted-network 默认 false；未有可信 adapter 且未显式启用时按 ADR 返回 UnsupportedRoute；split 默认 false，未实现不能忽略 true。 |
 | AppSessionOptions | `SetEndpoint(string)`；`SetProfile(string)`；`SetDeadline(Deadline)`；`Validate()` | 只是 Resolver/网络装配的值，不有 Create/Close/物理连接选项，不允许 Service 私建 session。profile/security 决定共享键，不能每业务请求换身份。 |
 
 Service/Actor 可以声明允许使用的 Component 类型；动态 BindComponent 也必须满足类型声明和 scope 限制。对于 `Service<>`，没有声明的类型绑定返回 InvalidArgument。MonitorService 声明 HttpComponent 为可选能力，没有绑定也可安装；“可用类型”不等于“必需依赖”。必需依赖由安装配置显式列出，缺失在 Install/Bind 返回 NotFound。Component 的依赖关系通过 BindComponent 记录，启动按拓扑、停止按逆拓扑；环返回 InvalidArgument 并保留失败记录，不自动打断或修复。
@@ -357,7 +357,7 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 
 ## 7. AppNetwork 与已验收 infra 的逐项映射
 
-AppNetwork 为私有装配类：一个共享 Engine、一个共享 Client，以及注入此 Client 的 Server；业务不获取它的强指针。默认每个 `(remote opaque identity, profile, security context)` 一个双向 link。System 只由 infra 生成控制帧；普通健康检查/Monitor RPC 仍为 Service traffic，不借 System 绕额度。
+AppNetwork 为私有装配类：一个共享 Engine、一个共享 CoRpcClient，以及注入此 CoRpcClient 的 CoRpcServer；业务不获取它的强指针。默认每个 `(remote opaque identity, profile, security context)` 一个双向 link。System 只由 infra 生成控制帧；普通健康检查/Monitor RPC 仍为 Service traffic，不借 System 绕额度。
 
 ```cpp
 class AppSession { // AppNetwork 发出的非拥有值句柄，不能业务构造
@@ -379,18 +379,39 @@ public:
 | ADR 范围（行） | framework 唯一映射/责任 | 实施验收，不是本轮通过项 |
 |---|---|---|
 | §1–2.1，12–170 | infra 类型不含 App/Actor；AppObjectAddress 映射到 Request Service/Method/Metadata/Payload；Traffic 由 target kind 唯一决定，Reply 由 CoCall/CoTell 唯一决定；Context 只读 | 稳定头独立 include，禁旧 transport/Socket/AppLink 泄漏；四种消息方向。 |
-| §2.2，174–246 | Client::Create(engine, options)，CoCall → Call(target,Request,infra CallOptions)，CoTell → Send(target,Request,SendOptions)；剩余预算只收紧；HTTP Send 为 UnsupportedRoute | 顶层无 deadline、本地满、HTTP Tell 拒绝；无自动 retry。 |
-| §2.3–2.4，250–336 | Server::Create(engine,同一个Client,AdmissionHandler,options)；同步 handler 只校验/授权/有界转移 owning AdmissionItem，不挂起、不执行业务 | Call/Send 单 FIFO，queue 满立即 Overloaded；不得在 reader 上跑 hook/Resolver I/O。 |
-| 同上及 §4.2，406–414 | Call 在独立协程填相同 correlation 字段，经 ReplyCompletion::Complete/Fail 写终态后 Release AdmissionLease；Send 成功入队后 infra 收投递 lease，framework 自有 lease 留到 Tell 执行终态 | 请求各一次终态，lease 各一次释放；infra Drain 完成不能冒充框架 Tell 排空。 |
+| §2.2，174–246 | CoRpcClient::Create(engine, options)，CoCall → Call(target,Request,infra CallOptions)，CoTell → Send(target,Request,SendOptions)；剩余预算只收紧；HTTP Send 为 UnsupportedRoute | 顶层无 deadline、本地满、HTTP Tell 拒绝；无自动 retry。 |
+| §2.3–2.4，250–336 | CoRpcServer::Create(engine,同一个CoRpcClient,AdmissionHandler,options)；同步 handler 只校验/授权/有界转移 owning AdmissionItem，不挂起、不执行业务 | Call/Send 单 FIFO，queue 满立即 Overloaded；不得在 reader 上跑 hook/Resolver I/O。 |
+| 同上及 §4.2，406–414 | Call 在独立协程填相同 correlation 字段，经 ReplyCompletion::Complete/Fail 写终态后 Release AdmissionLease；Send 成功入队后 infra 收投递 lease，framework 自有 lease 留到 Tell 执行终态 | 请求各一次终态，lease 各一次释放；infra 会话责任结清不能冒充框架 Tell 排空。 |
 | §3，338–391 | 本地 id 来自 AppNetworkOptions；endpoint 只是位置；自报 identity/epoch 非授权凭据；同时拨号/握手/fencing 归 infra，App 不另实现 | 默认双进程单 link、同时拨号、旧 epoch 不 admission；跨重启/迁移顺序不承诺。 |
 | §4.1/4.3，393–420 | RequireRemoteAcceptance 对应 SendOptions 同名值及 wire acceptance_requested，不把 SendAccepted 当业务结果；mailbox 满计 dead-letter/drop，确认式投递 Overloaded | 满一 Actor 不阻塞共享 reader/System/Service/其他 Actor；发送方不自动补发。 |
 | §5，422–552 | Codec/正式 v2 proto 与 u32be 归 infra；framework 只做 Payload/schema、route/fw 字段和 opaque ordering_key/sequence。metadata 仅 fw/route/trace，32项、key64/value256字节且无重复 | Call1→Tell2→Call3 同目标按序接纳；字段/长度/过期/关联拒绝；默认 frame8MiB，硬上限1GiB，握手≤64KiB。 |
 | §5.3–6，530–575 | 同发送方/目标以发送队列接纳为序；旧 epoch 不能复用新代额度；已 mailbox 接纳的不回滚。OutcomeUnknown 保留 request_phase，不推断未执行 | 部分写退役、不重放；旧 callback 只能结算既有责任，不捕获 framework 裸指针。 |
-| §2.3、6，317–330、565–575 | 所有 Server StopAccepting → infra Drain 与框架业务 drain → Server Close(deadline) → Client Close → 确认物理责任归零 → Engine Close。超时保留所有 owner 并继续驱动 | Client Close/Server IsClosed 只是逻辑关闭，禁止提前关闭共享 Engine；StopIncomplete 可追踪。 |
+| §2.3、6，317–330、565–575 | 宿主 StopAccepting 关闭业务门 → WaitHandlersDone 等宿主在途责任归零 → CoRpcServer::Shutdown() → 宿主 Close 对 RPC server/client 调用 Shutdown(reason) 并收口 Engine；HTTP 分支独立遵循其关闭接口 | RPC Shutdown/IsClosed 不证明物理释放；尚未结束的驱动线程仍由宿主持有并最终 join，StopIncomplete 可追踪。 |
 | §8，619–629 | 仅消费稳定 net/http/rpc/redis/mongo 面；HTTP Router/Request/Response/stream/pool、Redis Acquire/AUTH/SELECT、Mongo Collection/Document/worker 语义原样保留；Payload codec 归 framework | 模块 owner 实施对应 api/include/真实后端回归；不把本轮文档当作上述模块完成。 |
 | §8，622、631 | HttpComponent Freeze 前结构注册，token owner 为注册 Service；Revoke 先封新 dispatch，再等 handler lease；运行时新 path Busy | 并发撤销/Uninstall 不悬空；不偷偷重建 Router 或增加 route。 |
 | §9–11，633–684 | 授权/Resolver/mailbox/重试/业务 idempotency 归 framework；Monitor 只读、显式、opt-in；删除 LegacyHeaders/x-bbt-*、旧 envelope/transport/WaitStopped 稳定入口 | examples/API consumer、正反向 include、Monitor/schema、真实两 App 和关闭验收。 |
 | §7、12，577–611、688–698 | 这里只消费 C1–C5 已验收结论，不重新打开 infra 契约；保持 net/HTTP/Redis/Mongo 后续工作归属 | 目标文档不等同代码证据；未落地头/方法保持未验证。 |
+
+### 7.1 RPC V2 唯一消费面（ADR 0022 现行面）
+
+RPC 只按 V2 会话消费：`LegacyHeaders`/`ProtoWireV1`/`TcpV1` 模式选择、`x-bbt-*` 编解码、`RpcEnvelope`/`RpcAddress`/旧 `RpcHandler` 与两座旧桥（`RpcWireBridge`/`RpcHttpBridge`）已按 `bbtools-infra/docs/decisions/0022-rpc-single-protocol.md` 删除；`framework/src/host/` 现由 `RpcBridge.{hpp,cc}` 承担 V2 入站/出站装配。下表旧列只表示迁移历史，当前代码不存在这些旧面，也不保留兼容壳：
+
+| 旧 | 新 | 责任方 |
+|---|---|---|
+| `CoAppOptions::inbound_bridge`（`RpcInboundBridge`） | 删除；`CoAppOptions::local_identity`（映射 `rpc::ClientOptions::SetLocalIdentity`） | framework 装配 |
+| `InstallRpcHttpBridge` / `InstallRpcWireBridge` | `InstallRpcAdmission(InfraHttpHost&, shared_ptr<AppRuntimeState>)` | framework 入站 |
+| `InfraHttpHost::InstallRpcHandler` + `SetRpcInboundTransport` | `rpc::CoRpcServer::Create(engine, client, AdmissionHandler, ServerOptions)` | framework 宿主 |
+| `IncomingCallContext` + `RpcEnvelope`（入站） | `rpc::AdmissionItem`（`request` + `reply` + `lease`） | infra → framework |
+| `RpcAddress{transport,endpoint}` | `std::string target`（`"tcp://host:port"`）；路由表存 endpoint 字符串 | framework 路由 |
+| `HttpEgress` + `RpcEgressProfile` | `RpcEgress`：`CoRpcClient::Call(target, Request, CallOptions)` / `CoRpcClient::Send(target, Request, SendOptions)` | framework 出站 |
+| `AppRuntimeState::Send(const RpcEnvelope&, ...)` | `Send(const rpc::Request&, const bbt::infra::CallOptions&) -> result<rpc::Response>` | framework 路由门 + 策略 |
+| `InboundDispatcher::Dispatch(ctx, RpcEnvelope)` | `Dispatch(const rpc::Request&) -> result<rpc::Response>` | framework 分发 |
+| `RpcCallView{target: RpcAddress, request: RpcEnvelope}` | `RpcCallView{target: std::string, request: rpc::Request}` | framework 策略 |
+| `RpcSendAppFn(RpcAddress, RpcEnvelope, CallOptions)` | `RpcSendAppFn(std::string_view, const rpc::Request&, const bbt::infra::CallOptions&)` | 测试缝 |
+
+不变量：framework **不注册** `Server::RegisterRpc`——注册路由会为每帧派生独立协程并绕过单 FIFO admission 与 `OrderedIngress` 的唯一按序接纳（ADR 0014 §4.2）；全部入站（Call 与 Send）走 admission handler。入站 `Traffic=Service`，出站 `Call` 为 `Required`、`Tell` 为 `None`；V2 `OrderingKey`/`Sequence` 不填（`sequence=0` 即 infra 不启用顺序检查），业务有序票据继续走 `fw.*` 元数据。`peer_principal` 在明文 trusted-network 下恒空，授权仍由 `RpcPolicy` 与业务层承担。
+
+表中「新」列的 infra 类型与 framework 侧 `InstallRpcAdmission`、`RpcEgress`、`CoAppOptions::local_identity`、`InboundDispatcher::Dispatch(const rpc::Request&)`、`RpcSendAppFn(std::string_view, ...)` 均已落地；消费者按本表消费，不另起别名。
 
 ## 8. MonitorService：显式安装、访问控制与撤销
 
@@ -701,7 +722,7 @@ R3 不把旧 `Run` 改名后保留为隐藏兼容壳，也不在本节点扩大 
 
 非 Co 调用在副作用前返回 framework `InvalidContext`；对象/绑定不存在返回 `NotFound`，并发转换返回 `Busy`，封口/失效返回 `Closed`，截止时间耗尽返回 `TimedOut` 并保留清理 owner。hook 的原错误和异常继续写 `LifecycleFailures`；`OnUninstall`/`OnDestroy` 的异常隔离不伪造成功。CoApp 主协程正常返回即任务成功，投递失败或未捕获任务异常必须报告非成功并唤醒等待方。
 
-**关闭语义（简单 Close，收口后的唯一口径）**：`CoStop`/`CoUninstall*` 直接收口——先封对象 gate 与其 subject 绑定边拒新，在有限 deadline 内排空在途 borrow 到真实终态，再执行 OnStop/OnUninstall 并移除登记销毁对象；deadline 耗尽或 hook 失败保留 owner 与资源版本，记诚实的不完整状态（`StopIncomplete`/`UninstallIncomplete`）与 `LifecycleFailure`，允许再次以新期限调用推进。框架不新增 drain/receipt/多阶段关闭协议，等待顺序与业务任务编排由用户控制。infra 侧的 `Server::Close(deadline)`/`StopAccepting`/`Drain`/`WaitStopped` 属 infra 入口，由 infra 自己的简单 Close 语义定义，framework 不在此再造第二套协议；`StopIncomplete`/`PendingCleanup`/`CoWaitShutdownRequest` 是本仓已实现的诚实观察/等待面，不是多阶段 drain 协议。
+**关闭语义（简单 Close，收口后的唯一口径）**：`CoStop`/`CoUninstall*` 直接收口——先封对象 gate 与其 subject 绑定边拒新，在有限 deadline 内排空在途 borrow 到真实终态，再执行 OnStop/OnUninstall 并移除登记销毁对象；deadline 耗尽或 hook 失败保留 owner 与资源版本，记诚实的不完整状态（`StopIncomplete`/`UninstallIncomplete`）与 `LifecycleFailure`，允许再次以新期限调用推进。框架不新增 drain/receipt/多阶段关闭协议，等待顺序与业务任务编排由用户控制。infra RPC 仅提供统一 `Close(CloseFlag, timeout_ms, Error)` 与同步强制 `Shutdown(Error)`，不再暴露 `StopAccepting`/`Drain`/`WaitStopped`；宿主在 native 线程消费 Shutdown，业务门编排与 HTTP 关闭步骤见 [网络宿主与 RPC 消费](../guides/http-host.md)。`StopIncomplete`/`PendingCleanup`/`CoWaitShutdownRequest` 是本仓已实现的诚实观察/等待面，不是多阶段 drain 协议。
 
 **已否决的 Engine/native 控制接线（P2-9 收口，历史保留）**：早期草案拟定的「framework 组件经 coroutine `RegisterMainNativeControl` → infra `MainEngineControl` → Engine `Begin/Advance` 注册主控」方案已被用户否决，不再是实现契约——本仓不实现 `RunMainTask`/`MainNativeControl`/`IMainNativeControl`/`AdvanceNativeControl`/`BeginNativeControl`/`MainNativeWake`/`MainNativePoll`/`TryUnregisterProcesserDriver(Pending)`/`MainEngineControl`（含 `CoStart/CoClose`/`CoDial`），也不在 Co 域接管 `Engine::Run/Begin/Advance` 或任何 raw callback/物理清理。Engine 由 infra 的 `Engine::Create` + `Engine::Run`（宿主专用 native 线程）拥有；framework 侧网络收口只经 `InfraHttpHost` 的 `INetworkHost` seam 与 infra 公开 `Close/WaitHandlersDone` 语义完成，宿主不持有 Engine 控制桥。
 

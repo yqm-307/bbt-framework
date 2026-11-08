@@ -1,8 +1,8 @@
 # examples/dual_service — 双 Service / 跨进程示例（Issue #5）
 
-三个独立进程，经 framework 默认 HTTP 桥做真实 client/server。协议为
-**ProtoWireV1**（infra 正式 body wire profile：`POST /rpc` +
-`application/x-protobuf`），与 `examples/getvalue` 同口径：
+三个独立进程，经 framework 默认 V2 会话做真实 client/server。协议为
+infra 唯一 V2 profile（`SessionFrame` + u32be 分帧 + Hello/HelloAck，
+`local_identity` 互异），与 `examples/getvalue` 同口径：
 
 ```
 driver ──wire──> svc_b(gateway) ──wire──> svc_a(storage)
@@ -34,17 +34,17 @@ driver ──wire──> svc_b(gateway) ──wire──> svc_a(storage)
   （本示例只用 `UpdateOne`/`FindOne`/`DeleteOne` 的 upsert/find/delete）。
 - `svc_b` 托管 `gateway` 服务，`static_routes` 把 `storage` 显式指到
   `svc_a` 的真实 `host:port`——未配置目标一律 `NotFound`，无自动发现。
-- `driver` 是第三个进程：`net::Engine + http::Client`，用 infra 公开头
-  `<bbt/infra/rpc/RpcWire.hpp>` 直接组/解正式 wire 请求（不引用 framework
-  internal 头，也不读 `x-bbt-*` header）。
+- `driver` 是第三个进程：`net::Engine + rpc::CoRpcClient`，用 infra 公开头
+  （`rpc/CoRpcClient.hpp`、`rpc/Request.hpp`、`rpc/Response.hpp`）发真实 V2 Call
+  （不引用 framework internal 头，也不手写第二套 SessionFrame/握手 codec）。
 
-## 为什么必须是正式 body wire（ProtoWireV1）
+## 为什么必须是 V2 会话
 
-只有正式 wire body 携带 `remaining_budget_ms`，服务端才能在 handler 可见前
-把入站预算收敛为 `min(传输硬看门, now+budget)` 并据此中止。迁移期 header 桥
-（`LegacyHeaders`）没有任何预算字段，服务端只能吃传输层 `incoming_timeout`
-——调用方预算根本到不了对端，做不到真正继承。因此本示例三个进程统一走
-ProtoWireV1（该 profile 需要 `bbt_infra_rpc_net`，即 protobuf 前缀在场）。
+只有 V2 CALL 帧携带 `remaining_budget_ms`，服务端才能在 handler 可见前
+把入站预算收敛为 `min(传输硬看门, now+budget)` 并据此中止。旧 header 协议
+没有任何预算字段（且已随 V1 删除），服务端只能吃传输层 `incoming_timeout`
+——调用方预算根本到不了对端，做不到真正继承。因此本示例三个进程统一走 V2
+会话（该能力由 `bbt_infra_rpc_net` 承载，需 protobuf 前缀在场）。
 
 ## 覆盖路径
 
@@ -63,7 +63,7 @@ driver 按序执行并各自打印 PASS/FAIL + 实际结果：
 
 `gateway.slowcall` 经 `this->call("storage","sleep_ms",req,{},
 CallOptions{now+600ms})` 给 storage 一个显式**子预算**（`AdaptCallOptions`
-取 min，不得延长父预算）。该预算随 wire 的 `remaining_budget_ms` 到达
+取 min，不得延长父预算）。该预算随 CALL 帧的 `remaining_budget_ms` 到达
 storage，服务端据此在 handler 内中断 `sleep_ms` 并**自行**返回 `TimedOut`；
 gateway 再把该错误原样透传给 driver。
 
@@ -74,7 +74,7 @@ driver 用 **8000ms** 客户端预算发起调用，并断言：
 - 耗时 `< 3000ms`（实测约 590ms）→ 既不是 storage 睡满 5000ms，也不是
   客户端在 8000ms 处掐断。
 
-若预算只在客户端生效（如走 header 桥），本调用要么把 storage 拖到传输层
+若预算不随会话帧传递（如旧 header 协议），本调用要么把 storage 拖到传输层
 30s 看门（被客户端 8s 先掐断），要么在 8s 处由客户端超时——两种都不会产生
 「服务端自产 TimedOut」。因此本断言把「服务端继承」与「仅客户端超时」
 区分开。既有框架侧证据：`tests/Test_framework_resource_live.cc` 与
@@ -227,5 +227,5 @@ kill -TERM %1 %2   # 两进程各自优雅关闭，exit code 0
 mongocxx 前缀，以及 infra/coroutine 源码树路径。运行期：`docker`（起
 Redis/Mongo 临时容器）与 loopback 动态端口即可；driver/host 侧不需要
 `redis-cli`/`mongosh`（清理走后端接口，复核经 `docker exec`）。
-RPC 监听固定 `127.0.0.1`、明文 HTTP、单目录进程编排——只展示框架公共面
+RPC 监听固定 `127.0.0.1`、明文 TCP（V2 会话）、单目录进程编排——只展示框架公共面
 用法，**不作为部署形态**。
