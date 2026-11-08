@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""真实存储验收：自有固定镜像容器、独立服务进程、ProtoWireV1 请求与 Mongo 读回。"""
+"""真实存储验收：自有固定镜像容器、独立服务进程、V2 会话请求与 Mongo 读回。"""
 import argparse
 import concurrent.futures
-import http.client
 import json
 import os
 from pathlib import Path
@@ -66,29 +65,36 @@ def decode_record(data):
 
 
 def rpc(node, service, method, payload, request_type):
+    """一次真实 V2 Call（codec 复用 run.py 导入的唯一实现）。"""
     request_id = "wire-" + uuid.uuid4().hex
     prefix = "bbt.example.ecommerce.v1."
-    body = cluster._f_varint(1, 1) + cluster._f_len(2, request_id)
-    body += cluster._f_len(3, NAMES[service]) + cluster._f_len(4, method)
-    body += cluster._f_varint(5, 4000) + cluster._f_len(6, prefix + request_type)
-    body += cluster._f_len(7, prefix + "Record") + cluster._f_len(8, payload)
     port = int(node.ready_info["endpoint"].rsplit(":", 1)[1])
     start = time.monotonic()
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=7)
+    client = None
     try:
-        conn.request("POST", "/rpc", body, {"Content-Type": cluster.CONTENT_TYPE})
-        response = conn.getresponse()
-        raw = response.read()
-        env = cluster.dec_envelope(raw)
-        result = {"ok": env["success"], "elapsed": time.monotonic() - start,
-                  "http_status": response.status, "request_id": request_id}
-        if env.get("error"):
-            result["error"] = env["error"]
-        if env["success"]:
-            result["record"] = decode_record(env.get("payload", b""))
-        return result
+        client = cluster.v2.V2Client(port, identity="ecommerce-storage-driver",
+                                     timeout=7)
+        client.handshake()
+        env = client.call(NAMES[service], method, payload=payload,
+                          request_id=request_id,
+                          request_schema=prefix + request_type,
+                          response_schema=prefix + "Record",
+                          budget_ms=4000)
+    except (OSError, cluster.v2.WireError) as exc:
+        return {"ok": False, "elapsed": time.monotonic() - start,
+                "request_id": request_id, "error": {"message": str(exc)}}
     finally:
-        conn.close()
+        if client is not None:
+            client.close()
+    result = {"ok": True, "elapsed": time.monotonic() - start,
+              "request_id": request_id}
+    err = cluster.v2.error_of(env)
+    if err is not None:
+        result["ok"] = False
+        result["error"] = err
+        return result
+    result["record"] = decode_record(env.get("payload", b""))
+    return result
 
 
 def main():

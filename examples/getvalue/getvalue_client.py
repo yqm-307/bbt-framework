@@ -2,9 +2,13 @@
 """bbt-framework GetValue 示例的 Python 标准库客户端。
 
 不依赖 google.protobuf：按 proto3 wire format 手写业务 .proto
-(examples/getvalue/proto/bbt/example/v1/get_value.proto) 与 infra
-rpc_envelope.proto 的编解码，直接向 C++ getvalue_server 发起真实
-HTTP POST /rpc 调用。手写编解码本身即字节级互通证据。
+(examples/getvalue/proto/bbt/example/v1/get_value.proto) 的业务 payload
+编解码，会话/分帧/握手/错误信封一律复用唯一 V2 codec
+(tests/rpc_v2_wire.py)——不复制第二套 wire 实现。
+
+真实 V2 会话：TCP + u32be 分帧 + Hello/HelloAck 握手 + SessionFrame
+profile 2，直接向 C++ getvalue_server 发起 Call。手写业务编解码本身即
+字节级互通证据。
 
 结构化结果均带 auth_state=unauthenticated_loopback：本路径只证明业务/传输
 行为，不证明身份可信或授权（认证/授权由后续范围承载）。
@@ -15,13 +19,16 @@ HTTP POST /rpc 调用。手写编解码本身即字节级互通证据。
 """
 
 import argparse
-import http.client
 import json
-import socket
+import os
 import sys
 
-RPC_PATH = "/rpc"
-CONTENT_TYPE = "application/x-protobuf"
+# 唯一 V2 codec 在 tests/；示例目录用明确相对路径定位，不依赖 cwd。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_TESTS_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "tests"))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+import rpc_v2_wire as v2  # noqa: E402
 
 # 与 proto package bbt.example.v1 一致（唯一真源 = .proto 的 descriptor full_name）。
 SERVICE = "bbt.example.v1.GetValueService"
@@ -29,14 +36,17 @@ METHOD = "GetValue"
 REQUEST_SCHEMA = "bbt.example.v1.GetValueRequest"
 RESPONSE_SCHEMA = "bbt.example.v1.GetValueResponse"
 
+# 会话身份必须与服务端互异：V2 拒绝同 identity 的 self-connection。
+CLIENT_IDENTITY = "getvalue-python-client"
+
 AUTH_STATE = "unauthenticated_loopback"
 
-# RpcErrorCode（infra rpc_envelope.proto enum）
-INVALID_ARGUMENT = 1
-TIMED_OUT = 6
-PROTOCOL_ERROR = 10
-NOT_FOUND = 11
-TYPE_MISMATCH = 12
+# RpcErrorCode（session_frame.proto enum，与 infra ErrorCode 同序）
+INVALID_ARGUMENT = v2.ERR_INVALID_ARGUMENT
+TIMED_OUT = v2.ERR_TIMED_OUT
+PROTOCOL_ERROR = v2.ERR_PROTOCOL_ERROR
+NOT_FOUND = v2.ERR_NOT_FOUND
+TYPE_MISMATCH = v2.ERR_TYPE_MISMATCH
 
 WIRE_VARINT = 0
 WIRE_LEN = 2
@@ -48,7 +58,8 @@ GV_RESP_ALPHA = b"\x08\x01\x12\x0bvalue-alpha"        # found=true, value="value
 _RESULTS = {}
 
 
-# --- proto3 wire format 最小编解码 ------------------------------------------
+# --- proto3 wire format 最小编解码（业务 payload 专用）------------------------
+
 
 def _varint(n):
     out = bytearray()
@@ -64,10 +75,6 @@ def _varint(n):
 
 def _tag(field, wire):
     return _varint((field << 3) | wire)
-
-
-def _f_varint(field, n):
-    return _tag(field, WIRE_VARINT) + _varint(n)
 
 
 def _f_len(field, data):
@@ -117,6 +124,7 @@ def _parse_fields(buf):
 
 # --- 业务 payload codec ------------------------------------------------------
 
+
 def enc_get_value_request(key):
     return _f_len(1, key)
 
@@ -132,119 +140,39 @@ def dec_get_value_response(buf):
     return found, value
 
 
-# --- envelope codec ----------------------------------------------------------
-
-def enc_envelope(*, request_id, service, method, budget_ms, request_schema,
-                 response_schema, payload, metadata=()):
-    out = _f_varint(1, 1)                       # profile_version = 1
-    out += _f_len(2, request_id)
-    out += _f_len(3, service)
-    out += _f_len(4, method)
-    out += _f_varint(5, budget_ms)
-    out += _f_len(6, request_schema)
-    out += _f_len(7, response_schema)
-    out += _f_len(8, payload)
-    for k, v in metadata:
-        out += _f_len(9, _f_len(1, k) + _f_len(2, v))
-    return out
+# --- V2 会话调用 -------------------------------------------------------------
 
 
-def dec_error(buf):
-    err = {}
-    details = []
-    for f, w, v in _parse_fields(buf):
-        if w == WIRE_VARINT:
-            if f == 1:
-                err["code"] = v
-            elif f == 6:
-                err["backend_code"] = v
-        elif w == WIRE_LEN:
-            if f == 2:
-                err["domain"] = v.decode("utf-8")
-            elif f == 3:
-                err["domain_code"] = v.decode("utf-8")
-            elif f == 4:
-                err["message"] = v.decode("utf-8")
-            elif f == 5:
-                err["backend_category"] = v.decode("utf-8")
-            elif f == 8:
-                det = {}
-                for df, dw, dv in _parse_fields(v):
-                    if dw == WIRE_LEN and df == 1:
-                        det["key"] = dv.decode("utf-8")
-                    elif dw == WIRE_LEN and df == 2:
-                        det["value"] = dv.decode("utf-8")
-                details.append((det.get("key", ""), det.get("value", "")))
-    err["details"] = details
-    return err
-
-
-def dec_envelope(buf):
-    env = {"metadata": [], "unknown_fields": []}
-    for f, w, v in _parse_fields(buf):
-        if w == WIRE_VARINT:
-            if f == 1:
-                env["profile_version"] = v
-            elif f == 5:
-                env["remaining_budget_ms"] = v
-            elif f == 10:
-                env["success"] = bool(v)
-            else:
-                env["unknown_fields"].append(f)
-        elif w == WIRE_LEN:
-            if f == 2:
-                env["request_id"] = v.decode("utf-8")
-            elif f == 3:
-                env["service"] = v.decode("utf-8")
-            elif f == 4:
-                env["method"] = v.decode("utf-8")
-            elif f == 6:
-                env["request_schema"] = v.decode("utf-8")
-            elif f == 7:
-                env["response_schema"] = v.decode("utf-8")
-            elif f == 8:
-                env["payload"] = bytes(v)
-            elif f == 9:
-                kv = {}
-                for mf, mw, mv in _parse_fields(v):
-                    if mw == WIRE_LEN and mf == 1:
-                        kv["key"] = mv.decode("utf-8")
-                    elif mw == WIRE_LEN and mf == 2:
-                        kv["value"] = mv.decode("utf-8")
-                env["metadata"].append((kv.get("key", ""), kv.get("value", "")))
-            elif f == 11:
-                env["error"] = dec_error(v)
-            else:
-                env["unknown_fields"].append(f)
-    return env
-
-
-# --- HTTP --------------------------------------------------------------------
-
-def post_raw(port, body, path=RPC_PATH, content_type=CONTENT_TYPE):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    conn.request("POST", path, body=body,
-                 headers={"Content-Type": content_type})
-    resp = conn.getresponse()
-    data = resp.read()
-    status = resp.status
-    ctype = resp.getheader("Content-Type")
-    conn.close()
-    return status, ctype, data
-
-
-def call(port, *, request_id, method=METHOD, key="alpha", budget_ms=3000,
-         request_schema=REQUEST_SCHEMA, response_schema=RESPONSE_SCHEMA,
-         payload=None, extra_payload=b"", extra_envelope=b""):
+def call_frame(client, *, request_id, method=METHOD, key="alpha", budget_ms=3000,
+               request_schema=REQUEST_SCHEMA, response_schema=RESPONSE_SCHEMA,
+               payload=None):
     if payload is None:
-        payload = enc_get_value_request(key) + extra_payload
-    body = enc_envelope(
-        request_id=request_id, service=SERVICE, method=method,
-        budget_ms=budget_ms, request_schema=request_schema,
-        response_schema=response_schema, payload=payload) + extra_envelope
-    status, ctype, data = post_raw(port, body)
-    env = dec_envelope(data)
-    return status, ctype, env
+        payload = enc_get_value_request(key)
+    return {
+        "kind": v2.KIND_CALL,
+        "traffic": v2.TRAFFIC_SERVICE,
+        "session_epoch": client.epoch,
+        "request_id": request_id,
+        "service": SERVICE,
+        "method": method,
+        "reply": v2.REPLY_REQUIRED,
+        "remaining_budget_ms": budget_ms,
+        "request_schema": request_schema,
+        "response_schema": response_schema,
+        "payload": payload,
+        "metadata": [],
+    }
+
+
+def call(client, **kwargs):
+    """一次真实 V2 Call；返回响应帧（error_of 取错误分支）。"""
+    frame = call_frame(client, **kwargs)
+    return client.call(
+        frame["service"], frame["method"], payload=frame["payload"],
+        request_id=frame["request_id"],
+        request_schema=frame["request_schema"],
+        response_schema=frame["response_schema"],
+        budget_ms=frame["remaining_budget_ms"])
 
 
 _FAILURES = []
@@ -297,136 +225,139 @@ def main():
         ) else "fail",
         "auth_state": AUTH_STATE}
 
-    # S1 known
-    st, ct, env = call(port, request_id="sc-known")
-    ok = (st == 200 and ct == CONTENT_TYPE and "error" not in env
-          and env.get("success") and env.get("request_id") == "sc-known"
-          and env.get("response_schema") == RESPONSE_SCHEMA
-          and dec_get_value_response(env.get("payload", b"")) ==
-          (True, "value-alpha"))
-    check(st == 200, f"http={st}", "known")
-    check(ct == CONTENT_TYPE, f"content-type={ct}", "known")
-    check("error" not in env, "unexpected error", "known")
-    check(env.get("request_id") == "sc-known", "request_id not echoed", "known")
-    check(env.get("response_schema") == RESPONSE_SCHEMA,
-          "response_schema not declared schema", "known")
-    check(dec_get_value_response(env.get("payload", b"")) ==
-          (True, "value-alpha"), "payload wrong", "known")
-    finish("known", ok and not _FAILURES)
+    client = v2.V2Client(port, identity=CLIENT_IDENTITY)
+    client.handshake(expected_peer="getvalue-server")
+    try:
+        # S1 known
+        env = call(client, request_id="sc-known")
+        err = v2.error_of(env)
+        ok = (err is None
+              and env.get("request_id") == "sc-known"
+              and env.get("response_schema") == RESPONSE_SCHEMA
+              and dec_get_value_response(env.get("payload", b"")) ==
+              (True, "value-alpha"))
+        check(err is None, f"unexpected error {err}", "known")
+        check(env.get("request_id") == "sc-known", "request_id not echoed", "known")
+        check(env.get("response_schema") == RESPONSE_SCHEMA,
+              "response_schema not declared schema", "known")
+        check(dec_get_value_response(env.get("payload", b"")) ==
+              (True, "value-alpha"), "payload wrong", "known")
+        finish("known", ok and not _FAILURES)
 
-    # S2 miss
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-miss", key="no-such-key")
-    ok = (env.get("success") and
-          dec_get_value_response(env.get("payload", b"")) == (False, ""))
-    check(ok, "miss should be found=false/value=''", "miss")
-    finish("miss", ok and len(_FAILURES) == before)
+        # S2 miss
+        before = len(_FAILURES)
+        env = call(client, request_id="sc-miss", key="no-such-key")
+        ok = (v2.error_of(env) is None and
+              dec_get_value_response(env.get("payload", b"")) == (False, ""))
+        check(ok, "miss should be found=false/value=''", "miss")
+        finish("miss", ok and len(_FAILURES) == before)
 
-    # S3 empty key -> InvalidArgument
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-empty", key="")
-    ok = (env.get("error", {}).get("code") == INVALID_ARGUMENT)
-    check(ok, f"expected InvalidArgument, got {env.get('error')}", "empty-key")
-    finish("empty-key", ok and len(_FAILURES) == before)
+        # S3 empty key -> InvalidArgument
+        before = len(_FAILURES)
+        env = call(client, request_id="sc-empty", key="")
+        ok = (v2.error_of(env) or {}).get("code") == INVALID_ARGUMENT
+        check(ok, f"expected InvalidArgument, got {v2.error_of(env)}", "empty-key")
+        finish("empty-key", ok and len(_FAILURES) == before)
 
-    # S4 unknown method -> NotFound
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-nomethod", method="Nope")
-    ok = (env.get("error", {}).get("code") == NOT_FOUND)
-    check(ok, f"expected NotFound, got {env.get('error')}", "unknown-method")
-    finish("unknown-method", ok and len(_FAILURES) == before)
+        # S4 unknown method -> NotFound
+        before = len(_FAILURES)
+        env = call(client, request_id="sc-nomethod", method="Nope")
+        ok = (v2.error_of(env) or {}).get("code") == NOT_FOUND
+        check(ok, f"expected NotFound, got {v2.error_of(env)}", "unknown-method")
+        finish("unknown-method", ok and len(_FAILURES) == before)
 
-    # S5 request schema mismatch -> TypeMismatch
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-schema",
-                       request_schema="bbt.example.v1.Nope")
-    ok = (env.get("error", {}).get("code") == TYPE_MISMATCH)
-    check(ok, f"expected TypeMismatch, got {env.get('error')}", "schema-mismatch")
-    finish("schema-mismatch", ok and len(_FAILURES) == before)
+        # S5 request schema mismatch -> TypeMismatch
+        before = len(_FAILURES)
+        env = call(client, request_id="sc-schema",
+                   request_schema="bbt.example.v1.Nope")
+        ok = (v2.error_of(env) or {}).get("code") == TYPE_MISMATCH
+        check(ok, f"expected TypeMismatch, got {v2.error_of(env)}", "schema-mismatch")
+        finish("schema-mismatch", ok and len(_FAILURES) == before)
 
-    # S6a truncated business payload -> ProtocolError (业务 codec 失败)
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-badpayload",
-                       payload=b"\x0a\x05ab")
-    ok = (env.get("error", {}).get("code") == PROTOCOL_ERROR)
-    check(ok, f"expected ProtocolError, got {env.get('error')}", "malformed-payload")
-    finish("malformed-payload", ok and len(_FAILURES) == before)
+        # S6a truncated business payload -> ProtocolError (业务 codec 失败)
+        before = len(_FAILURES)
+        env = call(client, request_id="sc-badpayload", payload=b"\x0a\x05ab")
+        ok = (v2.error_of(env) or {}).get("code") == PROTOCOL_ERROR
+        check(ok, f"expected ProtocolError, got {v2.error_of(env)}", "malformed-payload")
+        finish("malformed-payload", ok and len(_FAILURES) == before)
 
-    # S6b truncated envelope body -> ProtocolError (wire 解码失败)
-    before = len(_FAILURES)
-    body = enc_envelope(request_id="sc-trunc", service=SERVICE, method=METHOD,
-                        budget_ms=3000, request_schema=REQUEST_SCHEMA,
-                        response_schema=RESPONSE_SCHEMA,
-                        payload=enc_get_value_request("alpha"))[:8]
-    st, ct, data = post_raw(port, body)
-    env = dec_envelope(data)
-    ok = (st == 200 and env.get("error", {}).get("code") == PROTOCOL_ERROR)
-    check(ok, f"expected ProtocolError, got status={st} {env.get('error')}",
-          "malformed-envelope")
-    finish("malformed-envelope", ok and len(_FAILURES) == before)
+        # S7 unknown field in SessionFrame -> 正常处理（proto3 前向兼容）
+        before = len(_FAILURES)
+        frame = call_frame(client, request_id="sc-fwd")
+        env = client.call_unchecked(frame, unknown_fields=[(200, 12345)])
+        ok = (v2.error_of(env) is None and env.get("request_id") == "sc-fwd" and
+              dec_get_value_response(env.get("payload", b"")) ==
+              (True, "value-alpha"))
+        check(ok, "frame unknown field broke processing", "unknown-field-frame")
+        finish("unknown-field-frame", ok and len(_FAILURES) == before)
 
-    # S6c wrong content-type -> InvalidArgument (wire 拒绝，不读 x-bbt-* 头旁路)
-    before = len(_FAILURES)
-    body = enc_envelope(request_id="sc-ctype", service=SERVICE, method=METHOD,
-                        budget_ms=3000, request_schema=REQUEST_SCHEMA,
-                        response_schema=RESPONSE_SCHEMA,
-                        payload=enc_get_value_request("alpha"))
-    st, ct, data = post_raw(port, body, content_type="application/json")
-    env = dec_envelope(data)
-    ok = (env.get("error", {}).get("code") == INVALID_ARGUMENT)
-    check(ok, f"expected InvalidArgument, got {env.get('error')}",
-          "wrong-content-type")
-    finish("wrong-content-type", ok and len(_FAILURES) == before)
+        # S8 V2 request adds client_note=2 -> 服务端忽略未知业务字段
+        before = len(_FAILURES)
+        v2_extra = _f_len(2, "from-v2-client")   # client_note = 2
+        env = call(client, request_id="sc-v2", key="beta",
+                   payload=enc_get_value_request("beta") + v2_extra)
+        ok = (v2.error_of(env) is None and
+              dec_get_value_response(env.get("payload", b"")) == (True, "value-beta"))
+        check(ok, f"V2 unknown field broke processing: {v2.error_of(env)}", "v2-compat")
+        finish("v2-compat", ok and not _FAILURES)
 
-    # S7 unknown field in envelope -> 正常处理（proto3 前向兼容）
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-fwd",
-                       extra_envelope=_tag(200, WIRE_VARINT) + _varint(12345))
-    ok = (env.get("success") and env.get("request_id") == "sc-fwd" and
-          dec_get_value_response(env.get("payload", b"")) ==
-          (True, "value-alpha"))
-    check(ok, "envelope unknown field broke processing", "unknown-field-envelope")
-    finish("unknown-field-envelope", ok and len(_FAILURES) == before)
+        # S9b 可解码但已过期（budget=1ms，接收端 local-min − 回包预留后期限已过）
+        # -> 在进 handler 前 TimedOut（错误帧回显 request_id/schema），
+        # journal 不得出现 handler_entered。不使用 0 预算拒收冒充「预算保护」。
+        before = len(_FAILURES)
+        env = call(client, request_id="sc-budget1", budget_ms=1)
+        err = v2.error_of(env) or {}
+        ok = (err.get("code") == TIMED_OUT
+              and env.get("request_id") == "sc-budget1"
+              and env.get("request_schema") == REQUEST_SCHEMA)
+        check(ok, f"expected TimedOut+id/schema echo, got {env}", "budget-expired")
+        finish("budget-expired", ok and len(_FAILURES) == before)
 
-    # S8 V2 request adds client_note=2 -> V1 服务端忽略未知字段
-    before = len(_FAILURES)
-    v2_extra = _f_len(2, "from-v2-client")   # client_note = 2
-    st, ct, env = call(port, request_id="sc-v2", key="beta", extra_payload=v2_extra)
-    ok = (env.get("success") and
-          dec_get_value_response(env.get("payload", b"")) == (True, "value-beta"))
-    check(ok, f"V2 unknown field broke processing: {env.get('error')}", "v2-compat")
-    finish("v2-compat", ok and len(_FAILURES) == before)
+        # S11 unknown error code（本地解码向量）：仅证明客户端对未知码的解码
+        # 不误判成功；**不是**服务端传播证据（服务端当前不产生未知码）。真实远端
+        # 错误传播由 S4(NotFound)/S5(TypeMismatch) 等经服务端产生的错误码承载。
+        before = len(_FAILURES)
+        synthetic = {
+            "kind": v2.KIND_RESPONSE,
+            "traffic": v2.TRAFFIC_SERVICE,
+            "session_epoch": client.epoch,
+            "request_id": "sc-unknown-code",
+            "service": SERVICE,
+            "method": METHOD,
+            "reply": v2.REPLY_REQUIRED,
+            "request_schema": REQUEST_SCHEMA,
+            "response_schema": RESPONSE_SCHEMA,
+            "outcome": "error",
+            "error": {"code": 999, "message": "x"},
+        }
+        decoded = v2.decode_frame(v2.encode_frame_unchecked(synthetic))
+        code = (v2.error_of(decoded) or {}).get("code")
+        ok = (code == 999 and code != 0)
+        check(ok, "unknown error code misclassified (local decode only)",
+              "unknown-error-code")
+        finish("unknown-error-code", ok and len(_FAILURES) == before)
+    finally:
+        client.close()
 
-    # S9 budget 0 -> wire 拒绝（InvalidArgument），不进 handler（journal 验证）
+    # S9 声明预算 0 -> wire 字段矩阵违规：对端以 SESSION_ERROR(ProtocolError)
+    # 拒绝并退役 link（0 不在 1..86400000 内），请求不进 handler。
+    # 独立连接：该拒绝会退役会话，不能复用上面的 link。
     before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-budget0", budget_ms=0)
-    ok = (env.get("error", {}).get("code") == INVALID_ARGUMENT)
-    check(ok, f"expected InvalidArgument, got {env.get('error')}", "budget-zero")
-    finish("budget-zero", ok and len(_FAILURES) == before)
-
-    # S9b 可解码但已过期（budget=1ms，接收端 local-min − 回包预留后期限已过）
-    # -> 在进 handler 前 TimedOut（error 信封回显 request_id/schema），
-    # journal 不得出现 handler_entered。不使用 0 预算拒收冒充「预算保护」。
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-budget1", budget_ms=1)
-    err = env.get("error", {})
-    ok = (err.get("code") == TIMED_OUT
-          and env.get("request_id") == "sc-budget1"
-          and env.get("request_schema") == REQUEST_SCHEMA)
-    check(ok, f"expected TimedOut+id/schema echo, got {env}", "budget-expired")
-    finish("budget-expired", ok and len(_FAILURES) == before)
-
-    # S9c 声明预算超过本地 in-flight 上限（2400000ms > incoming_timeout 30s）：
-    # 请求仍成功，但响应剩余预算必须被 clamp 到本地期限以内（不得原值回显）。
-    before = len(_FAILURES)
-    st, ct, env = call(port, request_id="sc-budgetlarge", budget_ms=2400000)
-    remaining = env.get("remaining_budget_ms", 0)
-    ok = (env.get("success") and env.get("request_id") == "sc-budgetlarge"
-          and 1 <= remaining <= 30000
-          and dec_get_value_response(env.get("payload", b"")) ==
-          (True, "value-alpha"))
-    check(ok, f"expected clamped remaining<=30000, got {env}", "budget-clamped")
-    finish("budget-clamped", ok and len(_FAILURES) == before)
+    bad = v2.V2Client(port, identity=CLIENT_IDENTITY + "-budget0")
+    try:
+        bad.handshake(expected_peer="getvalue-server")
+        frame = call_frame(bad, request_id="sc-budget0", budget_ms=0)
+        rejected = None
+        try:
+            bad.call_unchecked(frame)
+        except v2.ProtocolRejected as exc:
+            rejected = str(exc)
+        ok = rejected is not None and f"code={PROTOCOL_ERROR}" in rejected
+        check(ok, f"expected SESSION_ERROR ProtocolError, got {rejected!r}",
+              "budget-zero")
+        finish("budget-zero", ok and len(_FAILURES) == before)
+    finally:
+        bad.abort()
 
     # S10 发起后强制断连（丢 reply）-> 客户端记录未知结果，不重试
     before = len(_FAILURES)
@@ -439,16 +370,6 @@ def main():
         print(f"PASS scenario=disconnect-unknown outcome=unknown "
               f"auth_state={AUTH_STATE}")
 
-    # S11 unknown error code（本地解码向量，M-check）：仅证明客户端对未知码的解码
-    # 不误判成功；**不是**服务端传播证据（服务端当前不产生未知码）。真实远端错误
-    # 传播由 S4(NotFound)/S5(TypeMismatch) 等经服务端产生的错误码承载。
-    before = len(_FAILURES)
-    fake_err = dec_envelope(_f_len(11, _f_varint(1, 999) + _f_len(4, "x")))
-    code = fake_err.get("error", {}).get("code")
-    ok = ("error" in fake_err and code == 999 and code != 0)
-    check(ok, "unknown error code misclassified (local decode only)", "unknown-error-code")
-    finish("unknown-error-code", ok and len(_FAILURES) == before)
-
     tail = "ALL-SCENARIOS-PASS" if not _FAILURES else "SCENARIO-FAILURES"
     print(f"GRAND {tail} auth_state={AUTH_STATE}")
     if args.results:
@@ -460,19 +381,13 @@ def main():
 
 
 def send_and_disconnect(port, request_id):
-    """发起真实请求后立即关闭连接（不读回复）——客户端只能记为未知结果。"""
-    body = enc_envelope(request_id=request_id, service=SERVICE, method=METHOD,
-                        budget_ms=3000, request_schema=REQUEST_SCHEMA,
-                        response_schema=RESPONSE_SCHEMA,
-                        payload=enc_get_value_request("alpha"))
-    req = (f"POST {RPC_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-           f"Content-Type: {CONTENT_TYPE}\r\n"
-           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    """发起真实请求后立即断开 TCP（不读回复）——客户端只能记为未知结果。"""
+    client = v2.V2Client(port, identity=CLIENT_IDENTITY + "-abort")
     try:
-        s.sendall(req + body)
+        client.handshake(expected_peer="getvalue-server")
+        client.send_call_no_wait(call_frame(client, request_id=request_id))
     finally:
-        s.close()
+        client.abort()
     # 不读回复、不重试：结果未知。
     return "unknown"
 

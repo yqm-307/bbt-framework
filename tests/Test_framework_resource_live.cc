@@ -10,9 +10,9 @@
 // 不伪造：无真实服务时不构造桩替代，跳过由环境决定。
 //
 // 入站驱动经 DispatchInboundForTest（CoApp::dispatch_inbound 的测试
-// 转发口）：envelope → InboundDispatcher → RequestScope → handler →
-// 资源缝 → reply 全链，与真实线桥入站同源；不经 HTTP 栈也不绕过
-// Dispatcher 直接触 handler。
+// 转发口）：V2 Request → InboundDispatcher → RequestScope → handler →
+// 资源缝 → Response 全链，与真实入站同源；不经网络栈也不绕过
+// Dispatcher 直接触 handler。Context 由 infra 填充，测试不伪造入站事实。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -41,6 +41,8 @@
 
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
 #ifdef BBT_LIVE_HAS_REDIS
 // 新 net Redis 入口：框架侧资源适配器（engine+显式 Connect 收口归资源本体，
@@ -413,7 +415,8 @@ fw::CoAppOptions AppOpts() {
                            std::chrono::milliseconds{30000}},
         inf::ListenAddress{"127.0.0.1", 0},
         {},
-        std::chrono::milliseconds{3000}};
+        std::chrono::milliseconds{3000},
+        /*local_identity*/ std::string{"resource-live-test"}};
 }
 
 std::shared_ptr<fw::CoApp> MakeApp(const std::shared_ptr<NullNetHost>& host) {
@@ -507,8 +510,8 @@ std::shared_ptr<RunHandle> RunApp(std::shared_ptr<fw::CoApp> app) {
 // 返回是否已归零（可安全销毁 App）。
 bool JoinRun(const std::shared_ptr<RunHandle>& h) { return h->Finish(); }
 
-// 经 DispatchInboundForTest 在受管协程内分发：envelope → InboundDispatcher
-// → RequestScope → handler → 资源缝 → reply，与真实线桥入站同源。
+// 经 DispatchInboundForTest 在受管协程内分发：V2 Request → InboundDispatcher
+// → RequestScope → handler → 资源缝 → Response，与真实入站同源。
 // Dispatch 内的 handler 调用要求协程上下文（CoWaiter::WaitWithCallback 仅
 // 协程内合法），故本条路径必须经 g_scheduler->RegistCoroutineTask。
 template <class Fn>
@@ -634,21 +637,21 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
     auto h = RunApp(app);
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
 
-    // 真实往返：经 DispatchInboundForTest（envelope → Dispatcher →
-    // RequestScope → handler → 资源缝 → reply）驱动 Ping/Set/Get。
+    // 真实往返：经 DispatchInboundForTest（V2 Request → Dispatcher →
+    // RequestScope → handler → 资源缝 → Response）驱动 Ping/Set/Get。
     auto rpc = [&app](const char* method, fw::CoRpcReq req)
-        -> std::optional<fw::result<inf::RpcEnvelope>> {
-        inf::RpcEnvelope env;
-        env.service         = "cache";
-        env.method          = method;
-        env.request_id      = std::string{"r-"} + method;
-        env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
-        env.response_schema = std::string(fw::kCoRpcPositionalSchema);
-        env.payload         = req.payload();
+        -> std::optional<fw::result<inf::rpc::Response>> {
+        inf::rpc::Request env;
+        env.SetService("cache")
+            .SetMethod(method)
+            .SetRequestId(std::string{"r-"} + method)
+            .SetRequestSchema(std::string(fw::kCoRpcPositionalSchema))
+            .SetResponseSchema(std::string(fw::kCoRpcPositionalSchema))
+            .SetReply(inf::rpc::ReplyMode::Required)
+            .SetTraffic(inf::rpc::TrafficClass::Service)
+            .SetPayload(req.payload());
         return DispatchRpc(*app, [env](fw::CoApp& a) {
-            inf::IncomingCallContext incoming;
-            incoming.deadline = Clock::now() + kWait;
-            return fw::DispatchInboundForTest(a, incoming, env);
+            return fw::DispatchInboundForTest(a, env);
         });
     };
 
@@ -659,21 +662,21 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
             static_cast<int>((*ping).error().code));
     BOOST_REQUIRE(ping.has_value());
     BOOST_REQUIRE(*ping);
-    auto p = DecodeStrReply(fw::CoRpcResp::FromPayload((*ping).value().payload));
+    auto p = DecodeStrReply(fw::CoRpcResp::FromPayload((*ping).value().Payload()));
     BOOST_REQUIRE(p);
     BOOST_CHECK_EQUAL(std::get<1>(p.value()), "PONG");
 
     auto set = rpc("set", RequestStr(test_key, "v-42"));
     BOOST_REQUIRE(set.has_value());
     BOOST_REQUIRE(*set);
-    auto s = DecodeStrReply(fw::CoRpcResp::FromPayload((*set).value().payload));
+    auto s = DecodeStrReply(fw::CoRpcResp::FromPayload((*set).value().Payload()));
     BOOST_REQUIRE(s);
     BOOST_CHECK_EQUAL(std::get<1>(s.value()), "OK");
 
     auto get = rpc("get", RequestOne(test_key));
     BOOST_REQUIRE(get.has_value());
     BOOST_REQUIRE(*get);
-    auto g = DecodeStrReply(fw::CoRpcResp::FromPayload((*get).value().payload));
+    auto g = DecodeStrReply(fw::CoRpcResp::FromPayload((*get).value().Payload()));
     BOOST_REQUIRE(g);
     BOOST_CHECK_EQUAL(std::get<1>(g.value()), "v-42");
 
@@ -768,25 +771,25 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
 
     auto rpc = [&app](const char* method, fw::CoRpcReq req)
-        -> std::optional<fw::result<inf::RpcEnvelope>> {
-        inf::RpcEnvelope env;
-        env.service         = "docs";
-        env.method          = method;
-        env.request_id      = std::string{"m-"} + method;
-        env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
-        env.response_schema = std::string(fw::kCoRpcPositionalSchema);
-        env.payload         = req.payload();
+        -> std::optional<fw::result<inf::rpc::Response>> {
+        inf::rpc::Request env;
+        env.SetService("docs")
+            .SetMethod(method)
+            .SetRequestId(std::string{"m-"} + method)
+            .SetRequestSchema(std::string(fw::kCoRpcPositionalSchema))
+            .SetResponseSchema(std::string(fw::kCoRpcPositionalSchema))
+            .SetReply(inf::rpc::ReplyMode::Required)
+            .SetTraffic(inf::rpc::TrafficClass::Service)
+            .SetPayload(req.payload());
         return DispatchRpc(*app, [env](fw::CoApp& a) {
-            inf::IncomingCallContext incoming;
-            incoming.deadline = Clock::now() + kWait;
-            return fw::DispatchInboundForTest(a, incoming, env);
+            return fw::DispatchInboundForTest(a, env);
         });
     };
 
     auto put = rpc("put", RequestStr(doc_id, "42"));
     BOOST_REQUIRE(put.has_value());
     BOOST_REQUIRE(*put);
-    auto p = DecodeStrReply(fw::CoRpcResp::FromPayload((*put).value().payload));
+    auto p = DecodeStrReply(fw::CoRpcResp::FromPayload((*put).value().Payload()));
     if (!p)
         BOOST_TEST_MESSAGE("put error: " << p.error().message
             << " code=" << static_cast<int>(p.error().code));
@@ -796,7 +799,7 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
     auto get = rpc("get", RequestOne(doc_id));
     BOOST_REQUIRE(get.has_value());
     BOOST_REQUIRE(*get);
-    auto g = DecodeStrReply(fw::CoRpcResp::FromPayload((*get).value().payload));
+    auto g = DecodeStrReply(fw::CoRpcResp::FromPayload((*get).value().Payload()));
     BOOST_REQUIRE(g);
     BOOST_CHECK_EQUAL(std::get<1>(g.value()), "HIT");
 
@@ -1002,17 +1005,17 @@ BOOST_AUTO_TEST_CASE(live_service_lifetime_bounded_by_run) {
     }   // svc 出作用域：测试不再持有 Service 强引用
 
     auto dispatch = [&app] {
-        inf::RpcEnvelope env;
-        env.service         = "cache";
-        env.method          = "ping";
-        env.request_id      = "l-d2";
-        env.request_schema  = std::string(fw::kCoRpcPositionalSchema);
-        env.response_schema = std::string(fw::kCoRpcPositionalSchema);
-        env.payload         = RequestOne("x").payload();
+        inf::rpc::Request env;
+        env.SetService("cache")
+            .SetMethod("ping")
+            .SetRequestId("l-d2")
+            .SetRequestSchema(std::string(fw::kCoRpcPositionalSchema))
+            .SetResponseSchema(std::string(fw::kCoRpcPositionalSchema))
+            .SetReply(inf::rpc::ReplyMode::Required)
+            .SetTraffic(inf::rpc::TrafficClass::Service)
+            .SetPayload(RequestOne("x").payload());
         return DispatchRpc(*app, [env](fw::CoApp& a) {
-            inf::IncomingCallContext incoming;
-            incoming.deadline = Clock::now() + kWait;
-            return fw::DispatchInboundForTest(a, incoming, env);
+            return fw::DispatchInboundForTest(a, env);
         });
     };
 

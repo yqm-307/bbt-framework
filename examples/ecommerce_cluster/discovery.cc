@@ -211,13 +211,13 @@ bbt_co_async(void) ConsulDiscoveryComponent::_WatchLoop(std::size_t index) {
         }
         if (m_stop.load(std::memory_order_acquire)) break;
 
-        std::vector<bbt::infra::RpcAddress> endpoints;
+        std::vector<std::string> endpoints;
         std::vector<std::string> endpoint_names;
         endpoints.reserve(snapshot.value().instances.size());
         endpoint_names.reserve(snapshot.value().instances.size());
         for (const auto& instance : snapshot.value().instances) {
             const std::string endpoint = EndpointOf(instance);
-            endpoints.push_back(bbt::infra::RpcAddress{"http", endpoint});
+            endpoints.push_back(endpoint);
             endpoint_names.push_back(endpoint);
         }
 

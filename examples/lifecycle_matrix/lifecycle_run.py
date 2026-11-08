@@ -5,9 +5,10 @@
   lifecycle_run.py --bin <lifecycle_fixture> [--results <json>]
 
 职责（R3–R5 的真实运行证据，全部为真实公开入口 + 自有进程 + 动态 loopback）：
-  1. spawn 自有 fixture 进程（真实公开 CoApp + real infra HTTP loopback +
-     正式 ProtoWireV1 body profile），就绪以 port 文件为准；
-  2. 经 getvalue 切片的 Python 标准库 wire codec（getvalue_client.py）打真实 POST /rpc；
+  1. spawn 自有 fixture 进程（真实公开 CoApp + real infra V2 会话），
+     就绪以 port 文件为准；
+  2. 经唯一 V2 codec（tests/rpc_v2_wire.py）打真实 Call；业务 payload 复用
+     getvalue 切片的位置参数 codec；
   3. 场景：
      - S3 并发挂起两项，放行后上下文/协程不串（req_id/co_id 跨挂起一致）；
      - S3 客户端读超时后 work 仍物理在途占容量（新请求精确 Overloaded）；
@@ -17,8 +18,9 @@
      - R5 外部 supervisor 硬杀只留「未完成」证据、不称优雅完成。
   4. 收尾：stdin 触发关闭、有限等待；异常路径回收自有进程。
 
-wire 编解码复用 examples/getvalue/getvalue_client.py（唯一手写 proto3 codec），
-不另造第二套 schema/codec。全部结构化结果带 auth_state=unauthenticated_loopback。
+会话/分帧/握手/错误信封复用 tests/rpc_v2_wire.py，业务 payload 复用
+examples/getvalue/getvalue_client.py——不另造第二套 schema/codec。全部结构化
+结果带 auth_state=unauthenticated_loopback。
 """
 
 import argparse
@@ -35,22 +37,25 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(HERE, "..", "getvalue"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tests"))
 try:
+    import rpc_v2_wire as v2
     import getvalue_client as gvc
 except Exception as exc:  # noqa: BLE001
-    print(f"driver: cannot import #4 wire codec "
-          f"(examples/getvalue/getvalue_client.py): {exc}", file=sys.stderr)
+    print(f"driver: cannot import V2 codec (tests/rpc_v2_wire.py) or "
+          f"business codec (examples/getvalue/getvalue_client.py): {exc}",
+          file=sys.stderr)
     sys.exit(9)
 
 AUTH_STATE = "unauthenticated_loopback"
 SERVICE = "bbt.example.v1.LifecycleGateService"
 REQUEST_SCHEMA = "bbt.example.v1.GetValueRequest"
 RESPONSE_SCHEMA = "bbt.example.v1.GetValueResponse"
-RPC_PATH = "/rpc"
-CONTENT_TYPE = "application/x-protobuf"
+# 会话身份：驱动器客户端与 fixture 互异（V2 拒绝 self-connection）。
+IDENTITY = "lifecycle-driver"
 
-# RpcErrorCode（infra rpc_envelope.proto enum）
-OVERLOADED = 7
+# RpcErrorCode（session_frame.proto enum，与 infra ErrorCode 同序）
+OVERLOADED = v2.ERR_OVERLOADED
 
 RESULTS = {}
 _FAILURES = []
@@ -116,67 +121,50 @@ def event_index(entries, sign, occurrence=1):
     return -1
 
 
-# ── HTTP over raw socket（复用 getvalue wire codec；可控制超时/延迟读取）───────────
+# ── V2 over raw socket（复用唯一 codec；可控制超时/延迟读取）───────────
 
-def enc_hold(request_id, key="hold", method="Hold", budget_ms=30000):
-    return gvc.enc_envelope(
-        request_id=request_id, service=SERVICE, method=method,
-        budget_ms=budget_ms, request_schema=REQUEST_SCHEMA,
-        response_schema=RESPONSE_SCHEMA,
-        payload=gvc.enc_get_value_request(key))
+def open_and_send(port, *, request_id, key="hold", method="Hold",
+                  budget_ms=30000, timeout=10, identity=None):
+    """连接 + Hello/HelloAck 握手 + 发一帧 CALL；返回 (socket, FrameStream)。
 
-
-def open_and_send(port, body, timeout):
+    调用方自行控制读取时机/超时——这是「客户端读超时但 work 仍物理在途」
+    与「迟到回复」两组断言的构造基础。identity 默认是本驱动器的身份；需要
+    同时保持多条活跃会话时，每条会话必须用互异 identity（V2 同一 peer
+    identity 只保留一条活跃 link，重复 link 按 fencing 规则退役）。
+    """
+    ident = identity or IDENTITY
     s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-    req = (f"POST {RPC_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-           f"Content-Type: {CONTENT_TYPE}\r\nContent-Length: {len(body)}\r\n"
-           f"Connection: close\r\n\r\n").encode()
-    s.sendall(req + body)
-    return s
-
-
-def read_full_http(s):
-    """读完整 HTTP/1.1 响应（按 Content-Length）；返回 (status, body)。"""
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    if b"\r\n\r\n" not in data:
-        raise RuntimeError(f"no http headers: {data[:80]!r}")
-    head, _, rest = data.partition(b"\r\n\r\n")
-    status = int(head.split(b" ", 2)[1])
-    clen = None
-    for line in head.split(b"\r\n")[1:]:
-        if line.lower().startswith(b"content-length:"):
-            clen = int(line.split(b":", 1)[1].strip())
-    if clen is None:
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            rest += chunk
-        body = rest
-    else:
-        while len(rest) < clen:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            rest += chunk
-        body = rest[:clen]
-    return status, body
+    s.settimeout(timeout)
+    stream = v2.FrameStream(s)
+    epoch = v2.client_handshake(stream, ident, int(time.time() * 1000),
+                                v2.nonce_for(ident))
+    stream.send({
+        "kind": v2.KIND_CALL,
+        "traffic": v2.TRAFFIC_SERVICE,
+        "session_epoch": epoch,
+        "request_id": request_id,
+        "service": SERVICE,
+        "method": method,
+        "reply": v2.REPLY_REQUIRED,
+        "remaining_budget_ms": budget_ms,
+        "request_schema": REQUEST_SCHEMA,
+        "response_schema": RESPONSE_SCHEMA,
+        "payload": gvc.enc_get_value_request(key),
+        "metadata": [],
+    })
+    return s, stream
 
 
 def rpc_call(port, request_id, method="Fast", key="k", budget_ms=30000,
              timeout=10):
-    """单次同步调用 → (status, decoded envelope)。"""
-    s = open_and_send(port, enc_hold(request_id, key, method, budget_ms), timeout)
+    """单次同步调用 → 响应帧。"""
+    s, stream = open_and_send(port, request_id=request_id, key=key,
+                              method=method, budget_ms=budget_ms,
+                              timeout=timeout)
     try:
-        st, body = read_full_http(s)
+        return stream.read()
     finally:
         s.close()
-    return st, gvc.dec_envelope(body)
 
 
 def wait_port(path, proc, timeout):
@@ -307,17 +295,19 @@ def scenario_r3_r4(fx):
                    if e.get("event") == "handler_entered"}
         return {"r3-a", "r3-b"} <= entered
 
-    s_a = open_and_send(fx.port, enc_hold("r3-a", "hold"), timeout=60)
-    s_b = open_and_send(fx.port, enc_hold("r3-b", "hold"), timeout=60)
+    s_a, f_a = open_and_send(fx.port, request_id="r3-a", key="hold",
+                             timeout=60, identity=IDENTITY + "-r3a")
+    s_b, f_b = open_and_send(fx.port, request_id="r3-b", key="hold",
+                             timeout=60, identity=IDENTITY + "-r3b")
     es = wait_journal(fx.journal, both_entered, 12, fx.proc)
     check(both_entered(es), "two Hold handlers not both entered", "r3-concurrent")
 
     # 客户端读超时（连接保持打开，不主动断连）：两项都取不到回复。
     read_timeout = {}
-    for name, s in (("r3-a", s_a), ("r3-b", s_b)):
-        s.settimeout(0.8)
+    for name, sock, stream in (("r3-a", s_a, f_a), ("r3-b", s_b, f_b)):
+        sock.settimeout(0.8)
         try:
-            read_full_http(s)
+            stream.read()
             read_timeout[name] = "unexpected-reply"
         except socket.timeout:
             read_timeout[name] = "timeout"
@@ -331,18 +321,19 @@ def scenario_r3_r4(fx):
     held_entries = fx.entries()
     check(not [e for e in held_entries if e.get("event") == "handler_resumed"],
           "a held handler resumed before open (unexpected)", "r4-overloaded")
-    st, env = rpc_call(fx.port, "r3-probe", "Fast", "kprobe")
-    code = env.get("error", {}).get("code")
+    env = rpc_call(fx.port, "r3-probe", "Fast", "kprobe")
+    code = (v2.error_of(env) or {}).get("code")
     # proto3 省略 false：错误信封以 error 字段携带 code，success 字段缺省。
     probe_entered = any(e.get("event") == "handler_entered"
                         and e.get("req") == "r3-probe"
                         for e in fx.entries())
-    ok_over = ("error" in env and code == OVERLOADED and not probe_entered)
+    ok_over = (v2.error_of(env) is not None and code == OVERLOADED
+               and not probe_entered)
     check(ok_over, f"expected Overloaded (7) before handler for probe, got "
-                   f"status={st} env={env} probe_entered={probe_entered}",
+                   f"env={env} probe_entered={probe_entered}",
           "r4-overloaded")
     finish("r4-overloaded", ok_over,
-           {"probe_status": st, "probe_error_code": code,
+           {"probe_error_code": code,
             "held_read_timeout": read_timeout})
     finish("r3-read-timeout-still-inflight",
            read_timeout == {"r3-a": "timeout", "r3-b": "timeout"},
@@ -368,18 +359,17 @@ def scenario_r3_r4(fx):
 
     # 迟到回复仍可读出（工作真实完成、未悬空）。
     replies = {}
-    for name, s in (("r3-a", s_a), ("r3-b", s_b)):
-        s.settimeout(10)
+    for name, sock, stream in (("r3-a", s_a, f_a), ("r3-b", s_b, f_b)):
+        sock.settimeout(10)
         try:
-            st, body = read_full_http(s)
-            env = gvc.dec_envelope(body)
-            replies[name] = (st, env.get("success"),
+            env = stream.read()
+            replies[name] = (v2.error_of(env) is None,
                              env.get("request_id"),
                              gvc.dec_get_value_response(env.get("payload", b"")))
         except Exception as exc:  # noqa: BLE001
-            replies[name] = (None, None, None, f"err:{type(exc).__name__}")
+            replies[name] = (None, None, f"err:{type(exc).__name__}")
     for name in ("r3-a", "r3-b"):
-        st, succ, rid, gv = replies[name]
+        succ, rid, gv = replies[name]
         check(succ is True and rid == name and gv == (True, f"held:{name}"),
               f"late reply for {name} wrong: {replies[name]}", "r3-concurrent")
     finish("r3-concurrent",
@@ -387,8 +377,8 @@ def scenario_r3_r4(fx):
            {"resumed": [{k: e.get(k) for k in ("req", "ctx_id", "same_ctx",
                                                "same_co", "status")}
                         for e in resumed],
-            "late_replies": {k: {"status": v[0], "success": v[1],
-                                 "request_id": v[2], "payload": str(v[3])}
+            "late_replies": {k: {"success": v[0], "request_id": v[1],
+                                 "payload": str(v[2])}
                              for k, v in replies.items()}})
     for s in (s_a, s_b):
         try:
@@ -397,8 +387,8 @@ def scenario_r3_r4(fx):
             pass
 
     # 容量释放后可继续接纳（非原调用 retry 的独立探测）。
-    st, env = rpc_call(fx.port, "r3-recover", "Fast", "krecover")
-    ok = (env.get("success") is True
+    env = rpc_call(fx.port, "r3-recover", "Fast", "krecover")
+    ok = (v2.error_of(env) is None
           and gvc.dec_get_value_response(env.get("payload", b"")) ==
           (True, "fast:krecover"))
     check(ok, f"recovery probe failed: {env}", "r4-recovered")
@@ -406,30 +396,33 @@ def scenario_r3_r4(fx):
 
 
 def scenario_r4_byte_limit(fx):
-    """R4 字节上限维度：超过 NetworkLimits.max_body_bytes 的请求被拒（功能检查）。
+    """R4 字节上限维度：超过 NetworkLimits.max_body_bytes 的帧被拒（功能检查）。
 
-    新栈（bbt::infra::http::Server）对 body_limit 超限的契约是「协议拒绝或
-    断开」二选一的可观察拒绝——实测为不回复直接断连（上游
-    docs/rpc-net.md 边界：旧栈 413 应答与断开同属合法拒绝形态）。本场景断言
-    「请求被真实拒绝（413 或预期断连：EOF/reset）且未触达 handler、服务器
-    健康」；读超时或任何非预期异常一律判失败，不放宽为「被拒」。"""
-    big_key = "x" * 8000   # 信封 body 远超 max_body_bytes=4096
-    status = None
+    V2 的 frame 前缀上限 = limits.max_body_bytes：超限帧在解码边界被拒。非法
+    帧的拒绝形态是 SESSION_ERROR(ProtocolError) 帧、随后 link 退役；若退役先
+    于读端完成，读端也可能直接看到 EOF/reset。两者都算真实拒绝，但读超时或
+    任何非预期异常一律判失败，不放宽为「被拒」。本场景断言「请求被真实拒绝
+    且未触达 handler、服务器健康」。"""
+    big_key = "x" * 8000   # 帧 body 远超 max_body_bytes=4096
     outcome = None
     rejected = None
+    sock = None
     try:
-        s = open_and_send(fx.port, enc_hold("r4-big", big_key, "Fast"),
-                          timeout=5)
+        sock, stream = open_and_send(fx.port, request_id="r4-big", key=big_key,
+                                     method="Fast", timeout=5)
         try:
-            status, body = read_full_http(s)
-            env = gvc.dec_envelope(body)
-            outcome = {"status": status, "success": env.get("success"),
-                       "error_code": env.get("error", {}).get("code")}
-            # 只有 413 是协议级拒绝应答；其它任何 HTTP 响应（含 200）都不算
-            # 「超限被拒」——进入正常路径即漏检。
-            rejected = (status == 413)
+            env = stream.read()
+            err = v2.error_of(env)
+            outcome = {"reply": True,
+                       "kind": v2.KIND_NAMES.get(env.get("kind")),
+                       "error": err}
+            # V2 在解码边界拒绝超限帧：先尽力回一帧
+            # SESSION_ERROR(ProtocolError)，随后退役 link。该帧本身即真实
+            # 拒绝证据；其它回复（如正常 RESPONSE）才是漏检。
+            rejected = (env.get("kind") == v2.KIND_SESSION_ERROR
+                        and (err or {}).get("code") == v2.ERR_PROTOCOL_ERROR)
         finally:
-            s.close()
+            sock.close()
     except (socket.timeout, TimeoutError) as exc:
         # 读超时不是拒绝证据：服务端可能挂起或在途，必须判失败。
         outcome = {"status": None, "exception": type(exc).__name__}
@@ -439,17 +432,18 @@ def scenario_r4_byte_limit(fx):
         # 预期断连形态：服务端不回复直接断开连接。
         outcome = {"status": None, "exception": type(exc).__name__}
         rejected = True
-    except RuntimeError as exc:
-        # read_full_http 的「未收齐 HTTP 头即 EOF」＝ 服务端无应答断连；
-        # 只接受这一种 RuntimeError，其余（含脚本自身缺陷）判失败。
-        outcome = {"status": None, "exception": type(exc).__name__}
-        rejected = "no http headers" in str(exc)
+    except v2.ProtocolRejected as exc:
+        # 超限帧被拒后对端退役 link：读端看到 EOF（无回复）即预期拒绝。
+        outcome = {"status": None, "exception": type(exc).__name__,
+                   "detail": str(exc)}
+        rejected = "peer closed" in str(exc)
     except Exception as exc:  # noqa: BLE001
         outcome = {"status": None, "exception": type(exc).__name__}
         rejected = False
     check(rejected is True,
-          f"oversized body was not rejected (413 or expected EOF/reset): "
-          f"{outcome}", "r4-byte-limit")
+          f"oversized frame was not rejected (expected SESSION_ERROR/"
+          f"ProtocolError or EOF/reset): {outcome}",
+          "r4-byte-limit")
     # 超大请求未触达 handler 的独立证据：journal 没有 r4-big 的进入记录。
     big_entered = any(e.get("event") == "handler_entered"
                       and e.get("req") == "r4-big" for e in fx.entries())
@@ -457,21 +451,21 @@ def scenario_r4_byte_limit(fx):
           "oversized request reached handler (r4-big handler_entered)",
           "r4-byte-limit")
     # 服务器仍健康：正常请求成功。
-    st, env = rpc_call(fx.port, "r4-after", "Fast", "kafter")
-    healthy = (env.get("success") is True)
+    env = rpc_call(fx.port, "r4-after", "Fast", "kafter")
+    healthy = (v2.error_of(env) is None)
     check(healthy, f"server unhealthy after oversized request: {env}",
           "r4-byte-limit")
     finish("r4-byte-limit", bool(rejected) and not big_entered and healthy,
-           {"max_body_bytes": 4096, "oversized_body_bytes":
-            len(enc_hold("r4-big", big_key, "Fast")), "outcome": outcome,
+           {"max_body_bytes": 4096, "oversized_key_bytes": len(big_key),
+            "outcome": outcome,
             "reached_handler": big_entered,
             "server_healthy_after": healthy})
 
 
 def scenario_r5_graceful(fx):
     """R5 正常：拒新 → drain → 同步 Close → release；无未完成项。"""
-    st, env = rpc_call(fx.port, "r5-grace", "Fast", "kg")
-    check(env.get("success") is True, f"pre-shutdown request failed: {env}",
+    env = rpc_call(fx.port, "r5-grace", "Fast", "kg")
+    check(v2.error_of(env) is None, f"pre-shutdown request failed: {env}",
           "r5-graceful")
     fx.cmd("shutdown")
     fx.quit()
@@ -507,7 +501,8 @@ def scenario_r5_shutdown_incomplete(binpath, workdir):
     fx = Fixture(binpath, workdir, "b-incomplete", 4, 300)
     try:
         fx.start(20)
-        s = open_and_send(fx.port, enc_hold("s5-held", "hold"), timeout=60)
+        s, f_stream = open_and_send(fx.port, request_id="s5-held", key="hold",
+                                    timeout=60)
         es = wait_journal(
             fx.journal,
             lambda es: any(e.get("event") == "handler_entered"
@@ -547,10 +542,26 @@ def scenario_r5_shutdown_incomplete(binpath, workdir):
             refused = "connected"
             try:
                 c.settimeout(1.5)
-                c.sendall(b"POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                          b"Content-Length: 0\r\nConnection: close\r\n\r\n")
-                c.recv(64)
-                refused = "served"
+                c_stream = v2.FrameStream(c)
+                epoch = v2.client_handshake(c_stream, IDENTITY + "-refuse",
+                                            int(time.time() * 1000),
+                                            v2.nonce_for(IDENTITY + "-refuse"))
+                c_stream.send({
+                    "kind": v2.KIND_CALL,
+                    "traffic": v2.TRAFFIC_SERVICE,
+                    "session_epoch": epoch,
+                    "request_id": "r5-refuse",
+                    "service": SERVICE,
+                    "method": "Fast",
+                    "reply": v2.REPLY_REQUIRED,
+                    "remaining_budget_ms": 30000,
+                    "request_schema": REQUEST_SCHEMA,
+                    "response_schema": RESPONSE_SCHEMA,
+                    "payload": gvc.enc_get_value_request("k"),
+                    "metadata": [],
+                })
+                env = c_stream.read()
+                refused = "served" if v2.error_of(env) is None else "refused-error"
             except Exception as exc:  # noqa: BLE001
                 refused = f"connected-then-{type(exc).__name__}"
             finally:
@@ -594,9 +605,9 @@ def scenario_r5_shutdown_incomplete(binpath, workdir):
         late = None
         try:
             s.settimeout(10)
-            st, body = read_full_http(s)
-            env = gvc.dec_envelope(body)
-            late = {"delivered": True, "success": env.get("success"),
+            env = f_stream.read()
+            late = {"delivered": True,
+                    "success": v2.error_of(env) is None,
                     "request_id": env.get("request_id")}
         except Exception as exc:  # noqa: BLE001
             late = {"delivered": False, "exception": type(exc).__name__}
@@ -624,7 +635,8 @@ def scenario_r5_hard_kill(binpath, workdir):
     fx = Fixture(binpath, workdir, "c-hardkill", 4, 3000)
     try:
         fx.start(20)
-        s = open_and_send(fx.port, enc_hold("s5-kill", "hold"), timeout=60)
+        s, _ = open_and_send(fx.port, request_id="s5-kill", key="hold",
+                             timeout=60)
         es = wait_journal(
             fx.journal,
             lambda es: any(e.get("event") == "handler_entered"

@@ -2,7 +2,7 @@
 // CoApp 测试缝（机器面，internal/）。
 //
 // 业务路径只用 CoApp(CoAppOptions)——宿主与出站由框架默认装配
-// （InfraHttpHost + RpcHttpBridge + HttpEgress）。本头暴露的注入点
+// （InfraHttpHost + RpcBridge + RpcEgress）。本头暴露的注入点
 // 给框架自身测试用：替换网络宿主（INetworkHost 桩）或出站发送
 // （逻辑 endpoint → 对端真实地址的解析），业务侧不出现这些参数。
 //
@@ -11,8 +11,11 @@
 
 #include <functional>
 #include <memory>
+#include <string_view>
 
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
 #include <bbt/framework/Result.hpp>
 
@@ -24,10 +27,10 @@ struct CoAppOptions;
 
 // 应用级出站发送注入点（测试缝）：经路由门解析出的目标地址 +
 // 完整 envelope + 已适配的 infra::CallOptions → 回复 envelope。
-// 业务路径由框架默认 HttpEgress 供给，不暴露本类型。
-using RpcSendAppFn = std::function<result<bbt::infra::RpcEnvelope>(
-    const bbt::infra::RpcAddress&,
-    const bbt::infra::RpcEnvelope&,
+// 业务路径由框架默认 RpcEgress 供给，不暴露本类型。
+using RpcSendAppFn = std::function<result<bbt::infra::rpc::Response>(
+    std::string_view,
+    const bbt::infra::rpc::Request&,
     const bbt::infra::CallOptions&)>;
 
 // CoApp 测试缝：显式注入网络宿主与出站发送。host 为空 → run 校验
@@ -47,9 +50,8 @@ std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
 // InboundDispatcher 与 RequestScope 的真实分发链路，不绕过 Dispatcher）。
 // 业务路径不直接调用 dispatch_inbound；本入口仅框架测试用于断言
 // envelope→Dispatcher→handler→资源缝→reply 全链，不新增业务可见面。
-result<bbt::infra::RpcEnvelope> DispatchInboundForTest(
+result<bbt::infra::rpc::Response> DispatchInboundForTest(
     CoApp& app,
-    const bbt::infra::IncomingCallContext& incoming,
-    bbt::infra::RpcEnvelope request);
+    const bbt::infra::rpc::Request& request);
 
 } // namespace bbt::framework

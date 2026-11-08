@@ -2,7 +2,7 @@
 // 有序入口接收侧（机器面，internal/）：授权流校验 + 每流序号状态机
 // + 去重终态缓存。
 //
-// 本组件只做接收侧语义核，不做入站接线：从 RpcEnvelope 顶层字段与 fw.*
+// 本组件只做接收侧语义核，不做入站接线：从 rpc::Request 顶层字段与 fw.*
 // 系统元数据提取「有序请求事实」是入站适配器（InboundDispatcher）的职责，
 // 因此本组件不持有传输类型，只消费调用方给出的事实，不伪造字段来源。
 //
@@ -72,7 +72,7 @@ struct OrderedIngressRequest {
     std::string   producer_epoch;
     std::string   receiver_epoch;
     std::uint64_t sequence = 0;
-    std::string   request_id;             // RpcEnvelope 顶层字段，不写 metadata
+    std::string request_id;               // rpc::Request 顶层字段，不写 metadata
     std::string   request_digest;         // 请求摘要（内容一致性判定）
 };
 

@@ -153,16 +153,11 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/ActorRegistry.hpp
     internal/OrderedIngress.hpp
     internal/Registry.hpp
-    internal/RpcHttpBridge.hpp
+    internal/RpcBridge.hpp
     internal/CoAppSeam.hpp
     internal/ResourceClose.hpp
     internal/ObjectBase.hpp
     internal/ServiceBase.hpp)
-# Issue #4：正式 wire 桥头只在 protobuf 前缀锁定（infra 注册 bbt_infra_rpc_net）时
-# 进入自给自检；未配置时该头不参与（其 include 的上游头不可得）。
-if(TARGET bbt_infra_rpc_net)
-    list(APPEND BBT_FRAMEWORK_INTERNAL_HEADERS internal/RpcWireBridge.hpp)
-endif()
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")
 set(_selfcheck_srcs "")

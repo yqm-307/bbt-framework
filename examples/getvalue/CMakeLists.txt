@@ -1,9 +1,9 @@
 # GetValue 业务切片。
 #
 # - 业务 .proto 是唯一 schema 真源；protoc 生成到构建目录（不进仓库）；
-# - C++ server 经公开 CoApp/CoService + 正式 body wire bridge 装配；
-# - Python 标准库客户端做真实跨进程验收（手写 proto3 wire 编解码，无
-#   google.protobuf runtime）。
+# - C++ server 经公开 CoApp/CoService + 真实 V2 会话装配；
+# - Python 标准库客户端做真实跨进程验收（手写 proto3 业务编解码，会话复用
+#   tests/rpc_v2_wire.py，无 google.protobuf runtime）。
 #
 # protoc/runtime 来自 infra 锁定的 3.21.12 前缀（BBT_PROTOBUF_PREFIX）。
 

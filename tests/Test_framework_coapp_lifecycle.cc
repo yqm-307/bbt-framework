@@ -259,7 +259,9 @@ fw::CoAppOptions AppOpts(std::vector<fw::StaticRoute> routes = {}) {
             /*incoming_timeout*/ std::chrono::milliseconds{30000}},
         bbt::infra::ListenAddress{"127.0.0.1", 0},
         std::move(routes),
-        /*shutdown_step_budget*/ std::chrono::milliseconds{2000}};
+        /*shutdown_step_budget*/ std::chrono::milliseconds{2000},
+        // V2 会话身份必填；每个 owner 使用明确且互异身份。
+        /*local_identity*/ std::string{"coapp-lifecycle-test"}};
 }
 
 // 测试缝构造：宿主桩 + 无出站发送（受管出站如实 RuntimeUnavailable）。
@@ -723,9 +725,7 @@ BOOST_AUTO_TEST_CASE(invalid_options_fail_before_any_startup) {
 // 拒绝发生在任何网络动作之前（桩计数 0）。
 BOOST_AUTO_TEST_CASE(unconfigured_route_target_rejected) {
     auto host = std::make_shared<StubNetHost>();
-    fw::CoAppOptions opts = AppOpts({
-        fw::StaticRoute{"svc.allowed",
-                        bbt::infra::RpcAddress{"tcp", "127.0.0.1:9001"}}});
+    fw::CoAppOptions opts = AppOpts({fw::StaticRoute{"svc.allowed", "127.0.0.1:9001"}});
     auto app = MakeApp(opts, host);
 
     auto bad = app->find_route("svc.unknown");
@@ -735,8 +735,7 @@ BOOST_AUTO_TEST_CASE(unconfigured_route_target_rejected) {
 
     auto good = app->find_route("svc.allowed");
     BOOST_REQUIRE(good);
-    BOOST_TEST(good.value().transport == "tcp");
-    BOOST_TEST(good.value().endpoint == "127.0.0.1:9001");
+    BOOST_TEST(good.value() == "127.0.0.1:9001");
 
     // 拒绝发生在网络组件启动之前：桩一次都未被调用。
     BOOST_TEST(host->TotalCalls() == std::size_t{0});

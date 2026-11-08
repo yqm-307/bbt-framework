@@ -28,7 +28,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <bbt/infra/NetworkTypes.hpp>
 
 #include <bbt/framework/Result.hpp>
 
@@ -38,7 +37,7 @@ namespace bbt::framework {
 struct DynamicRouteSnapshot {
     std::uint64_t revision{0};   ///< 注册中心 revision；不跨 provider 比较
     std::chrono::steady_clock::time_point observed_at{};
-    std::vector<bbt::infra::RpcAddress> endpoints;
+    std::vector<std::string> endpoints;
 };
 
 /**
@@ -69,7 +68,7 @@ public:
      */
     result<void> Replace(std::string service,
                          std::uint64_t revision,
-                         std::vector<bbt::infra::RpcAddress> endpoints);
+                         std::vector<std::string> endpoints);
 
     /**
      * @brief 解析一次出站目标（round-robin）。
@@ -77,7 +76,7 @@ public:
      * @return 未配置过该服务或集合为空 → NotFound；显式 MarkUnavailable 或
      *         超过 stale_limit 未刷新 → RuntimeUnavailable。
      */
-    result<bbt::infra::RpcAddress> Resolve(std::string_view service) const;
+    result<std::string> Resolve(std::string_view service) const;
 
     /// @brief 标记该服务视图不可用（保留已配置事实），Resolve 立即失败。
     void MarkUnavailable(std::string_view service) noexcept;

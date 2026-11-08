@@ -1,10 +1,10 @@
 # examples/lifecycle_matrix — 容量 / 并发上下文 / 关闭生命周期验收。
 #
-# 一个自有 fixture 进程：公开 CoApp + 真实 infra HTTP loopback 宿主 + 正式
-# ProtoWireV1 body profile，注册公开 CoService<T>（lifecycle::LifecycleGateService，
+# 一个自有 fixture 进程：公开 CoApp + 真实 infra V2 会话宿主，注册公开
+# CoService<T>（lifecycle::LifecycleGateService，
 # 复用 examples/getvalue 的 getvalue_proto 与 ProtoCodec 特化——不另造第二套
-# 外部 Python 驱动器用 getvalue 切片的手写 proto3 wire codec（getvalue_client.py）
-# 打真实 POST /rpc，覆盖并发挂起/上下文不串/容量 Overloaded/字节上限/drain/
+# 外部 Python 驱动器用唯一 V2 codec（tests/rpc_v2_wire.py）打真实 Call，
+# 覆盖并发挂起/上下文不串/容量 Overloaded/字节上限/drain/
 # ShutdownIncomplete/外部硬杀 journal。
 #
 # 本目录只在 examples/ 入口被加入时构建（根 CMakeLists：NEED_TEST=ON 且

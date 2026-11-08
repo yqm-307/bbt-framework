@@ -68,10 +68,10 @@ cmake/                 CMake 模块
 // reader 只有一个，不能在这里等写终态——写背压会把后续 Response/System
 // 帧一起堵住。所以这里只入队错误帧，写责任仍由 WriterLoop/Kill 结算。
 
-// 好：多阶段关闭画出来（复杂机制允许少量字符画）
-//   Close(deadline)
-//     ├─ Seal：拒新 Call/Send，在途 link RequestClose
-//     └─ WaitStopped：listener/worker/conn 全部真实回收才算收口
+// 好：区分关闭请求和物理回收（复杂机制允许少量字符画）
+//   rpc::CoRpcServer::Shutdown()
+//     ├─ 立即拒新并强制关闭会话，不等待业务或物理释放
+//     └─ Engine 继续驱动；物理回收由宿主最终收口确认
 ```
 
 - 断言/异常消息示例：`static_assert(..., "ManagerBase: automatic key requires TKey == CoObjectId")`、`throw std::invalid_argument("ManagerBase: creator returned an empty owner")`。

@@ -4,8 +4,8 @@
 由 ctest 调用：
   rpc_policy_run.py --bin <rpc_policy> --results <json>
 
-每场景独立 spawn 一个 fixture 子进程（一 CoApp 一策略），经 getvalue 切片的 Python 标准
-库 wire codec 真实 HTTP POST /rpc 打 caller 服务，读 fixture journal 断言：
+每场景独立 spawn 一个 fixture 子进程（一 CoApp 一策略），经唯一 V2 codec
+（tests/rpc_v2_wire.py）真实 Call 打 caller 服务，读 fixture journal 断言：
 
   1. allow     —— 策略放行：调用成功、Preflight 恰一次、callee handler 恰一次；
   2. reject    —— 策略拒绝（Cancelled）：调用报错、Preflight 一次、callee 零 hit
@@ -25,8 +25,9 @@ ECONNREFUSED，与框架是否关闭 listener 无关，那种断言恒真、不�
 （result=error）判失败。该探针只证明「存活期 listener 已关」，不证明关闭期零额外
 I/O。
 
-wire 编解码复用 examples/getvalue/getvalue_client.py（唯一手写 proto3 codec）。
-所有结构化结果标注 auth_state=unauthenticated_loopback。
+会话/分帧/握手/错误信封复用 tests/rpc_v2_wire.py；业务 payload 复用
+examples/getvalue/getvalue_client.py。所有结构化结果标注
+auth_state=unauthenticated_loopback。
 """
 
 import argparse
@@ -43,10 +44,12 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(HERE, "..", "getvalue"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tests"))
 try:
+    import rpc_v2_wire as v2
     import getvalue_client as gvc
 except Exception as exc:  # noqa: BLE001
-    print(f"driver: cannot import #4 wire codec: {exc}", file=sys.stderr)
+    print(f"driver: cannot import V2/business codec: {exc}", file=sys.stderr)
     sys.exit(9)
 
 AUTH_STATE = "unauthenticated_loopback"
@@ -54,10 +57,13 @@ CALLER_SERVICE = "bbt.example.v1.PolicyCaller"
 REQUEST_SCHEMA = "bbt.example.v1.GetValueRequest"
 RESPONSE_SCHEMA = "bbt.example.v1.GetValueResponse"
 
-# RpcErrorCode（infra rpc_envelope.proto enum）
-CANCELLED = 5
-TIMED_OUT = 6
-NOT_FOUND = 11
+# 会话身份：驱动器客户端与 fixture 互异（V2 拒绝 self-connection）。
+IDENTITY = "rpc-policy-driver"
+
+# RpcErrorCode（session_frame.proto enum，与 infra ErrorCode 同序）
+CANCELLED = v2.ERR_CANCELLED
+TIMED_OUT = v2.ERR_TIMED_OUT
+NOT_FOUND = v2.ERR_NOT_FOUND
 
 DECLARED_BUDGET_MS = 3000
 MAX_BUDGET_MS = 30000
@@ -80,19 +86,21 @@ def finish(scenario, ok):
     print(f"{'PASS' if ok else 'FAIL'} scenario={scenario} auth_state={AUTH_STATE}")
 
 
-def call(port, request_id, method, key="alpha", budget_ms=DECLARED_BUDGET_MS):
-    payload = gvc.enc_get_value_request(key)
-    body = gvc.enc_envelope(
-        request_id=request_id,
-        service=CALLER_SERVICE,
-        method=method,
-        budget_ms=budget_ms,
-        request_schema=REQUEST_SCHEMA,
-        response_schema=RESPONSE_SCHEMA,
-        payload=payload,
-    )
-    status, _ctype, data = gvc.post_raw(port, body)
-    return status, gvc.dec_envelope(data)
+def call(port, request_id, method, key="alpha", budget_ms=DECLARED_BUDGET_MS,
+         timeout=10):
+    """一次真实 V2 Call；返回响应帧。"""
+    client = v2.V2Client(port, identity=IDENTITY, timeout=timeout)
+    try:
+        client.handshake()
+        return client.call(
+            CALLER_SERVICE, method,
+            payload=gvc.enc_get_value_request(key),
+            request_id=request_id,
+            request_schema=REQUEST_SCHEMA,
+            response_schema=RESPONSE_SCHEMA,
+            budget_ms=budget_ms)
+    finally:
+        client.close()
 
 
 def read_journal(path):
@@ -301,17 +309,14 @@ def main():
     try:
         # 1) allow：放行、Preflight 恰一次、callee 恰一次。
         def a_allow(port, resp, entries):
-            st, env = resp[0]
-            rem = env.get("remaining_budget_ms", 0)
+            env = resp[0]
             cd = callee_deadline_ms(entries)
             ok = (
-                st == 200
-                and env.get("success") is True
+                v2.error_of(env) is None
                 and env.get("request_id") == "rp-allow"
                 and env.get("response_schema") == RESPONSE_SCHEMA
                 and gvc.dec_get_value_response(env.get("payload", b""))
                 == (True, "alpha")
-                and 1 <= rem <= MAX_BUDGET_MS
                 and cd is not None
                 and 1 <= cd <= MAX_BUDGET_MS
                 and preflight_names(entries) == ["allow"]
@@ -319,13 +324,12 @@ def main():
             )
             check(
                 ok,
-                f"st={st} rem={rem} callee_deadline={cd} "
+                f"callee_deadline={cd} "
                 f"pre={preflight_names(entries)} "
                 f"hits={len(callee_hits(entries))}",
                 "allow",
             )
             RESULTS["allow"] = {
-                "remaining_budget_ms": rem,
                 "callee_deadline_ms": cd,
                 "auth_state": AUTH_STATE,
             }
@@ -342,11 +346,11 @@ def main():
 
         # 2) reject：拒绝、Preflight 一次、callee 零 hit（零 I/O）。
         def a_reject(port, resp, entries):
-            st, env = resp[0]
-            code = env.get("error", {}).get("code")
-            msg = env.get("error", {}).get("message", "")
+            env = resp[0]
+            code = (v2.error_of(env) or {}).get("code")
+            msg = (v2.error_of(env) or {}).get("message", "")
             ok = (
-                env.get("success") is not True
+                v2.error_of(env) is not None
                 and code == CANCELLED
                 and "rejected" in msg
                 and preflight_names(entries) == ["reject"]
@@ -354,7 +358,7 @@ def main():
             )
             check(
                 ok,
-                f"st={st} env={env} pre={preflight_names(entries)} "
+                f"env={env} pre={preflight_names(entries)} "
                 f"hits={len(callee_hits(entries))}",
                 "reject",
             )
@@ -376,10 +380,10 @@ def main():
 
         # 3) tighten：只缩不放，callee 观测可见期限 ≤ 收紧值且 < 原预算。
         def a_tighten(port, resp, entries):
-            st, env = resp[0]
+            env = resp[0]
             cd = callee_deadline_ms(entries)
             ok = (
-                env.get("success") is True
+                v2.error_of(env) is None
                 and cd is not None
                 and 0 < cd <= TIGHTEN_MS + 50
                 and cd < DECLARED_BUDGET_MS
@@ -388,7 +392,7 @@ def main():
             )
             check(
                 ok,
-                f"st={st} callee_deadline={cd} (tighten={TIGHTEN_MS}) "
+                f"callee_deadline={cd} (tighten={TIGHTEN_MS}) "
                 f"hits={len(callee_hits(entries))}",
                 "tighten",
             )
@@ -411,10 +415,10 @@ def main():
 
         # 4) widen：策略放大被忽略；callee 观测期限仍≈原预算而非放大值/上限。
         def a_widen(port, resp, entries):
-            st, env = resp[0]
+            env = resp[0]
             cd = callee_deadline_ms(entries)
             ok = (
-                env.get("success") is True
+                v2.error_of(env) is None
                 and cd is not None
                 and DECLARED_BUDGET_MS - 300 <= cd <= DECLARED_BUDGET_MS
                 and preflight_names(entries) == ["widen"]
@@ -422,7 +426,7 @@ def main():
             )
             check(
                 ok,
-                f"st={st} callee_deadline={cd} "
+                f"callee_deadline={cd} "
                 f"(amplification would give ~{MAX_BUDGET_MS})",
                 "widen",
             )
@@ -444,15 +448,15 @@ def main():
 
         # 5) expired：收紧到已过期 → 调用方 I/O 前 TimedOut、callee 零 hit。
         def a_expired(port, resp, entries):
-            st, env = resp[0]
-            code = env.get("error", {}).get("code")
+            env = resp[0]
+            code = (v2.error_of(env) or {}).get("code")
             ok = (
-                env.get("success") is not True
+                v2.error_of(env) is not None
                 and code == TIMED_OUT
                 and preflight_names(entries) == ["expired"]
                 and len(callee_hits(entries)) == 0
             )
-            check(ok, f"st={st} env={env}", "expired")
+            check(ok, f"env={env}", "expired")
             finish("expired", ok)
 
         scenario(
@@ -466,13 +470,13 @@ def main():
 
         # 6) decorator：外层包内层，两个虚 Preflight 各一次、顺序 outer→inner。
         def a_decorator(port, resp, entries):
-            st, env = resp[0]
+            env = resp[0]
             ok = (
-                env.get("success") is True
+                v2.error_of(env) is None
                 and preflight_names(entries) == ["outer", "inner"]
                 and len(callee_hits(entries)) == 1
             )
-            check(ok, f"st={st} pre={preflight_names(entries)}", "decorator")
+            check(ok, f"pre={preflight_names(entries)}", "decorator")
             RESULTS["decorator.order"] = preflight_names(entries)
             finish("decorator", ok)
 
@@ -487,15 +491,15 @@ def main():
 
         # 7) 路由先于策略：未配置静态路由 → NotFound、Preflight 计数为 0。
         def a_noroute(port, resp, entries):
-            st, env = resp[0]
-            code = env.get("error", {}).get("code")
+            env = resp[0]
+            code = (v2.error_of(env) or {}).get("code")
             ok = (
-                env.get("success") is not True
+                v2.error_of(env) is not None
                 and code == NOT_FOUND
                 and preflight_names(entries) == []
                 and len(callee_hits(entries)) == 0
             )
-            check(ok, f"st={st} env={env} pre={preflight_names(entries)}", "noroute")
+            check(ok, f"env={env} pre={preflight_names(entries)}", "noroute")
             finish("noroute", ok)
 
         scenario(

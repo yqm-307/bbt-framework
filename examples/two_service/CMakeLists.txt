@@ -2,7 +2,7 @@
 #
 # 一个公开 CoApp 注册两个公开 CoService<T>（getvalue 切片的 GetValueService 与
 # GetValueCallerService），caller 经受保护的 this->call<Req,Resp> 调用 callee；
-# 唯一静态路由指向本进程自己的 loopback 端点，故调用经真实 ProtoWireV1 body
+# 唯一静态路由指向本进程自己的 loopback 端点，故调用经真实 V2 会话
 # 走一次 socket 回到同一宿主。业务 schema/codec 复用 examples/getvalue 的
 # getvalue_proto 与 ProtoCodec 特化，不另造第二套。
 #

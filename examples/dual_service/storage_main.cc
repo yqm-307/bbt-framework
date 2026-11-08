@@ -10,8 +10,8 @@
 // put/get/del 落到真实后端往返，两端地址由命令行显式传入（无可达
 // 后端 → 工厂 Create 失败 → run 拒绝）。Redis 侧只接受数值
 // IPv4/IPv6（net::Address::Ip 不解析主机名，非法地址在装配期如实失败）。
-// 跨进程对端（gateway 经 static_routes 指向本进程）与 driver 都按 HTTP
-// bridge 线格式（x-bbt-* header + 位置参数负载）真实接入。
+// 跨进程对端（gateway 经 static_routes 指向本进程）与 driver 都按 V2 会话
+// （SessionFrame + u32be + Hello/HelloAck）真实接入。
 //
 // 方法表：
 //   put(key, value)   写 Redis SET + Mongo upsert；空 key → InvalidArgument。
@@ -22,7 +22,7 @@
 //                     取自入站上下文——调用方预算到期时如实 TimedOut）。
 //
 // 资源预算：put/get/del 的 Redis/Mongo 出站 deadline 取本请求入站上下文
-// deadline（ProtoWireV1 已按 min(传输硬看门, now+budget) 收敛），不使用无限
+// deadline（V2 入站已按 min(传输硬看门, now+budget) 收敛），不使用无限
 // deadline——调用方预算耗尽时后端调用随之受限，不悬挂在无界等待上。
 //
 // 优雅关闭：SIGINT/SIGTERM → watcher 线程调用 request_shutdown →
@@ -331,9 +331,9 @@ int main(int argc, char** argv) {
         /*max_body_bytes*/  65536,
         /*incoming_timeout*/std::chrono::milliseconds{30000}};
     opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
-    // 正式 body wire（与 examples/getvalue 同口径）：入站预算经 wire 的
-    // remaining_budget_ms 收敛后才对 handler 可见，资源调用据此获得有限预算。
-    opts.inbound_bridge = fw::RpcInboundBridge::ProtoWireV1;
+    // V2 会话：入站预算经 wire 的 remaining_budget_ms 与本地 incoming_timeout
+    // 取 local-min 后才对 handler 可见，资源调用据此获得有限预算。
+    opts.local_identity = "dual-storage";
     opts.static_routes = {};                    // 纯被调方：无出站 RPC 路由
     opts.shutdown_step_budget = std::chrono::milliseconds{2000};
 

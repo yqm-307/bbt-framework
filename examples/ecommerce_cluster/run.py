@@ -4,7 +4,7 @@
 只使用 Python 标准库，不 mock 注册中心、不代替 C++ adapter：
   - 启动本次任务独占的 Consul agent（loopback、动态端口、独立 data-dir/日志）；
   - 以独立进程启动 catalog ×2 → order → gateway，全部动态 loopback 端口；
-  - 用真实 ProtoWireV1 请求打 gateway，按响应里的实例身份断言实际落点；
+  - 用真实 V2 会话请求打 gateway，按响应里的实例身份断言实际落点；
   - 断言：双实例命中、扩容后三实例命中、实例退出/重启后落点自动更新、
     视图无变化时健康超过 5s 仍可用、目标全退时有限失败、注册中心不可用超过
     5s 后显式失败并能恢复；
@@ -30,19 +30,26 @@ import threading
 import time
 import traceback
 
-RPC_PATH = "/rpc"
-CONTENT_TYPE = "application/x-protobuf"
+# 唯一 V2 codec 在 tests/；示例目录用明确相对路径定位，不依赖 cwd。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_TESTS_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "tests"))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+import rpc_v2_wire as v2  # noqa: E402
+
+# 会话身份：驱动器客户端与集群节点互异（V2 拒绝 self-connection）。
+DRIVER_IDENTITY = "ecommerce-driver"
 
 SERVICE = "bbt.example.ecommerce.v1.GatewayService"
 METHOD = "Checkout"
 REQUEST_SCHEMA = "bbt.example.ecommerce.v1.CheckoutRequest"
 RESPONSE_SCHEMA = "bbt.example.ecommerce.v1.CheckoutResponse"
 
-# RpcErrorCode（infra rpc_envelope.proto v1）
-INVALID_ARGUMENT = 1
-RUNTIME_UNAVAILABLE = 3
-TIMED_OUT = 6
-NOT_FOUND = 11
+# RpcErrorCode（session_frame.proto enum，与 infra ErrorCode 同序）
+INVALID_ARGUMENT = v2.ERR_INVALID_ARGUMENT
+RUNTIME_UNAVAILABLE = v2.ERR_RUNTIME_UNAVAILABLE
+TIMED_OUT = v2.ERR_TIMED_OUT
+NOT_FOUND = v2.ERR_NOT_FOUND
 
 WIRE_VARINT = 0
 WIRE_LEN = 2
@@ -140,42 +147,6 @@ def dec_checkout_response(buf):
         elif wire == WIRE_VARINT:
             out[name] = value
     return out
-
-
-def enc_envelope(request_id, budget_ms, payload):
-    out = _f_varint(1, 1)                       # profile_version = 1
-    out += _f_len(2, request_id)
-    out += _f_len(3, SERVICE)
-    out += _f_len(4, METHOD)
-    out += _f_varint(5, budget_ms)
-    out += _f_len(6, REQUEST_SCHEMA)
-    out += _f_len(7, RESPONSE_SCHEMA)
-    out += _f_len(8, payload)
-    return out
-
-
-def dec_error(buf):
-    err = {}
-    for field, wire, value in _parse_fields(buf):
-        if wire == WIRE_VARINT and field == 1:
-            err["code"] = value
-        elif wire == WIRE_LEN and field == 4:
-            err["message"] = value.decode("utf-8", "replace")
-    return err
-
-
-def dec_envelope(buf):
-    env = {"success": False}
-    for field, wire, value in _parse_fields(buf):
-        if wire == WIRE_VARINT and field == 10:
-            env["success"] = bool(value)
-        elif wire == WIRE_LEN and field == 2:
-            env["request_id"] = value.decode("utf-8", "replace")
-        elif wire == WIRE_LEN and field == 8:
-            env["payload"] = bytes(value)
-        elif wire == WIRE_LEN and field == 11:
-            env["error"] = dec_error(value)
-    return env
 
 
 # --- 断言与结果收集 ---------------------------------------------------------
@@ -393,36 +364,32 @@ class Node:
 
 
 def call_gateway(port, request_id, sku=SKU, qty=1, budget_ms=3000, timeout=8.0):
-    payload = enc_checkout_request(sku, qty)
-    body = enc_envelope(request_id, budget_ms, payload)
+    """一次真实 V2 Call：TCP + u32be + Hello/HelloAck + SessionFrame。
+
+    gateway 的实例身份随动态发现变化，故握手不固定 expected_peer；落点由
+    响应里的 gateway_instance 字段断言。
+    """
     started = time.monotonic()
+    client = None
     try:
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-        conn.request("POST", RPC_PATH, body=body,
-                     headers={"Content-Type": CONTENT_TYPE})
-        resp = conn.getresponse()
-        data = resp.read()
-        status = resp.status
-        ctype = resp.getheader("Content-Type")
-        conn.close()
-    except OSError as exc:
+        client = v2.V2Client(port, identity=DRIVER_IDENTITY, timeout=timeout)
+        client.handshake()
+        env = client.call(
+            SERVICE, METHOD, payload=enc_checkout_request(sku, qty),
+            request_id=request_id, request_schema=REQUEST_SCHEMA,
+            response_schema=RESPONSE_SCHEMA, budget_ms=budget_ms)
+    except (OSError, v2.WireError) as exc:
         return {"ok": False, "transport_error": str(exc),
                 "elapsed": time.monotonic() - started}
+    finally:
+        if client is not None:
+            client.close()
     elapsed = time.monotonic() - started
-    try:
-        env = dec_envelope(data)
-    except ValueError as exc:
-        return {"ok": False, "decode_error": str(exc), "status": status,
-                "elapsed": elapsed}
-    result = {"status": status, "content_type": ctype,
-              "elapsed": elapsed, "request_id": env.get("request_id")}
-    if "error" in env:
-        result.update({"ok": False, "error_code": env["error"].get("code", -1),
-                       "error_message": env["error"].get("message", "")})
-        return result
-    if not env.get("success"):
-        result.update({"ok": False, "error_code": -1,
-                       "error_message": "envelope success=false"})
+    result = {"elapsed": elapsed, "request_id": env.get("request_id")}
+    err = v2.error_of(env)
+    if err is not None:
+        result.update({"ok": False, "error_code": err.get("code", -1),
+                       "error_message": err.get("message", "")})
         return result
     result.update(dec_checkout_response(env.get("payload", b"")))
     result["ok"] = True

@@ -227,6 +227,8 @@ cmd_build() {
         -DNEED_TEST=ON \
         -DBBT_INFRA_SOURCE_DIR="$deps_dir/infra-main" \
         -DBBT_COROUTINE_SOURCE_DIR="$deps_dir/coroutine-main" \
+        -DBBT_INFRA_RPC_NET=ON \
+        -DBBT_PROTOBUF_PREFIX="$protobuf_prefix" \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DBBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON \
         >"$work_dir/ds-gate-negative.log" 2>&1

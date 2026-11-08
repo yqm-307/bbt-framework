@@ -132,24 +132,24 @@ class FocusedMapTests(unittest.TestCase):
 
     def test_changed_files_to_expected_regex(self):
         # 前缀是前缀匹配，父子前缀取并集：framework/src/host/ 命中 host 段
-        # 的同时也命中兜底段 framework/src/（rpc_surface/rpc_codec/rpc_profile）。
+        # 的同时也命中兜底段 framework/src/（rpc_surface/rpc_codec/rpc_matrix）。
         cases = {
             ("framework/src/actor/ActorMailbox.cc",):
                 "^framework\\.actor_mailbox$|^framework\\.ordered_egress$|"
-                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_http$|"
-                "^framework\\.rpc_codec$|^framework\\.rpc_profile$|"
+                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_rpc$|"
+                "^framework\\.rpc_codec$|^framework\\.rpc_matrix$|"
                 "^framework\\.rpc_surface$",
             ("framework/src/CoApp.cc",):
-                "^framework\\.rpc_codec$|^framework\\.rpc_profile$|"
+                "^framework\\.rpc_codec$|^framework\\.rpc_matrix$|"
                 "^framework\\.rpc_surface$",
             ("framework/src/host/CoApp.cc",
              "framework/src/actor/ActorMailbox.cc"):
                 "^framework\\.actor_mailbox$|^framework\\.close_gate$|"
                 "^framework\\.coapp_lifecycle$|^framework\\.egress_request_phase$|"
                 "^framework\\.inbound_http$|^framework\\.ordered_egress$|"
-                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_http$|"
+                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_rpc$|"
                 "^framework\\.request_context$|^framework\\.resource_lifecycle$|"
-                "^framework\\.rpc_codec$|^framework\\.rpc_profile$|"
+                "^framework\\.rpc_codec$|^framework\\.rpc_matrix$|"
                 "^framework\\.rpc_surface$|^framework\\.shutdown$",
             ("examples/getvalue/getvalue_server.cc",):
                 "^examples\\.getvalue\\.s2s$|^examples\\.getvalue\\.xlang$|"

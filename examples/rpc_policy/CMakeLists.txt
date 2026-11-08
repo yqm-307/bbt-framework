@@ -1,7 +1,7 @@
 # examples/rpc_policy — 公开出站策略 fixture。
 #
-# 一个公开 CoApp（caller+callee 两服务 + 自环静态路由）经正式 ProtoWireV1 body
-# wire 真实 socket 回环；caller handler 出站经公开策略 CoAppOptions::rpc_policy。
+# 一个公开 CoApp（caller+callee 两服务 + 自环静态路由）经真实 V2 会话
+# socket 回环；caller handler 出站经公开策略 CoAppOptions::rpc_policy。
 # 只用公开面（bbt/framework/CoApp.hpp + RpcPolicy.hpp + getvalue 业务），不触
 # internal seam。本目录只在 examples/ 入口被加入时构建（根 CMakeLists：
 # NEED_TEST=ON 且 bbt_infra_rpc_net 已注册），与 examples/getvalue 同一前置。

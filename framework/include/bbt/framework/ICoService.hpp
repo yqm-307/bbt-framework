@@ -26,6 +26,8 @@
 #include <bbt/infra/Codec.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 
 #include <bbt/framework/CallOptions.hpp>
 #include <bbt/framework/CoRpc.hpp>
@@ -94,8 +96,8 @@ protected:
 private:
     // 出站发送注入点（机器面私有别名）：宿主在 _bind_runtime 供给，
     // 路由门（find_route）在宿主侧实现——业务不可命名、不可注入。
-    using RpcSendFn = std::function<result<bbt::infra::RpcEnvelope>(
-        const bbt::infra::RpcEnvelope&,
+    using RpcSendFn = std::function<result<bbt::infra::rpc::Response>(
+        const bbt::infra::rpc::Request&,
         const bbt::infra::CallOptions&)>;
 
     // 宿主注入运行时身份、actor key、出站发送注入点与资源视图；

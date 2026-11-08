@@ -258,7 +258,9 @@ Envoy 区分面向上游调用的 circuit breaking 与面向本进程资源耗�
 - 每次请求记录 method、operation/attempt、选中实例及代际、route/config revision、队列时间、执行时间、结果知识状态。指标标签不放用户 id/actor key/request id，避免高基数。
 - 服务健康拆成 liveness、readiness、draining 与控制面陈旧；“进程活着”不等于“可承接新的有状态写入”。
 
-已读 `RpcHttpBridge` 只是在当前代码位置承担 HTTP/RPC 映射，本轮不直接迁移它。后续应把稳定 wire 编码/验证收敛给 infra，framework 保留组装与策略，迁移须对已有消费者兼容。[L14]
+已读 `RpcHttpBridge` 只是在当时代码位置承担 HTTP/RPC 映射，本轮不直接迁移它。后续应把稳定 wire 编码/验证收敛给 infra，framework 保留组装与策略，迁移须对已有消费者兼容。[L14]
+
+> 现状更新：`RpcHttpBridge`/`RpcWireBridge` 已按 `bbtools-infra/docs/decisions/0022-rpc-single-protocol.md` 删除，RPC 只走 V2 会话（`SessionFrame`）；本节保留为当时的决策记录。
 
 需要补证的协议问题：现有桥的显式请求头没有列出跨进程 budget 字段；错误回复只列 code/domain/domain_code/message。应以完整集成链实测核对预算和结构化 details 是否保真，不能因内存类型有字段就宣称线上具备。[L11,L14]
 

@@ -8,7 +8,7 @@ infra owner·限额·关联·Close 约束。
 
 `framework/include/bbt/framework/RpcPolicy.hpp`：
 
-- `RpcCallView`：只读调用事实（已解析目标 + 不可改写 `RpcEnvelope` + 已适配
+- `RpcCallView`：只读调用事实（已解析目标 + 不可改写 `rpc::Request` + 已适配
   绝对期限）。
 - `RpcPolicyDecision`：`Allow`（放行，可选 `tightened_deadline` 只收紧期限）或
   `Reject`（拒绝，零 I/O）。
@@ -18,17 +18,20 @@ infra owner·限额·关联·Close 约束。
 `nullptr` = 默认 no-op，行为与今天逐字一致）。
 
 插入点：`CoApp::_MakeEgress()` 在静态路由门（`find_route`）**之后**、发送
-**之前**调用一次；无论 `LegacyHeaders` 还是 `ProtoWireV1` profile 都经过它。
+**之前**调用一次；V2 会话（`RpcEgress` → `rpc::CoRpcClient`）是唯一出站路径，没有
+profile 或旧 envelope 分支。
 
 ## 本 fixture
 
-单进程一个公开 `CoApp`（caller + callee 两服务 + 指向自身 loopback 的静态
-路由），caller handler 内经 `this->call<Req,Resp>` 出站，经正式 ProtoWireV1
-body wire 走一次真实 socket 回到同宿主的 callee 入站。**只用公开面**，不 include
+caller/callee 是**两个互异 identity 的真实 CoApp 进程**（V2 拒绝
+self-connection，框架约束进程内至多一个活跃 CoApp）：caller 进程
+（`rpc-policy-caller`）宿主 `PolicyCallerService`，其 handler 内经
+`this->call<Req,Resp>` 出站，经 V2 会话到达 callee 进程
+（`rpc-policy-callee`）宿主的 `PolicyCalleeService`。**只用公开面**，不 include
 `internal/`、不用 `CoAppSeam`/`MakeCoAppForTest`/发送注入。
 
-每场景独立进程（一 CoApp 一策略），`rpc_policy_run.py` 经 #4 的 Python 标准库
-wire codec 驱动并断言：
+每场景独立 caller 进程（一策略），由它派生一个 callee 子进程；
+`rpc_policy_run.py` 经 `tests/rpc_v2_wire.py` 驱动并断言：
 
 | 场景 | 断言 |
 |---|---|

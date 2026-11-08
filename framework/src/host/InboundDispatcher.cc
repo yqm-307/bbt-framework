@@ -1,11 +1,13 @@
 #include <bbt/framework/internal/InboundDispatcher.hpp>
 
 #include <chrono>
+#include <boost/scope/scope_exit.hpp>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
@@ -29,7 +31,7 @@ constexpr std::size_t kMaxRouteValueBytes  = 256;
 constexpr std::string_view kRoutePrefix = "route.";
 constexpr std::string_view kFwTraceId   = "fw.trace_id";
 
-// IncomingCallContext.deadline 是整个在途交换的硬看门：读、排队、处理
+// Request::Context().deadline 是整个在途交换的硬看门：读、排队、处理
 // 直到回包写出共用同一时刻，infra 到点即取消并切断回复路径。若
 // handler 可见期限与之同点，恰在到期时刻产出的结果必然无法送达——
 // 调用方只能看到无信息的传输断开而非真实的 TimedOut/Cancelled。
@@ -99,19 +101,31 @@ InboundDispatcher::InboundDispatcher(
     }
 }
 
-result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
-    const bbt::infra::IncomingCallContext& incoming,
-    bbt::infra::RpcEnvelope request) {
-    using bbt::infra::RpcEnvelope;
+result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
+    const bbt::infra::rpc::Request& request, const std::function<void()>& on_dispatched) {
     using bbt::coroutine::WaitOptions;
     using bbt::coroutine::WaitStatus;
+    using bbt::infra::rpc::Response;
+
+    // 调度门只覆盖同步校验和 Actor 入队；业务挂起之前必须放行后续请求。
+    bool dispatched = false;
+    const auto ready = [&] {
+        if (!dispatched) {
+            dispatched = true;
+            if (on_dispatched)
+                on_dispatched();
+        }
+    };
+    auto dispatch_guard = boost::scope::make_scope_exit(ready);
+    const auto& incoming = request.Context();
 
     // 1. envelope 基本字段：service/method/request_id 为分发的最小事实。
-    if (request.service.empty() || request.method.empty())
-        return result<RpcEnvelope>::err(
+    if (request.Service().empty() || request.Method().empty())
+        return result<Response>::err(
             ErrInvalid("inbound envelope missing service/method"));
-    if (request.request_id.empty())
-        return result<RpcEnvelope>::err(
+    if (request.RequestId().empty() &&
+        (request.Reply() == bbt::infra::rpc::ReplyMode::Required || request.MessageId().empty()))
+        return result<Response>::err(
             ErrInvalid("inbound envelope missing request_id"));
 
     // 2. metadata：route.* 之外的键一律不接受；fw.* 只收白名单。
@@ -123,15 +137,20 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
     std::string ordered_receiver_epoch;
     std::uint64_t ordered_sequence = 0;
     bool has_sequence_field = false;
-    for (const auto& [k, v] : request.metadata) {
+    std::unordered_set<std::string> metadata_keys;
+    if (request.Metadata().size() > 32)
+        return result<Response>::err(ErrInvalid("too many metadata entries"));
+    for (const auto& [k, v] : request.Metadata()) {
+        if (k.empty() || k.size() > 64 || v.size() > 256 || !metadata_keys.insert(k).second)
+            return result<Response>::err(ErrInvalid("invalid or duplicate metadata entry"));
         if (k.compare(0, kRoutePrefix.size(), kRoutePrefix) == 0) {
             const std::string name = k.substr(kRoutePrefix.size());
             if (name.empty() || name.size() > kMaxRouteKeyBytes ||
                 v.size() > kMaxRouteValueBytes)
-                return result<RpcEnvelope>::err(
+                return result<Response>::err(
                     ErrInvalid("route.* field out of bounds"));
             if (custom.values.size() >= kMaxRouteFieldCount)
-                return result<RpcEnvelope>::err(
+                return result<Response>::err(
                     ErrInvalid("too many route.* fields"));
             custom.values.emplace_back(name, v);
         } else if (k == kFwTraceId) {
@@ -139,14 +158,14 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         } else if (IsOrderedFwKey(k)) {
             // 受限系统字段：格式校验（有序流语义由 OrderedIngress 消费）。
             if (v.empty())
-                return result<RpcEnvelope>::err(
+                return result<Response>::err(
                     ErrInvalid("malformed " + k));
             if (k == "fw.sequence") {
                 if (!IsUnsignedDecimal(v))
-                    return result<RpcEnvelope>::err(
+                    return result<Response>::err(
                         ErrInvalid("fw.sequence must be unsigned decimal"));
                 if (!ParseUnsignedDecimal(v, ordered_sequence))
-                    return result<RpcEnvelope>::err(
+                    return result<Response>::err(
                         ErrInvalid("fw.sequence exceeds uint64 range"));
                 has_sequence_field = true;
             } else if (k == "fw.producer_id") {
@@ -156,43 +175,44 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             } else if (k == "fw.receiver_epoch") {
                 ordered_receiver_epoch = v;
             }
-        } else {
-            return result<RpcEnvelope>::err(
-                ErrInvalid("metadata key outside route.*: " + k));
+        } else if (k.compare(0, 6, "trace.") != 0) {
+            return result<Response>::err(
+                ErrInvalid("metadata key outside framework namespaces: " + k));
         }
     }
     (void)custom;   // 不驱动路由策略；custom 只验签不收进上下文。
 
     // 3. 服务与方法查找；schema 不符显式失败，不等 handler 随机失败。
-    auto svc_it = m_services.find(request.service);
+    auto svc_it = m_services.find(request.Service());
     if (svc_it == m_services.end())
-        return result<RpcEnvelope>::err(MakeError(ErrorCode::NotFound,
-            "inbound dispatch: unregistered service '" + request.service + "'"));
+        return result<Response>::err(MakeError(ErrorCode::NotFound,
+                                               "inbound dispatch: unregistered service '" + request.Service() + "'"));
     PerService& svc = *svc_it->second;
-    const RpcMethod* method = svc.entry.table->find(request.method);
+    const RpcMethod* method = svc.entry.table->find(request.Method());
     if (method == nullptr)
-        return result<RpcEnvelope>::err(MakeError(ErrorCode::NotFound,
-            "inbound dispatch: unknown method '" + request.method +
-                "' on service '" + request.service + "'"));
-    if (request.request_schema != method->request_schema)
-        return result<RpcEnvelope>::err(MakeError(ErrorCode::TypeMismatch,
-            "inbound dispatch: request schema mismatch on '" +
-                request.service + "." + request.method + "'"));
+        return result<Response>::err(MakeError(ErrorCode::NotFound,
+                                               "inbound dispatch: unknown method '" + request.Method() +
+                                                   "' on service '" + request.Service() + "'"));
+    if (request.RequestSchema() != method->request_schema ||
+        request.ResponseSchema() != method->response_schema)
+        return result<Response>::err(MakeError(ErrorCode::TypeMismatch,
+                                               "inbound dispatch: request schema mismatch on '" +
+                                                   request.Service() + "." + request.Method() + "'"));
 
     // 4. 服务级接纳上限：容量耗尽拒绝，不无限排队。
     if (svc.inflight.fetch_add(1, std::memory_order_acq_rel) >=
         svc.entry.options.max_inflight) {
         svc.inflight.fetch_sub(1, std::memory_order_acq_rel);
-        return result<RpcEnvelope>::err(MakeError(ErrorCode::Overloaded,
-            "inbound dispatch: service '" + request.service +
-                "' reached max_inflight"));
+        return result<Response>::err(MakeError(ErrorCode::Overloaded,
+                                               "inbound dispatch: service '" + request.Service() +
+                                                   "' reached max_inflight"));
     }
     InflightGuard guard(svc.inflight);
 
     // 5. 请求上下文：字段只取已验证来源（infra 换算的 deadline、已验证
     //    peer_principal、envelope 顶层 request_id、fw.trace_id）。
     auto ctx = std::make_shared<RequestContext>();
-    ctx->request_id     = request.request_id;
+    ctx->request_id = request.RequestId().empty() ? request.MessageId() : request.RequestId();
     ctx->deadline       = incoming.deadline - kReplyDeliveryReserve;
     ctx->peer_principal = incoming.peer_principal;
     ctx->trace_id       = std::move(trace_id);
@@ -203,16 +223,16 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
     // ordered 终态副作用；0 预算已在 wire 解码期拒绝，本门承载「可解码
     // 但 handler 可见期限已过」。
     if (ctx->deadline <= std::chrono::steady_clock::now())
-        return result<RpcEnvelope>::err(MakeError(ErrorCode::TimedOut,
-            "inbound request budget already expired before handler entry"));
+        return result<Response>::err(MakeError(ErrorCode::TimedOut,
+                                               "inbound request budget already expired before handler entry"));
 
     std::vector<std::uint8_t> reply_payload;
 
     if (method->actor_keyed) {
         // ActorSerial：key 由解码请求的提取器得出（不从 metadata 伪造）。
-        auto key = method->extract_key(request.payload);
+        auto key = method->extract_key(request.Payload());
         if (!key)
-            return result<RpcEnvelope>::err(std::move(key.error()));
+            return result<Response>::err(std::move(key.error()));
         ctx->actor_key = key.value();
 
         std::shared_ptr<OrderedIngress> ordered_ingress;
@@ -220,13 +240,13 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         if (svc.entry.options.ordered_ingress) {
             ordered_ingress = svc.entry.ordered_ingress;
             if (!ordered_ingress)
-                return result<RpcEnvelope>::err(MakeError(
+                return result<Response>::err(MakeError(
                     ErrorCode::RuntimeUnavailable,
                     "ordered ingress is not bound for service '" +
-                        request.service + "'"));
+                        request.Service() + "'"));
 
             OrderedIngressRequest ordered_request;
-            ordered_request.method            = request.method;
+            ordered_request.method = request.Method();
             ordered_request.actor_key         = key.value();
             ordered_request.peer_principal    = incoming.peer_principal;
             ordered_request.has_ordered_stamp = has_sequence_field;
@@ -234,13 +254,13 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             ordered_request.producer_epoch    = ordered_producer_epoch;
             ordered_request.receiver_epoch    = ordered_receiver_epoch;
             ordered_request.sequence          = ordered_sequence;
-            ordered_request.request_id        = request.request_id;
+            ordered_request.request_id = request.RequestId();
             ordered_request.request_digest = OrderedRequestDigest(
-                request.method, key.value(), request.payload);
+                request.Method(), key.value(), request.Payload());
 
             auto admitted = ordered_ingress->Admit(ordered_request);
             if (!admitted)
-                return result<RpcEnvelope>::err(std::move(admitted.error()));
+                return result<Response>::err(std::move(admitted.error()));
             if (admitted.value().kind == OrderedIngress::DecisionKind::Replay) {
                 const auto& replay = admitted.value().replay;
                 if (!replay.is_ok) {
@@ -254,45 +274,36 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
                         safe = v.error();
                         rep = &safe;
                     }
-                    return result<RpcEnvelope>::err(*rep);
+                    return result<Response>::err(*rep);
                 }
-                // 回复五个关联字段全部从这里回填（含 request_schema）：
-                // infra HandleRpcRequest 对 handler 回复做五字段校验，缺
-                // request_schema 会被判 changed association fields。回填
-                // 属关联事实搬运，与 response_schema 同源（method 表项已
-                // 在步骤 3 与请求 request_schema 对齐）。
-                RpcEnvelope reply;
-                reply.service = request.service;
-                reply.method = request.method;
-                reply.request_id = request.request_id;
-                reply.request_schema = method->request_schema;
-                reply.response_schema = method->response_schema;
-                reply.payload.assign(replay.payload.begin(), replay.payload.end());
-                return result<RpcEnvelope>::ok(std::move(reply));
+                // 重放仍从本次请求复制五个关联字段，不沿用缓存的请求身份。
+                auto reply = Response::FromRequest(request);
+                reply.SetPayload(std::vector<std::uint8_t>(replay.payload.begin(), replay.payload.end()));
+                return result<Response>::ok(std::move(reply));
             }
             ordered_admission = std::move(admitted.value());
         }
 
         auto finish_ordered_error = [&](Error error)
-            -> result<RpcEnvelope> {
+            -> result<Response> {
             // 首发结果与 Complete 缓存的终态须使用同一安全错误；
             // 不能只规范化缓存，让非 HTTP 首发路径泄露非法 details。
             if (auto valid = ValidateErrorAtBoundary(error); !valid)
                 error = std::move(valid.error());
             if (!ordered_admission)
-                return result<RpcEnvelope>::err(std::move(error));
+                return result<Response>::err(std::move(error));
             OrderedTerminalReply terminal;
             terminal.is_ok = false;
             terminal.error = error;
             auto completed = ordered_ingress->Complete(
                 *ordered_admission, std::move(terminal));
             if (!completed)
-                return result<RpcEnvelope>::err(std::move(completed.error()));
-            return result<RpcEnvelope>::err(std::move(error));
+                return result<Response>::err(std::move(completed.error()));
+            return result<Response>::err(std::move(error));
         };
 
-        auto inst = svc.entry.registry->GetOrCreate(request.service,
-                                                   key.value());
+        auto inst = svc.entry.registry->GetOrCreate(request.Service(),
+                                                    key.value());
         if (!inst)
             return finish_ordered_error(std::move(inst.error()));
         auto mailbox = _MailboxFor(svc, key.value());
@@ -328,7 +339,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
         const WaitStatus st = waiter->WaitWithCallback(wo, [&]() -> bool {
             auto enq = mailbox->TryEnqueue(
                 [ctx, method = std::move(method_copy), inst, slot, waiter,
-                 payload = std::move(request.payload)]() mutable {
+                 payload = request.Payload()]() mutable {
                     RequestScope scope(ctx);
                     slot->r = method.invoke(*inst.value(), payload);
                     waiter->Notify();
@@ -338,6 +349,7 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
                     std::move(enq.error()));
                 waiter->Notify();
             }
+            ready();
             return true;
         });
         switch (st) {
@@ -376,35 +388,30 @@ result<bbt::infra::RpcEnvelope> InboundDispatcher::Dispatch(
             auto completed = ordered_ingress->Complete(
                 *ordered_admission, std::move(terminal));
             if (!completed)
-                return result<RpcEnvelope>::err(std::move(completed.error()));
+                return result<Response>::err(std::move(completed.error()));
         }
     } else {
         // Concurrent：派发协程内联执行，实例并发安全由业务负责。
         auto& inst = svc.entry.instance;
         if (!inst)
-            return result<RpcEnvelope>::err(MakeError(
+            return result<Response>::err(MakeError(
                 ErrorCode::RuntimeUnavailable,
                 "service instance not bound"));
         RequestScope scope(ctx);
-        auto r = method->invoke(*inst, request.payload);
-        if (!r)
-            return result<RpcEnvelope>::err(std::move(r.error()));
+        ready();
+        auto r = method->invoke(*inst, request.Payload());
+        if (!r) {
+            if (auto valid = ValidateErrorAtBoundary(r.error()); !valid)
+                return result<Response>::err(std::move(valid.error()));
+            return result<Response>::err(std::move(r.error()));
+        }
         reply_payload = std::move(r.value());
     }
 
-    // 回复五个关联字段（含 request_schema）全由本组件回填，与
-    // response_schema 同源（method 表项已在步骤 3 与请求 request_schema
-    // 对齐）。infra HandleRpcRequest 对 handler 回复做五字段校验：缺
-    // request_schema 的入站回复被判 changed association fields，因此回填
-    // 必须发生在源头（此处），任何消费 InboundDispatcher 的路径都满足关联。
-    RpcEnvelope reply;
-    reply.service = request.service;
-    reply.method = request.method;
-    reply.request_id = request.request_id;
-    reply.request_schema = method->request_schema;
-    reply.response_schema = method->response_schema;
-    reply.payload = std::move(reply_payload);
-    return result<RpcEnvelope>::ok(std::move(reply));
+    // 两个 schema 已与方法表对齐，成功回复复制请求的五个关联字段。
+    auto reply = Response::FromRequest(request);
+    reply.SetPayload(std::move(reply_payload));
+    return result<Response>::ok(std::move(reply));
 }
 
 ActorMailbox::SPtr InboundDispatcher::_MailboxFor(

@@ -9,9 +9,10 @@
 //   slowcall(ms)        → storage.sleep_ms；显式子预算到期，服务端继承后 TimedOut
 //   missing()           → 调用未路由服务名 → find_route NotFound 失败路径
 //
-// 协议：inbound_bridge=ProtoWireV1（与 examples/getvalue 同口径）。选正式 body
-// wire 而非迁移期 header 桥，是因为只有 wire body 携带 remaining_budget_ms，
-// 出站子预算/父预算才能真正到达对端服务端（见 SlowCall 注释）。
+// 协议：V2 会话（SessionFrame + u32be + Hello/HelloAck，与 examples/getvalue
+// 同口径）。V2 的 CallOptions.deadline 同时是客户端等待上限与 wire
+// remaining_budget_ms 的来源，出站子预算/父预算才能真正到达对端服务端
+// （见 SlowCall 注释）。
 //
 // 优雅关闭同 svc_a：SIGINT/SIGTERM → watcher 线程 request_shutdown。
 
@@ -33,7 +34,7 @@ namespace fw = bbt::framework;
 
 namespace {
 
-// slowcall 对 storage 的显式子预算：经 ProtoWireV1 body 的 remaining_budget_ms
+// slowcall 对 storage 的显式子预算：经 V2 Call 的 remaining_budget_ms
 // 传到对端，storage handler 可见前收敛为 min(传输硬看门, now+budget) 并据此
 // 中断 sleep_ms。driver 用远大于它的客户端预算，故收到的 TimedOut 只能由
 // 服务端自产——这是「服务端继承预算」而非「仅客户端超时」的可判定证据。
@@ -74,7 +75,7 @@ public:
     fw::CoRpcResp SlowCall(fw::CoRpcReq req) {
         // 显式给 storage 一个 600ms 子预算（两参数重载：CallOptions 经
         // AdaptCallOptions 与父预算取 min，不会延长父预算）。预算随
-        // ProtoWireV1 body 的 remaining_budget_ms 到达 storage，服务端继承后
+        // V2 Call 的 remaining_budget_ms 到达 storage，服务端继承后
         // 在其 deadline 到期时如实 TimedOut；本进程再把该错误透传给 driver。
         fw::CallOptions o;
         o.deadline = std::chrono::steady_clock::now() +
@@ -153,13 +154,12 @@ int main(int argc, char** argv) {
         /*max_body_bytes*/  65536,
         /*incoming_timeout*/std::chrono::milliseconds{30000}};
     opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
-    // 正式 body wire（与 examples/getvalue 同口径）：预算字段随 wire 到达对端。
-    opts.inbound_bridge = fw::RpcInboundBridge::ProtoWireV1;
+    // V2 会话身份必填；gateway 与 storage 进程使用互异身份。
+    opts.local_identity = "dual-gateway";
     // 出站白名单：仅允许名为 "storage" 的逻辑目标，endpoint 为真实
     // host:port——没有自动发现，也未配置的目标一律 NotFound。
     opts.static_routes = {
-        fw::StaticRoute{"storage",
-                        bbt::infra::RpcAddress{"http", storage_ep}}};
+        fw::StaticRoute{"storage", storage_ep}};
     opts.shutdown_step_budget = std::chrono::milliseconds{2000};
 
     fw::CoApp app{opts};

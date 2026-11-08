@@ -1,7 +1,7 @@
 #pragma once
 // 受管请求上下文的值类型（业务面）。
-// 入站适配器从 infra::IncomingCallContext 接收已换算的 deadline 与已验证的
-// peer_principal，并从 RpcEnvelope 取得 request_id；本类型是这些已验证字段
+// 入站适配器从 infra::rpc::Request::Context() 接收已换算的 deadline 与已验证的
+// peer_principal，并从 rpc::Request 取得 request_id；本类型是这些已验证字段
 // 在框架层的受管形态，字段不得由业务侧自行伪造。
 //
 // 取消不由本上下文字段表达：协程等待结果按 coroutine 自身契约处理，

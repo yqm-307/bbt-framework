@@ -1,9 +1,9 @@
 // bbt-framework 容量 / 并发上下文 / 关闭生命周期验收 fixture。
 //
-// 形态：**一个自有进程**（真实公开 `CoApp` + 真实 infra HTTP loopback 宿主 +
-// 正式 ProtoWireV1 body profile）注册一个公开 `CoService<T>`
-// （lifecycle::LifecycleGateService，复用 getvalue 切片 schema/codec）。外部
-// Python 驱动器用 getvalue 切片的手写 proto3 wire codec 打真实 POST /rpc。
+// 形态：**一个自有进程**（真实公开 `CoApp` + 真实 loopback V2 会话宿主）注册一个
+// 公开 `CoService<T>`（lifecycle::LifecycleGateService，复用 getvalue 切片
+// schema/codec）。外部 Python 驱动器复用唯一 V2 codec（`tests/rpc_v2_wire.py`）
+// 走真实 `SessionFrame` 会话（Hello/HelloAck + u32be）发起 Call。
 //
 // 覆盖（真实公开入口；不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
 // DispatchInboundForTest、INetworkHost 桩或任何发送注入；不额外创建 io_thread）：
@@ -164,7 +164,8 @@ int main(int argc, char* argv[]) {
     options.listen               = inf::ListenAddress{"127.0.0.1", port};
     options.static_routes        = {};   // 无出站目标：未配置即 NotFound
     options.shutdown_step_budget = std::chrono::milliseconds{step_budget};
-    options.inbound_bridge       = fw::RpcInboundBridge::ProtoWireV1;
+    // V2 会话身份必填。
+    options.local_identity = "lifecycle-fixture";
 
     fw::CoApp app{options};
     if (auto r = app.add_service<lifecycle::LifecycleGateService>(
@@ -220,7 +221,7 @@ int main(int argc, char* argv[]) {
         f << "response_schema="
           << bbt::example::v1::GetValueResponse::descriptor()->full_name()
           << "\n";
-        f << "inbound_bridge=proto_wire_v1\n";
+        f << "local_identity=lifecycle-fixture\n";
         f << "max_inflight=" << max_inflight << "\n";
         f << "step_budget_ms=" << step_budget << "\n";
         f << "auth_state=" << kAuthState << "\n";

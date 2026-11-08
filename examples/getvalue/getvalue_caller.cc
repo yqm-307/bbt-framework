@@ -1,17 +1,17 @@
 // bbt-framework Service→Service 正式出站 caller 进程。
 //
-// 与 getvalue_server 同装配口径：公开 CoApp（inbound_bridge=ProtoWireV1）
-// + 公开 CoService，不使用测试缝。宿主 GetValueCallerService；其 handler 内
-// 经 ICoService::call<Req,Resp> 向另一个 framework CoApp（callee 进程）发起
-// 真实正式 body 出站。监听 loopback 动态端口，写端口/元数据文件，阻塞等待
+// 与 getvalue_server 同装配口径：公开 CoApp（local_identity 显式、V2 入站
+// 经 InstallRpcAdmission）+ 公开 CoService，不使用测试缝。宿主
+// GetValueCallerService；其 handler 内经 ICoService::call<Req,Resp> 向另一个
+// framework CoApp（callee 进程）发起真实 V2 Call 出站。监听 loopback 动态端口，写端口/元数据文件，阻塞等待
 // stdin EOF 后按序优雅关闭。
 //
 // argv:
 //   getvalue_caller caller <port_file> <callee_ep> <blackhole_ep> <meta_file>
 //     callee_ep / blackhole_ep 形如 127.0.0.1:<port>（静态路由 endpoint 形态）。
 //   getvalue_caller badroute <kind> <result_file>
-//     以公开入口验证四类非法静态路由在 run 启动任何组件前被拒绝。
-//     kind ∈ {empty-service, empty-transport, empty-endpoint, duplicate}；
+//     以公开入口验证三类非法静态路由在 run 启动任何组件前被拒绝。
+//     kind ∈ {empty-service, empty-endpoint, duplicate}；
 //     写出机器可读观测（rc/lifecycle_failures/bound_endpoint/资源工厂计数）。
 
 #include <atomic>
@@ -50,33 +50,31 @@ bbt::framework::CoAppOptions BaseOptions() {
         64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    options.inbound_bridge = bbt::framework::RpcInboundBridge::ProtoWireV1;
+    // V2 会话身份必填；caller 与 callee/badroute 进程使用互异身份。
+    options.local_identity = "getvalue-caller";
     return options;
 }
 
 bool IsKnownBadRouteKind(const std::string& kind) {
-    return kind == "empty-service" || kind == "empty-transport" ||
-           kind == "empty-endpoint" || kind == "duplicate";
+    return kind == "empty-service" || kind == "empty-endpoint" ||
+           kind == "duplicate";
 }
 
-// 四类非法静态路由（其余字段保持与正常 caller 相同的合法口径），供公开
+// 三类非法静态路由（其余字段保持与正常 caller 相同的合法口径），供公开
 // CoApp 装配后在 run 前被 _ValidateConfig 拒绝：
-//   empty-service   空 service_name
-//   empty-transport 空 transport（endpoint 非空）
-//   empty-endpoint  空 endpoint（transport 非空）
-//   duplicate       两条相同 service_name
+//   empty-service  空 service_name
+//   empty-endpoint 空 endpoint（V2 只校验 endpoint 非空，地址语法归 infra）
+//   duplicate      两条相同 service_name
+// （transport 维度随 V2 endpoint 字符串收敛而消失。）
 std::vector<bbt::framework::StaticRoute> BadRoutes(const std::string& kind) {
     using bbt::framework::StaticRoute;
-    using bbt::infra::RpcAddress;
     if (kind == "empty-service")
-        return {StaticRoute{"", RpcAddress{"http", "127.0.0.1:1"}}};
-    if (kind == "empty-transport")
-        return {StaticRoute{"svc.route", RpcAddress{"", "127.0.0.1:1"}}};
+        return {StaticRoute{"", "127.0.0.1:1"}};
     if (kind == "empty-endpoint")
-        return {StaticRoute{"svc.route", RpcAddress{"http", ""}}};
+        return {StaticRoute{"svc.route", ""}};
     if (kind == "duplicate")
-        return {StaticRoute{"svc.route", RpcAddress{"http", "127.0.0.1:1"}},
-                StaticRoute{"svc.route", RpcAddress{"http", "127.0.0.1:2"}}};
+        return {StaticRoute{"svc.route", "127.0.0.1:1"},
+                StaticRoute{"svc.route", "127.0.0.1:2"}};
     return {};
 }
 
@@ -190,10 +188,10 @@ int main(int argc, char* argv[]) {
     options.static_routes = {
         bbt::framework::StaticRoute{
             std::string(getvalue::GetValueCallerService::kCalleeService),
-            bbt::infra::RpcAddress{"http", callee_ep}},
+            callee_ep},
         bbt::framework::StaticRoute{
             std::string(getvalue::GetValueCallerService::kBlackholeService),
-            bbt::infra::RpcAddress{"http", black_ep}},
+            black_ep},
     };
 
     bbt::framework::CoApp app(options);
@@ -236,7 +234,7 @@ int main(int argc, char* argv[]) {
           << bbt::example::v1::GetValueRequest::descriptor()->full_name() << "\n";
         f << "response_schema="
           << bbt::example::v1::GetValueResponse::descriptor()->full_name() << "\n";
-        f << "inbound_bridge=proto_wire_v1\n";
+        f << "local_identity=getvalue-caller\n";
         f << "auth_state=unauthenticated_loopback\n";
     }
     std::fprintf(stderr, "getvalue caller up endpoint=%s callee=%s blackhole=%s\n",
