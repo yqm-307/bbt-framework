@@ -113,12 +113,101 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
+    env:
+      # 跨 run 只复用两类东西：ccache 编译对象、已按锁定 sha256 校验的 Boost 源码
+      # 归档。都放 runner.temp（不进工作区），路径里没有 build 树/任何 prefix。
+      # 可见范围由 GitHub ref scope 决定（PR 写 merge-ref、main 读默认分支），
+      # key 与下面的 if 只决定「取哪份/存不存」，不构成安全边界。
+      # job 级 env 不允许 runner context：两个目录由下面的初始化步骤写进
+      # $GITHUB_ENV，缓存步骤的 path 用步骤级 runner.temp。
+      CCACHE_EPOCH: v1
+      CCACHE_MAX_SIZE: 500M
+      # fork PR 保持「不装 ccache、不写对象缓存」：对象是可执行内容，只让同仓
+      # 与默认分支建立条目。此开关不扩大任何权限，也不改变 pull_request 触发面。
+      CACHE_ALLOWED: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}"
     steps:
       - name: "拉取代码库"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      # 缓存目录取自 runner.temp；同时显式设置 ccache 开关：镜像若偶然预装 ccache，
+      # 禁用态必须关掉，避免镜像里的工具被当成 launcher 隐式启用对象缓存。
+      - name: "初始化缓存目录与 ccache 开关"
+        run: |
+          set -euo pipefail
+          {
+            echo "CCACHE_DIR=$RUNNER_TEMP/ccache"
+            echo "BOOST_SOURCE_CACHE=$RUNNER_TEMP/src-cache"
+          } >> "$GITHUB_ENV"
+          if [ "$CACHE_ALLOWED" = 'true' ]; then
+            echo "CCACHE_NODISABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: "安装 ccache（hosted 临时 runner；真实版本进缓存键）"
+        if: env.CACHE_ALLOWED == 'true'
+        run: |
+          set -euo pipefail
+          # 镜像不自带 ccache，必须显式安装。不钉 apt 包版本：从受认证源装可用版本，
+          # 解析实际版本（进缓存键），只做主版本 >=4 的语义检查。
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ccache
+          version="$(ccache --version | sed -n '1s/^ccache version \([0-9][0-9.]*\).*$/\1/p')"
+          case "$version" in
+            4.*|[5-9].*) ;;
+            *) echo "FATAL: ccache 版本 '$version' 不满足 >=4（--set-config/base_dir 语义）" >&2; exit 2 ;;
+          esac
+          # 依赖/工具链指纹：任一固定输入变化即更换恢复前缀，恢复不跨指纹。
+          # 只列本仓真实存在的固定输入（本仓无单独 cmake/ 目录）。
+          deps_files=(
+            CMakeLists.txt
+            deps.lock
+            scripts/prepare_protobuf.sh
+            scripts/ci/prepare_boost.sh
+          )
+          deps_id="$(sha256sum "${deps_files[@]}" | sha256sum | cut -c1-16)"
+          {
+            echo "CCACHE_VERSION=$version"
+            echo "GCC_ID=$(g++ -dumpversion)"
+            echo "DEPS_ID=$deps_id"
+          } >> "$GITHUB_ENV"
+
+      - name: "恢复 ccache 编译对象（缓存服务异常不阻断冷构建）"
+        if: env.CACHE_ALLOWED == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}-cc${{ env.CCACHE_VERSION }}-deps${{ env.DEPS_ID }}-run${{ github.run_id }}-a${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}-cc${{ env.CCACHE_VERSION }}-deps${{ env.DEPS_ID }}
+
+      - name: "恢复已校验 Boost 源码归档（只存 tar.gz，不存 prefix/解包树）"
+        if: env.CACHE_ALLOWED == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/src-cache
+          key: boost-src-1.90.0-5e93d582aff2
+
+      - name: "固化 ccache 配置并清零统计（恢复后重设，避免被缓存内旧配置覆盖）"
+        if: env.CACHE_ALLOWED == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=max_size="$CCACHE_MAX_SIZE"
+          ccache --set-config=compression=true
+          ccache --set-config=compiler_check=content
+          ccache --set-config=base_dir="$GITHUB_WORKSPACE"
+          # 归零计数：日志里的命中数只反映本次 run（恢复的旧计数不得混入判读）。
+          ccache --zero-stats
+          # 编译器 launcher 走既有 BBT_CMAKE_ARGS 透传口（run_framework_gate.sh），
+          # 不改 gate/build 脚本；fork PR 不装 ccache 时不设该变量。
+          echo "BBT_CMAKE_ARGS=-DCMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+          ccache --show-config | sed -n '1,20p'
 
       - name: "拉取 deps.lock 固定依赖（coroutine/infra 源码树）"
         run: bash scripts/fetch_deps.sh
@@ -128,6 +217,19 @@ jobs:
 
       - name: "复现锁定 Boost 1.90 context（工作区私有前缀，hosted 无 /opt/boost）"
         run: bash scripts/ci/prepare_boost.sh "$BOOST_PREFIX" --jobs "$BBT_JOBS"
+
+      - name: "写入 Boost 源码归档缓存（仅 push 建立本仓共享条目，PR 只读）"
+        if: success() && github.event_name == 'push' && env.CACHE_ALLOWED == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/src-cache
+          key: boost-src-1.90.0-5e93d582aff2
+
+      # CI 契约/缓存回归：静态断言与 prepare_boost 缓存行为用例必须在 hosted 门禁里
+      # 跑，否则 workflow 漂移可以绕过它们（不新增 action、不装依赖）。
+      - name: "CI 契约与缓存回归测试（scripts/ci/test_formal_ci.py）"
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci/test_formal_ci.py
 
       - name: "构建 + 门禁 + 封包 + provenance（等价现役 build 判据）"
         run: |
@@ -241,6 +343,24 @@ jobs:
             --profile focused \
             --regex '${{ needs.changes.outputs.focused_regex }}' \
             --timeout 300
+
+      - name: "ccache 统计（命中率入日志，供冷暖对照判读）"
+        if: always() && env.CACHE_ALLOWED == 'true'
+        run: |
+          set -euo pipefail
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats -v || true
+          else
+            echo "ccache 未安装（fork PR 或前置步骤失败），跳过统计"
+          fi
+
+      - name: "保存 ccache 编译对象（仅成功；上限 500M，键含 run/attempt）"
+        if: success() && env.CACHE_ALLOWED == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}-cc${{ env.CCACHE_VERSION }}-deps${{ env.DEPS_ID }}-run${{ github.run_id }}-a${{ github.run_attempt }}
 
       - name: "Cleanup workspace"
         if: always()
