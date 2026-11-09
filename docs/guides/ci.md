@@ -12,7 +12,7 @@
 | `.github/workflows/manual.yml` | 手动任务（仅 `workflow_dispatch`，非 required）：`toolchain-verify` 与 `resource-acceptance`（`arc-s4-framework`），见 §7 |
 | `scripts/ci/changed_files.py` | 从真实 git diff 归一受限变更集，完成路径分类（本仓内联，见 §2），并按 `FOCUSED_MAP` 前缀映射产出 `focused_regex`（见 §5 必要 focused） |
 | `scripts/ci/result.py` | result job 的本仓内联汇总：needs.*.result → verdict，fail-closed（见 §3） |
-| `scripts/ci/prepare_boost.sh` | 按锁定版本/sha256 源码构建 Boost 1.90 `context` 到工作区私有前缀 |
+| `scripts/ci/prepare_boost.sh` | 按锁定版本/sha256 源码构建 Boost 1.90 `context` 到工作区私有前缀；可选 `BOOST_SOURCE_CACHE` 只复用已校验的原始 tar.gz（不缓存 prefix） |
 | `scripts/ci/run_framework_gate.sh` | `build` 子命令承载 build_test 的「构建+门禁+provenance+封包」；`verify-archive` 接收侧子命令仍在仓内（sha256 校验+闭集/穿越/symlink 门禁+安全解包），当前普通 workflow 无跨 runner 传递，不由其调用 |
 | `scripts/ci/check_docs.py` | docs-check：相对链接有效、docs 文件名无过程编号、README 行数上限 |
 | `scripts/ci/check_format_diff.sh` | 只检查本 PR 改动行的 clang-format 违规（changes 内 `continue-on-error`，告警不阻断） |
@@ -73,8 +73,46 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
   CTest 配置固化）。
 - **/usr/local 剔除**：`ldd` 复核与 CTest 步先从 `LD_LIBRARY_PATH` 剔除
   `/usr/local` 项，防止镜像预装的 bbt 旧产物被 NEEDED 抢绑。
+- **跨 run 缓存**：只复用两类东西——`ccache` 编译对象（`runner.temp/ccache`，
+  上限 500M）与**已按锁定 sha256 校验**的 Boost 源码归档
+  （`runner.temp/src-cache`，只存 `boost_1_90_0.tar.gz`）。不复用 build 树、
+  `.ci-work`、Boost/deps/protobuf 任何 prefix，缓存步骤的 `path` 只有这两个
+  目录。编译器 launcher 经既有 `BBT_CMAKE_ARGS` 透传口传给 cmake
+  （`-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`），gate/build 脚本不含 ccache 分支。
+  - **键**：`ccache-v1-linux-gcc<g++版本>-cc<ccache真实版本>-deps<固定输入指纹>
+    -run<run_id>-a<run_attempt>`；恢复前缀保留完整指纹但去掉 run/attempt，故
+    同指纹的后续 run 能命中上一次条目。指纹来自 `CMakeLists.txt`、`deps.lock`、
+    `scripts/prepare_protobuf.sh`、`scripts/ci/prepare_boost.sh` 的内容摘要——
+    任一固定输入变化即换前缀，**恢复不跨指纹**。Boost 归档键为
+    `boost-src-1.90.0-<sha256 前 12 位>`，内容寻址。
+  - **ccache 来源**：hosted 临时 runner 上 `apt-get install ccache`（不钉 apt 包
+    版本——没有该版本在 hosted 实装的证据），随即解析 `ccache --version` 的实际
+    版本进键，只做「主版本 >=4」的语义检查（`--set-config`/`base_dir` 需要），
+    版本号解析不出即失败。镜像不自带 ccache，本地主机不安装。
+  - **恢复后固化配置**：缓存归档带着上一次的 `ccache.conf`，恢复会覆盖安装时的
+    设置，所以 `max_size/compression/compiler_check/base_dir` 在恢复之后重新设置，
+    同一处 `ccache --zero-stats`——日志里的命中数只反映本次 run。
+  - **缓存目录**：`runner.temp` 在 job 级 `env` 不可用（该位置没有 `runner`
+    context），`CCACHE_DIR`/`BOOST_SOURCE_CACHE` 由 build 首个 run 步骤写进
+    `$GITHUB_ENV`；同一步按 `CACHE_ALLOWED` 显式设置 `CCACHE_DISABLE`（允许 `0`、
+    禁用 `1`），预装 ccache 的镜像也不会被隐式当成 launcher。
+  - **可见范围由 GitHub ref scope 决定，不是 key、也不是 `if`**：PR run 写的条目
+    落在 `refs/pull/N/merge`，只有该 PR 自己能恢复；main 的 run 只读当前分支/
+    默认分支。`key`/`if` 只决定「取哪份、存不存」。
+  - **fork PR 不装 ccache、不写对象缓存**（对象是可执行内容）：`CACHE_ALLOWED`
+    只决定装不装/存不存，不扩大任何权限；同仓 PR 的 ccache 只写 merge-ref，
+    `main` 只消费默认分支可见的缓存，PR 条目不可能回到 main。
+  - **缓存故障不改变判据**：恢复/保存步骤 `continue-on-error`，Boost 缓存命中
+    与否都要过原有 `sha256sum --check` 门（损坏即告警重下载、再次校验；缓存目录
+    不可写只告警），ccache 恢复失败即冷构建。ccache 安装失败或主版本 <4 则显式失败，
+    不静默降级。缓存只影响耗时，不影响任何门禁。
+  - **判读**：job 末尾打印 `ccache --show-stats -v`，命中率必须进日志；是否提速
+    需同 SHA 冷暖对照，未实测不得声称优化达成。
+  - **回归测试接线**：`scripts/ci/test_formal_ci.py`（本缓存契约、key、步骤顺序与
+    `prepare_boost.sh` 缓存行为用例）在 build 步骤前作为独立步骤执行，失败即阻断
+    job；不再只在本地跑。
 - **cleanup**：job 末尾 `if: always()` 清理 `.ci-work`、`boost-prefix`、`.deps`
-  与本地构建归档。
+  与本地构建归档（缓存目录在 `runner.temp` 下，不参与清理）。
 
 ## 5. 门禁清单（不得放宽）
 
@@ -105,6 +143,9 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
 - **format-diff**：`scripts/ci/check_format_diff.sh <base>` 只检查本 PR 改动的
   C/C++ 行，不强制格式化存量代码；当前为 changes 内 `continue-on-error`（告警不
   阻断）。
+- **缓存中立**：跨 run 缓存（§4）只影响耗时。恢复/保存失败、Boost 缓存损坏都
+  退回冷构建；ccache 安装/版本不符显式失败。smoke/focused 选集、`result.py` 判定、
+  链接来源与 provenance 判据均不因缓存改动。
 
 ## 6. 测试数（当前注册面）
 
@@ -136,7 +177,8 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
 
 ## 8. 固定输入
 
-- 远程 action 全部完整 40-hex pin（checkout）。
+- 远程 action 全部完整 40-hex pin（`actions/checkout`、`actions/cache/restore|save`
+  同一 release commit）。
 - 依赖：`deps.lock`（coroutine/infra 固定 SHA）。
 - Boost：`docker/toolchain.lock` 的 `BOOST_VERSION=1.90.0` + 锁定 sha256（只编
   `context`）。

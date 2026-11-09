@@ -24,7 +24,8 @@ build_test + 本仓 result.py）的**直接测试**：只验证「CI 配方 / �
 - 正式 workflow 文本契约（stdlib，恒跑，直接读真实 ci.yml 与 manual.yml）：
   触发面/身份/权限/concurrency/hosted runner/固定 SHA pin/无 callee 复用/
   内联分类与 result.py required-optional/docs-only 跳过门禁/always result/
-  单 runner build_test 判据命令/内联 bash -n/无影子双跑/无跨 runner artifact；
+  单 runner build_test 判据命令/内联 bash -n/无影子双跑/无跨 runner artifact/
+  缓存契约（只允许 ccache 对象与已校验 Boost 源码归档，path 限 runner.temp）；
 - 正式 workflow 结构契约（需 PyYAML，缺省显式 SKIP）；
 - 手动任务保留契约：manual.yml 中 toolchain-verify / resource-acceptance 及
   其 inputs/资源边界不删不改；
@@ -39,6 +40,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -64,6 +66,8 @@ DEPS_LOCK = os.path.join(WORKTREE, "deps.lock")
 TOOLCHAIN_LOCK = os.path.join(WORKTREE, "docker", "toolchain.lock")
 
 CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
+CACHE_ACTION_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"  # actions/cache v6.1.0
+BOOST_SHA256_PIN = "5e93d582aff26868d581a52ae78c7d8edf3f3064742c6e77901a1f18a437eea9"
 SHA_PIN_RE = re.compile(r"^actions/[^@\s]+@[0-9a-f]{40}$")
 HOSTED_RUNNER = "ubuntu-24.04"
 MANUAL_RUNNER = "arc-s4-framework"
@@ -112,6 +116,20 @@ def _extract_run_blocks(text: str):
             buf = [line[base:] if len(line) >= base else line for line in buf]
         blocks.append("\n".join(buf))
     return blocks
+
+
+def _steps(text: str):
+    """按 `- name:` 切出每个 step 的原文（含其 uses/with/run），供缓存契约逐块断言。"""
+    steps, current = [], []
+    for line in text.splitlines():
+        if re.match(r"^\s+- name:", line) and current:
+            steps.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        steps.append("\n".join(current))
+    return steps
 
 
 def _sha256(path: str) -> str:
@@ -283,6 +301,232 @@ class RecipeGuardTests(unittest.TestCase):
                 env=ENV,
             )
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Boost 源码归档缓存（执行真实 prepare_boost.sh；载荷为合成归档，不冒充真实编译）
+# --------------------------------------------------------------------------- #
+_FAKE_BOOTSTRAP = """#!/usr/bin/env bash
+set -euo pipefail
+prefix=""
+for arg in "$@"; do
+  case "$arg" in --prefix=*) prefix="${arg#--prefix=}" ;; esac
+done
+[ -n "$prefix" ]
+mkdir -p "$prefix/include/boost" "$prefix/lib"
+printf '#define BOOST_VERSION 109000\\n' > "$prefix/include/boost/version.hpp"
+: > "$prefix/lib/libboost_context.so"
+"""
+
+_CURL_STUB = """#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ]
+printf '%s\\n' "curl" >> "${CURL_LOG:?}"
+cp -- "${CURL_PAYLOAD:?}" "$out"
+"""
+
+
+def _make_boost_tarball(path: str) -> str:
+    """合成 `boost_1_90_0/` 归档：只含本脚本会执行的 bootstrap/b2 与最小 prefix。
+
+    这不是真实 Boost，也不产生 C++ 产物；本类只验证缓存/校验分支的真实行为。
+    """
+    with tarfile.open(path, "w:gz") as tf:
+        for name, payload in (
+            ("boost_1_90_0/bootstrap.sh", _FAKE_BOOTSTRAP),
+            ("boost_1_90_0/b2", "#!/usr/bin/env bash\nexit 0\n"),
+        ):
+            data = payload.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(data))
+    return _sha256(path)
+
+
+def _prepare_boost_probe(td: str, sha256: str) -> str:
+    """复制真实脚本，仅把锁定 sha256 换成合成归档摘要（其余逐字执行）。"""
+    path = os.path.join(td, "prepare_boost.sh")
+    text = raw(PREPARE_BOOST).replace(BOOST_SHA256_PIN, sha256)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(path, 0o755)
+    return path
+
+
+class BoostSourceCacheTests(unittest.TestCase):
+    def _env(self, td, cache_dir):
+        bindir = os.path.join(td, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        stub = os.path.join(bindir, "curl")
+        with open(stub, "w", encoding="utf-8") as handle:
+            handle.write(_CURL_STUB)
+        os.chmod(stub, 0o755)
+        env = dict(ENV,
+                   PATH=bindir + os.pathsep + ENV["PATH"],
+                   CURL_LOG=os.path.join(td, "curl.log"),
+                   CURL_PAYLOAD=os.path.join(td, "payload.tar.gz"))
+        if cache_dir is None:
+            env.pop("BOOST_SOURCE_CACHE", None)
+        else:
+            env["BOOST_SOURCE_CACHE"] = cache_dir
+        return env
+
+    def _downloaded(self, td) -> bool:
+        return os.path.exists(os.path.join(td, "curl.log"))
+
+    def test_cache_hit_skips_download_and_keeps_verified_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            cache = os.path.join(td, "src-cache")
+            os.makedirs(cache)
+            shutil.copyfile(payload, os.path.join(cache, "boost_1_90_0.tar.gz"))
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, cache))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("命中源码缓存", proc.stdout)
+            self.assertFalse(self._downloaded(td), "命中缓存时不得再下载")
+            self.assertTrue(
+                os.path.isfile(os.path.join(prefix, "lib/libboost_context.so")),
+                "命中缓存后仍须完成前缀构建",
+            )
+
+    def test_cache_miss_downloads_and_backfills(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            cache = os.path.join(td, "src-cache")
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, cache))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("下载", proc.stdout)
+            self.assertTrue(self._downloaded(td))
+            self.assertIn("已写入源码缓存", proc.stdout)
+            self.assertEqual(
+                _sha256(os.path.join(cache, "boost_1_90_0.tar.gz")), digest,
+                "回写的缓存必须与锁定摘要一致",
+            )
+
+    def test_corrupt_cache_falls_back_to_download_and_reverifies(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            cache = os.path.join(td, "src-cache")
+            os.makedirs(cache)
+            with open(os.path.join(cache, "boost_1_90_0.tar.gz"), "wb") as handle:
+                handle.write(b"corrupted bytes, not the locked archive")
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, cache))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("sha256 不符", proc.stdout)
+            self.assertTrue(self._downloaded(td), "坏缓存必须回退下载")
+            self.assertTrue(os.path.isfile(os.path.join(prefix, "lib/libboost_context.so")))
+            self.assertEqual(
+                _sha256(os.path.join(cache, "boost_1_90_0.tar.gz")), digest,
+                "坏缓存须被重新校验过的字节覆盖",
+            )
+
+    def test_download_failing_pinned_sha_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            with open(payload, "wb") as handle:
+                handle.write(b"tampered download")
+            cache = os.path.join(td, "src-cache")
+            script = _prepare_boost_probe(td, BOOST_SHA256_PIN)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, cache))
+            self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+            self.assertIn("sha256 不符", proc.stderr)
+            self.assertFalse(os.path.exists(prefix), "校验失败不得留下前缀")
+            self.assertFalse(
+                os.path.exists(os.path.join(cache, "boost_1_90_0.tar.gz")),
+                "校验失败不得回写缓存",
+            )
+
+    def test_symlink_cache_entry_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            cache = os.path.join(td, "src-cache")
+            os.makedirs(cache)
+            os.symlink(payload, os.path.join(cache, "boost_1_90_0.tar.gz"))
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, cache))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("不是普通文件", proc.stdout)
+            self.assertTrue(self._downloaded(td), "symlink 条目不得被当作缓存命中")
+            self.assertTrue(os.path.isfile(os.path.join(prefix, "lib/libboost_context.so")))
+
+    def test_symlinked_cache_root_is_ignored_and_not_written_through(self):
+        # 根目录是 symlink 时，缓存读写都可能被引到目录之外：整条忽略，命中和
+        # 回写都不许沿链接发生。
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            real = os.path.join(td, "real-cache")
+            os.makedirs(real)
+            shutil.copyfile(payload, os.path.join(real, "boost_1_90_0.tar.gz"))
+            link = os.path.join(td, "cache-link")
+            os.symlink(real, link)
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, link))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("BOOST_SOURCE_CACHE 是符号链接", proc.stdout)
+            self.assertTrue(self._downloaded(td), "根目录 symlink 不得被当作缓存命中")
+            self.assertTrue(os.path.isfile(os.path.join(prefix, "lib/libboost_context.so")))
+
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            real = os.path.join(td, "real-cache")
+            os.makedirs(real)
+            link = os.path.join(td, "cache-link")
+            os.symlink(real, link)
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, link))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(os.listdir(real), [], "不得沿根目录 symlink 回写缓存")
+
+    def test_unwritable_cache_degrades_to_cold_build(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            blocker = os.path.join(td, "not-a-dir")
+            with open(blocker, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"],
+                       env=self._env(td, os.path.join(blocker, "src-cache")))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("源码缓存不可写", proc.stdout)
+            self.assertTrue(os.path.isfile(os.path.join(prefix, "lib/libboost_context.so")))
+
+    def test_cache_unset_keeps_current_behavior(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = os.path.join(td, "payload.tar.gz")
+            digest = _make_boost_tarball(payload)
+            script = _prepare_boost_probe(td, digest)
+            prefix = os.path.join(td, "boost-prefix")
+            proc = run(["bash", script, prefix, "--jobs", "1"], env=self._env(td, None))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("源码缓存", proc.stdout)
+            self.assertTrue(self._downloaded(td))
+            self.assertFalse(os.path.exists(os.path.join(td, "src-cache")))
 
 
 # --------------------------------------------------------------------------- #
@@ -667,10 +911,123 @@ class FormalWorkflowTextContractTests(unittest.TestCase):
                     proc = run(["bash", "-c", script], env=env)
                     self.assertEqual(proc.returncode == 0, should_pass, proc.stderr)
 
-    def test_no_cache(self):
-        for forbidden in ("actions/cache", "ccache", "cache:"):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, self.stripped)
+    def test_cache_contract_scoped_to_runner_temp(self):
+        # 缓存只允许两类：ccache 编译对象、已校验 Boost 源码归档；每个 restore/save
+        # 必须 40-hex pin（actions/cache/restore|save），path 只落在 runner.temp，
+        # 且步骤文本里不得出现 build 树或任何 prefix。
+        cache_steps = [s for s in _steps(self.text) if "actions/cache/" in s]
+        self.assertEqual(len(cache_steps), 4, "应为 2 个 restore + 2 个 save")
+        restores = [s for s in cache_steps if "actions/cache/restore@" in s]
+        saves = [s for s in cache_steps if "actions/cache/save@" in s]
+        self.assertEqual(len(restores), 2)
+        self.assertEqual(len(saves), 2)
+        for step in cache_steps:
+            with self.subTest(step=step.splitlines()[0].strip()):
+                self.assertIn(f"@{CACHE_ACTION_SHA}", step)
+                self.assertRegex(step, r"path: \$\{\{ runner\.temp \}\}/(ccache|src-cache)")
+                for forbidden in ("build", ".ci-work", "boost-prefix", ".deps/",
+                                  "protobuf-prefix", "deps-bundle", "github.workspace"):
+                    self.assertNotIn(forbidden, step)
+        # job 级 env 不允许 runner context，目录由初始化步骤导出到 $GITHUB_ENV；
+        # 具体位置只能是 runner.temp 下两个目录。
+        self.assertIn('echo "CCACHE_DIR=$RUNNER_TEMP/ccache"', self.stripped)
+        self.assertIn('echo "BOOST_SOURCE_CACHE=$RUNNER_TEMP/src-cache"', self.stripped)
+        self.assertNotRegex(self.stripped,
+                            r"(?m)^\s+(CCACHE_DIR|BOOST_SOURCE_CACHE): \$\{\{ runner\.temp \}\}")
+        # 不得使用 `cache:` 简写、浮动 `actions/cache@v*` 或第三方 ccache action。
+        self.assertNotRegex(self.stripped, r"(?m)^\s*cache:\s")
+        self.assertNotRegex(self.stripped, r"actions/cache@")
+        self.assertNotIn("ccache-action", self.stripped)
+
+    def test_cache_keys_use_fingerprint_and_run_attempt(self):
+        cache_steps = [s for s in _steps(self.text) if "actions/cache/" in s]
+        # path 里不再出现 env 别名，按 key 形态区分两类条目。
+        ccache_steps = [s for s in cache_steps if "ccache-${{ env.CCACHE_EPOCH }}" in s]
+        boost_steps = [s for s in cache_steps if "src-cache" in s]
+        self.assertEqual(len(ccache_steps), 2)
+        self.assertEqual(len(boost_steps), 2)
+        # ccache 键 = epoch + 真实编译器/ccache 版本 + 依赖指纹 + run/attempt；
+        # 恢复前缀保留完整指纹但不含 run，才能跨 run 命中。
+        for step in ccache_steps:
+            for needle in ("ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}",
+                           "-cc${{ env.CCACHE_VERSION }}-deps${{ env.DEPS_ID }}",
+                           "run${{ github.run_id }}-a${{ github.run_attempt }}"):
+                self.assertIn(needle, step)
+        restore = next(s for s in ccache_steps if "restore@" in s)
+        lines = [line.strip() for line in restore.splitlines()]
+        key_line = next(line for line in lines if line.startswith("key:"))
+        prefix_key = next(line for line in lines
+                          if line.startswith("ccache-") and "-run${{" not in line)
+        self.assertIn("github.run_id", key_line)
+        self.assertNotIn("run${{", prefix_key)
+        self.assertIn("deps${{ env.DEPS_ID }}", prefix_key)
+        # Boost 只缓存原始归档：版本 + 锁定 sha256 前缀寻址；PR 只读、push 建立条目。
+        boost_key = f"boost-src-1.90.0-{BOOST_SHA256_PIN[:12]}"
+        for step in boost_steps:
+            self.assertIn(f"key: {boost_key}", step)
+        boost_save = next(s for s in boost_steps if "save@" in s)
+        self.assertIn("github.event_name == 'push'", boost_save)
+
+    def test_ccache_install_records_actual_version_and_launcher_goes_through_existing_hook(self):
+        steps = _steps(self.text)
+        # 不钉 apt 包版本（该版本无 hosted 实装证据）：装可用版本，解析实际版本进键，
+        # 只做主版本 >=4 的语义检查。
+        install = next(s for s in steps
+                       if "sudo apt-get install -y --no-install-recommends ccache" in s)
+        for needle in ("ccache --version", 'case "$version" in', "4.*|[5-9].*",
+                       "exit 2", "CCACHE_VERSION=$version", "GCC_ID=", "DEPS_ID=",
+                       "deps.lock", "scripts/prepare_protobuf.sh",
+                       "scripts/ci/prepare_boost.sh"):
+            self.assertIn(needle, install)
+        self.assertNotIn("ccache=$CCACHE_VERSION", self.stripped,
+                         "不得固定未经 hosted 实装验证的 apt 包版本")
+        for name in ("CMakeLists.txt", "deps.lock", "scripts/prepare_protobuf.sh",
+                     "scripts/ci/prepare_boost.sh"):
+            self.assertTrue(os.path.isfile(os.path.join(WORKTREE, name)),
+                            f"依赖指纹文件必须真实存在: {name}")
+        config = next(s for s in steps if "max_size" in s)
+        for needle in ('max_size="$CCACHE_MAX_SIZE"', "compression=true",
+                       "compiler_check=content", 'base_dir="$GITHUB_WORKSPACE"',
+                       "ccache --zero-stats",
+                       "BBT_CMAKE_ARGS=-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+                       "ccache --show-config"):
+            self.assertIn(needle, config)
+        # 归零统计必须在本次编译之前，日志里的命中数才只反映本 run。
+        self.assertLess(self.text.index("ccache --zero-stats"),
+                        self.text.index("run_framework_gate.sh build"))
+        self.assertIn("CCACHE_MAX_SIZE: 500M", self.stripped)
+        self.assertNotIn('CCACHE_VERSION: "4.9.1"', self.stripped,
+                         "版本必须来自实际安装结果，不写死 job env")
+        # launcher 只经既有 BBT_CMAKE_ARGS 透传口，gate/build 脚本不内联 ccache。
+        self.assertIn("BBT_CMAKE_ARGS", body(GATE))
+        self.assertNotIn("ccache", body(GATE))
+        self.assertNotIn("CCACHE", body(BUILD_STACK))
+        # fork PR 一律不安装、不写对象缓存（缓存条目是可执行内容）。
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository",
+                      self.stripped)
+        for step in steps:
+            if ("actions/cache/" in step or "ccache=$" in step or "max_size" in step
+                    or "ccache --show-stats" in step):
+                with self.subTest(step=step.splitlines()[0].strip()):
+                    self.assertIn("env.CACHE_ALLOWED == 'true'", step)
+
+    def test_cache_step_order(self):
+        # 安装 → 恢复 ccache → 恢复源码 → 固化配置 → 依赖准备 → 构建 → 统计 → 保存。
+        order = [
+            "安装 ccache",
+            "恢复 ccache 编译对象",
+            "恢复已校验 Boost 源码归档",
+            "固化 ccache 配置",
+            "bash scripts/fetch_deps.sh",
+            "复现锁定 Boost 1.90 context",
+            "写入 Boost 源码归档缓存",
+            "run_framework_gate.sh build",
+            "ccache 统计",
+            "保存 ccache 编译对象",
+            "Cleanup workspace",
+        ]
+        positions = [self.text.index(needle) for needle in order]
+        self.assertEqual(positions, sorted(positions), "缓存步骤顺序被破坏")
 
     def test_preserves_build_test_gate_commands(self):
         # 单 runner build_test 判据命令原样保留（deps/前缀/gate build/统一
