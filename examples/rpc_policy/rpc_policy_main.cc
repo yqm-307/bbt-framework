@@ -1,16 +1,16 @@
 // bbt-framework 公开出站策略 fixture。
 //
-// V2 会话拒绝 self-connection，框架又约束进程内同一时刻至多一个活跃 CoApp，
-// 因此本 fixture 由 caller 进程派生一个互异 identity 的 callee 进程：
+// V2 会话拒绝 self-connection，因此本 fixture 由 caller 进程派生一个互异
+// identity 的 callee 进程：
 //
 //   caller 进程（local_identity=rpc-policy-caller）
-//     CoApp 宿主 PolicyCallerService；其 handler 内经受保护的
+//     v2::CoApp 宿主 PolicyCallerService；其 handler 内经受保护的
 //     `this->call<Req,Resp>` 出站，出站目标解析成功后、真实 socket 发送之前
-//     调用公开策略 `CoAppOptions::rpc_policy`
+//     由框架 AppRuntimeState::Send 调用公开策略 Preflight
 //   callee 进程（local_identity=rpc-policy-callee）
-//     CoApp 宿主 PolicyCalleeService；入站经真实 V2 会话分发
+//     v2::CoApp 宿主 PolicyCalleeService；入站经真实 V2 会话分发
 //
-// 只用公开面：`bbt/framework/CoApp.hpp`、`bbt/framework/RpcPolicy.hpp`、
+// 只用公开面：`bbt/framework/V2.hpp`、`bbt/framework/RpcPolicy.hpp`、
 // `RequestContext.hpp` + getvalue 的 proto/codec。**不** include internal/、
 // **不**用 CoAppSeam/MakeCoAppForTest/DispatchInboundForTest/INetworkHost 桩/
 // 发送注入——编译期即证明「不依赖 internal 测试缝」。
@@ -19,27 +19,35 @@
 // 剩余预算，作为「期限只缩不放」的真实 oracle（不依赖 reply envelope 预算，
 // 后者只反映 caller 自己的入站预算）。
 //
-// argv: rpc_policy <mode> <port_file> <meta_file> <journal_file>
+// 参数（生成式入口 `bbtco_main` 不暴露 argv，参数经环境变量传入）：
+//   BBT_EXAMPLE_MODE=<mode> BBT_EXAMPLE_PORT_FILE / BBT_EXAMPLE_META_FILE /
+//   BBT_EXAMPLE_JOURNAL_FILE
 //   mode ∈ allow | reject | tighten | widen | expired | decorator
 //   - allow     ：策略允许（只计数）
-//   - reject    ：策略拒绝（Cancelled）：`_MakeEgress` 在 Send 之前返回错误
+//   - reject    ：策略拒绝（Cancelled）：AppRuntimeState::Send 在发送之前返回错误
 //   - tighten   ：策略收紧出站期限到 now+300ms（应传播到 callee 可见预算）
 //   - widen     ：策略返回「放大」期限 now+3600s（框架必须忽略）
 //   - expired   ：策略收紧到 now-1ms（框架须在 I/O 前 TimedOut）
 //   - decorator ：外层策略包内层策略，两个虚 Preflight 各调一次、顺序固定
-//   内部模式 `--callee <port_file> <meta_file> <journal_file>` 由 caller 派生，
-//   不对外使用。
+//   内部模式 BBT_EXAMPLE_MODE=callee（由 caller 派生，不对外使用）。
+//
+// 主内容在业务主协程里：装配 → CoStart → 写就绪文件 → 等关闭触发 → CoStop →
+// 关闭后探针。入口是 runtime 的生成式 `bbtco_main`，不写 native main、不启动/
+// 停止 scheduler、不建 runner 线程、不 join；共享 Engine 的唯一一次
+// Engine::Run 由 bbtco_main_host_hook 执行。
 //
 // journal 事件：preflight name=<n> seq=<k> / callee_handler_entered
 //   deadline_ms=<n> / listener_probe phase=after_run_before_exit port=<n>
 //   result=refused|connected|error errno=<n> / resource_close /
 //   shutdown rc=.. state=.. owner_closed=.. / callee_shutdown rc=..
 //
-// 关闭后验收（B1）：`app.run()` 返回、runner 已 join、进程与 `CoApp` 对象均仍
-// 存活时，由本进程对自己的 bound 端口做一次**有界** nonblocking connect 并入
+// 关闭后验收（B1）：`CoStop()` 返回、主协程仍存活、进程与 `v2::CoApp` 对象均仍
+// 存在时，由本进程对自己的 bound 端口做一次**有界** nonblocking connect 并入
 // journal。只有 ECONNREFUSED 记 result=refused（唯一判绿值）；超时或其它 errno
 // 记 result=error（不算绿）。该探针只证明「存活期 listener 已关」——它不证明
 // 关闭期零额外 I/O，也不替代在途 I/O 排空的判定。
+//
+// 策略由 AppOptions::SetRpcPolicy 在构造期装配；默认空值不改变出站行为。
 
 #include <atomic>
 #include <cerrno>
@@ -52,7 +60,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -65,18 +72,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
+#include <bbt/infra/CloseOptions.hpp>
 
-#include <bbt/framework/CoApp.hpp>
+#include <bbt/framework/Component.hpp>
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/CoService.hpp>
+#include <bbt/framework/HostGate.hpp>
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
+#include <bbt/framework/V2.hpp>
 
 #include "getvalue_service.hpp" // ProtoCodec<GetValueRequest/Response>（公开面）
 
 namespace fw = bbt::framework;
+namespace v2 = bbt::framework::v2;
 namespace inf = bbt::infra;
 
 namespace {
@@ -96,35 +106,37 @@ void Journal(const std::string& line) {
     g_journal.flush();
 }
 
-class CloseJournal final : public inf::ICoCloseable {
+class CloseJournalComponent final : public v2::CoComponent {
 public:
-    void Close() noexcept override {
-        bool first = false;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            first = !m_closed;
-            m_closed = true;
-        }
-        if (first)
-            Journal(std::string("event=resource_close auth_state=") + kAuthState);
-    }
-    bool IsClosed() const noexcept override {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        return m_closed;
-    }
+    struct Options {};
+    static std::atomic_bool stopped;
 
-private:
-    mutable std::mutex m_mtx;
-    bool m_closed = false;
+    explicit CloseJournalComponent(fw::detail::ConstructKey k, Options)
+        : v2::CoComponent(k) {}
+
+protected:
+    ~CloseJournalComponent() noexcept override = default;
+
+    fw::result<void> OnStop(const inf::CloseOptions&) override {
+        if (!stopped.exchange(true))
+            Journal(std::string("event=resource_close auth_state=") +
+                    kAuthState);
+        return fw::result<void>::ok();
+    }
+    friend class fw::detail::Registry;
 };
+std::atomic_bool CloseJournalComponent::stopped{false};
 
 // —— 业务（公开面）：caller 出站 + callee 观测 ——
 //
 // callee：journal handler 进入与**公开可见**的 handler 期限剩余（RequestContext
 // ::deadline - now），作为「期限只缩不放」的真实 oracle。
-class PolicyCalleeService final : public fw::CoService<PolicyCalleeService> {
+class PolicyCalleeService final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "bbt.example.v1.PolicyCallee";
+
+    explicit PolicyCalleeService(fw::detail::ConstructKey k)
+        : v2::CoService<>(k) {}
 
     fw::CoRpcResp GetValue(fw::CoRpcReq req) {
         long long remaining_ms = -1;
@@ -148,15 +160,22 @@ public:
     static constexpr auto kRpcMethods =
         fw::RpcMethods(fw::ProtoMethod<&PolicyCalleeService::GetValue, bbt::example::v1::GetValueRequest,
                                        bbt::example::v1::GetValueResponse>("GetValue"));
+
+protected:
+    ~PolicyCalleeService() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 // caller：经公开 typed 出站 `this->call<Req,Resp>` 转发到 callee（静态路由）或
-// 未配置路由目标（find_route 门拒绝，策略不被询问）。
-class PolicyCallerService final : public fw::CoService<PolicyCallerService> {
+// 未配置路由目标（路由门拒绝，策略不被询问）。
+class PolicyCallerService final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "bbt.example.v1.PolicyCaller";
     static constexpr std::string_view kCalleeService = "bbt.example.v1.PolicyCallee";
     static constexpr std::string_view kNoRouteService = "bbt.example.v1.PolicyUnrouted";
+
+    explicit PolicyCallerService(fw::detail::ConstructKey k)
+        : v2::CoService<>(k) {}
 
     fw::CoRpcResp Forward(fw::CoRpcReq req) {
         return _Forward(std::move(req), kCalleeService);
@@ -171,6 +190,10 @@ public:
                                        bbt::example::v1::GetValueResponse>("Forward"),
                        fw::ProtoMethod<&PolicyCallerService::ForwardNoRoute, bbt::example::v1::GetValueRequest,
                                        bbt::example::v1::GetValueResponse>("ForwardNoRoute"));
+
+protected:
+    ~PolicyCallerService() noexcept override = default;
+    friend class fw::detail::Registry;
 
 private:
     fw::CoRpcResp _Forward(fw::CoRpcReq req, std::string_view target) {
@@ -261,14 +284,24 @@ const char* ProbeResultName(ListenerProbeResult r) {
 // —— B1 关闭后存活期 listener 探针 END ——
 
 fw::ServiceOptions ConcurrentOpts() {
-    return fw::ServiceOptions{fw::ExecutionPolicy::Concurrent,
-                              /*max_inflight*/ 64,
-                              /*mailbox_capacity*/ 0,
-                              /*max_actors*/ 0,
-                              /*ordered_ingress*/ false,
-                              /*max_ordered_streams*/ 0,
-                              /*max_cached_results*/ 0,
-                              /*max_cached_result_bytes*/ 0};
+    return fw::ServiceOptions{}.SetMaxInflight(64);
+}
+
+fw::AppOptions BaseOptions(std::string identity) {
+    fw::AppNetworkOptions network;
+    network.SetLimits(inf::NetworkLimits{
+                          /*max_connections*/ 64, /*max_inflight*/ 64,
+                          /*max_header_bytes*/ 16 * 1024,
+                          /*max_body_bytes*/ 64 * 1024,
+                          /*incoming_timeout*/
+                          std::chrono::milliseconds{30000}})
+        .SetListenAddress(inf::ListenAddress{"127.0.0.1", 0})
+        .SetLocalAppId(std::move(identity));
+    return fw::AppOptions{}
+        .SetLimits(64, 64, 8, 64)
+        .SetShutdownBudget(std::chrono::milliseconds{3000})
+        .SetLifecycleBudget(std::chrono::milliseconds{3000})
+        .SetNetworkOptions(std::move(network));
 }
 
 // —— 公开策略实现（继承 RpcPolicy）；组合包装见 DecoratorPolicy ——
@@ -345,16 +378,25 @@ std::shared_ptr<fw::RpcPolicy> MakePolicy(const std::string& mode) {
     return nullptr;
 }
 
-std::string BoundEndpointOrEmpty(fw::CoApp& app, int timeout_ms) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::string bound = app.bound_endpoint();
-        if (!bound.empty())
-            return bound;
-        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+std::string Env(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string{} : std::string{value};
+}
+
+// 生命周期结果 → 进程退出码，沿用既有验收口径：
+//   0 按期优雅关闭 / 1 配置校验拒绝（未启动任何组件）/ 2 启动中途失败回退 /
+//   3 关闭曾超预算（ShutdownIncomplete）/ 4 关闭收尾存在失败项。
+int CoRc(const fw::result<void>& r) {
+    if (r)
+        return 0;
+    switch (r.error().code) {
+    case fw::ErrorCode::InvalidArgument:
+        return 1;
+    case fw::ErrorCode::TimedOut:
+        return 3;
+    default:
+        return 4;
     }
-    return {};
 }
 
 void WriteTextFile(const std::string& path, const std::string& text,
@@ -373,37 +415,53 @@ std::uint16_t PortOf(const std::string& endpoint) {
     return static_cast<std::uint16_t>(std::stoi(endpoint.substr(colon + 1)));
 }
 
-void ServeUntilEof(fw::CoApp& app) {
-    char buf[8];
-    while (::read(STDIN_FILENO, buf, sizeof(buf)) > 0) {
+// 在当前协程内非阻塞地观察 stdin EOF（驱动器关管道即关闭触发）；不建观察线程。
+void WaitStdinEof() {
+    for (;;) {
+        pollfd pfd{STDIN_FILENO, POLLIN, 0};
+        const int ready = ::poll(&pfd, 1, 0);
+        if (ready > 0) {
+            char buf[64];
+            const ssize_t n = ::read(STDIN_FILENO, buf, sizeof(buf));
+            if (n <= 0)
+                return;
+            continue;
+        }
+        if (ready < 0 && errno != EINTR)
+            return;
+        bbtco_sleep(20);
     }
-    app.request_shutdown();
 }
 
-// —— callee 进程：由 caller 派生，独立 CoApp（互异 identity） ——
-int RunCallee(const std::string& port_file, const std::string& meta_file) {
-    fw::CoAppOptions options;
-    options.network_limits = inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
-                                                /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
-                                                /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    options.listen = inf::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    options.local_identity = kCalleeIdentity;
+// 关闭触发只有一个：驱动器关 stdin。请求槽是持久位，先置位再等待不丢通知。
+void ServeUntilEof(v2::CoApp& app) {
+    WaitStdinEof();
+    app.RequestShutdown();
+}
 
-    fw::CoApp app{std::move(options)};
-    if (auto r = app.add_service<PolicyCalleeService>(ConcurrentOpts()); !r) {
-        std::fprintf(stderr, "callee: add_service failed: %s\n", r.error().message.c_str());
+// —— callee 进程：由 caller 派生，独立 v2::CoApp（互异 identity） ——
+int RunCallee(const std::string& port_file, const std::string& meta_file) {
+    auto app = v2::CoApp::Create(BaseOptions(kCalleeIdentity),
+                                 "rpc-policy-callee");
+    if (auto r = bbt_co_await
+            app->CoInstallService<PolicyCalleeService>(ConcurrentOpts());
+        !r) {
+        std::fprintf(stderr, "callee: CoInstallService failed: %s\n",
+                     r.error().message.c_str());
         return 4;
     }
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
-    const std::string bound = BoundEndpointOrEmpty(app, 10000);
+    auto started = bbt_co_await app->CoStart();
+    if (!started) {
+        std::fprintf(stderr, "callee: start failed: %s\n",
+                     started.error().message.c_str());
+        return CoRc(started);
+    }
+    const std::string bound = app->BoundEndpoint();
     if (bound.empty()) {
-        app.request_shutdown();
-        if (runner.joinable())
-            runner.join();
-        std::fprintf(stderr, "callee: bind did not become ready rc=%d\n", rc);
+        std::fprintf(stderr, "callee: bind did not become ready\n");
+        auto closed = bbt_co_await app->CoStop();
+        (void)closed;
         return 5;
     }
     WriteTextFile(port_file, std::to_string(PortOf(bound)), "callee port");
@@ -415,9 +473,9 @@ int RunCallee(const std::string& port_file, const std::string& meta_file) {
                   "callee meta");
     std::fprintf(stderr, "rpc_policy callee up endpoint=%s\n", bound.c_str());
 
-    ServeUntilEof(app);
-    if (runner.joinable())
-        runner.join();
+    ServeUntilEof(*app);
+    auto stopped = bbt_co_await app->CoStop();
+    const int rc = CoRc(stopped);
     Journal(std::string("event=callee_shutdown rc=") + std::to_string(rc) +
             " auth_state=" + kAuthState);
     return rc;
@@ -434,6 +492,12 @@ bool SpawnCallee(const std::string& dir, const std::string& journal_path,
                  CalleeProcess& out) {
     out.port_file = dir + "/callee.port";
     out.meta_file = dir + "/callee.meta";
+    // 子进程参数经环境变量传：生成式入口（bbtco_main）拿不到 argv。必须在
+    // fork 之前写好——fork 之后子进程只能调用 async-signal-safe 接口。
+    ::setenv("BBT_EXAMPLE_MODE", "callee", 1);
+    ::setenv("BBT_EXAMPLE_PORT_FILE", out.port_file.c_str(), 1);
+    ::setenv("BBT_EXAMPLE_META_FILE", out.meta_file.c_str(), 1);
+    ::setenv("BBT_EXAMPLE_JOURNAL_FILE", journal_path.c_str(), 1);
     int in_pipe[2] = {-1, -1};
     if (::pipe(in_pipe) != 0)
         return false;
@@ -454,9 +518,9 @@ bool SpawnCallee(const std::string& dir, const std::string& journal_path,
         if (n <= 0)
             ::_exit(127);
         exe[static_cast<std::size_t>(n)] = '\0';
-        ::execl(exe.data(), exe.data(), "--callee", out.port_file.c_str(),
-                out.meta_file.c_str(), journal_path.c_str(),
-                static_cast<char*>(nullptr));
+        // 生成式入口只认环境变量；fork 之后只做 async-signal-safe 的 execl，
+        // 环境在 fork 前已由父进程写好（见下）。
+        ::execl(exe.data(), exe.data(), static_cast<char*>(nullptr));
         ::_exit(127);
     }
     ::close(in_pipe[0]);
@@ -479,7 +543,7 @@ bool WaitCalleePort(CalleeProcess& callee, std::uint16_t& port, int timeout_ms) 
             port = static_cast<std::uint16_t>(value);
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        bbtco_sleep(25);
     }
     return false;
 }
@@ -501,7 +565,7 @@ void ReapCallee(CalleeProcess& callee) {
             callee.pid = -1;
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        bbtco_sleep(20);
     }
     ::kill(callee.pid, SIGKILL);
     ::waitpid(callee.pid, &status, 0);
@@ -526,42 +590,47 @@ int RunCaller(const std::string& mode, const std::string& port_file,
     }
     const std::string callee_endpoint = "127.0.0.1:" + std::to_string(callee_port);
 
-    fw::CoAppOptions options;
-    options.network_limits = inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
-                                                /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
-                                                /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    options.listen = inf::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    // V2 会话身份必填；caller/callee/驱动器三方互异。
-    options.local_identity = kCallerIdentity;
-    options.static_routes = {
-        fw::StaticRoute{std::string(PolicyCallerService::kCalleeService), callee_endpoint}};
-    // 唯一组装点——构造期选择公开策略。
-    options.rpc_policy = MakePolicy(mode);
+    auto options = BaseOptions(kCallerIdentity);
+    options.AddRoute(std::string(PolicyCallerService::kCalleeService),
+                     callee_endpoint);
+    options.SetRpcPolicy(MakePolicy(mode));
 
-    fw::CoApp app{std::move(options)};
-    if (auto r = app.add_service<PolicyCallerService>(ConcurrentOpts()); !r) {
-        std::fprintf(stderr, "fixture: add_service(caller) failed: %s\n", r.error().message.c_str());
+    auto app = v2::CoApp::Create(std::move(options), "rpc-policy-caller");
+    if (auto r = bbt_co_await
+            app->CoInstallService<PolicyCallerService>(ConcurrentOpts());
+        !r) {
+        std::fprintf(stderr, "fixture: CoInstallService(caller) failed: %s\n",
+                     r.error().message.c_str());
         ReapCallee(callee);
         return 4;
     }
-    auto owner = std::make_shared<CloseJournal>();
-    if (auto r = app.add_resource<CloseJournal>(owner); !r) {
-        std::fprintf(stderr, "fixture: add_resource failed: %s\n", r.error().message.c_str());
+    CloseJournalComponent::stopped.store(false);
+    if (auto r = bbt_co_await
+            app->CoInstallComponent<CloseJournalComponent>(
+                "journal", CloseJournalComponent::Options{});
+        !r) {
+        std::fprintf(stderr, "fixture: CoInstallComponent failed: %s\n",
+                     r.error().message.c_str());
         ReapCallee(callee);
         return 4;
     }
+    Journal(std::string("event=policy_installed mode=") + mode +
+            " auth_state=" + kAuthState);
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
+    auto started = bbt_co_await app->CoStart();
+    if (!started) {
+        ReapCallee(callee);
+        std::fprintf(stderr, "fixture: start failed: %s\n",
+                     started.error().message.c_str());
+        return CoRc(started);
+    }
 
-    const std::string bound = BoundEndpointOrEmpty(app, 10000);
+    const std::string bound = app->BoundEndpoint();
     if (bound.empty()) {
-        app.request_shutdown();
-        if (runner.joinable())
-            runner.join();
+        auto closed = bbt_co_await app->CoStop();
+        (void)closed;
         ReapCallee(callee);
-        std::fprintf(stderr, "fixture: bind did not become ready rc=%d\n", rc);
+        std::fprintf(stderr, "fixture: bind did not become ready\n");
         return 5;
     }
     const std::uint16_t port = PortOf(bound);
@@ -579,14 +648,19 @@ int RunCaller(const std::string& mode, const std::string& port_file,
     std::fprintf(stderr, "rpc_policy fixture up mode=%s endpoint=%s callee=%s\n",
                  mode.c_str(), bound.c_str(), callee_endpoint.c_str());
 
-    ServeUntilEof(app);
-    if (runner.joinable())
-        runner.join();
+    ServeUntilEof(*app);
+    // 存活期探针要求 listener 已物理关闭；默认 Immediate 只封口，不能作该凭据。
+    // 等模块自己的回收，不等主任务返回后才结束的共享 Engine::Run。
+    auto close_options = inf::CloseOptions::Immediate();
+    close_options.wait_release = true;
+    close_options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    auto stopped = bbt_co_await app->CoStop(close_options);
+    const int rc = CoRc(stopped);
 
-    const int state = static_cast<int>(app.shutdown_state());
-    Journal(std::string("event=shutdown rc=") + std::to_string(rc) + " state=" + std::to_string(state) + " owner_closed=" + (owner->IsClosed() ? "1" : "0") + " auth_state=" + kAuthState);
+    const int state = static_cast<int>(app->State());
+    Journal(std::string("event=shutdown rc=") + std::to_string(rc) + " state=" + std::to_string(state) + " owner_closed=" + (CloseJournalComponent::stopped.load() ? "1" : "0") + " auth_state=" + kAuthState);
 
-    // B1：run 已返回、runner 已 join，而本进程与 app 对象仍存活——此刻对 bound
+    // B1：co_stop 已返回，而本进程与 app 对象仍存活——此刻对 bound
     // 端口做有界探针才可能区分「框架关掉了 listener」与「进程回收后被内核顺带
     // 释放」。端口取自已服务过真实 RPC 的同一个值（driver 核 port 字段一致）。
     int probe_errno = 0;
@@ -598,36 +672,41 @@ int RunCaller(const std::string& mode, const std::string& port_file,
     std::fprintf(stderr,
                  "rpc_policy fixture rc=%d state=%d owner_closed=%d "
                  "listener_probe=%s errno=%d\n",
-                 rc, state, owner->IsClosed() ? 1 : 0, ProbeResultName(probe), probe_errno);
+                 rc, state, CloseJournalComponent::stopped.load() ? 1 : 0,
+                 ProbeResultName(probe), probe_errno);
     return rc;
 }
 
 } // namespace
 
-int main(int argc, char* argv[]) {
-    if (argc < 5)
-        return 90; // EX_USAGE
 
+// handler 内做 protobuf 编解码 + 出站策略 + 真实跨进程调用，默认 12KB 协程栈
+// 不足；经公开配置宏在 Start 前放大（process-global）。
+void setup_runtime() {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
+}
+
+int bbtco_main() {
+    const std::string mode = Env("BBT_EXAMPLE_MODE");
+    const std::string port_file = Env("BBT_EXAMPLE_PORT_FILE");
+    const std::string meta_file = Env("BBT_EXAMPLE_META_FILE");
+    const std::string journal_path = Env("BBT_EXAMPLE_JOURNAL_FILE");
+    if (mode.empty() || port_file.empty() || meta_file.empty() ||
+        journal_path.empty())
+        return 90; // EX_USAGE
 
     // 内部 callee 模式：先于 caller 打开 journal（append），不截断。
-    if (std::strcmp(argv[1], "--callee") == 0) {
-        const std::string port_file = argv[2];
-        const std::string meta_file = argv[3];
-        const std::string journal_path = argv[4];
+    if (mode == "callee") {
         g_journal.open(journal_path, std::ios::out | std::ios::app);
         if (!g_journal) {
-            std::fprintf(stderr, "callee: cannot open journal %s\n", journal_path.c_str());
+            std::fprintf(stderr, "callee: cannot open journal %s\n",
+                         journal_path.c_str());
             return 6;
         }
         return RunCallee(port_file, meta_file);
     }
 
-    const std::string mode = argv[1];
-    const std::string port_file = argv[2];
-    const std::string meta_file = argv[3];
-    const std::string journal_path = argv[4];
     if (!MakePolicy(mode)) {
         std::fprintf(stderr, "fixture: unknown mode %s\n", mode.c_str());
         return 90;
@@ -635,9 +714,17 @@ int main(int argc, char* argv[]) {
 
     g_journal.open(journal_path, std::ios::out | std::ios::app);
     if (!g_journal) {
-        std::fprintf(stderr, "fixture: cannot open journal %s\n", journal_path.c_str());
+        std::fprintf(stderr, "fixture: cannot open journal %s\n",
+                     journal_path.c_str());
         return 6;
     }
 
     return RunCaller(mode, port_file, meta_file, journal_path);
 }
+
+// 入口 native host hook：共享 Engine 的 Engine::Run 在主线程执行一次。
+int bbtco_main_host_hook(bbt::coroutine::HostHookContext& ctx) {
+    return bbt::framework::HostGate::RunHostGate(ctx);
+}
+
+BBTCO_MAIN_WITH_SETUP_AND_HOST_HOOK();

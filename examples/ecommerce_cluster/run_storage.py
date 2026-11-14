@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""真实存储验收：自有固定镜像容器、独立服务进程、V2 会话请求与 Mongo 读回。"""
+"""真实存储验收：HTTP 入口、typed RPC、多进程组件与自有 Redis/Mongo 读回。"""
 import argparse
+import http.client
 import concurrent.futures
 import json
 import os
@@ -24,6 +25,23 @@ NAMES = {role: "bbt.example.ecommerce.v1." + role.title() + "Service"
 NAMES["settlement"] = "ecommerce.settlement"
 
 
+STORAGE_ENV = {
+    "--redis": "BBT_EXAMPLE_REDIS",
+    "--mongo": "BBT_EXAMPLE_MONGO",
+    "--database": "BBT_EXAMPLE_DATABASE",
+    "--key-prefix": "BBT_EXAMPLE_KEY_PREFIX",
+}
+
+
+def storage_env(mode, consul_url, storage_args):
+    """生成式入口（bbtco_main）不暴露 argv：角色/依赖地址经环境变量传入。"""
+    env = dict(os.environ, BBT_EXAMPLE_MODE=mode, BBT_EXAMPLE_CONSUL=consul_url,
+               BBT_EXAMPLE_STORAGE="1")
+    for i in range(0, len(storage_args), 2):
+        env[STORAGE_ENV[storage_args[i]]] = storage_args[i + 1]
+    return env
+
+
 class StorageNode(cluster.Node):
     def __init__(self, binary, mode, consul_url, log_path, storage_args):
         self.mode = mode
@@ -33,7 +51,7 @@ class StorageNode(cluster.Node):
         self._cv = threading.Condition()
         self._log = open(log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
-            [binary, mode, "--consul", consul_url, "--storage"] + storage_args,
+            [binary], env=storage_env(mode, consul_url, storage_args),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=1, text=True)
         self._reader = threading.Thread(target=self._read, daemon=True)
@@ -70,6 +88,26 @@ def rpc(node, service, method, payload, request_type):
     prefix = "bbt.example.ecommerce.v1."
     port = int(node.ready_info["endpoint"].rsplit(":", 1)[1])
     start = time.monotonic()
+    if service == "gateway":
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=7)
+        try:
+            conn.request("POST", "/" + method, body=payload,
+                         headers={"Content-Type": "application/x-protobuf", "X-Request-Id": request_id})
+            response = conn.getresponse()
+            body = response.read()
+            result = {"ok": response.status == 200, "elapsed": time.monotonic() - start,
+                      "request_id": request_id, "transport": "http/1.1", "http_status": response.status}
+            if result["ok"]:
+                result["record"] = decode_record(body)
+            else:
+                result["error"] = {"message": body.decode("utf-8", "replace"),
+                                   "code": response.getheader("X-Bbt-Error-Code")}
+            return result
+        except (OSError, http.client.HTTPException) as exc:
+            return {"ok": False, "elapsed": time.monotonic() - start,
+                    "request_id": request_id, "transport": "http/1.1", "error": {"message": str(exc)}}
+        finally:
+            conn.close()
     client = None
     try:
         client = cluster.v2.V2Client(port, identity="ecommerce-storage-driver",
@@ -135,6 +173,34 @@ def main():
         result["nodes"].append(ready)
         return node
 
+    def cache_views(node):
+        services = [NAMES["catalog"], "ecommerce.catalog.search", "ecommerce.catalog.recommendations",
+                    "ecommerce.catalog.stock", "ecommerce.catalog.audit"]
+        port = int(node.ready_info["endpoint"].rsplit(":", 1)[1])
+        views = []
+        for service in services:
+            client = cluster.v2.V2Client(port, identity="ecommerce-component-" + uuid.uuid4().hex, timeout=7)
+            try:
+                client.handshake()
+                env = client.call(service, "Inspect", payload=b"", request_id="inspect-" + uuid.uuid4().hex,
+                                  request_schema="bbt.example.ecommerce.v1.LookupRequest",
+                                  response_schema="bbt.example.ecommerce.v1.ComponentView", budget_ms=4000)
+                if cluster.v2.error_of(env):
+                    raise RuntimeError(str(cluster.v2.error_of(env)))
+                view = {field: value.decode() if wire == 2 else value
+                        for field, wire, value in cluster._parse_fields(env.get("payload", b""))}
+                views.append(view)
+            except (OSError, cluster.v2.WireError) as error:
+                raise RuntimeError(f"component inspection {service}: {error}") from error
+            finally:
+                client.close()
+        check("five_services_two_redis_3_plus_2", len(views) == 5 and
+              all(v.get(5) == 1 for v in views) and len({v.get(4) for v in views}) == 1 and
+              views[0].get(1) == views[1].get(1) == views[2].get(1) and
+              views[3].get(1) == views[4].get(1) != views[0].get(1) and
+              views[0].get(3) == views[1].get(3) == views[2].get(3) and
+              views[3].get(3) == views[4].get(3) != views[0].get(3), views)
+
     def query(node, method, order_id):
         return rpc(node, "gateway", method, cluster._f_len(1, order_id), "LookupRequest")
 
@@ -190,6 +256,7 @@ def main():
             containers[kind] = name
             cid = command(["docker", "run", "--pull=never", "-d", "--name", name,
                            "--label", "bbt.ecommerce.run=" + run_id,
+                           "--memory", "768m", "--cpus", "1", "--pids-limit", "256",
                            "-p", f"127.0.0.1::{port}", image])
             containers[kind] = cid
             mapped = command(["docker", "port", cid, str(port) + "/tcp"])
@@ -215,14 +282,34 @@ def main():
                         "--mongo", "mongodb://" + result["containers"]["mongo"]["endpoint"] + "/?retryWrites=false",
                         "--database", run_id, "--key-prefix", run_id]
         catalog = start("catalog", storage_args)
+        cache_views(catalog)
         settlement = start("settlement", storage_args)
         order = start("order", storage_args)
         gateway = start("gateway", storage_args)
+        if gateway.ready_info is None:
+            raise RuntimeError("gateway readiness missing")
+        gateway_port = int(gateway.ready_info["endpoint"].rsplit(":", 1)[1])
+        for name, verb, path, headers, status in [
+            ("http_unknown_path", "POST", "/Missing", {"X-Request-Id": "probe"}, 404),
+            ("http_method_rejected", "GET", "/CreateOrder", {"X-Request-Id": "probe"}, 405),
+            ("http_missing_id", "POST", "/CreateOrder", {}, 400),
+            ("http_bad_id", "POST", "/CreateOrder", {"X-Request-Id": "bad id"}, 400),
+        ]:
+            conn = http.client.HTTPConnection("127.0.0.1", gateway_port, timeout=7)
+            try:
+                conn.request(verb, path, body=b"", headers=headers)
+                response = conn.getresponse()
+                body = response.read()
+                check(name, response.status == status,
+                      {"transport": "http/1.1", "status": response.status, "body": body.decode()})
+            finally:
+                conn.close()
         routes_ready(gateway, ["GetOrder", "GetBill"])
         views_ready(order, gateway)
         # 没有写请求的自动重试：每次 CreateOrder 都是显式验收动作。
         created = rpc(gateway, "gateway", "CreateOrder", order_payload("order-one"), "OrderRequest")
-        check("create_settled", created.get("ok") and created["record"]["state"] == "settled" and
+        check("create_settled", created.get("transport") == "http/1.1" and
+              created.get("http_status") == 200 and created.get("ok") and created["record"]["state"] == "settled" and
               created["record"]["total_cents"] == 2598 and created["record"]["payable_cents"] == 2498, created)
         original = created["record"]
         replay = rpc(gateway, "gateway", "CreateOrder", order_payload("order-one"), "OrderRequest")
@@ -275,6 +362,7 @@ def main():
             rc, message = node.stop()
             check(node.mode + "_restart_stop", rc == 0, {"rc": rc, "message": message})
         catalog = start("catalog", storage_args)
+        cache_views(catalog)
         settlement = start("settlement", storage_args)
         order = start("order", storage_args)
         routes_ready(gateway, ["GetOrder", "GetBill"])
@@ -294,19 +382,25 @@ def main():
               len({h["pid"] for h in first_hops.values() if h is not None}) == 4 and
               len({h["request_id"] for h in first_hops.values() if h is not None}) == 4, first_hops)
         # 验证显式存储模式缺配置时失败，不回落报价。
-        rejected = subprocess.run([args.binary, "order", "--consul", consul.url(), "--storage"],
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=8)
+        rejected = subprocess.run(
+            [args.binary],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="order",
+                     BBT_EXAMPLE_CONSUL=consul.url(), BBT_EXAMPLE_STORAGE="1"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=8)
         check("storage_fail_closed", rejected.returncode != 0 and "storage requires" in rejected.stdout,
               {"rc": rejected.returncode, "output": rejected.stdout})
         # 实际停止本次后端，再证明新进程拒绝进入 ready；不触碰共享服务。
         for backend, role in [("redis", "catalog"), ("mongo", "order")]:
             command(["docker", "stop", "--time", "3", containers[backend]], timeout=10)
+            # 该后端已停：同角色同依赖地址重启，必须拒绝进入 ready。
             failed_start = subprocess.run(
-                [args.binary, role, "--consul", consul.url(), "--storage"] + storage_args,
+                [args.binary],
+                env=storage_env(role, consul.url(), storage_args),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, timeout=18)
             check(backend + "_unavailable_fail_closed", failed_start.returncode != 0 and
-                  "event=ready" not in failed_start.stdout,
+                  "event=ready" not in failed_start.stdout and
+                  f"event=start_failure_cleanup mode={role} complete=1" in failed_start.stdout,
                   {"rc": failed_start.returncode, "output": failed_start.stdout})
     except Exception as error:
         result["failures"].append(str(error))

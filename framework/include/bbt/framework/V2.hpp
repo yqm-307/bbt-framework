@@ -18,5 +18,8 @@
 
 #include <bbt/framework/Address.hpp>
 #include <bbt/framework/App.hpp>
+#include <bbt/framework/Actor.hpp>
+#include <bbt/framework/Component.hpp>
 #include <bbt/framework/Object.hpp>
+#include <bbt/framework/RpcMethods.hpp>
 #include <bbt/framework/Service.hpp>

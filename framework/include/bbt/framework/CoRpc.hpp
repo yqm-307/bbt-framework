@@ -26,7 +26,7 @@ namespace bbt::framework {
 namespace rpc_detail {
 
 // 通用位置参数 codec 的唯一实现在 bbt::infra::rpc::*；下面只做名字转发，
-// 保持旧 rpc_detail 调用点（本仓 MethodTable/ICoService 及未来消费方）不变，
+// 保持旧 rpc_detail 调用点（本仓 MethodTable/CoServiceBase 及未来消费方）不变，
 // 不引入第二套字节规则。result/Error 与 infra 同一类型（framework/Result.hpp
 // 即 infra 的别名），转发不产生类型转换。
 

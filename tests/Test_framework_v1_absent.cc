@@ -22,7 +22,8 @@
 #include <string>
 #include <vector>
 
-#include <bbt/framework/CoApp.hpp>
+#include <bbt/framework/App.hpp>
+#include <bbt/framework/internal/AppRuntimeState.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 #include <bbt/infra/rpc/Request.hpp>
 #include <bbt/infra/rpc/Response.hpp>
@@ -119,7 +120,8 @@ BOOST_AUTO_TEST_CASE(v2_surface_compiles_and_is_usable) {
     BOOST_CHECK(response.Payload().empty());
 
     // 安装入口与出站入口都是 V2 名字（类型可用即证明头已就位）。
-    using AdmissionFn = void (*)(fw::InfraHttpHost&, fw::CoApp&);
+    using AdmissionFn =
+        void (*)(fw::InfraHttpHost&, std::shared_ptr<fw::AppRuntimeState>);
     AdmissionFn admission = static_cast<AdmissionFn>(&fw::InstallRpcAdmission);
     BOOST_CHECK(admission != nullptr);
     BOOST_CHECK(sizeof(fw::RpcEgress) > 0);

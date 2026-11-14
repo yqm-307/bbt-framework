@@ -28,7 +28,7 @@
 #include <bbt/infra/rpc/Request.hpp>
 #include <bbt/infra/rpc/Response.hpp>
 
-#include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/internal/ServiceBase.hpp>
 #include <bbt/framework/DynamicRouteTable.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
@@ -45,17 +45,19 @@ struct AppRuntimeState {
     // 装配期写入（构造/Publish，先于接纳），此后只读：出站依赖。
     std::map<std::string, std::string> routes;
     // 出站回调强持有同一动态表，不借用 CoApp；表内同步保护后续快照更新。
-    std::shared_ptr<DynamicRouteTable>           dynamic_routes;
-    std::shared_ptr<RpcPolicy>                    rpc_policy;
+    std::shared_ptr<DynamicRouteTable> dynamic_routes;
+    std::shared_ptr<RpcPolicy> rpc_policy;
     std::shared_ptr<RpcEgress> default_egress;
-    RpcSendAppFn                                  seam_send;
+    RpcSendAppFn seam_send;
+    // 测试缝：宿主 Create 后启动其共享 Engine 的等价入口 host hook。
+    std::function<void(INetworkHost&)> start_host_engine;
 
     // run 期受管对象（mtx 保护）。Publish 填入；Release 全部放弃。
     std::mutex mtx;
-    std::shared_ptr<InboundDispatcher>                  dispatcher;
+    std::shared_ptr<InboundDispatcher> dispatcher;
     std::map<std::string, std::shared_ptr<const RpcMethodTable>> tables;
-    std::map<std::string, std::shared_ptr<ICoService>>           instances;
-    std::shared_ptr<ActorRegistry>                              registry;
+    std::map<std::string, std::shared_ptr<v2::CoServiceBase>> instances;
+    std::shared_ptr<ActorRegistry> registry;
 
     // 查询与真实出站共用路由门：动态已配置服务不回退静态地址。
     result<std::string> FindRoute(std::string_view service) const;
@@ -70,7 +72,7 @@ struct AppRuntimeState {
     void Publish(
         std::shared_ptr<InboundDispatcher> d,
         std::map<std::string, std::shared_ptr<const RpcMethodTable>> t,
-        std::map<std::string, std::shared_ptr<ICoService>> inst,
+        std::map<std::string, std::shared_ptr<v2::CoServiceBase>> inst,
         std::shared_ptr<ActorRegistry> reg);
 
     // 收束：拒新分发并放弃全部受管对象引用；在途分发靠本地强引用与
@@ -81,7 +83,8 @@ struct AppRuntimeState {
     // RuntimeUnavailable，明确失败而非悬垂访问。
     result<bbt::infra::rpc::Response> Dispatch(
         const bbt::infra::rpc::Request& request,
-        const std::function<void()>& on_dispatched = {});
+        const std::function<void()>& on_dispatched = {},
+        const bbt::infra::IncomingCallContext* http_context = nullptr);
 };
 
 } // namespace bbt::framework

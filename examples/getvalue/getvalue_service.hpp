@@ -21,10 +21,10 @@
 #include <bbt/example/v1/get_value.pb.h>
 
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
+#include <bbt/framework/Service.hpp>
 
 namespace bbt::framework::rpc_detail {
 
@@ -129,10 +129,13 @@ private:
 // 业务服务：GetValue(key) -> {found, value}。空 key 返回 InvalidArgument；
 // 负载非法/类型错误由 ProtoCodec::Decode 返回 ProtocolError，原样经错误信封
 // 回传；miss 返回 found=false。
-class GetValueService final : public bbt::framework::CoService<GetValueService> {
+class GetValueService final : public bbt::framework::v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.GetValueService";
+
+    explicit GetValueService(bbt::framework::detail::ConstructKey key)
+        : bbt::framework::v2::CoService<>(key) {}
 
     bbt::framework::CoRpcResp GetValue(bbt::framework::CoRpcReq req) {
         using bbt::framework::CoRpcResp;
@@ -178,8 +181,12 @@ public:
                                     bbt::example::v1::GetValueResponse>(
             "GetValue"));
 
+protected:
+    ~GetValueService() noexcept override = default;
+
 private:
     InMemoryStore store_;
+    friend class bbt::framework::detail::Registry;
 };
 
 } // namespace getvalue

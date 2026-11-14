@@ -84,8 +84,13 @@ def main():
                                  args.proto_root, work)
         print(f"protoc-drift {drift}", file=sys.stderr)
 
+        # 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
         server = subprocess.Popen(
-            [args.server_bin, "server", port_file, meta_file, journal_file],
+            [args.server_bin],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="server",
+                     BBT_EXAMPLE_PORT_FILE=port_file,
+                     BBT_EXAMPLE_META_FILE=meta_file,
+                     BBT_EXAMPLE_JOURNAL_FILE=journal_file),
             stdin=subprocess.PIPE, stdout=sys.stderr, stderr=sys.stderr)
         deadline = time.monotonic() + args.timeout
         port = 0

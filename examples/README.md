@@ -8,12 +8,16 @@
 | 组件式业务复用：两个 Service 共享一个受管组件实例 | [`component_services/`](component_services/README.md) | `v2::CoApp::CoInstallComponent/CoInstallService`、`ServiceOptions::BindComponent`、`CoService<C>::GetComponent`、`ComponentHandle::Borrow` | 同进程、同一 App/Registry 内共享实例；跨进程只能复用代码/协议 |
 | 组件热拔插与 hook | 同上 | `CoBindComponent/CoUnbindComponent`、`CoUninstallComponent/CoInstallComponent`、`CoComponent` 生命周期/`OnBindingChanged`、`CoObserve`/`ObserverToken`、`App::LifecycleFailures` | 换的是受管组件实例，不是 dlopen/代码热更新；不跨进程热共享 |
 | 跨进程模块复用（代码层） | 同上（`node` 模式） | 同一业务头 `store.hpp` 在独立进程各自装配 | 两个进程各有独立组件实例，不是 RPC、不是集群、不是服务发现 |
-| 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `CoApp::add_service`、`kRpcMethods`、V2 会话（`SessionFrame`）+ `ProtoCodec` | 需要 protobuf 前缀与 `bbt_infra_rpc_net`；单服务 |
-| 双进程 Service→Service 调用 | [`two_service/`](two_service/README.md) | `this->call<Req,Resp>`、`find_route` 静态路由、真实 V2 会话 | 两个互异 identity 的 CoApp 进程；不证明发现或认证 |
-| 出站调用策略 | [`rpc_policy/`](rpc_policy/README.md) | `RpcPolicy`、`CoRpcReq/Resp` | 复用 getvalue 业务，callee 为独立 CoApp 进程 |
-| 容量 / 并发上下文 / 关闭生命周期 | [`lifecycle_matrix/`](lifecycle_matrix/README.md) | `ExecutionPolicy::Concurrent`、`max_inflight`、`ShutdownIncomplete`、`request_shutdown` | 真实 loopback V2 会话，不代表生产部署 |
-| 多进程 + 真实 Redis/Mongo 资源 | [`dual_service/`](dual_service/README.md) | `add_resource` 工厂/`ICoCloseable`、真实 Redis/Mongo 客户端 | 显式 opt-in（`BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON`）；资源示例，不是注册中心 |
-| 真实注册中心 + 多进程动态发现（gateway→order→catalog，catalog 双实例） | [`ecommerce_cluster/`](ecommerce_cluster/README.md) | `DynamicRouteTable`/`CoAppOptions::dynamic_routes`、`CoApp::find_route` 动态优先、`bbt::infra_consul`、`add_resource` 工厂 | 需真实 Consul 二进制与 `BBT_INFRA_CONSUL=ON`；TCP check 健康、5s 陈旧边界、每服务 round-robin、无重试/权重 |
+| 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `v2::CoApp::CoInstallService`、`kRpcMethods`、V2 会话（`SessionFrame`）+ `ProtoCodec` | 需要 protobuf 前缀与 `bbt_infra_rpc_net`；单服务 |
+| 双进程 Service→Service 调用 | [`two_service/`](two_service/README.md) | `this->call<Req,Resp>`、`AddRoute` 静态路由、真实 V2 会话 | 两个互异 identity 的 v2::CoApp 进程；不证明发现或认证 |
+| 出站调用策略 | [`rpc_policy/`](rpc_policy/README.md) | `AppOptions::SetRpcPolicy`、`RpcPolicy`、`CoRpcReq/Resp` | 复用 getvalue 业务，callee 为独立 v2::CoApp 进程；策略在发送前执行，loopback 调用不证明身份认证 |
+| 容量 / 并发上下文 / 关闭生命周期 | [`lifecycle_matrix/`](lifecycle_matrix/README.md) | `ExecutionPolicy::Concurrent`、`max_inflight`、`StopIncomplete`、`RequestShutdown` | 真实 loopback V2 会话，不代表生产部署 |
+| 多进程 + 真实 Redis/Mongo 资源 | [`dual_service/`](dual_service/README.md) | `v2::CoApp::CoInstallComponent`、`RedisComponent`/`MongoDBComponent`、`ComponentHandle::Borrow`、真实 Redis/Mongo 客户端 | 显式 opt-in（`BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON`）；资源示例，不是注册中心 |
+| 真实注册中心 + 多进程动态发现（gateway→order→catalog，catalog 双实例） | [`ecommerce_cluster/`](ecommerce_cluster/README.md) | `AppOptions::SetDynamicRoutes`、`DynamicRouteTable`、`v2::CoComponent`、发现组件、`bbt::infra_consul` | 需真实 Consul 二进制与 `BBT_INFRA_CONSUL=ON`；发现组件发布快照，出站优先解析动态表；TCP check 健康、5s 陈旧边界、每服务 round-robin、无重试/权重；loopback 不构成认证 |
+
+入口约定（完整规则见 [`docs/conventions.md` §7](../docs/conventions.md)）：所有示例
+写 `int bbtco_main()` 由 coroutine runtime 生成 native main，不启停 scheduler、不建
+runner/观察线程；参数经 `BBT_EXAMPLE_*` 环境变量传入。
 
 ## 运行 component_services
 
@@ -22,17 +26,17 @@
 HTTP/RPC 开关。这里是唯一可复制的配置入口；
 [`component_services/README.md`](component_services/README.md) 链接回此处。
 
-先准备可读的 infra 源码树、一个干净的 coroutine Git checkout（必须是完整
-`.git` 检出，HEAD 精确为 `b0ba3e0239c06bf91a874f988187c7e2f56bf13d`，不能用
-`git archive` 导出的无 `.git` 目录）和 protobuf 3.21.12 前缀。然后在仓库根目录
-显式设置路径并核验 coroutine pin：
+先准备可读的 infra 源码树、coroutine Git 检出和 protobuf 3.21.12 前缀。
+本地默认使用所选目录的当前源码，允许未提交候选；需要指定 coroutine 版本时
+额外传 `-DBBT_COROUTINE_PINNED_SHA=<完整 commit>`，不可用脏树冒充该版本。
+然后在仓库根目录显式设置路径：
 
 ```bash
 export INFRA="$PWD/build/deps/infra"
 export CO="$PWD/build/local/coroutine-src"
 export PROTOBUF_PREFIX="<protobuf-3.21.12 prefix 的绝对路径>"
 test -d "$INFRA" && test -d "$CO" && test -d "$PROTOBUF_PREFIX"
-test "$(git -C "$CO" rev-parse HEAD)" = b0ba3e0239c06bf91a874f988187c7e2f56bf13d
+git -C "$CO" rev-parse HEAD   # 记录基线；未提交改动另行记录
 
 flock /tmp/bbt-build.lock cmake -S . -B build/local -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -50,10 +54,11 @@ ctest --test-dir build/local -j1 -R '^examples[.]component_services$' --no-tests
 ```bash
 JOURNAL_DIR="$(mktemp -d build/local/component-services-journal.XXXXXX)"
 
-build/local/examples/component_services/component_services shared \
-  --journal "$JOURNAL_DIR/shared.journal"
-build/local/examples/component_services/component_services node \
-  --journal "$JOURNAL_DIR/node.journal" --price 700
+BBT_EXAMPLE_MODE=shared BBT_EXAMPLE_JOURNAL="$JOURNAL_DIR/shared.journal" \
+  build/local/examples/component_services/component_services
+BBT_EXAMPLE_MODE=node BBT_EXAMPLE_JOURNAL="$JOURNAL_DIR/node.journal" \
+BBT_EXAMPLE_PRICE=700 \
+  build/local/examples/component_services/component_services
 ```
 
 退出码 `0` 表示全部检查通过；journal 中每行 `event=check name=... ok=1|0
@@ -61,12 +66,17 @@ detail=...` 可机器判定。
 
 ## 运行 ecommerce_cluster（真实注册中心 + 动态发现）
 
-Issue #70 第五项已实现：framework 侧新增 `DynamicRouteTable`（公开扩展，经
-`CoAppOptions::dynamic_routes` 接入 `find_route`，动态配置的服务名优先于静态路由），
+动态发现已接入 v2：framework 侧通过 `DynamicRouteTable` 与
+`AppOptions::SetDynamicRoutes(...)` 装配到 `find_route`，动态配置的服务名优先于静态路由，
 infra 侧新增 `bbt::infra_consul`（Consul agent HTTP adapter）。示例
 `ecommerce_cluster/` 用真实 Consul + 多进程（gateway → order → catalog 双实例）
 验收落点变化、陈旧边界与恢复；细节与边界见
 [`ecommerce_cluster/README.md`](ecommerce_cluster/README.md)。
+
+当前边界：动态路由表由 `AppOptions::SetDynamicRoutes(...)` 在构造期装配，
+运行期由发现组件更新快照；出站解析优先使用动态表，未命中时再使用静态路由。
+示例驱动覆盖真实注册中心、多进程发现、扩缩容与恢复；它不把 loopback 无认证
+当作身份验证。
 
 除上面 component_services 的配置外，本示例还需要：
 

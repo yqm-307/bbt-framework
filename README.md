@@ -5,45 +5,68 @@
 
 业务公共面：handler 签名统一 `CoRpcResp(CoRpcReq)`，请求/回复经位置参数 codec
 （`CoRpcReq::From` / `req.Parse<Ts...>` / `CoRpcResp::From`）；`kRpcMethods` +
-`this->call` 声明/发起 RPC，`CoService<T>` / `ICoService` 继承服务，`CoApp` 注册并运行。
-跨语言/结构化负载走 Protobuf 适配（`ProtoCodec` seam）。
+`this->call` 声明/发起 RPC，`v2::CoService<Components...>` 继承服务
+（`ConstructKey` 受控构造、protected 析构、`kServiceName` 供给名字），
+`v2::CoApp::Create` 是唯一装配根。跨语言/结构化负载走 Protobuf 适配
+（`ProtoCodec` seam）。
 
 ```cpp
-#include <bbt/framework/Framework.hpp>
-#include <bbt/framework/CoApp.hpp>
+#include <bbt/coroutine/coroutine.hpp>
+#include <bbt/framework/V2.hpp>
 
-class EchoSvc final : public fw::CoService<EchoSvc> {
+class EchoSvc final : public fw::v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "echo";
+    explicit EchoSvc(fw::detail::ConstructKey k) : fw::v2::CoService<>(k) {}
     fw::CoRpcResp Ping(fw::CoRpcReq req);   // req.Parse<std::string>() 取第 0 个位置参数
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoSvc::Ping>("ping"));
+protected:
+    ~EchoSvc() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
-fw::CoApp app{opts};
-app.add_service<EchoSvc>(service_opts);
-app.run();
+int bbtco_main() {
+    auto app = fw::v2::CoApp::Create(app_opts);            // 唯一创建入口（受管协程内）
+    (void)bbt_co_await app->CoInstallService<EchoSvc>(service_opts);
+    if (auto started = bbt_co_await app->CoStart(); !started) return 1;
+    (void)bbt_co_await app->CoWaitShutdownRequest();       // 任意线程 RequestShutdown() 唤醒
+    return bbt_co_await app->CoStop() ? 0 : 3;
+}
+
+BBTCO_MAIN();   // runtime 生成 native main：Start → 提交主协程 → 退出码
 ```
 
-`Framework.hpp` 汇总服务/RPC 声明头，不含宿主。`CoApp.hpp` 是宿主头
-（`add_service` 会展开方法表）。编解码、envelope、分发器、发送注入在框架内部；
-测试缝在 `internal/`。
+入口归 coroutine runtime：应用只写 `int bbtco_main()`（可用 `BBTCO_MAIN_WITH_SETUP()`
+在 Start 前冻结协程配置），framework 不启动调度器、不建 native 线程、不等待
+future/join。关闭由 `RequestShutdown()` 唤醒主协程后在同一协程内 `CoStop()` 收口。
 
-资源缝：服务在受管生命周期内经 `context().resource<R>(name)` 取客户端
-（未装配 → `nullptr`）。两种装配入口：
-- `add_resource<R>(name, shared_ptr<R>)`：预创建实例，登记即对服务可见；
-- `add_resource<R>(name, factory)`：延迟工厂——`factory` 返回
-  `result<shared_ptr<R>>`，在运行时初始化后、绑定服务与开始接纳之前执行
-  `Create`；若 `R` 暴露 `result<void> Start()` 由框架随即调用一次，若实现
-  `bbt::infra::ICoCloseable` 则由关闭序列统一 `Close()` 同步收口
-  （handler 排空之后、网络组件关闭之前）。任一资源创建/启动失败 →
-  启动失败回退，已启动资源按序收束，不留半装配状态。
+`Framework.hpp` 汇总服务/RPC 声明头；`V2.hpp` 聚合 v2 唯一类型面
+（`v2::CoApp`/`v2::CoService`/`v2::CoComponent`/`v2::CoActor`），`App.hpp` 是宿主头
+（`CoInstallService` 会展开方法表）。编解码、envelope、分发器、发送注入在框架内部；
+测试缝在 `internal/`。旧公共面 `CoApp.hpp`/`ICoService.hpp`/`CoService.hpp` 与
+`CoApp::add_service`/`add_resource`/`run()` 已删除。
+
+能力对象只有一条受管路径：`v2::RedisComponent`（借用共享 `net::Engine`）与
+`v2::MongoDBComponent`（自有 worker）经 `v2::CoApp::CoInstallComponent` 安装、
+`CoBindComponent` 绑定、`ComponentHandle::Borrow` 借用；`OnStop` 把
+`CoStop(CloseOptions)` 的同一个值转发给对应 infra 对象。产品
+`RedisNetResource`/`MongoDbResource` 与并列资源缝（`CoApp::add_resource`/
+`ResourceSpec`/framework `ICoResource`/`ServiceContext::resource`）已删除，
+`ServiceContext` 只保留请求上下文；第二条能力路径不再存在。
+
+共享 Engine：默认装配路径由 `v2::CoApp` 以 `AppOptions::SetNetworkOptions`
+以 Idle 装配创建（`CoApp::engine()`），宿主与组件借用同一实例；`CoStart`
+在宿主 Create 之后把 `{engine, config}` 与主任务唤醒口发布给入口宿主闸门
+（`HostGate`），应用入口的 `bbtco_main_host_hook` 调用
+`bbt::framework::HostGate::RunHostGate` 在主线程执行唯一一次 `Engine::Run`；
+主任务结束 → `RequestClose`，`Run` 提前失败 → 唤醒主任务。
 
 公共目标 `bbt::framework`（静态库）。
 
 ## 构建与测试
 
-依赖：`bbtools-infra`（其自身再依赖 `bbtools-coroutine`）。本机/候选分支开发经显式路径覆盖接入：
+依赖：`bbtools-infra`（其自身再依赖 `bbtools-coroutine`）。本地默认使用显式路径内的当前源码，允许未提交候选；指定版本时按指定版本构建，coroutine 可传 `-DBBT_COROUTINE_PINNED_SHA=<完整 commit>`。设计需指定版本，完整规则见 infra `docs/guides/development.md`「依赖版本选择」。
 
 ```bash
 INFRA=/path/to/bbtools-infra            # 含顶层 CMakeLists.txt 与 include/
@@ -66,7 +89,7 @@ cmake --build build --parallel 2 --target \
   Test_framework_ordered_ingress Test_framework_ordered_ingress_rpc \
   Test_framework_v1_absent \
   Test_framework_shutdown Test_framework_rpc_codec Test_framework_close_gate \
-  Test_framework_resource_lifecycle Test_framework_egress_request_phase \
+  Test_framework_component_lifecycle Test_framework_egress_request_phase \
   Test_framework_getvalue_codec Test_framework_rpc_matrix rpc_xlang_server \
   getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture \
   component_services Test_framework_dynamic_routes
@@ -99,6 +122,10 @@ ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
   边界见 [HTTP 宿主指南](docs/guides/http-host.md)；RPC 只经 V2 会话消费，
   映射见 [框架契约 §7.1](docs/architecture/framework-contract.md)。
 - 构建产物只进已忽略的 `build/`。
+- 示例与消费骨架只写 `bbtco_main()`（`BBTCO_MAIN*` 生成 native main，参数经
+  `BBT_EXAMPLE_*` 环境变量传入）：不自行启停 scheduler、不建 runner/观察线程、
+  不 `future.wait/get`。本仓 `examples/` 已全部迁移到该入口，规则见
+  [代码约定 §7](docs/conventions.md)。
 
 ## 跨语言 RPC 示例：GetValue
 
@@ -109,7 +136,7 @@ ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
 - 业务 schema：`examples/getvalue/proto/bbt/example/v1/get_value.proto`
   （`bbt.example.v1.GetValueRequest/Response`；`GetValue(key) -> {found, value}`）。
 - V2 会话 wire：`SessionFrame`（`session_frame.proto`，profile 2）+ u32be
-  分帧 + Hello/HelloAck 身份协商；`CoAppOptions::local_identity` 必填且与
+  分帧 + Hello/HelloAck 身份协商；`AppNetworkOptions::SetLocalAppId` 必填且与
   peer 互异（拒绝 self-connection）。`remaining_budget_ms` 由 CALL 帧携带，
   接收端按 local-min 收紧；0 预算在解码期以 `SESSION_ERROR(ProtocolError)`
   拒绝。没有 HTTP header 旁路或版本化 envelope。

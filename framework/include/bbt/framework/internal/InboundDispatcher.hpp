@@ -37,7 +37,7 @@
 #include <bbt/framework/internal/ActorMailbox.hpp>
 #include <bbt/framework/internal/ActorRegistry.hpp>
 #include <bbt/framework/ExecutionPolicy.hpp>
-#include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/internal/ServiceBase.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
 
@@ -55,7 +55,7 @@ public:
     struct ServiceEntry {
         ServiceOptions          options;
         std::shared_ptr<const RpcMethodTable> table;
-        std::shared_ptr<ICoService> instance;      // 仅 Concurrent
+        std::shared_ptr<v2::CoServiceBase> instance;      // 仅 Concurrent
         std::shared_ptr<ActorRegistry> registry;   // 仅 ActorSerial
         std::shared_ptr<OrderedIngress> ordered_ingress; // 仅 ordered ActorSerial
     };
@@ -69,7 +69,8 @@ public:
     // 路径返回 InvalidContext 错误而不是未定义行为。
     result<bbt::infra::rpc::Response> Dispatch(
         const bbt::infra::rpc::Request& request,
-        const std::function<void()>& on_dispatched = {});
+        const std::function<void()>& on_dispatched = {},
+        const bbt::infra::IncomingCallContext* http_context = nullptr);
 
 private:
     struct PerService {

@@ -45,11 +45,11 @@ METHOD = "Checkout"
 REQUEST_SCHEMA = "bbt.example.ecommerce.v1.CheckoutRequest"
 RESPONSE_SCHEMA = "bbt.example.ecommerce.v1.CheckoutResponse"
 
-# RpcErrorCode（session_frame.proto enum，与 infra ErrorCode 同序）
-INVALID_ARGUMENT = v2.ERR_INVALID_ARGUMENT
-RUNTIME_UNAVAILABLE = v2.ERR_RUNTIME_UNAVAILABLE
-TIMED_OUT = v2.ERR_TIMED_OUT
-NOT_FOUND = v2.ERR_NOT_FOUND
+# HTTP 错误头使用 framework ErrorCode，不是 wire RpcErrorCode。
+INVALID_ARGUMENT = 0
+RUNTIME_UNAVAILABLE = 2
+TIMED_OUT = 3
+NOT_FOUND = 10
 
 WIRE_VARINT = 0
 WIRE_LEN = 2
@@ -277,8 +277,11 @@ class Node:
         self.ready_info = None
         self._cv = threading.Condition()
         self._log = open(log_path, "w")
+        # 生成式入口（bbtco_main）不暴露 argv：角色与注册中心地址经环境变量传入。
         self.proc = subprocess.Popen(
-            [binary, mode, "--consul", consul_url],
+            [binary],
+            env=dict(os.environ, BBT_EXAMPLE_MODE=mode,
+                     BBT_EXAMPLE_CONSUL=consul_url),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=1, text=True)
         self._reader = threading.Thread(target=self._read, daemon=True)
@@ -364,36 +367,29 @@ class Node:
 
 
 def call_gateway(port, request_id, sku=SKU, qty=1, budget_ms=3000, timeout=8.0):
-    """一次真实 V2 Call：TCP + u32be + Hello/HelloAck + SessionFrame。
-
-    gateway 的实例身份随动态发现变化，故握手不固定 expected_peer；落点由
-    响应里的 gateway_instance 字段断言。
-    """
+    """真实 HTTP/1.1 POST；嵌套跨进程调用仍由 Service 走 typed V2 RPC。"""
     started = time.monotonic()
-    client = None
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
-        client = v2.V2Client(port, identity=DRIVER_IDENTITY, timeout=timeout)
-        client.handshake()
-        env = client.call(
-            SERVICE, METHOD, payload=enc_checkout_request(sku, qty),
-            request_id=request_id, request_schema=REQUEST_SCHEMA,
-            response_schema=RESPONSE_SCHEMA, budget_ms=budget_ms)
-    except (OSError, v2.WireError) as exc:
+        conn.request("POST", "/Checkout", body=enc_checkout_request(sku, qty),
+                     headers={"Content-Type": "application/x-protobuf", "X-Request-Id": request_id})
+        response = conn.getresponse()
+        body = response.read()
+        result = {"elapsed": time.monotonic() - started, "request_id": request_id,
+                  "transport": "http/1.1", "http_status": response.status}
+        if response.status != 200:
+            result.update({"ok": False,
+                           "error_code": int(response.getheader("X-Bbt-Error-Code", "-1")),
+                           "error_message": body.decode("utf-8", "replace")})
+            return result
+        result.update(dec_checkout_response(body))
+        result["ok"] = True
+        return result
+    except (OSError, http.client.HTTPException) as exc:
         return {"ok": False, "transport_error": str(exc),
                 "elapsed": time.monotonic() - started}
     finally:
-        if client is not None:
-            client.close()
-    elapsed = time.monotonic() - started
-    result = {"elapsed": elapsed, "request_id": env.get("request_id")}
-    err = v2.error_of(env)
-    if err is not None:
-        result.update({"ok": False, "error_code": err.get("code", -1),
-                       "error_message": err.get("message", "")})
-        return result
-    result.update(dec_checkout_response(env.get("payload", b"")))
-    result["ok"] = True
-    return result
+        conn.close()
 
 
 def call_n(port, count, prefix, **kwargs):

@@ -4,11 +4,11 @@
 由 ctest 调用：
   two_service_run.py --bin <two_service> --results <json>
 
-形态：**两个互异 identity 的真实 CoApp 进程**（V2 会话拒绝 self-connection，
-且框架约束进程内同一时刻至多一个活跃 CoApp）：
+形态：**两个互异 identity 的真实 v2::CoApp 进程**（V2 会话拒绝
+self-connection）：
   - callee 进程：local_identity=two-service-callee，宿主 GetValueService
   - caller 进程：local_identity=two-service-caller，宿主 GetValueCallerService；
-    handler 经公开 ICoService::call<Req,Resp> 按显式静态路由向 callee 发起
+    handler 经公开 CoServiceBase::call<Req,Resp> 按显式静态路由向 callee 发起
     真实 V2 Call
 驱动器是与两者互异的第三个 identity（two-service-driver）。
 
@@ -17,8 +17,8 @@
   2. 经唯一 V2 codec（tests/rpc_v2_wire.py）打 caller 服务，
      覆盖 正常请求 / 业务错误 / 有限 deadline / 未配置路由；
   3. 读共享 journal：callee handler 只被真正到达的请求进入；关闭记录
-     rc=0、state=Closed、owner 同步 Close 且在最后一条 handler 进入之后；
-  4. 收尾：关 stdin 触发 request_shutdown，有限等待；异常路径回收自有进程。
+     rc=0、state=Stopped、owner 同步 OnStop 且在最后一条 handler 进入之后；
+  4. 收尾：关 stdin 触发 RequestShutdown，有限等待；异常路径回收自有进程。
 
 会话/分帧/握手/错误信封复用 tests/rpc_v2_wire.py；业务 payload 复用
 examples/getvalue/getvalue_client.py——不另造第二套 schema/codec。
@@ -204,17 +204,25 @@ def main():
     caller_rc = None
     try:
         # 1) callee 进程就先绪，caller 的静态路由直接指向它的真实 endpoint。
+        # 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
         callee = subprocess.Popen(
-            [args.bin, "callee", callee_port_file, callee_meta_file,
-             journal_file],
+            [args.bin],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="callee",
+                     BBT_EXAMPLE_PORT_FILE=callee_port_file,
+                     BBT_EXAMPLE_META_FILE=callee_meta_file,
+                     BBT_EXAMPLE_JOURNAL_FILE=journal_file),
             stdin=subprocess.PIPE, stdout=sys.stderr, stderr=sys.stderr)
         callee_port = wait_port(callee_port_file, callee, args.timeout)
         print(f"callee up port={callee_port}", file=sys.stderr)
         callee_ep = f"127.0.0.1:{callee_port}"
 
         caller = subprocess.Popen(
-            [args.bin, "caller", caller_port_file, callee_ep, caller_meta_file,
-             journal_file],
+            [args.bin],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="caller",
+                     BBT_EXAMPLE_PORT_FILE=caller_port_file,
+                     BBT_EXAMPLE_CALLEE_EP=callee_ep,
+                     BBT_EXAMPLE_META_FILE=caller_meta_file,
+                     BBT_EXAMPLE_JOURNAL_FILE=journal_file),
             stdin=subprocess.PIPE, stdout=sys.stderr, stderr=sys.stderr)
         caller_port = wait_port(caller_port_file, caller, args.timeout)
         print(f"caller up port={caller_port}", file=sys.stderr)
@@ -353,7 +361,7 @@ def main():
                          if e.get("peer_principal")]
         ok = (caller_rc == 0 and callee_exit == 0
               and shutdown_rec.get("rc") == "0"
-              and shutdown_rec.get("state") == "3"      # ShutdownState::Closed
+              and shutdown_rec.get("state") == "6"      # AppState::Stopped
               and shutdown_rec.get("owner_closed") == "1"
               and len(callee_shutdown) == 1
               and callee_shutdown[0].get("rc") == "0"

@@ -100,6 +100,19 @@ cmake/                 CMake 模块
 - 每个示例放在 `examples/<name>/`，附 `README.md`，说明演示内容、运行方式和期望输出。
 - 示例只展示用法；断言和验收逻辑写进 `tests/`，不在示例中用断言充当测试。
 - CI 编译全部示例；依赖外部服务的示例只编译、不在普通 CI 中运行。
+- 入口归 coroutine runtime：示例写 `int bbtco_main()`，需要非默认协程配置时配
+  `BBTCO_MAIN_WITH_SETUP()` 在 Start 前冻结 `g_bbt_coroutine_config`。示例不写
+  native `main`、不调用 `g_scheduler->Start/Stop`、不建 runner 或 native 观察
+  线程、不等待 future/join——关闭只经 `request_shutdown()` 唤醒主协程，收口由
+  同一协程 `co_stop()` 完成。stdin/信号这类阻塞触发在主协程内以非阻塞 `poll`
+  ＋ `bbtco_sleep` 观察，不额外开线程。
+- 主内容按固定顺序展开：装配 → `co_start()` → 就绪输出（端口/元数据/`event=ready`）
+  → 等待关闭触发 → `co_stop()`；`co_start()` 返回即已 Ready，不再轮询
+  `bound_endpoint()`。
+- 生成式入口不暴露 argv：示例参数一律经环境变量传入（`BBT_EXAMPLE_*`），
+  README 与驱动脚本使用同名字段；缺参返回 usage 退出码。
+- 生命周期退出码统一：`0` 按期优雅关闭、`1` 配置校验拒绝（未启动组件）、
+  `2` 启动中途失败回退、`3` 关闭曾超预算（`ShutdownIncomplete`）、`4` 收尾失败项。
 
 ## 8. 文档分类与维护
 

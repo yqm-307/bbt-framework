@@ -1,14 +1,14 @@
 #pragma once
 // bbt-framework Service→Service 出站 caller 业务（应用层）。
 //
-// 只用公开面：CoApp 装配的显式静态路由 + CoService + ICoService::call<Req,Resp>
-// （typed 出站 seam，schema 由生成物 descriptor 推导）。业务不接触 envelope/
-// codec/发送注入点/http::Client。
+// 只用公开面：v2::CoApp 装配的显式静态路由 + v2::CoService +
+// CoServiceBase::call<Req,Resp>（typed 出站 seam，schema 由生成物 descriptor
+// 推导）。业务不接触 envelope/codec/发送注入点/http::Client。
 //
 // 四个方法承载不同真实出站场景（供跨进程 driver 断言）：
 //   Forward          —— 正常 typed call（预算继承父请求，不放大）
 //   ForwardExpired   —— 显式已过期 deadline；应在发起任何 I/O 前 TimedOut
-//   ForwardNoRoute   —— 目标无静态路由；find_route 门拒绝，不发起 I/O
+//   ForwardNoRoute   —— 目标无静态路由；路由门拒绝，不发起 I/O
 //   ForwardBlackhole —— 目标是「完整读下请求后断开（丢 reply）」的真实端点
 
 #include <chrono>
@@ -18,9 +18,9 @@
 
 #include <bbt/framework/CallOptions.hpp>
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
+#include <bbt/framework/Service.hpp>
 
 // ProtoCodec<GetValueRequest/Response> 特化（schema 真源 = .proto descriptor）
 // 与 callee 服务同源定义；caller 复用同一 codec，不另造一套。
@@ -29,10 +29,13 @@
 namespace getvalue {
 
 class GetValueCallerService final
-    : public bbt::framework::CoService<GetValueCallerService> {
+    : public bbt::framework::v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.GetValueCallerService";
+
+    explicit GetValueCallerService(bbt::framework::detail::ConstructKey key)
+        : bbt::framework::v2::CoService<>(key) {}
     // caller 默认转发目标（callee 进程宿主）。schema 真源 = .proto descriptor。
     static constexpr std::string_view kCalleeService =
         "bbt.example.v1.GetValueService";
@@ -97,6 +100,10 @@ private:
             return CoRpcResp::Error(reply.error());
         return CoRpcResp::FromProto(reply.value());
     }
+
+protected:
+    ~GetValueCallerService() noexcept override = default;
+    friend class bbt::framework::detail::Registry;
 };
 
 } // namespace getvalue

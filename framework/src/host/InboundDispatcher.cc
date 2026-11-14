@@ -1,5 +1,7 @@
 #include <bbt/framework/internal/InboundDispatcher.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <boost/scope/scope_exit.hpp>
 #include <cstdint>
@@ -10,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/framework/internal/OrderedIngress.hpp>
@@ -102,7 +105,8 @@ InboundDispatcher::InboundDispatcher(
 }
 
 result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
-    const bbt::infra::rpc::Request& request, const std::function<void()>& on_dispatched) {
+    const bbt::infra::rpc::Request& request, const std::function<void()>& on_dispatched,
+    const bbt::infra::IncomingCallContext* http_context) {
     using bbt::coroutine::WaitOptions;
     using bbt::coroutine::WaitStatus;
     using bbt::infra::rpc::Response;
@@ -117,7 +121,10 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
         }
     };
     auto dispatch_guard = boost::scope::make_scope_exit(ready);
-    const auto& incoming = request.Context();
+    const auto& rpc_context = request.Context();
+    const bbt::infra::IncomingCallContext incoming = http_context
+                                                         ? *http_context
+                                                         : bbt::infra::IncomingCallContext{rpc_context.deadline, rpc_context.peer_principal};
 
     // 1. envelope 基本字段：service/method/request_id 为分发的最小事实。
     if (request.Service().empty() || request.Method().empty())
@@ -201,7 +208,7 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
 
     // 4. 服务级接纳上限：容量耗尽拒绝，不无限排队。
     if (svc.inflight.fetch_add(1, std::memory_order_acq_rel) >=
-        svc.entry.options.max_inflight) {
+        svc.entry.options.MaxInflight()) {
         svc.inflight.fetch_sub(1, std::memory_order_acq_rel);
         return result<Response>::err(MakeError(ErrorCode::Overloaded,
                                                "inbound dispatch: service '" + request.Service() +
@@ -237,7 +244,7 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
 
         std::shared_ptr<OrderedIngress> ordered_ingress;
         std::optional<OrderedIngress::Admission> ordered_admission;
-        if (svc.entry.options.ordered_ingress) {
+        if (svc.entry.options.OrderedIngress()) {
             ordered_ingress = svc.entry.ordered_ingress;
             if (!ordered_ingress)
                 return result<Response>::err(MakeError(
@@ -319,6 +326,8 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
             result<std::vector<std::uint8_t>> r =
                 result<std::vector<std::uint8_t>>::err(MakeError(
                     ErrorCode::InternalError, "actor task produced no result"));
+            // handler 完成是持久事实：早到 Notify 不保存，等待侧据此复查。
+            std::atomic<bool> done{false};
         };
         auto slot = std::make_shared<Slot>();
         bbt::coroutine::sync::CoWaiter::SPtr waiter;
@@ -336,22 +345,55 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
         // 该裸指针带过 Release。方法描述是不可变且可复制的，按值封装进任务，
         // 连同 inst 的 shared_ptr 一起保证迟到任务不悬空。
         RpcMethod method_copy = *method;
-        const WaitStatus st = waiter->WaitWithCallback(wo, [&]() -> bool {
-            auto enq = mailbox->TryEnqueue(
-                [ctx, method = std::move(method_copy), inst, slot, waiter,
-                 payload = request.Payload()]() mutable {
-                    RequestScope scope(ctx);
-                    slot->r = method.invoke(*inst.value(), payload);
-                    waiter->Notify();
-                });
-            if (!enq) {
-                slot->r = result<std::vector<std::uint8_t>>::err(
-                    std::move(enq.error()));
+        // 入队先于等待登记：邮箱空转→活跃边沿注册 drain 协程时要申请协程栈，
+        // 这是可挂起操作；若放在等待登记回调内执行，当前协程已有 await 事件，
+        // 运行时按 RuntimeUnavailable 拒绝（ActorMailbox 报 scheduler unavailable）。
+        // 入队失败即未转移、未产生 ordered 终态，直接回传原错误。
+        auto enqueued = mailbox->TryEnqueue(
+            [ctx, method = std::move(method_copy), inst, slot, waiter,
+             payload = request.Payload()]() mutable {
+                RequestScope scope(ctx);
+                slot->r = method.invoke(*inst.value(), payload);
+                slot->done.store(true, std::memory_order_release);
                 waiter->Notify();
+            });
+        if (!enqueued)
+            return finish_ordered_error(std::move(enqueued.error()));
+        // 入队成功：调度门立即放行后续请求，业务结果的等待从同步派发中拆出。
+        ready();
+
+        // 持久谓词 + 50ms 分片等待：handler 可能在本协程登记等待前完成，
+        // Notify 早到不保存，因此每片前都复查 done；分片到点只复查不判定
+        // 超时，只有 ctx 的绝对期限耗尽才如实返回 TimedOut。
+        WaitStatus st = WaitStatus::Completed;
+        for (;;) {
+            if (slot->done.load(std::memory_order_acquire)) {
+                st = WaitStatus::Completed;
+                break;
             }
-            ready();
-            return true;
-        });
+            const auto now = std::chrono::steady_clock::now();
+            if (wo.deadline != bbt::coroutine::Deadline::max() &&
+                now >= wo.deadline) {
+                st = WaitStatus::TimedOut;
+                break;
+            }
+            WaitOptions slice;
+            slice.deadline = std::min(
+                wo.deadline, now + std::chrono::milliseconds{50});
+            st = waiter->Wait(slice);
+            if (slot->done.load(std::memory_order_acquire)) {
+                st = WaitStatus::Completed;
+                break;
+            }
+            if (st == WaitStatus::TimedOut)
+                continue;   // 分片到点：复查 done 后继续等同一绝对期限
+            if (st == WaitStatus::AlreadyWaiting) {
+                bbtco_sleep(5);
+                continue;
+            }
+            if (st != WaitStatus::Completed)
+                break;
+        }
         switch (st) {
         case WaitStatus::Completed:
             break;
@@ -420,7 +462,7 @@ ActorMailbox::SPtr InboundDispatcher::_MailboxFor(
     auto it = svc.mailboxes.find(actor_key);
     if (it != svc.mailboxes.end())
         return it->second;
-    auto mb = ActorMailbox::Create(svc.entry.options.mailbox_capacity);
+    auto mb = ActorMailbox::Create(svc.entry.options.MailboxCapacity());
     svc.mailboxes.emplace(actor_key, mb);
     return mb;
 }

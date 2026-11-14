@@ -12,16 +12,15 @@ add_library(bbt_framework STATIC
     host/App.cc
     host/AppRuntimeState.cc
     host/CallOptionsAdapter.cc
-    host/CoApp.cc
     host/CoServiceCall.cc
     host/DynamicRouteTable.cc
+    host/HostGate.cc
     host/HostLifecycle.cc
     host/InboundDispatcher.cc
     host/InfraHttpHost.cc
     host/Object.cc
     host/Registry.cc
     host/RequestScope.cc
-    host/ResourceClose.cc
     host/RpcBridge.cc
     host/Service.cc)
 add_library(bbt::framework ALIAS bbt_framework)

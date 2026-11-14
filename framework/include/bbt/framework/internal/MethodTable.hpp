@@ -22,7 +22,7 @@
 
 #include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/internal/ServiceBase.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
 
@@ -56,7 +56,7 @@ struct rpc_traits<CoRpcResp (Service::*)(const CoRpcReq&)> {
 
 struct RpcMethod {
     using Invoker = std::function<result<std::vector<std::uint8_t>>(
-        ICoService&, const std::vector<std::uint8_t>&)>;
+        v2::CoServiceBase&, const std::vector<std::uint8_t>&)>;
     using KeyExtractor = std::function<result<std::string>(
         const std::vector<std::uint8_t>&)>;
 
@@ -129,9 +129,9 @@ template <class MemberPtr>
 RpcMethod::Invoker MakeCoRpcInvoker(MemberPtr handler) {
     using Traits = rpc_traits<MemberPtr>;
     using Service = typename Traits::service_type;
-    static_assert(std::is_base_of_v<ICoService, Service>,
-                  "RpcMethods: Service must derive from ICoService");
-    return [handler](ICoService& base,
+    static_assert(std::is_base_of_v<v2::CoServiceBase, Service>,
+                  "RpcMethods: Service must derive from v2::CoServiceBase");
+    return [handler](v2::CoServiceBase& base,
                      const std::vector<std::uint8_t>& payload)
         -> result<std::vector<std::uint8_t>> {
         try {

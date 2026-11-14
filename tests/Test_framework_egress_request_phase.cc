@@ -53,6 +53,8 @@
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 
+#include "framework_co_harness.hpp"
+
 namespace fw  = bbt::framework;
 namespace inf = bbt::infra;
 using Clock = std::chrono::steady_clock;
@@ -89,6 +91,7 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
     std::mutex              m_mtx;
     std::condition_variable m_cv;
@@ -413,13 +416,17 @@ struct EgressHost {
         limits.incoming_timeout = std::chrono::milliseconds{5000};
         host = std::make_shared<fw::InfraHttpHost>(
             limits, inf::ListenAddress{"127.0.0.1", 0}, "egress-phase-client");
-        if (!host->Create()) return false;
-        if (!host->Start())  return false;
+        // 纯出站宿主（client-only）：Create 同步，Start 在 Co 域完成。
+        if (!framework_test::HostCreateStart(*host))
+            return false;
         if (!host->rpc_client())
             return false;
         return true;
     }
-    void Stop() { if (host) host->Close(); }
+    void Stop() {
+        if (host)
+            (void)framework_test::HostClose(*host);
+    }
 };
 
 // 在真实协程内调用框架出站（RpcEgress::Call 是协程阻塞调用）。

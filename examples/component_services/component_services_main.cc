@@ -1,9 +1,11 @@
 // bbt-framework 组件式服务示例：共享组件、运行期热拔插、hook 与观察者。
 //
-// 形态：普通 main 启动 coroutine runtime，再把场景投递进受管协程；场景内部
+// 形态：业务主协程（runtime 的生成式 `bbtco_main`）里直接跑场景，场景内部
 // 只使用公开 v2 面（v2::CoApp::Create、CoInstall/CoUninstall/CoBind/CoUnbind、
 // CoStart/CoStop/CoObserve、ComponentHandle::Borrow）。不使用 internal/ 缝、
-// 不启网络、不依赖 RPC/protobuf。
+// 不启网络、不依赖 RPC/protobuf；进程不写 native main、不启动/停止 scheduler、
+// 不建 runner 线程，也不等待 future/CV。场景参数经环境变量传入
+// （BBT_EXAMPLE_MODE / BBT_EXAMPLE_JOURNAL / BBT_EXAMPLE_PRICE）。
 //
 // 模式：
 //   component_services shared --journal <path>
@@ -471,76 +473,52 @@ void RunNodeScenario(int price_cents) {
          " checks=" + Int(g_checks) + " failures=" + Int(g_failures));
 }
 
-// 把场景投递进受管协程，宿主线程用限时 CV 等它结束（不阻塞 worker）。
-bool RunInManagedCoroutine(const std::function<void()>& fn,
-                           std::chrono::milliseconds budget) {
-    struct Slot {
-        std::mutex              mtx;
-        std::condition_variable cv;
-        bool                    done = false;
-    };
-    auto slot = std::make_shared<Slot>();
-    bool submitted = false;
-    g_scheduler->RegistCoroutineTask(
-        [slot, fn]() {
-            try {
-                fn();
-            } catch (const std::exception& e) {
-                Journal(std::string("event=exception what=") + e.what());
-                ++g_failures;
-            } catch (...) {
-                Journal("event=exception what=unknown");
-                ++g_failures;
-            }
-            std::lock_guard<std::mutex> lk(slot->mtx);
-            slot->done = true;
-            slot->cv.notify_all();
-        },
-        submitted);
-    if (!submitted) return false;
-    std::unique_lock<std::mutex> lk(slot->mtx);
-    return slot->cv.wait_for(lk, budget, [&] { return slot->done; });
-}
-
 struct Args {
     std::string mode = "shared";
     std::string journal;
     int         price = 0;
 };
 
-bool ParseArgs(int argc, char* argv[], Args* out) {
-    if (argc < 2) return false;
-    out->mode = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--journal" && i + 1 < argc) {
-            out->journal = argv[++i];
-        } else if (a == "--price" && i + 1 < argc) {
-            const char* text = argv[++i];
-            char* end = nullptr;
-            errno = 0;
-            const long value = std::strtol(text, &end, 10);
-            if (text == end || *end != '\0' || errno == ERANGE || value < 0 ||
-                value > INT_MAX / shop::CartService::kQtyPerBinding) {
-                return false;
-            }
-            out->price = static_cast<int>(value);
-        } else {
+// 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
+//   BBT_EXAMPLE_MODE=shared|node
+//   BBT_EXAMPLE_JOURNAL=<path>
+//   BBT_EXAMPLE_PRICE=<cents>（仅 node 模式使用）
+bool ParseArgs(Args* out) {
+    const char* mode = std::getenv("BBT_EXAMPLE_MODE");
+    const char* journal = std::getenv("BBT_EXAMPLE_JOURNAL");
+    if (mode == nullptr || journal == nullptr || *journal == '\0')
+        return false;
+    out->mode = mode;
+    out->journal = journal;
+    if (const char* price = std::getenv("BBT_EXAMPLE_PRICE")) {
+        char* end = nullptr;
+        errno = 0;
+        const long value = std::strtol(price, &end, 10);
+        if (price == end || *end != '\0' || errno == ERANGE || value < 0 ||
+            value > INT_MAX / shop::CartService::kQtyPerBinding)
             return false;
-        }
+        out->price = static_cast<int>(value);
     }
-    if (out->journal.empty()) return false;
     return out->mode == "shared" || out->mode == "node";
 }
 
 } // namespace
 
-int main(int argc, char* argv[]) {
+// 场景里做组件安装/绑定/卸载与 hook，默认 12KB 协程栈偏紧，显式放大。
+void setup_runtime() {
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+    g_bbt_coroutine_config->m_cfg_stack_size = 256 * 1024;
+}
+
+// 业务主协程：场景自己 await 组件的安装/启动/收口；进程不再需要把场景投递进
+// 协程再等 CV，也没有可 join 的 runner 线程。
+int bbtco_main() {
     Args args;
-    if (!ParseArgs(argc, argv, &args)) {
+    if (!ParseArgs(&args)) {
         std::fprintf(stderr,
-                     "usage: %s shared|node --journal <path> [--price <cents>]\n",
-                     argv[0]);
+                     "usage: component_services with env BBT_EXAMPLE_MODE="
+                     "shared|node BBT_EXAMPLE_JOURNAL=<path> "
+                     "[BBT_EXAMPLE_PRICE=<cents>]\n");
         return 90;   // EX_USAGE
     }
 
@@ -552,25 +530,14 @@ int main(int argc, char* argv[]) {
     }
     shop::SetJournal(&Journal);
 
-    // 普通 main + 协程入口：先配置并启动 runtime，再把场景投递进受管协程。
-    // hook 内含字符串/容器操作，默认 12KB 栈偏紧，显式放大。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
-    g_bbt_coroutine_config->m_cfg_stack_size        = 256 * 1024;
-    g_scheduler->Start();
-
-    bool finished = false;
-    if (args.mode == "shared") {
-        finished = RunInManagedCoroutine(RunSharedScenario,
-                                         std::chrono::seconds{60});
-    } else {
-        finished = RunInManagedCoroutine(
-            [price = args.price] { RunNodeScenario(price); },
-            std::chrono::seconds{60});
-    }
-    if (!finished) {
-        Journal("event=timeout mode=" + args.mode);
-        std::fprintf(stderr, "component_services: scenario timed out\n");
-        return 3;
+    try {
+        if (args.mode == "shared")
+            RunSharedScenario();
+        else
+            RunNodeScenario(args.price);
+    } catch (const std::exception& e) {
+        Journal(std::string("event=exception what=") + e.what());
+        ++g_failures;
     }
 
     const int rc = g_failures == 0 ? 0 : 1;
@@ -582,3 +549,5 @@ int main(int argc, char* argv[]) {
                  args.mode.c_str(), g_checks, g_failures, rc);
     return rc;
 }
+
+BBTCO_MAIN_WITH_SETUP();

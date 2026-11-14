@@ -50,7 +50,6 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
 
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
@@ -59,18 +58,18 @@
 
 #include <bbt/example/v1/get_value.pb.h>
 
-#include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/Result.hpp>
-#include <bbt/framework/ShutdownState.hpp>
-#include <bbt/framework/internal/HostLifecycle.hpp>
+#include <bbt/framework/Service.hpp>
+#include <bbt/framework/V2.hpp>
 
 // ProtoCodec<GetValueRequest/Response> 特化（schema 真源 = .proto descriptor）。
 #include "getvalue_service.hpp"
+#include "framework_co_harness.hpp"
 
 namespace fw  = bbt::framework;
+namespace v2 = bbt::framework::v2;
 namespace co  = bbt::coroutine;
 namespace inf = bbt::infra;
 namespace rpcw = bbt::infra::rpc;
@@ -98,6 +97,7 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
     std::mutex              m_mtx;
     std::condition_variable m_cv;
@@ -127,6 +127,7 @@ public:
             return true;
         });
     }
+
 private:
     std::mutex                            m_mtx;
     bool                                  m_open = false;
@@ -222,30 +223,12 @@ CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     return s;
 }
 
-// ── 资源 owner（自有 ICoCloseable；记录 Close 时序，不伪造计数）─────────
-
-class OwnerRes final : public inf::ICoCloseable {
-public:
-    void Close() noexcept override {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_closed) return;
-        m_closed = true;
-        if (g_seq) g_seq->Push("resource_close");
-    }
-    bool IsClosed() const noexcept override {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        return m_closed;
-    }
-private:
-    mutable std::mutex m_mtx;
-    bool               m_closed = false;
-};
-
 // ── 测试服务：公开 ProtoMethod，只读 GetValue 语义 ─────────────────────
 
-class NetMatrixSvc final : public fw::CoService<NetMatrixSvc> {
+class NetMatrixSvc final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "test.matrix.GetValueService";
+    explicit NetMatrixSvc(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
 
     // Hold：快照上下文 → 到 arrived → 在 per-rid 独立 gate 上以无界期限挂起
     // （不依 ctx.deadline 自动返回，保持物理在途）→ 恢复后再快照当前上下文。
@@ -306,54 +289,60 @@ public:
         fw::ProtoMethod<&NetMatrixSvc::Fast,
                         bbt::example::v1::GetValueRequest,
                         bbt::example::v1::GetValueResponse>("Fast"));
+protected:
+    ~NetMatrixSvc() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 // ── 装配 ───────────────────────────────────────────────────────────────
 
 fw::ServiceOptions ConcurrentOpts(std::size_t max_inflight) {
-    return fw::ServiceOptions{
-        fw::ExecutionPolicy::Concurrent,
-        max_inflight, /*mailbox_capacity*/ 0, /*max_actors*/ 0,
-        /*ordered_ingress*/ false, /*max_ordered_streams*/ 0,
-        /*max_cached_results*/ 0, /*max_cached_result_bytes*/ 0};
+    return fw::ServiceOptions{}.SetMaxInflight(max_inflight);
 }
 
-// 正式装配：V2 会话（local_identity 必填；入站走 admission，无 bridge 选择）。
-fw::CoAppOptions AppOpts(std::chrono::milliseconds shutdown_step_budget) {
-    fw::CoAppOptions o{};
-    o.network_limits = inf::NetworkLimits{
-        /*max_connections*/ 64, /*max_inflight*/ 64,
-        /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
-        /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    o.listen = inf::ListenAddress{"127.0.0.1", 0};
-    o.static_routes = {};
-    o.shutdown_step_budget = shutdown_step_budget;
-    o.local_identity = "matrix-server";
-    return o;
+// 正式装配：V2 会话（local_identity 必填；入站经内部 InstallRpcAdmission）。
+fw::AppOptions AppOpts(std::chrono::milliseconds shutdown_step_budget) {
+    inf::AppNetworkOptions network;
+    network.SetLimits(inf::NetworkLimits{
+                          /*max_connections*/ 64, /*max_inflight*/ 64,
+                          /*max_header_bytes*/ 16 * 1024,
+                          /*max_body_bytes*/ 64 * 1024,
+                          /*incoming_timeout*/
+                          std::chrono::milliseconds{30000}})
+        .SetListenAddress(inf::ListenAddress{"127.0.0.1", 0})
+        .SetLocalAppId("matrix-server");
+    return fw::AppOptions{}
+        .SetLimits(64, 64, 8, 64)
+        .SetShutdownBudget(shutdown_step_budget)
+        .SetLifecycleBudget(shutdown_step_budget)
+        .SetNetworkOptions(std::move(network));
 }
 
 struct RunHandle {
     std::thread       th;
     std::atomic<bool> done{false};
-    int               rc{-1};
+    // 生命周期结果是 Co 面的 result：启动原错误或收口 TimedOut 都如实保留，
+    // 不再压成退出码（Run/HostLifecycle 已从产品面删除）。
+    fw::result<void> rc = fw::result<void>::err(
+        fw::MakeError(fw::ErrorCode::RuntimeUnavailable, "not run"));
 };
 struct RunJoinOnExit {
-    fw::CoApp*                  app = nullptr;
+    v2::CoApp*                  app = nullptr;
     std::unique_ptr<RunHandle>* h   = nullptr;
     void JoinNow() { if (h && *h && (*h)->th.joinable()) (*h)->th.join(); }
     // 失败/异常退出也必须安全收尾：先 request_shutdown 再释放全部挂起 gate，
     // 避免存在在途 handler 时 join 无界阻塞（不依赖 ctest 超时兜底）。
     ~RunJoinOnExit() {
-        if (app) app->request_shutdown();
+        if (app) app->RequestShutdown();
         if (g_probe) g_probe->CompleteAll();
         JoinNow();
     }
 };
 
-std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
+std::unique_ptr<RunHandle> RunApp(v2::CoApp& app) {
     // 配置非线程安全：仅在调度器尚未初始化（无工作线程）时写入进程全局配置。
-    // HostLifecycle 只在未初始化时 Start，运行时为进程寿命单例（无 Stop），
-    // 故 T2+ 调用时调度器已初始化，跳过写入以规避运行期数据竞争。
+    // 运行时为进程寿命单例（无 Stop），故 T2+ 调用时调度器已初始化，跳过写入
+    // 以规避运行期数据竞争。
     if (!g_scheduler->IsInitialized()) {
         // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
@@ -364,14 +353,27 @@ std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
     auto h = std::make_unique<RunHandle>();
     RunHandle* p = h.get();
     h->th = std::thread([p, &app] {
-        p->rc = app.run();
+        // 生产入口是 runtime 的 bbtco_main；测试线程用同一 Co 序列
+        // （co_start → 等关闭请求 → co_stop）并保留自己的有界同步。
+        p->rc = framework_test::RunAppUntilStopped(app);
         p->done.store(true, std::memory_order_release);
     });
     return h;
 }
 
 // 有界 yield 轮询观测（非固定 sleep 凑时序）。
-std::string WaitEndpoint(fw::CoApp& app) {
+bool WaitRunSettled(const std::unique_ptr<RunHandle>& h,
+                    std::chrono::milliseconds ms = kWait) {
+    const auto end = Clock::now() + ms;
+    while (Clock::now() < end) {
+        if (h->done.load(std::memory_order_acquire))
+            return true;
+        std::this_thread::yield();
+    }
+    return h->done.load(std::memory_order_acquire);
+}
+
+std::string WaitEndpoint(v2::CoApp& app) {
     const auto end = Clock::now() + kWait;
     while (Clock::now() < end) {
         auto ep = app.bound_endpoint();
@@ -381,14 +383,14 @@ std::string WaitEndpoint(fw::CoApp& app) {
     return {};
 }
 
-bool WaitShutdownState(fw::CoApp& app, fw::ShutdownState want,
+bool WaitShutdownState(v2::CoApp& app, fw::AppState want,
                        std::chrono::milliseconds ms = kWait) {
     const auto end = Clock::now() + ms;
     while (Clock::now() < end) {
-        if (app.shutdown_state() == want) return true;
+        if (app.State() == want) return true;
         std::this_thread::yield();
     }
-    return app.shutdown_state() == want;
+    return app.State() == want;
 }
 
 // ── 客户端：独立 V2 会话 owner（互异 identity，真实 TCP loopback）──────
@@ -408,14 +410,20 @@ struct ClientEnv {
             lim, inf::ListenAddress{"127.0.0.1", 0}, "matrix-client");
         if (!r) return false;
         rt = r;
+        // 测试宿主是 Co 面：Create 同步，Start/Close 由 harness 在受管协程里
+        // 驱动（产品代码没有这条路径）。
         if (auto s = rt->Create(); !s) return false;
-        if (auto s = rt->Start(); !s) return false;
+        if (!framework_test::CoOk(framework_test::HostCreateStart(*rt)))
+            return false;
         if (!rt->rpc_client())
             return false;
         egress = std::make_shared<fw::RpcEgress>(rt);
         return true;
     }
-    void Stop() { if (rt) rt->Close(); }
+    void Stop() {
+        if (rt)
+            (void)framework_test::HostClose(*rt);
+    }
 };
 struct ClientStopOnExit {
     ClientEnv* c;
@@ -495,12 +503,22 @@ BOOST_AUTO_TEST_SUITE(framework_matrix_network)
 //         随逻辑请求绑定、不串；合法 metadata 不升级未认证 principal。
 BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
     g_probe = std::make_shared<ProbeState>(3);
-    fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
-    BOOST_REQUIRE(app.add_service<NetMatrixSvc>(ConcurrentOpts(8)));
+    auto app = framework_test::CreateV2App(
+        [] { return v2::CoApp::Create(AppOpts(std::chrono::milliseconds{2000})); });
+    BOOST_REQUIRE(app);
+    std::thread([&] {
+        (void)framework_test::RunAppEngineWhenPublished(
+            app->engine(), inf::ListenAddress{"127.0.0.1", 0});
+    }).detach();
+    BOOST_REQUIRE(framework_test::CoOk(
+        framework_test::CoEvalVoid([&] {
+            return bbt_co_await app->CoInstallService<NetMatrixSvc>(
+                ConcurrentOpts(8));
+        })));
 
-    auto rh = RunApp(app);
-    RunJoinOnExit join_guard{&app, &rh};
-    const std::string ep = WaitEndpoint(app);
+    auto rh = RunApp(*app);
+    RunJoinOnExit join_guard{app.get(), &rh};
+    const std::string ep = WaitEndpoint(*app);
     BOOST_REQUIRE(!ep.empty());
     ClientEnv cl;
     BOOST_REQUIRE(cl.Start());
@@ -576,26 +594,33 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
     BOOST_CHECK(d[1] < d[2]);                  // 各请求预算独立、未串
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 
-    app.request_shutdown();
+    app->RequestShutdown();
     join_guard.JoinNow();
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
 }
 
 // T2（B）：客户端有限 deadline 先落 OutcomeUnknown+RequestCommitted，handler 经
 //         独立 gate 物理在途仍占容量（max_inflight=1）→ 新请求精确 Overloaded；
-//         释放后容量恢复（探测请求非原调用 retry）；owner 在迟到完成前未被 Close
-//         （IsClosed 仅观测 Close() 是否被调用，不表示所有权/寿命）。
+//         释放后容量恢复（探测请求非原调用 retry）。
 BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     g_probe = std::make_shared<ProbeState>(1);
     g_seq   = std::make_shared<SequenceLog>();
-    fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
-    BOOST_REQUIRE(app.add_service<NetMatrixSvc>(ConcurrentOpts(1)));
-    auto owner = std::make_shared<OwnerRes>();
-    BOOST_REQUIRE(app.add_resource<OwnerRes>(owner));
+    auto app = framework_test::CreateV2App(
+        [] { return v2::CoApp::Create(AppOpts(std::chrono::milliseconds{2000})); });
+    BOOST_REQUIRE(app);
+    std::thread([&] {
+        (void)framework_test::RunAppEngineWhenPublished(
+            app->engine(), inf::ListenAddress{"127.0.0.1", 0});
+    }).detach();
+    BOOST_REQUIRE(framework_test::CoOk(
+        framework_test::CoEvalVoid([&] {
+            return bbt_co_await app->CoInstallService<NetMatrixSvc>(
+                ConcurrentOpts(1));
+        })));
 
-    auto rh = RunApp(app);
-    RunJoinOnExit join_guard{&app, &rh};
-    const std::string ep = WaitEndpoint(app);
+    auto rh = RunApp(*app);
+    RunJoinOnExit join_guard{app.get(), &rh};
+    const std::string ep = WaitEndpoint(*app);
     BOOST_REQUIRE(!ep.empty());
     ClientEnv cl;
     BOOST_REQUIRE(cl.Start());
@@ -604,10 +629,9 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     // 取服务强引用后立即释放；释放不影响框架持有的实例（CoApp 生命周期期间
     // 持有）。此块不证明「因在途而强持有 service」。
     {
-        auto svc = app.find_service(NetMatrixSvc::kServiceName);
+        auto svc = app->FindService(NetMatrixSvc::kServiceName);
         BOOST_REQUIRE(svc);
     }
-    BOOST_CHECK(owner->IsClosed() == false);
 
     // A：client deadline 1.5s、预算 30s → handler 在 gate 上物理在途（不依 ctx.deadline）。
     auto a = CallAsync(cl.egress, ep, "Hold", "t2-a", "ka",
@@ -623,10 +647,8 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     BOOST_TEST(static_cast<int>(*ae.request_phase) ==
                static_cast<int>(inf::RequestPhase::RequestCommitted));
 
-    // 此刻：handler completion marker 仍无、owner 尚未被 Close
-    // （IsClosed 只观测 Close() 调用，不代表所有权/寿命）。
+    // 此刻：handler completion marker 仍无（物理在途）。
     BOOST_CHECK(g_probe->Active("t2-a"));
-    BOOST_CHECK(owner->IsClosed() == false);
 
     // 容量仍被占：新请求 Fast → 精确 Overloaded（只尝试一次）。
     auto b = CallAsync(cl.egress, ep, "Fast", "t2-b", "kb",
@@ -653,22 +675,31 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     BOOST_REQUIRE(GetReply(c, rc));
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 
-    app.request_shutdown();
+    app->RequestShutdown();
     join_guard.JoinNow();
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(owner->IsClosed());   // 关闭序列最终 Close owner
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
 }
 
 // T3（D）：Service max_inflight=2 有界 → 第三个明确 Overloaded（不排队）；峰值恰为
 //         声明 limit；释放后恢复接纳。NetworkLimits 维度未分别压测。
 BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     g_probe = std::make_shared<ProbeState>(2);
-    fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
-    BOOST_REQUIRE(app.add_service<NetMatrixSvc>(ConcurrentOpts(2)));
+    auto app = framework_test::CreateV2App(
+        [] { return v2::CoApp::Create(AppOpts(std::chrono::milliseconds{2000})); });
+    BOOST_REQUIRE(app);
+    std::thread([&] {
+        (void)framework_test::RunAppEngineWhenPublished(
+            app->engine(), inf::ListenAddress{"127.0.0.1", 0});
+    }).detach();
+    BOOST_REQUIRE(framework_test::CoOk(
+        framework_test::CoEvalVoid([&] {
+            return bbt_co_await app->CoInstallService<NetMatrixSvc>(
+                ConcurrentOpts(2));
+        })));
 
-    auto rh = RunApp(app);
-    RunJoinOnExit join_guard{&app, &rh};
-    const std::string ep = WaitEndpoint(app);
+    auto rh = RunApp(*app);
+    RunJoinOnExit join_guard{app.get(), &rh};
+    const std::string ep = WaitEndpoint(*app);
     BOOST_REQUIRE(!ep.empty());
     ClientEnv cl;
     BOOST_REQUIRE(cl.Start());
@@ -712,30 +743,38 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     BOOST_REQUIRE(GetReply(again, ra));
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 
-    app.request_shutdown();
+    app->RequestShutdown();
     join_guard.JoinNow();
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
 }
 
 // T4（C-配对正常）：一次正常请求后 request_shutdown → 排空 → 同步 Close → Closed；
-//                     无未完成清理项；资源 owner 被 Close。
+//                     无未完成清理项。
 BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
     g_probe = std::make_shared<ProbeState>(0);
     g_seq   = std::make_shared<SequenceLog>();
-    fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
-    BOOST_REQUIRE(app.add_service<NetMatrixSvc>(ConcurrentOpts(4)));
-    auto owner = std::make_shared<OwnerRes>();
-    BOOST_REQUIRE(app.add_resource<OwnerRes>(owner));
+    auto app = framework_test::CreateV2App(
+        [] { return v2::CoApp::Create(AppOpts(std::chrono::milliseconds{2000})); });
+    BOOST_REQUIRE(app);
+    std::thread([&] {
+        (void)framework_test::RunAppEngineWhenPublished(
+            app->engine(), inf::ListenAddress{"127.0.0.1", 0});
+    }).detach();
+    BOOST_REQUIRE(framework_test::CoOk(
+        framework_test::CoEvalVoid([&] {
+            return bbt_co_await app->CoInstallService<NetMatrixSvc>(
+                ConcurrentOpts(4));
+        })));
 
-    auto rh = RunApp(app);
-    RunJoinOnExit join_guard{&app, &rh};
-    const std::string ep = WaitEndpoint(app);
+    auto rh = RunApp(*app);
+    RunJoinOnExit join_guard{app.get(), &rh};
+    const std::string ep = WaitEndpoint(*app);
     BOOST_REQUIRE(!ep.empty());
     ClientEnv cl;
     BOOST_REQUIRE(cl.Start());
     ClientStopOnExit cl_guard{&cl};
 
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Running);
+    BOOST_CHECK(app->State() == fw::AppState::Running);
     auto ok = CallAsync(cl.egress, ep, "Fast", "t4-ok", "k",
                         std::chrono::seconds{30});
     BOOST_REQUIRE(ok != nullptr);
@@ -743,31 +782,36 @@ BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
     inf::rpc::Response rk;
     BOOST_REQUIRE(GetReply(ok, rk));
 
-    app.request_shutdown();
+    app->RequestShutdown();
     join_guard.JoinNow();
-    BOOST_CHECK(rh->rc == fw::HostLifecycle::kExitOk);
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(app.pending_cleanup().empty());
-    BOOST_CHECK(owner->IsClosed());
+    BOOST_TEST(framework_test::CoOk(rh->rc));
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
+    BOOST_CHECK(app->PendingCleanup().empty());
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 }
 
 // T5（C-超预算配对）：一条真实在途 handler 被 gate 扣住时 request_shutdown →
-//      ShutdownIncomplete、run 未返回；释放 → 迟到完成 → run 收束；资源 Close
-//      调用序列发生在 handler completion 之后（handler_done:t5-a <
-//      resource_close）。不宣称析构/所有权观测。
+//      ShutdownIncomplete、run 未返回；释放 → 迟到完成 → run 收束。
 BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
     g_probe = std::make_shared<ProbeState>(1);
     g_seq   = std::make_shared<SequenceLog>();
     // 小步预算：在途 handler 让排空步超预算 → ShutdownIncomplete。
-    fw::CoApp app(AppOpts(std::chrono::milliseconds{300}));
-    BOOST_REQUIRE(app.add_service<NetMatrixSvc>(ConcurrentOpts(4)));
-    auto owner = std::make_shared<OwnerRes>();
-    BOOST_REQUIRE(app.add_resource<OwnerRes>(owner));
+    auto app = framework_test::CreateV2App(
+        [] { return v2::CoApp::Create(AppOpts(std::chrono::milliseconds{300})); });
+    BOOST_REQUIRE(app);
+    std::thread([&] {
+        (void)framework_test::RunAppEngineWhenPublished(
+            app->engine(), inf::ListenAddress{"127.0.0.1", 0});
+    }).detach();
+    BOOST_REQUIRE(framework_test::CoOk(
+        framework_test::CoEvalVoid([&] {
+            return bbt_co_await app->CoInstallService<NetMatrixSvc>(
+                ConcurrentOpts(4));
+        })));
 
-    auto rh = RunApp(app);
-    RunJoinOnExit join_guard{&app, &rh};
-    const std::string ep = WaitEndpoint(app);
+    auto rh = RunApp(*app);
+    RunJoinOnExit join_guard{app.get(), &rh};
+    const std::string ep = WaitEndpoint(*app);
     BOOST_REQUIRE(!ep.empty());
     ClientEnv cl;
     BOOST_REQUIRE(cl.Start());
@@ -777,30 +821,27 @@ BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
                        std::chrono::seconds{60});
     BOOST_REQUIRE(a != nullptr);
     BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // handler 在途
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Running);
+    BOOST_CHECK(app->State() == fw::AppState::Running);
 
-    app.request_shutdown();
-    BOOST_REQUIRE(WaitShutdownState(app, fw::ShutdownState::ShutdownIncomplete));
-    BOOST_CHECK(!rh->done.load());                    // run 未返回
-    BOOST_CHECK(!owner->IsClosed());                  // owner 未被 Close 调用（时序，非所有权）
+    app->RequestShutdown();
+    BOOST_REQUIRE(WaitShutdownState(*app, fw::AppState::StopIncomplete));
+    // 首次 co_stop 以预算耗尽如实返回（不 park、不假装完成）；状态先于返回落定，
+    // 故先有界等待生命周期任务落定再读结果，不把竞态当断言。
+    BOOST_REQUIRE(WaitRunSettled(rh));
+    BOOST_CHECK(!framework_test::CoOk(rh->rc));
+    BOOST_CHECK(rh->rc.error().code == fw::ErrorCode::TimedOut);
+    BOOST_CHECK(app->State() == fw::AppState::StopIncomplete);
     BOOST_CHECK(g_probe->Active("t5-a"));             // handler 仍物理在途
-    BOOST_CHECK(!app.pending_cleanup().empty());      // 有未完成清理项
 
     // release 原 handler → 迟到完成。
     g_probe->GateFor("t5-a")->Open();
     BOOST_REQUIRE(g_probe->handler_done.WaitFor(kWait));
 
     join_guard.JoinNow();
-    BOOST_CHECK(rh->rc == fw::HostLifecycle::kExitShutdownLate);
-    BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(app.pending_cleanup().empty());
-    BOOST_CHECK(owner->IsClosed());
-
-    const int hi = g_seq->IndexOf("handler_done:t5-a");
-    const int ci = g_seq->IndexOf("resource_close");
-    BOOST_REQUIRE(hi >= 0);
-    BOOST_REQUIRE(ci >= 0);
-    BOOST_CHECK(hi < ci);                             // Close 在 handler 完成之后
+    // 迟到收尾后必须再显式推进一次收口，才到真实终态（co_stop 幂等）。
+    BOOST_REQUIRE(framework_test::CoOk(framework_test::CoStop(*app)));
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
+    BOOST_CHECK(app->PendingCleanup().empty());
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 }
 

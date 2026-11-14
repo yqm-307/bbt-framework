@@ -89,4 +89,8 @@ template <>
 struct ProtoCodec<bbt::example::ecommerce::v1::Record>
     : ecommerce_codec::MessageCodec<bbt::example::ecommerce::v1::Record> {};
 
+template <>
+struct ProtoCodec<bbt::example::ecommerce::v1::ComponentView>
+    : ecommerce_codec::MessageCodec<bbt::example::ecommerce::v1::ComponentView> {};
+
 } // namespace bbt::framework::rpc_detail

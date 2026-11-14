@@ -152,7 +152,7 @@ protected:
         return result<void>::ok();
     }
 
-    result<void> OnStop() override {
+    result<void> OnStop(const bbt::infra::CloseOptions&) override {
         ++s_stop;
         // 真实挂起：证明 hook 在受管协程中执行，有限 deadline 覆盖它。
         if (m_halt_ms > 0) bbtco_sleep(m_halt_ms);

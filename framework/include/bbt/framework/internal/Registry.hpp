@@ -346,13 +346,6 @@ public:
     // hook 协程结束时由任务体归还：--hooks_in_flight 并唤醒等待者。
     void NoteHookSettled(const ObjectId& id) noexcept;
 
-    // ---- 组件依赖拓扑（锁内计算，返回 id 顺序）----
-    // 依赖边：binding.subject 是 Component 且 target 是本组件条目
-    // （subject → target 读作 subject 依赖 target）。
-    // 启动序：依赖先于使用者（DFS 后序，稳定按登记顺序）。
-    // 环在 Bind 期拒绝；若仍残留（防御），环内节点按登记顺序附尾并返回
-    // had_cycle=true。
-    std::vector<ObjectId> ComponentStartOrderLocked(bool* had_cycle) const;
 
     // ---- Uninstall ----
     // 封 gate → 标 destroying/op → 供调用方随后锁外跑 OnStop/OnUninstall。

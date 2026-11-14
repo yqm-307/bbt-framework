@@ -10,7 +10,7 @@
 | 文件 | 作用 |
 |---|---|
 | `store.hpp` | 业务复用模块：`PriceBook` 组件、`CatalogService`、`CartService` |
-| `component_services_main.cc` | 普通 `main` + 受管协程入口；`shared` / `node` 两种模式 |
+| `component_services_main.cc` | runtime 生成式 `bbtco_main` 入口（不写 native main、不启停 scheduler）；`shared` / `node` 两种模式，参数经 `BBT_EXAMPLE_MODE` / `BBT_EXAMPLE_JOURNAL` / `BBT_EXAMPLE_PRICE` 传入 |
 | `component_services_run.py` | Python 标准库驱动器：并发拉起自有进程、解析 journal、断言、清理 |
 | `CMakeLists.txt` | `component_services` 可执行目标 + `examples.component_services` CTest |
 

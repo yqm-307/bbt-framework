@@ -91,10 +91,6 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     ShutdownState.hpp
     RpcMethods.hpp
     RpcPolicy.hpp
-    ICoService.hpp
-    CoService.hpp
-    CoRpc.hpp
-    CoApp.hpp
     DynamicRouteTable.hpp
     Object.hpp
     Address.hpp
@@ -103,15 +99,15 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     Actor.hpp
     App.hpp
     V2.hpp
+    HostGate.hpp
     Framework.hpp)
-# RedisNetResource.hpp 依赖新 net Redis 入口公开头（bbt::infra_redis_net
-# 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
-# bbt::infra_redis_net 的公开 include 面可见，不引入 hiredis）。
+# RedisComponent.hpp / MongoDBComponent.hpp 依赖上游 infra 的公开头：对应
+# target 在场时单独自给自检（公开面不泄漏 hiredis/mongocxx/bsoncxx）。
 if(TARGET bbt::infra_redis_net)
     set(_redis_net_hdr_tu
-        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/RedisNetResource.cc")
+        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/RedisComponent.cc")
     file(WRITE "${_redis_net_hdr_tu}"
-        "#include <bbt/framework/RedisNetResource.hpp>\n")
+        "#include <bbt/framework/RedisComponent.hpp>\n")
     add_library(bbt_framework_redis_net_header_selfcheck STATIC
         "${_redis_net_hdr_tu}")
     target_link_libraries(bbt_framework_redis_net_header_selfcheck PRIVATE
@@ -121,14 +117,11 @@ if(TARGET bbt::infra_redis_net)
     set_target_properties(bbt_framework_redis_net_header_selfcheck PROPERTIES
         LINKER_LANGUAGE CXX)
 endif()
-# MongoDbResource.hpp 依赖新 mongo owner/句柄入口公开头（bbt::infra_mongo
-# 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
-# bbt::infra_mongo 的公开 include 面可见，不引入 mongocxx/bsoncxx）。
 if(TARGET bbt::infra_mongo)
     set(_mongo_hdr_tu
-        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/MongoDbResource.cc")
+        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/MongoDBComponent.cc")
     file(WRITE "${_mongo_hdr_tu}"
-        "#include <bbt/framework/MongoDbResource.hpp>\n")
+        "#include <bbt/framework/MongoDBComponent.hpp>\n")
     add_library(bbt_framework_mongo_header_selfcheck STATIC
         "${_mongo_hdr_tu}")
     target_link_libraries(bbt_framework_mongo_header_selfcheck PRIVATE
@@ -139,7 +132,7 @@ if(TARGET bbt::infra_mongo)
         LINKER_LANGUAGE CXX)
 endif()
 # internal/ 机器面头文件同样做自给自检（Framework.hpp 不传递包含它们，
-# 但仍要求独立可编译）。CoApp.hpp 因 add_service 展开方法表而包含
+# 但仍要求独立可编译）。App.hpp 因 CoInstallService 展开方法表而包含
 # MethodTable.hpp，属宿主头而非本汇总头。
 set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/AppRuntimeState.hpp
@@ -155,7 +148,7 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/Registry.hpp
     internal/RpcBridge.hpp
     internal/CoAppSeam.hpp
-    internal/ResourceClose.hpp
+    internal/CloseOptionsCheck.hpp
     internal/ObjectBase.hpp
     internal/ServiceBase.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")

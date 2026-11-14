@@ -240,7 +240,7 @@ protected:
         s_order.push_back("start:" + std::to_string(m_tag));
         return result<void>::ok();
     }
-    result<void> OnStop() override {
+    result<void> OnStop(const bbt::infra::CloseOptions&) override {
         if (bbt::coroutine::GetLocalCoroutineId() != 0) ++s_stop_co;
         const int ms = s_suspend_ms.load();
         if (ms > 0) bbtco_sleep(ms);   // 真实挂起：不阻塞 worker
@@ -280,7 +280,7 @@ protected:
         DepComponent::s_order.push_back("start:U");
         return result<void>::ok();
     }
-    result<void> OnStop() override {
+    result<void> OnStop(const bbt::infra::CloseOptions&) override {
         std::lock_guard<std::mutex> lk(DepComponent::s_order_mtx);
         DepComponent::s_order.push_back("stop:U");
         return result<void>::ok();
@@ -700,8 +700,8 @@ CO_TEST_CASE(two_subjects_independent_unbind) {
     BOOST_CHECK(b2);
 }
 
-// 组件→组件依赖：subject 组件的 GetComponent 可取得依赖句柄并借用；
-// 环绑定被拒绝（InvalidArgument）。
+// 组件→组件绑定：subject 组件的 GetComponent 可取得依赖句柄并借用；
+// v2 不做组件依赖拓扑/环检查，成对的绑定边按显式 Bind/Unbind 维护。
 CO_TEST_CASE(component_dep_getcomponent_and_cycle) {
     auto app = fw::v2::CoApp::Create(MakeAppOptions());
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<DepComponent>("dep",
@@ -722,9 +722,15 @@ CO_TEST_CASE(component_dep_getcomponent_and_cycle) {
     BOOST_CHECK(UserComponent::s_get_ok.load() >= 1);
     BOOST_CHECK(UserComponent::s_borrow_ok.load() >= 1);
 
-    // dep → user 会成环（user 已依赖 dep）→ InvalidArgument。
+    // v2 不自动维护组件依赖拓扑：dep → user 的环绑定同样允许建立，
+    // 由业务显式解绑；此处只验证绑定边可关闭。
     auto cyc = bbt_co_await app->CoBindComponent<UserComponent>(dep_h.value(), "user");
-    BOOST_CHECK(!cyc && cyc.error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(cyc);
+    if (cyc) {
+        BOOST_REQUIRE(bbt_co_await
+                          app->CoUnbindComponent<UserComponent>(dep_h.value(),
+                                                                "user"));
+    }
 
     // 解绑派发 bound=false 事件。
     UserComponent::s_unbind_events = 0;
@@ -1233,7 +1239,7 @@ public:
 
 protected:
     ~StopCtlComponent() noexcept override = default;
-    result<void> OnStop() override {
+    result<void> OnStop(const bbt::infra::CloseOptions&) override {
         ++s_stop_calls;
         {
             std::lock_guard<std::mutex> lk(s_mtx);

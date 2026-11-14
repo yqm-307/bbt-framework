@@ -1,13 +1,13 @@
-# framework v2：对象、绑定、生命周期与监控唯一实施契约
+# framework v2：对象、绑定、生命周期与网络分发唯一实施契约
 
-状态：**目标契约，非已实现 API**。本文件收敛讨论稿的互相取代部分；后续 framework 实现以这里的唯一签名和行为为目标。本文不重审或修改已验收 infra ADR，也不把文档交付当作实现、编译或运行验收。
+状态：**当前 framework 产品契约**。公共对象、组件、服务、网络宿主与分发实现均经 v2 `CoApp` 单一路径装配；本文记录代码应保持的签名和边界。本文不替代 infra ADR，也不把文档本身当作编译或运行证据。
 
 ## 1. 权威、基线与取代关系
 
 - 架构基调仍为 [distributed-framework-baseline.md](distributed-framework-baseline.md)，这里冻结具体对象接口，不替换分布式保证的边界。
 - 最新决定：工作区 `workspace/dag/bbt-v2-r1-brief.md` §Frozen design decisions / Contract-stage clarifications、`bbt-v2-r2-brief.md`，以及 `workspace/infra-interface-v2-plan.md` F14–F16。讨论稿标题中的“待确认”不覆盖 brief 已冻结决定。
 - infra 唯一消费契约：`bbtools-infra/docs/decisions/0014-app-session.md`，698 行，SHA-256 `0034d5196853d99132aed4b07a6af0e4f25d7f17c9cb51cad82fbe1730e4da1b`。候选 infra 树的副本与其逐字相同；不从正在并行变化的实现另猜接口。
-- framework 候选基线 `d55cdb5ef392facd74f6929360affa141f9623aa`；infra 主仓 `8573b7a831eeab75f7d787d1709ee330f20f8b63`；只读 coroutine 主仓 `45c575b37ee6b38cfada86cc3d0339cf85c54fe3`。这不是将来构建的依赖 pin；构建必须使用 infra 声明且实测的精确 pin。
+- framework 候选基线 `d55cdb5ef392facd74f6929360affa141f9623aa`；infra 主仓 `8573b7a831eeab75f7d787d1709ee330f20f8b63`；只读 coroutine 主仓 `45c575b37ee6b38cfada86cc3d0339cf85c54fe3`。这些是原始设计依据，不是本地构建的强制 pin；后续设计应指定实际依赖版本，开发/构建选择遵循 infra `docs/guides/development.md`「依赖版本选择」，并记录候选差异。
 - C++17，命名空间 `bbt::framework`；以下代码块是公共声明目标，不是可直接编译的完整头文件。`result/Error/ErrorCode` 沿用现有体系，下面的错误名不另造第二套异常或错误协议。
 
 | 历史冲突 | 唯一处理 |
@@ -21,7 +21,7 @@
 | F15 无鉴权公开监控示例 | HTTP/RPC 默认关闭；显式开启且具备授权检查才可暴露。仅绑定 HttpComponent 不等于开启 HTTP。 |
 | F2/F7 的 MongoComponent 与 F16 的 MongoDBComponent | 唯一 framework 名为 `MongoDBComponent`；infra 仍为 `mongo::Database`。 |
 
-本轮仅新增本文和 [app-monitor.schema.json](../schemas/app-monitor.schema.json)。现有 `CoApp::add_service`、`add_resource` 等是基线实现；RPC 入站/出站已按 ADR 0022 收敛为 V2 会话（`InstallRpcAdmission` + `RpcEgress`），`RpcInboundBridge`/`IncomingCallContext` 旧面已删除，不属于这里的 v2 接口。
+framework 公共面只保留 `v2::CoApp`、`v2::CoService`、`v2::CoComponent` 与 `v2::CoActor`；组件能力经 Install/Bind/Handle/Borrow 使用。RPC 入站/出站按 ADR 0022 收敛为 V2 会话（`InstallRpcAdmission` + `RpcEgress`），旧 CoApp、旧 ICoService、旧 Resource 和双轨适配层不属于产品面。
 
 ## 2. 对象职责与所有权
 
@@ -111,55 +111,58 @@ public:
 ```cpp
 class CoApp {
 public:
-    // 唯一创建入口：经 coroutine MakeCoObject 真实 creator 与统计接管。
-    // 构造 private（业务不能栈构造或直接 new）；返回业务 owner 强引用。
     static std::shared_ptr<CoApp> Create(AppOptions options,
                                          std::string name = "app");
-    ~CoApp(); // 宿主必须先完成 Stop；未完成时不得提前析构
+    ~CoApp();
     CoApp(const CoApp&) = delete;
     CoApp& operator=(const CoApp&) = delete;
 
-    template<class C> result<void> InstallComponent(
+    template<class C> bbt_co_async(result<void>) CoInstallComponent(
         std::string name, typename C::Options options,
-        const ComponentOptions& placement = {}, const LifecycleOptions& life = {});
-    template<class C> result<void> UninstallComponent(
+        const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    template<class C> bbt_co_async(result<void>) CoUninstallComponent(
         std::string_view name, const ComponentOptions& placement = {},
         const LifecycleOptions& life = {});
-    template<class S, class... Args> result<void> InstallService(
-        ServiceOptions options = {}, Args&&... args);
-    template<class S> result<void> UninstallService(const LifecycleOptions& life = {});
-    template<class A> result<void> InstallActor(ActorOptions options = {}); // 登记类型
-    template<class A> result<void> UninstallActor(const LifecycleOptions& life = {});
+    template<class S> bbt_co_async(result<void>) CoInstallService(
+        ServiceOptions options = {});
+    template<class S> bbt_co_async(result<void>) CoUninstallService(
+        const LifecycleOptions& life = {});
+    template<class A> bbt_co_async(result<void>) CoInstallActor(
+        ActorOptions options = {});
+    template<class A> bbt_co_async(result<void>) CoUninstallActor(
+        const LifecycleOptions& life = {});
 
     result<ObjectHandle> FindService(std::string_view service) const;
     result<ObjectHandle> FindActor(const ActorId& id) const;
     template<class C> result<ObjectHandle> FindComponent(
         std::string_view name, const ComponentOptions& placement = {}) const;
-    template<class C> result<ComponentHandle<C>> BindComponent(
+    template<class C> bbt_co_async(result<ComponentHandle<C>>) CoBindComponent(
         const ObjectHandle& subject, std::string_view name,
-        const ComponentOptions& placement = {}, const LifecycleOptions& life = {});
-    template<class C> result<void> UnbindComponent(
+        const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    template<class C> bbt_co_async(result<void>) CoUnbindComponent(
         const ObjectHandle& subject, std::string_view name,
-        const ComponentOptions& placement = {}, const LifecycleOptions& life = {});
-    result<void> BindObject(const ObjectHandle& subject, const ObjectHandle& target);
-    result<void> UnbindObject(const ObjectHandle& subject, const ObjectHandle& target);
-    result<ObserverToken> Observe(const ObjectHandle& observer,
-        const ObjectHandle& target, ObjectObserver callback);
-    ObjectHandle Handle() const;                 // App 自身的非拥有身份
-    AppInspector Inspector() const;             // 非拥有、只读，App 失效后 Closed
+        const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    bbt_co_async(result<void>) CoBindObject(const ObjectHandle& subject,
+                                            const ObjectHandle& target);
+    bbt_co_async(result<void>) CoUnbindObject(const ObjectHandle& subject,
+                                              const ObjectHandle& target);
+    bbt_co_async(result<ObserverToken>) CoObserve(const ObjectHandle& observer,
+                                                  const ObjectHandle& target,
+                                                  ObjectObserver callback);
+    ObjectHandle Handle() const;
 
-    result<void> Start(const LifecycleOptions& life = {});
-    result<void> Pause(const LifecycleOptions& life = {});
-    result<void> Resume(const LifecycleOptions& life = {});
-    result<void> Stop(const LifecycleOptions& life = {});
     bbt_co_async(result<void>) CoStart(const LifecycleOptions& life = {});
     bbt_co_async(result<void>) CoPause(const LifecycleOptions& life = {});
     bbt_co_async(result<void>) CoResume(const LifecycleOptions& life = {});
     bbt_co_async(result<void>) CoStop(const LifecycleOptions& life = {});
-    int Run();
+    bbt_co_async(result<void>) CoStop(const bbt::infra::CloseOptions& options);
+    bbt_co_async(result<void>) CoWaitShutdownRequest(
+        const bbt::coroutine::WaitOptions& wait = {});
     void RequestShutdown() noexcept;
     AppState State() const noexcept;
-    result<std::string> BoundEndpoint() const;
     std::vector<CleanupInfo> PendingCleanup() const;
     std::vector<LifecycleFailure> LifecycleFailures() const;
 };
@@ -167,7 +170,7 @@ public:
 
 `ObjectObserver = std::function<void(const ObjectStateEvent&)>`；事件是 owning 值，含 id、generation、state、revision、observed_at、稳定错误 code/phase，以及可选 ActorInfo，不含引用或 payload。Component 依赖也是 BindComponent 的 subject；BindObject 只记录非拥有的关系，不授权直接调用对象、不隐式建立组件启动依赖。Find 只查已存在对象，失败安装对象仍可通过名字找到以清理；Actor Find 不会激活对象。UninstallActor 先拒新建，按预算销毁已建实例，再撤登记；失败保留类型及残留实例记录。
 
-上面安装、卸载、绑定、Observe 是非协程宿主控制面，误上下文返回 InvalidContext；运行期操作同步完成局部 Start/Stop/绑定 hook 后返回。动态创建/销毁 Actor 只能通过下节 Co 入口在受管协程执行，不在 admission reader 内执行。读值快照和 RequestShutdown 可任意线程调用。需要异步停机时用 RequestShutdown，不从本 App handler 调会等待自身的 CoStop/CoPause；这种调用返回 InvalidContext。
+上面的 Co 安装、卸载、绑定、观察和生命周期入口均须在受管协程中调用，误上下文返回 InvalidContext；操作可挂起等待局部生命周期或绑定 hook 完成，不阻塞原生 worker。动态创建/销毁 Actor 同样通过下节 Co 入口执行，不在 admission reader 内执行。读值快照和 RequestShutdown 可任意线程调用。需要异步停机时用 RequestShutdown，不从本 App handler 调会等待自身的 CoStop/CoPause；这种调用返回 InvalidContext。
 
 ### 4.1 Options 的完整装配面
 
@@ -175,18 +178,19 @@ public:
 
 | 类型 | setter/查询的目标签名 | 默认/边界 |
 |---|---|---|
-| LifecycleOptions | `SetDeadline(Deadline)`；`Deadline() const noexcept -> Deadline` | 未设时使用 App 配置的有限 lifecycle budget；每步不得重置总 deadline。 |
+| LifecycleOptions | `SetDeadline(Deadline)`；`Deadline() const noexcept -> Deadline` | 未设时使用 App 配置的有限 lifecycle budget；每步不得重置总 deadline。用于 Start/Pause/Resume/Install/Uninstall，不用于 Stop。 |
+| infra::CloseOptions | `CloseMode mode`；`bool wait_release`；`std::optional<Error> reason`；`Deadline deadline`；`Immediate()`/`Graceful(deadline)` 工厂 | 默认 `Immediate` + `wait_release=false`（`CloseOptions{}` 合法）；`Graceful` 或 `wait_release=true` 必须给有限绝对期限；组件停止沿用同一值、同一 deadline，不按组件重置。语义唯一真源是 infra `close-options-contract.md`。 |
 | ComponentOptions | `SetScope(ComponentScope)`；`SetOwner(ObjectHandle)` | App 默认且 owner 为空；Service/Actor 必须有本 App、相符类型且同代的 owner。 |
 | ServiceOptions | `SetLifecycleOptions(LifecycleOptions)`；`SetMaxInflight(size_t)`；`SetMaxSerialKeys(size_t)`；`SetSerialQueueCapacity(size_t)`；`SetOrderedIngress(OrderedIngressOptions)`；`BindComponent<C>(string name)`；`SetServiceOptions(O options)` | BindComponent 明确指向 App scope 已安装项；`SetServiceOptions` 的 O 必须为 S::Options，不隐式转换/序列化。默认无组件。 |
 | ActorOptions | `SetLifecycleOptions(LifecycleOptions)`；`SetMaxActors(size_t)`；`SetMailboxCapacity(size_t)`；`SetAggregateQueueCapacity(size_t)`；`BindComponent<C>(string name)` | 默认无组件；所有额度有限正值，Actor scope 需对显式创建后的实例安装/绑定。 |
 | CreateOptions | `SetDeadline(Deadline)` | 继承并收紧父预算，顶层必须有限。 |
 | CallOptions | `SetDeadline(Deadline)`；`SetRouteKey(string)`；`AddRouteField(string,string)`；`SetOrdered(OrderedStamp)` | 父子 min；顶层无预算拒绝；默认不重试。 |
 | TellOptions | `SetDeadline(Deadline)`；`RequireRemoteAcceptance(bool=true)` | 默认 false（仅本地接纳）；不提供 WaitReply。 |
-| AppOptions | `Listen(string uri)`；`AddRoute(string service,string uri)`；`SetNetworkOptions(AppNetworkOptions)`；`SetLimits(size_t max_objects,size_t max_bindings,size_t max_observers,size_t observer_queue_capacity)`；`SetShutdownBudget(milliseconds)`；`SetRpcPolicy(shared_ptr<RpcPolicy>)`；`SetResolver(shared_ptr<Resolver>)` | 只有一种 RPC 通道（V2 `tcp://` 会话，见 §7.1），无 profile 选择；默认无监听/静态路由，未配置目标 NotFound；SetShutdownBudget 必须为正有限值，未设则 Start/Run 校验失败；不自动安装资源或 Monitor。 |
+| AppOptions | `Listen(string uri)`；`AddRoute(string service,string uri)`；`AddHttpRoute(HttpServiceRoute)`；`SetNetworkOptions(AppNetworkOptions)`；`SetLimits(size_t,size_t,size_t,size_t)`；`SetShutdownBudget(milliseconds)`；`SetLifecycleBudget(milliseconds)`；`SetRpcPolicy(shared_ptr<RpcPolicy>)`；`SetDynamicRoutes(shared_ptr<DynamicRouteTable>)` | 只有一种 RPC 通道（V2 `tcp://` 会话，见 §7.1），无 profile 选择；默认无监听/静态路由，未配置目标 NotFound；预算必须为正有限值；不自动安装资源或 Monitor。 |
 | AppNetworkOptions | `SetLocalAppId(string)`；`SetTrustedNetworkPlaintext(bool)`；`SetMaxSessions(size_t)`；`SetMaxFrameBytes(size_t)`；`SetSystemQueueBytes(size_t)`；`SetServiceQueueBytes(size_t)`；`SetActorQueueBytes(size_t)`；`SetServiceWeight(uint32_t)`；`SetActorWeight(uint32_t)`；`SetControlDataSplit(bool)` | `SetLocalAppId` 即 infra `rpc::ClientOptions::LocalIdentity`（非空 ≤256 UTF-8，同值自连被拒）；明文 trusted-network 默认 false；未有可信 adapter 且未显式启用时按 ADR 返回 UnsupportedRoute；split 默认 false，未实现不能忽略 true。 |
 | AppSessionOptions | `SetEndpoint(string)`；`SetProfile(string)`；`SetDeadline(Deadline)`；`Validate()` | 只是 Resolver/网络装配的值，不有 Create/Close/物理连接选项，不允许 Service 私建 session。profile/security 决定共享键，不能每业务请求换身份。 |
 
-Service/Actor 可以声明允许使用的 Component 类型；动态 BindComponent 也必须满足类型声明和 scope 限制。对于 `Service<>`，没有声明的类型绑定返回 InvalidArgument。MonitorService 声明 HttpComponent 为可选能力，没有绑定也可安装；“可用类型”不等于“必需依赖”。必需依赖由安装配置显式列出，缺失在 Install/Bind 返回 NotFound。Component 的依赖关系通过 BindComponent 记录，启动按拓扑、停止按逆拓扑；环返回 InvalidArgument 并保留失败记录，不自动打断或修复。
+Service/Actor 可以声明允许使用的 Component 类型；动态 BindComponent 也必须满足类型声明和 scope 限制。必需依赖由安装配置显式列出，缺失在 Install/Bind 返回 NotFound。BindComponent 只记录 subject 到目标组件的关系并控制 Borrow gate；CoApp 不自动维护组件依赖拓扑、不根据绑定边排序 Start/Stop，也不自动修复环。
 
 ## 5. Service、Actor、Component 与消息
 
@@ -256,7 +260,7 @@ protected:
     bbt::infra::net::Engine& NetEngine(); // 仅受管 hook/borrow；不得存出管理域
     virtual result<void> OnInstall() { return {}; }
     virtual result<void> OnStart() { return {}; }
-    virtual result<void> OnStop() { return {}; }
+    virtual result<void> OnStop(const bbt::infra::CloseOptions&) { return {}; }
     virtual void OnUninstall() {}
     virtual void OnMonitorCollect(MonitorWriter&) {}
     virtual void OnBindingChanged(const BindingEvent&) {}
@@ -310,13 +314,19 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 
 ### 5.2 内置 Component 不截断能力
 
-`RedisComponent(ConstructKey, infra::redis::ClientOptions)` 暴露 `Client() -> infra::redis::Client&`；`MongoDBComponent(ConstructKey, infra::mongo::DatabaseOptions)` 暴露 `Database() -> infra::mongo::Database&`；`HttpComponent(ConstructKey, HttpComponent::Options)` 暴露 `Router() -> infra::http::Router&`。构造只 Registry 可用，Options 按组件归属头定义；Mongo 配置类型在 infra 稳定头落地前不得假称已可编译。
+组件 hook 接收关闭选项：`CoComponent::OnStop(const bbt::infra::CloseOptions& options)`（其余 hook 签名不变）。`CoApp::CoStop(options)` 把**同一个值**传给按登记顺序逆序收口的每个组件；绑定边只负责 gate 与 Borrow 排空，不形成自动拓扑。组件不自行换算模式、不按组件重置 deadline，也不在 hook 内新建等待线程。`OnStop` 必须先把选项校验完再产生任何副作用（非法组合返回 `InvalidArgument`/`InvalidContext`，见 infra `close-options-contract.md` §1），然后只关闭自己拥有的客户端/连接/会话。
 
-这些引用仅在实际 ComponentBorrow 的寿命内使用；业务不得 Close 客户端、改共享池配置、移动所有权或保存引用。组件只做 Create/Start/Stop、错误映射，不自建轮询线程，不包装有限命令子集。HttpComponent 的 Options 明确 listen、server/router 限额及 lifecycle budget；只有用户显式安装且启动该 Component 才有 HTTP listener，Monitor 不暗建 Server。
+`RedisComponent(ConstructKey, Options)` 的 `Options` 至少含：借用的 `std::shared_ptr<bbt::infra::net::Engine>`、`net::Address`、`CoRedisPool::PoolOptions`，以及 OnStart 建连的有限预算 `connect_timeout`（默认 5s）。暴露 `Pool()`（只在 `ComponentBorrow` 寿命内使用）。`OnInstall` 只做参数校验与 `CoRedisPool::Create`（Engine 必须仍 Idle，不联网）；`OnStart` 在 `connect_timeout` 内 `Connect` 并等就绪；`OnStop` 先校验 `CloseOptions`（非法组合零副作用）再调 `Pool()->Close(options)`，原样转发同一值。`MongoDBComponent(ConstructKey, Options)` 的 `Options` 至少含 `MongoRuntimeConfig` 与 `MongoTarget`；`OnInstall` 只做参数校验与 `CoMongoDb::Create`（不建 worker）；`OnStart` 调 owner `Start` 后绑定 `Collection`（infra 公共契约要求 owner Running 才接纳新句柄；句柄本身不建线程）；`OnStop` 先校验选项再调 owner `Close(options)`（本轮组件验收只承诺 `Immediate`；`Graceful` 按 owner 现有语义转发；`wait_release=true` 时 Co 调用挂起到同一 deadline，由 owner 的 infra native finalizer 完成 worker 退出/`JoinWorkers()`/lease 归还后唤醒，组件 hook 与 Co worker 都不执行 join、不新建等待线程；owner 侧的 Co 等待面由 mongo-close 补齐，补齐前只能按缺口报告，不得改成 `InvalidArgument` 拒绝）。两者都不拥有、不 `Run`、不 `RequestClose`、不析构共享 Engine；共享 Engine 由应用根持有、由入口 host hook 执行一次，见 §12.5。实现文件：`framework/include/bbt/framework/RedisComponent.hpp`、`MongoDBComponent.hpp`。
+
+`HttpComponent` 暴露 `Router()` 需要 infra 提供 Router 类型，本轮不新增该类型，也不以组件名义暗建第二个 listener；HTTP/RPC 宿主仍按现有 `http::Server`/`rpc::CoRpcServer` 装配，但其 Engine 共享与关闭规则与上面两个组件相同。Monitor 不暗建 Server。
+
+这些引用仅在实际 `ComponentBorrow` 的寿命内使用；业务不得 Close 客户端、改共享池配置、移动所有权或保存引用。组件只做 Create/Start/Stop、错误映射，不自建轮询线程，不包装有限命令子集。
+
+**本轮的 5 Service / 2 Redis 验收场景**：同一 App 安装 `redis-a`、`redis-b` 两个 `RedisComponent`（不同地址/池配置），安装 5 个 `v2::CoService`；前三个在 `ServiceOptions::BindComponent<RedisComponent>` 中绑定 `redis-a`，后两个绑定 `redis-b`。断言：两组件对象身份各自唯一、配置互不串用；解绑其中一个 Service 不关闭另一 Service 仍使用的组件；`CoStop` 按登记逆序关闭（Service 先、组件后），完成后组件 `Close` 收到同一 `CloseOptions`；借用必须经 `ComponentHandle::Borrow`，非受管协程的装配/生命周期调用在副作用前被拒绝。裸引用逸出属于使用错误：C++ 基类无法运行期拦截任意裸指针/reference 逃出 borrow，契约只把它写成「只在 `ComponentBorrow` 寿命内使用」的受控约束，不承诺自动检测或运行期拒绝。
 
 ### 5.3 核心头文件、模板与注释组织
 
-本节规定后续核心整理的目标与验收条件，不表示当前候选源码已经完成这些整理；只调整代码组织和注释，不改变上文的接口语义、所有权、受控构造或生命周期保证。
+本节记录核心整理后的代码组织与验收条件；只调整代码组织和注释，不改变上文的接口语义、所有权、受控构造或生命周期保证。
 
 **按独立概念拆文件。** `Component` 本身就是带默认 hook 的组件基类，不是缺少基类；不为命名形式再叠加职责重复的 `IComponent → ComponentBase → Component`。只有出现独立的纯接口职责时，才按 `docs/conventions.md` 的 `I` 前缀和接口目录规则设计接口。
 
@@ -346,9 +356,9 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 ## 6. 动态控制、观察与失败兜底
 
 - Install：无副作用参数/额度/名字校验 → Registry 登记 Installing → 构造 → 显式依赖检查 → OnInstall → Installed；App 已 Running 时再 OnStart 成功才发布业务 dispatch。构造失败不发布空实例；hook 失败已登记对象为 InstallFailed，可 Find/卸载，不能返回“全部回滚”。
-- 组件先 Install 并按依赖拓扑启动，Service 再 Start；Actor 创建先确认依赖 ready，再 OnCreate，最后允许消息。Stop 反序：拒新 → 每个对象先封其 subject 绑定边并排**空在途 borrow** → 再 Service OnStop/Actor OnDestroy → scoped Component → App Component（旧 borrow 不得在 OnStop 关闭资源后仍运行同一资源版本；OnStop 失败/超时同样保留 owner 记 LifecycleFailure 并继续其他对象收口）。**排空粒度是该 subject 自己的 binding 边**（per-(component, subject, generation) `WaitBindingDrained`），不是组件全量 borrow：共享组件上其他 subject 的合法借用不阻塞本对象收口。subject 已封口（gate_closed/op_in_progress/关闭语义状态）后在同一 Registry 临界区内拒绝新增 Bind——销毁路径只擦除 retiring 边，关闭期间新增的 active 边不会被收口看到。
+- 组件和服务按登记顺序启动；绑定只表达可用能力，不驱动自动拓扑。Actor 创建先确认显式安装项，再 OnCreate，最后允许消息。Stop 反序：拒新 → 每个对象先封其 subject 绑定边并排空在途 borrow → 再 Service OnStop/Actor OnDestroy → 按登记逆序收口 Component。
 - Pause：拒新并排空在途后 OnPause；Resume 的 OnResume 成功后重新接纳。Stop 后不能 Start；StopIncomplete 允许再次 Stop 使用更晚期限推进 cleanup，不重开入口。
-- UninstallService：移除新 dispatch、撤自己的 observer/Router token、等 execution/callback/borrow 终态、OnStop/OnUninstall、解绑、收口 owned-scope Component、最后销毁。各安全独立清理分支继续运行，任一未完为 UninstallIncomplete。逆序指实际已成功登记/启动的依赖图，不只反转名字列表。
+- UninstallService：移除新 dispatch、撤自己的 observer/Router token、等 borrow/callback 终态、OnStop/OnUninstall、解绑、按登记逆序收口 owned-scope Component、最后销毁。各安全独立清理分支继续运行，任一未完为 UninstallIncomplete。
 - `CleanupInfo` 为 object id/generation、phase、pending borrows/tasks/callbacks、stable error code；`LifecycleFailure` 为 object id/generation、operation、phase、code、发生时间及本地脱敏说明。诊断列表受 App 的 max_objects/有界 ring 限制，溢出计 dropped；原始异常文本、URI、凭据不得直接导出 Monitor。
 - 所有 hook 的 error return 和 std/非 std 异常均捕获，转 InternalError/原 error 并记录 phase；OnUninstall/OnDestroy 虽 void，抛异常仍记录并继续其他安全清理。析构 noexcept。try/catch 不保证 UB、数据竞争、死循环、进程崩溃或泄漏协程可恢复。
 - Observe 只建立非拥有边。ObserverToken 绑定 observer generation，observer 卸载时 Registry 自动撤销；target 销毁时先发布一次终结事件再使 token 失效。事件队列有界、best-effort，终结事件也可能因队列满/观察者退出未交付；不能靠“必收 Destroyed”维持安全，handle gate 的实际失效才是依据。回调在锁外受管执行，回调抛异常计数，不拖垮业务。**在途 callback lease**：派发方在锁内校验 active 并取得 lease（在途计数）后才执行业务回调；Revoke 先标 inactive 阻断新派发，等待已派发 lease 归零后抹除记录与闭包——闭包捕获对象不会在回调仍在途时被销毁，撤销返回时闭包已确定释放。通知/序列缺口后用 Inspector 重新取快照。
@@ -386,7 +396,7 @@ public:
 | §4.1/4.3，393–420 | RequireRemoteAcceptance 对应 SendOptions 同名值及 wire acceptance_requested，不把 SendAccepted 当业务结果；mailbox 满计 dead-letter/drop，确认式投递 Overloaded | 满一 Actor 不阻塞共享 reader/System/Service/其他 Actor；发送方不自动补发。 |
 | §5，422–552 | Codec/正式 v2 proto 与 u32be 归 infra；framework 只做 Payload/schema、route/fw 字段和 opaque ordering_key/sequence。metadata 仅 fw/route/trace，32项、key64/value256字节且无重复 | Call1→Tell2→Call3 同目标按序接纳；字段/长度/过期/关联拒绝；默认 frame8MiB，硬上限1GiB，握手≤64KiB。 |
 | §5.3–6，530–575 | 同发送方/目标以发送队列接纳为序；旧 epoch 不能复用新代额度；已 mailbox 接纳的不回滚。OutcomeUnknown 保留 request_phase，不推断未执行 | 部分写退役、不重放；旧 callback 只能结算既有责任，不捕获 framework 裸指针。 |
-| §2.3、6，317–330、565–575 | 宿主 StopAccepting 关闭业务门 → WaitHandlersDone 等宿主在途责任归零 → CoRpcServer::Shutdown() → 宿主 Close 对 RPC server/client 调用 Shutdown(reason) 并收口 Engine；HTTP 分支独立遵循其关闭接口 | RPC Shutdown/IsClosed 不证明物理释放；尚未结束的驱动线程仍由宿主持有并最终 join，StopIncomplete 可追踪。 |
+| §2.3、6，317–330、565–575 | framework 关闭业务门并等待自身在途责任归零 → 消费 infra 资源的 Close/Shutdown → 通过 infra native lifecycle handle 发起 Engine Close/物理观察；HTTP 分支独立遵循其资源接口 | RPC Shutdown/IsClosed 不证明物理释放；Engine 的 native owner、Run 返回凭据、join 与 PhysicalReleased 均归 infra handle，StopIncomplete 可追踪。 |
 | §8，619–629 | 仅消费稳定 net/http/rpc/redis/mongo 面；HTTP Router/Request/Response/stream/pool、Redis Acquire/AUTH/SELECT、Mongo Collection/Document/worker 语义原样保留；Payload codec 归 framework | 模块 owner 实施对应 api/include/真实后端回归；不把本轮文档当作上述模块完成。 |
 | §8，622、631 | HttpComponent Freeze 前结构注册，token owner 为注册 Service；Revoke 先封新 dispatch，再等 handler lease；运行时新 path Busy | 并发撤销/Uninstall 不悬空；不偷偷重建 Router 或增加 route。 |
 | §9–11，633–684 | 授权/Resolver/mailbox/重试/业务 idempotency 归 framework；Monitor 只读、显式、opt-in；删除 LegacyHeaders/x-bbt-*、旧 envelope/transport/WaitStopped 稳定入口 | examples/API consumer、正反向 include、Monitor/schema、真实两 App 和关闭验收。 |
@@ -398,7 +408,7 @@ RPC 只按 V2 会话消费：`LegacyHeaders`/`ProtoWireV1`/`TcpV1` 模式选择�
 
 | 旧 | 新 | 责任方 |
 |---|---|---|
-| `CoAppOptions::inbound_bridge`（`RpcInboundBridge`） | 删除；`CoAppOptions::local_identity`（映射 `rpc::ClientOptions::SetLocalIdentity`） | framework 装配 |
+| 旧入站桥配置 | 删除；`AppNetworkOptions::SetLocalAppId`（映射 `rpc::ClientOptions::SetLocalIdentity`） | framework 装配 |
 | `InstallRpcHttpBridge` / `InstallRpcWireBridge` | `InstallRpcAdmission(InfraHttpHost&, shared_ptr<AppRuntimeState>)` | framework 入站 |
 | `InfraHttpHost::InstallRpcHandler` + `SetRpcInboundTransport` | `rpc::CoRpcServer::Create(engine, client, AdmissionHandler, ServerOptions)` | framework 宿主 |
 | `IncomingCallContext` + `RpcEnvelope`（入站） | `rpc::AdmissionItem`（`request` + `reply` + `lease`） | infra → framework |
@@ -411,7 +421,7 @@ RPC 只按 V2 会话消费：`LegacyHeaders`/`ProtoWireV1`/`TcpV1` 模式选择�
 
 不变量：framework **不注册** `Server::RegisterRpc`——注册路由会为每帧派生独立协程并绕过单 FIFO admission 与 `OrderedIngress` 的唯一按序接纳（ADR 0014 §4.2）；全部入站（Call 与 Send）走 admission handler。入站 `Traffic=Service`，出站 `Call` 为 `Required`、`Tell` 为 `None`；V2 `OrderingKey`/`Sequence` 不填（`sequence=0` 即 infra 不启用顺序检查），业务有序票据继续走 `fw.*` 元数据。`peer_principal` 在明文 trusted-network 下恒空，授权仍由 `RpcPolicy` 与业务层承担。
 
-表中「新」列的 infra 类型与 framework 侧 `InstallRpcAdmission`、`RpcEgress`、`CoAppOptions::local_identity`、`InboundDispatcher::Dispatch(const rpc::Request&)`、`RpcSendAppFn(std::string_view, ...)` 均已落地；消费者按本表消费，不另起别名。
+表中「新」列的 infra 类型与 framework 侧 `InstallRpcAdmission`、`RpcEgress`、`AppNetworkOptions::SetLocalAppId`、`InboundDispatcher::Dispatch(const rpc::Request&)`、`RpcSendAppFn(std::string_view, ...)` 均已落地；消费者按本表消费，不另起别名。
 
 ## 8. MonitorService：显式安装、访问控制与撤销
 
@@ -614,9 +624,9 @@ bbt_co_async(result<void>) CoInstallComponent(
     const ComponentOptions& placement = {},
     const LifecycleOptions& life = {});
 
-template<class S, class... Args>
+template<class S>
 bbt_co_async(result<void>) CoInstallService(
-    ServiceOptions options = {}, Args&&... args);
+    ServiceOptions options = {});
 
 template<class A>
 bbt_co_async(result<void>) CoInstallActor(ActorOptions options = {});
@@ -646,8 +656,7 @@ bbt_co_async(result<void>) CoStart(const LifecycleOptions& life = {});
 bbt_co_async(result<void>) CoPause(const LifecycleOptions& life = {});
 bbt_co_async(result<void>) CoResume(const LifecycleOptions& life = {});
 bbt_co_async(result<void>) CoStop(const LifecycleOptions& life = {});
-bbt_co_async(result<void>) CoJoin(
-    const ObjectHandle& target, const LifecycleOptions& life = {});
+bbt_co_async(result<void>) CoStop(const bbt::infra::CloseOptions& options);
 bbt_co_async(result<void>) CoWaitShutdownRequest(
     const bbt::coroutine::WaitOptions& wait = {});
 ```
@@ -659,39 +668,38 @@ bbt_co_async(result<void>) CoWaitShutdownRequest(
 | `InstallComponent/Service/Actor`、`UninstallComponent/Service/Actor` | 移出业务 public，分别由 `CoInstall*`/`CoUninstall*` 替代 | Registry 构造、登记、hook 和失败清理在 Co 域；构造失败不发布半成品 |
 | `BindComponent/UnbindComponent`、`Observe` | 由 `CoBindComponent`/`CoUnbindComponent`/`CoObserve` 替代 | `ComponentHandle`/`ObserverToken` 仍是非拥有值；borrow/callback lease 仍按原 deadline 排空 |
 | `Start/Pause/Resume/Stop` | 从 public 生命周期面删除，分别由 `CoStart/CoPause/CoResume/CoStop` 替代 | 不保留宿主版第二套 hook 调用路径；超时返回 `TimedOut`/`StopIncomplete`，owner 继续保留 |
-| `Run()` | 从 `CoApp` public 面删除 | 应用以普通 `main` + 既有 `bbtco` 注册启动主协程；`RequestShutdown() noexcept` 仅保留为 native/跨域关闭信号，不执行 hook、不等待自身 |
+| `Run()` | 从 `CoApp` public 面删除 | 应用以 runtime 的 `bbtco_main` 生成式入口启动主协程；`RequestShutdown() noexcept` 仅保留为 native/跨域关闭信号，不执行 hook、不等待自身 |
 | `Find*`、`Handle()`、`State()`、`Inspector()`、`PendingCleanup()`、`LifecycleFailures()` | 保留只读/观察面 | 不创建对象、不取得裸指针；跨域调用只读值快照，可在合法观察域调用 |
 
-`CoApp` 本身不是 native I/O owner；它持有 Registry、逻辑 AppNetwork 和业务对象的所有权责任。`RequestShutdown() noexcept` 是任意域可发的幂等请求：只置位并通知单一 shutdown-request waiter，不执行 hook、不调用 Stop、不等待自身。`CoWaitShutdownRequest(wait)` 在 Co 域以现有 CoWaiter/Notify 挂起，使用持久 flag 谓词，先请求后等待也不丢通知；只允许一个活动 waiter，第二个返回 Busy，非法域返回 InvalidContext，超时返回 TimedOut 且不清请求/不销毁 App。它只证明收到请求，App 可仍 Running，不是 Stopped/Released。`CoJoin(target, life)` 仅接受本 Registry 非 App 对象/任务句柄（本切片未实现）；`app.Handle()` 明确返回 InvalidContext，不借 Join 等待自己负责推进的 App。hook 内重入同 App 生命周期继续在副作用前拒绝。Join 不等 scheduler 或排空 detached，超时保留 target owner。现有 hook 返回形状不变，只从 Co 控制任务调用。
+`CoApp` 本身持有 Registry、统一 v2 网络宿主和业务对象的所有权责任。`RequestShutdown() noexcept` 是任意域可发的幂等请求：只置位并通知单一 shutdown-request waiter，不执行 hook、不调用 Stop、不等待自身。`CoWaitShutdownRequest(wait)` 在 Co 域以现有 CoWaiter/Notify 挂起，使用持久 flag 谓词，先请求后等待也不丢通知；只允许一个活动 waiter，第二个返回 Busy，非法域返回 InvalidContext，超时返回 TimedOut 且不清请求/不销毁 App。它只证明收到请求，App 可仍 Running，不是 Stopped/Released。hook 内重入同 App 生命周期继续在副作用前拒绝。现有 hook 返回形状不变，只从 Co 控制任务调用。
 
-最短用法只保留一个请求等待槽，不引入事件系统。宿主入口是普通 `main`：业务协程经既有 `bbtco` 注册到 coroutine runtime，不引入隐藏 main、第二 runtime 或 App 专用 native control 桥。以下是实现后定向子进程的成功路径（失败即 abort，使测试失败；不把失败进程退出当优雅收口）：
+最短用法只保留一个请求等待槽，不引入事件系统。宿主入口是 runtime 的 `bbtco_main`：应用只写 `int bbtco_main()`（可选 native hook），runtime 负责 Start、hook 顺序、主任务提交与退出码；framework 不启动 scheduler、不建 runner、不等待 future/join，也不引入隐藏 main、第二 runtime 或 App 专用 native control 桥。以下是实现后示例（返回非零即失败；测试用独立进程观察真实退出码，不把失败进程退出当优雅收口）：
 
 ```cpp
-int main() {
-    bbtco [] {
-        auto app = fw::v2::CoApp::Create(AppOptions{}, "app");
-        // 业务协程持有 root owner；示例省略 namespace using/include
-        if (auto r = bbt_co_await app->CoStart(); !r) std::abort();
-        auto requested = bbt_co_await app->CoWaitShutdownRequest();
-        if (!requested) std::abort(); // 仅收到请求，App 仍可 Running
-        LifecycleOptions life;
-        life.SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(1));
-        auto stopped = bbt_co_await app->CoStop(life); // 主协程发起真正收口
-        if (!stopped || app->State() != AppState::Stopped) std::abort();
-    };
+int bbtco_main() {
+    auto app = fw::v2::CoApp::Create(AppOptions{}, "app");
+    // 业务协程持有 root owner；示例省略 namespace using/include
+    if (auto r = bbt_co_await app->CoStart(); !r) return 1;
+    auto requested = bbt_co_await app->CoWaitShutdownRequest();
+    if (!requested) return 2; // 仅收到请求，App 仍可 Running
+    LifecycleOptions life;
+    life.SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    auto stopped = bbt_co_await app->CoStop(life); // 主协程发起真正收口
+    if (!stopped || app->State() != AppState::Stopped) return 3;
     return 0;
 }
+BBTCO_MAIN()
 ```
 
-外部控制者（包括另一业务协程或 native 线程）发 RequestShutdown；主协程局部变量持有 App，醒来后亲自 CoStop，必要时 CoJoin 的是子对象而非 App。测试必须证明请求到达后仍 Running、仅一次 Stop 才 Stopped，且唯一 worker 的另一任务在 request/Join 等待期间仍前进。TimedOut/StopIncomplete 分支不照抄本成功测试的 abort：活进程须继续保留主任务中的 App/Registry 和在途资源版本，不能清 owner/返回成功；本次 Stop 的同一绝对 deadline 不续期，下一次显式控制调用才是新预算。超时测试用已有 CoWaiter 闸门保留主任务/owner，断言仍在途后释放闸门，再作显式收口并核实际 Released/计数；不引入清理线程、事件总线或隐含后台 owner。
+外部控制者（包括另一业务协程或 native 线程）发 RequestShutdown；主协程局部变量持有 App，醒来后亲自 CoStop。测试必须证明请求到达后仍 Running、仅一次 Stop 才 Stopped，且唯一 worker 的另一任务在 request/Join 等待期间仍前进。TimedOut/StopIncomplete 分支不照抄本成功测试的 abort：活进程须继续保留主任务中的 App/Registry 和在途资源版本，不能清 owner/返回成功；本次 Stop 的同一绝对 deadline 不续期，下一次显式控制调用才是新预算。超时测试用已有 CoWaiter 闸门保留主任务/owner，断言仍在途后释放闸门，再作显式收口并核实际 Released/计数；不引入清理线程、事件总线或隐含后台 owner。
 
-**已否决方案（历史保留，非实现契约）**：`RunMainTask`、`MainNativeControl`/`IMainNativeControl`、`AdvanceNativeControl`/`BeginNativeControl`、`RegisterMainNativeControl`/`TryUnregisterProcesserDriver(Pending)`、`MainNativeWake`/`MainNativePoll`、`MainEngineControl`（含其 `CoStart/CoClose`）与 `bbtco_main` 专用入口都不是本仓或相邻两仓的实现契约——实现的宿主入口是普通 `main` + 既有 `bbtco` 注册，`Engine::Create`+`Engine::Run` 由 infra 拥有，framework 不接管 Engine 控制桥。后续 Review 不得把下列条款当成待实现目标：凡引用上述名字要求 framework 注册/驱动 native Engine 收口或专用 main 入口的段落，均为历史草案。
+**已否决方案（历史保留，非实现契约）**：`RunMainTask`、`MainNativeControl`/`IMainNativeControl`、`AdvanceNativeControl`/`BeginNativeControl`、`RegisterMainNativeControl`/`TryUnregisterProcesserDriver(Pending)`、`MainNativeWake`/`MainNativePoll`、`MainEngineControl`（含其 `CoStart/CoClose`）都不是本仓或 infra 的实现契约。主入口由 coroutine runtime 的 `bbtco_main`/`RuntimeMain` 拥有（签名与启动顺序见其 `docs/architecture/core-runtime-contract.md` §12.2）；framework 不实现第二套 main 入口，也不注册/驱动 native Engine。Engine native 控制与物理 owner 唯一归 infra，生成式入口消费 infra `docs/architecture/native-lifecycle-seam-contract.md` 冻结的窄 handle（由 infra-close-net 实现，非现有能力）；framework 不接管或补造 Engine 控制桥。后续 Review 不得把下列条款当成待实现目标：凡引用上述名字要求 framework 注册/驱动 native Engine 收口或专用 main 入口的段落，均为历史草案。
 
 ### 12.2 对象身份、工厂与所有权
 
 `detail::ObjectBase` 保留 `ICoObject` 能力并接 coroutine 的 `CoObject`/Member 通知；`CoApp` 不是 ObjectBase 派生，须单独接相同身份与创建/实际析构计数。framework 的 `ObjectHandle`、generation、Registry 语义不变；App 的 self entry 仍是非拥有条目，不反向强持有 App。`CoObjectInfo.id` 是 runtime 身份，不能替代 Registry 句柄，也不能代替 borrow、RPC lease、fd 或 callback 物理释放证据。
 
-R3 固定命名/创建映射如下（均是待迁移目标，不是假称现存类型已改名）：
+R3 当前命名/创建映射如下：
 
 | 当前实体 | 目标名与创建观测 | owner / 实际销毁 |
 |---|---|---|
@@ -710,25 +718,47 @@ Registry 继续是受管业务对象唯一所有权责任方；这里的“唯�
 
 | 责任 | R3 最小文件范围 | 关键迁移/签名 | 直接测试映射 |
 |---|---|---|---|
-| framework public | `framework/include/bbt/framework/App.hpp`、`Object.hpp`、`Component.hpp`、`Actor.hpp`、`Service.hpp`、`internal/ObjectBase.hpp`、`internal/Registry.hpp`、`internal/ServiceBase.hpp` | 上述 `CoInstall*`/`CoUninstall*`/`CoBind*`/`CoObserve`/`CoStart`/`CoStop`/`CoJoin`；保留 `ICoObject`、`ObjectHandle`、`Deadline`；业务类型唯一面为 `v2::CoService<...>`/`v2::CoComponent`/`v2::CoActor` | `tests/Test_framework_v2_core.cc` → `framework.v2_core` 只证明当前无网络核心；`Test_framework_coapp_lifecycle.cc` → `framework.coapp_lifecycle` 含旧 `StubNetHost`，不能充当 F17 真实 loopback；新 v2 loopback 必须另注册实名目标 |
+| framework public | `framework/include/bbt/framework/App.hpp`、`Object.hpp`、`Component.hpp`、`Actor.hpp`、`Service.hpp`、`internal/ObjectBase.hpp`、`internal/Registry.hpp`、`internal/ServiceBase.hpp` | `CoInstall*`/`CoUninstall*`/`CoBind*`/`CoObserve`/`CoStart`/`CoStop`/`CoWaitShutdownRequest`；业务类型唯一面为 `v2::CoService<...>`/`v2::CoComponent`/`v2::CoActor` | `tests/Test_framework_v2_core.cc` → `framework.v2_core` 只证明当前无网络核心；`Test_framework_coapp_lifecycle.cc` → `framework.coapp_lifecycle` 含旧 `StubNetHost`，不能充当 F17 真实 loopback；新 v2 loopback 必须另注册实名目标 |
 | framework implementation | `framework/src/host/App.cc`、`Object.cc`、`Registry.cc`、`Service.cc`，必要时现有 `CoServiceCall.cc` | Registry 接同一 creator；CoWaitShutdownRequest 单槽挂起、RequestShutdown 仅通知；控制面锁外调用 hook（锁外使用点一律持对象 owner 作 callback lease），不新增 scheduler/线程 | 现有 framework.v2_core、framework.coapp_lifecycle 保有效原断言；新增用例见下一行，旧 stub 不证明网络 |
-| native owner bridge / 新 v2 集成 | `InfraHttpHost` 旧路径仅作源码依据；拟新增 `tests/Test_framework_v2_coapp_loopback.cc` 与 `tests/CMakeLists.txt`；既有 `RedisNetResource.hpp`/资源实现仅替换实际 EngineThread 消费点 | 已授权口径：普通 `main` + 既有 `bbtco` 注册；Engine 由 infra `Engine::Create`+`Engine::Run` 拥有，framework 组件只经公开 seam 消费，不接管 Begin/Advance/native control 注册。新增 target Test_framework_v2_coapp_loopback / CTest framework.v2_coapp_loopback；动态端口真实 peer 子进程 | 未注册/构建/运行；装配→启动→真实字节请求→RequestShutdown→CoStop/子对象 Join→Engine 真实收口→实际析构/统计基线；timeout 保 owner/request≠stop；旧 StubNetHost 不得替代 |
-| examples/CMake | `tests/CMakeLists.txt`、根/`framework/src/CMakeLists.txt`、受影响 examples | 示例由普通 `main` + `bbtco` 建主入口，所有装配和 stop/join 在 Co 域；`RequestShutdown` 只触发请求 waiter，主协程负责 `CoStop`；失败通知不能挂死 native 入口 | 新 v2 真实 loopback：装配→启动→请求→CoStop/Join；必须区分 request observed 与 stop settled |
-| framework↔infra seam | `framework/include/bbt/framework/RedisNetResource.hpp`、`MongoDbResource.hpp`、`internal/*Network*` 及其实现/测试（只改实际消费点） | 组件借用仍是 lease；Co 命令携带同一 `Deadline`；native callback 不直接进入业务对象 | 资源命令 gate、borrow 跨挂起、超时保 owner、底层 `Released`/Close 证据 |
+| native owner bridge / v2 network core | `framework/include/bbt/framework/internal/HostGate.hpp`、`InfraHttpHost.hpp`、`src/host/App.cc`、`RpcBridge.{hpp,cc}`；不新增第二网络框架 | `v2::CoApp` 创建并持有共享 Engine；宿主 Create 完成后发布 `{engine, config}` 与唤醒口，入口 host hook 执行唯一一次 `Run`。Service 的 call 经 `CoServiceBase` → `AppRuntimeState` → `RpcEgress`，入站经 `InstallRpcAdmission` → `InboundDispatcher`；Engine 不由业务协程 Run，不新增 Service 全请求执行租约或组件依赖拓扑 | 本节点 build 被 dirty coroutine pin 阻塞；HTTP/RPC 真实链路仍需对应 focused/live 证据，不把文档当作运行证据 |
+| examples/CMake | `tests/CMakeLists.txt`、根/`framework/src/CMakeLists.txt`、受影响 examples | 示例由 runtime 生成式 `bbtco_main` 建主入口；业务装配与 Co stop 在 Co 域，native join 由 infra handle 隐藏；`RequestShutdown` 只触发请求 waiter，主协程负责 `CoStop`/handle Close；失败通知不能挂死 native 入口 | 新 v2 真实 loopback：handle Start/Ready→请求→CoStop/Close→分别观察 Closed 与 PhysicalReleased；必须区分 request observed 与 stop settled |
+| framework↔infra seam | `framework/include/bbt/framework/RedisComponent.hpp`、`MongoDBComponent.hpp`、`internal/*Network*` 及其实现/测试（只改实际消费点） | 组件借用仍是 lease；Co 命令携带同一 `Deadline`；native callback 不直接进入业务对象；组件只关闭自己拥有的 client/pool/owner | 资源命令 gate、borrow 跨挂起、超时保 owner、`CloseOptions` 同值转发与物理凭据证据 |
 
-R3 不把旧 `Run` 改名后保留为隐藏兼容壳，也不在本节点扩大 Actor、Monitor、存储或消息协议迁移；只按这张表切换直接生命周期消费者。现有 v2 头和测试仍是候选事实，未迁移前不得引用其局部通过作为 F17 验收。
+R3 不把旧 `Run` 改名后保留为隐藏兼容壳，也不在本节点扩大 Actor、Monitor、存储或消息协议迁移；直接生命周期消费者统一按这张表使用 v2 公共面。网络 focused/live 结果仍需独立运行证据，不以文档或局部编译替代。
 
 ### 12.4 失败协议与开放边界
 
-非 Co 调用在副作用前返回 framework `InvalidContext`；对象/绑定不存在返回 `NotFound`，并发转换返回 `Busy`，封口/失效返回 `Closed`，截止时间耗尽返回 `TimedOut` 并保留清理 owner。hook 的原错误和异常继续写 `LifecycleFailures`；`OnUninstall`/`OnDestroy` 的异常隔离不伪造成功。CoApp 主协程正常返回即任务成功，投递失败或未捕获任务异常必须报告非成功并唤醒等待方。
+非 Co 调用在副作用前返回 framework `InvalidContext`；对象/绑定不存在返回 `NotFound`，并发转换返回 `Busy`，封口/失效返回 `Closed`，截止时间耗尽返回 `TimedOut` 并保留清理 owner。hook 的原错误和异常继续写 `LifecycleFailures`；`OnUninstall`/`OnDestroy` 的异常隔离不伪造成功。CoApp 主协程正常返回时退出码服从 runtime 的 int 返回值；投递失败或未捕获任务异常必须报告非成功并唤醒等待方。
 
-**关闭语义（简单 Close，收口后的唯一口径）**：`CoStop`/`CoUninstall*` 直接收口——先封对象 gate 与其 subject 绑定边拒新，在有限 deadline 内排空在途 borrow 到真实终态，再执行 OnStop/OnUninstall 并移除登记销毁对象；deadline 耗尽或 hook 失败保留 owner 与资源版本，记诚实的不完整状态（`StopIncomplete`/`UninstallIncomplete`）与 `LifecycleFailure`，允许再次以新期限调用推进。框架不新增 drain/receipt/多阶段关闭协议，等待顺序与业务任务编排由用户控制。infra RPC 仅提供统一 `Close(CloseFlag, timeout_ms, Error)` 与同步强制 `Shutdown(Error)`，不再暴露 `StopAccepting`/`Drain`/`WaitStopped`；宿主在 native 线程消费 Shutdown，业务门编排与 HTTP 关闭步骤见 [网络宿主与 RPC 消费](../guides/http-host.md)。`StopIncomplete`/`PendingCleanup`/`CoWaitShutdownRequest` 是本仓已实现的诚实观察/等待面，不是多阶段 drain 协议。
+**关闭语义（简单 Close，收口后的唯一口径）**：`CoStop`/`CoUninstall*` 直接收口——先封对象 gate 与其 subject 绑定边拒新，在有限 deadline 内排空在途 borrow 到真实终态，再执行 `OnStop(options)`/`OnUninstall` 并移除登记销毁对象；deadline 耗尽或 hook 失败保留 owner 与资源版本，记诚实的不完整状态（`StopIncomplete`/`UninstallIncomplete`）与 `LifecycleFailure`，允许再次以新的 `CloseOptions` 显式推进。框架不新增 drain/receipt/多阶段关闭协议，等待顺序与业务任务编排由用户控制。infra 的公开关闭控制面统一为 `Close(CloseOptions{mode, wait_release, reason, deadline})`（语义见 infra `docs/architecture/close-options-contract.md`）：framework 只消费其绝对 deadline、逻辑终态与 `wait_release` 物理等待；组件 `OnStop` 把同一个值转发给对应 infra 对象。**framework 的共享 Engine 归 v2 `CoApp` 持有**；Create 完成后经 `HostGate` 发布给入口 host hook，`CoStop` 关闭网络宿主与业务对象，但不在业务协程执行 Engine::Run 或额外创建 runner，见 §12.5。RPC 等模块的物理收口由 infra owner 观察；framework 不暴露 `StopAccepting`/`Drain`/`WaitStopped`，也不把 `CoStop` 的 deadline 与 infra 的关闭预算拆成两套。`StopIncomplete`/`PendingCleanup`/`CoWaitShutdownRequest` 是本仓已实现的诚实观察/等待面，不是多阶段 drain 协议。R2/F2 的修复口径：任一资源/组件收口失败都保留 owner 与未完成步骤，正常 `CoStop` 不自动换 Immediate、不续预算、不重试；下一次显式 `CoStop` 才可用新的绝对期限。
 
-**已否决的 Engine/native 控制接线（P2-9 收口，历史保留）**：早期草案拟定的「framework 组件经 coroutine `RegisterMainNativeControl` → infra `MainEngineControl` → Engine `Begin/Advance` 注册主控」方案已被用户否决，不再是实现契约——本仓不实现 `RunMainTask`/`MainNativeControl`/`IMainNativeControl`/`AdvanceNativeControl`/`BeginNativeControl`/`MainNativeWake`/`MainNativePoll`/`TryUnregisterProcesserDriver(Pending)`/`MainEngineControl`（含 `CoStart/CoClose`/`CoDial`），也不在 Co 域接管 `Engine::Run/Begin/Advance` 或任何 raw callback/物理清理。Engine 由 infra 的 `Engine::Create` + `Engine::Run`（宿主专用 native 线程）拥有；framework 侧网络收口只经 `InfraHttpHost` 的 `INetworkHost` seam 与 infra 公开 `Close/WaitHandlersDone` 语义完成，宿主不持有 Engine 控制桥。
+**已否决的 Engine/native 控制接线（P2-9 收口，历史保留）**：早期草案拟定的「framework 组件经 coroutine `RegisterMainNativeControl` → infra `MainEngineControl` → Engine `Begin/Advance` 注册主控」方案已被用户否决，不再是实现契约——本仓不实现 `RunMainTask`/`MainNativeControl`/`IMainNativeControl`/`AdvanceNativeControl`/`BeginNativeControl`/`MainNativeWake`/`MainNativePoll`/`TryUnregisterProcesserDriver(Pending)`/`MainEngineControl`（含 `CoStart/CoClose`/`CoDial`），也不在 Co 域接管 `Engine::Run/Begin/Advance` 或任何 raw callback/物理清理。**本轮替代形态不是恢复该方案**：应用入口的一个 native host hook（普通函数）在提交后于原生 main 线程直接调用一次 `Engine::Run`，业务协程仍不调用 `Run`、不持有 runner/thread/future/join；启动、ready 失败与共享所有权见 infra `docs/architecture/native-lifecycle-seam-contract.md`，入口 hook 与两向退出见 coroutine `docs/architecture/core-runtime-contract.md` §12.2 与本文 §12.5。`InfraHttpHost` 是当前 v2 App 的内部网络宿主；`RedisNetResource`/`MongoDbResource` 已从 framework 产品面删除。
 
 **真实接线边界（保留）**：`RequestShutdown`/`CoWaitShutdownRequest` 只证明关闭请求到达；唯一显式 `CoStop`/`CoUninstall*` 才推进收口至 `Stopped`/Destroyed。Stop 收口未竟时 `AppState::StopIncomplete`、对象保留 `StopIncomplete`/`UninstallIncomplete` 态与 cleanup 记录，owner/receipt/资源版本仍有效、不强制销毁；再次显式调用以更晚期限推进至真实终态。正常主任务不 Stop 而 return 时进程直接退出，不增加隐藏 graceful shutdown、不等待全部 control 或 detached drain；该进程终止分支不宣称 Released/统计归零，显式 Stop 成功后的正常销毁必须及时回基线。
 
 **可区分断言（验收时逐条核对）**：
-- 请求先于等待、以及谓词检查到挂起间到达都不丢；请求被观察时仍 Running，唯一显式 CoStop 后才 Stopped/对象销毁/统计回基线。hook 重入及 App self CoJoin 负例保持拒绝。
+- 请求先于等待、以及谓词检查到挂起间到达都不丢；请求被观察时仍 Running，唯一显式 CoStop 后才 Stopped/对象销毁/统计回基线。hook 重入负例保持拒绝。
 - 进入真实 close/callback 在途阶段再耗尽同一 deadline，断言 StopIncomplete、owner/receipt/quota 仍有效、未强制销毁；释放闸门后再显式 Stop 收口。最后释放 App/组件 owner，通过实际析构通知等待计数回基线（不靠 sleep；不能只看请求/Close 或 native 槽路径集合）。
 - 登记失败、安装提交失败、启动回滚失败分别断言错误/非成功出口，不永久等待，不把仍 Closing 的对象标 Released。主任务自然 return 的分支另证不借隐藏 shutdown 完成收口。
+
+### 12.5 共享 Engine 宿主与组件关闭（本轮目标）
+
+本轮把「Engine 归 infra lifecycle handle、framework 只观察」改为「应用根持有共享 Engine、入口 native host hook 在主线程直接执行一次 `Run`」。所有实现节点只在该形态内补缺，不再扩接缝。
+
+- **唯一 Engine**：`v2::CoApp::Create` 后在主协程内创建 `net::Engine`（Idle，不监听、不建线程）与 `EngineConfig`（监听地址来自 `AppOptions::Listen`，`runtime_progress=Independent`，`num_event_loop` 取网络选项或固定 1）。一个应用运行实例一个 Engine；进程内第二个 App 仍按既有规则拒绝，不建多 Engine 注册表。
+- **发布与执行**：v2 `CoApp` 先完成 Service/Component 的登记与 hook，再由宿主 `Create` 完成 Engine/Server/Client 的 Idle 装配，发布 `{engine, config}` 给入口宿主闸门；host hook 执行一次 `Engine::Run`，网络宿主在 `CoWaitRunning` 后启动 Server 接纳。
+- **两向退出**：主任务返回/异常时 host hook 收到恰好一次 `OnMainTaskDone`，对 Engine 调一次 `RequestClose`；`Run` 在 Ready 前失败时 Engine 进入 `Stopped` 并保留 `LastError`，主任务的 `CoWaitRunning` 返回该错误后自行收口。`CoStop` 只收口组件与业务对象，不等待 Engine；Engine 的物理凭据只有 `Run` 已返回且 `Phase()==Stopped`，由 runtime 在 host hook 与主任务都结束后退出 native main。
+- **借用规则**：组件 `Options` 接收共享 `shared_ptr<net::Engine>`（只在实际调用与 `ComponentBorrow` 寿命内使用）；组件不 `Run`、不 `RequestClose`、不关闭/析构共享 Engine，只关闭自己拥有的 Client/Pool/Session/Watcher。Mongo 不用 Engine（自有 worker），不因此获得第二个 Engine。
+- **关闭选项传递**：`CoApp::CoStop(CloseOptions)` → 按登记逆序 `OnStop(options)` → 模块 `Close(options)`；同一值、同一 deadline，`wait_release=true` 才把本组件物理回收并入该次 `Close`。参数校验在 `Close`/`OnStop` 的副作用之前完成。
+- **旧审查归属**：F2 由 `CoStop`/`OnStop` 的「失败保留 owner、不自动换 Immediate、不续预算、显式重试」覆盖；F3 由「组件 hook 与接纳路径不持 OS 锁跨挂起/入队」覆盖（Registry 锁外执行 hook 保持不变，Redis/Mongo/HTTP 组件不自建锁内 Co 等待）；F6 由本节与 infra `close-options-contract.md` §1 的校验先行覆盖；F7 归 infra-close；F4 归 mongo-close + framework-components：Mongo 组件 `OnStop` 只把同一 `CloseOptions` 转发给 owner，`wait_release=true` 时 Co 调用挂起等 infra native finalizer 完成 worker 退出/`JoinWorkers()`/lease 归还，组件 hook、Co worker 与析构都不执行 join。F1/F5 随 `EngineLifecycle` 删除消失，替代路径见 infra 契约 §3。
+- **验收落点**：5 Service / 2 Redis 的身份、配置隔离、解绑隔离、按登记逆序关闭、非法原生调用纳入 `framework.resource_lifecycle`（`tests/Test_framework_component_lifecycle.cc`：两个 RedisComponent + 一个 MongoDBComponent + 5 个 CoService 的 3+2 绑定、`CoStop(CloseOptions)` 同值转发、F2 首次停止失败保留 owner 后显式重试、F6 非法选项零副作用）；`framework.close_gate` 另覆盖 HostLifecycle 的资源收束失败重试与关闭选项前置校验。真实 Redis/Mongo live 另计，不以测试替身冒充。
+
+## 13. Co-only 入口与示例规则
+
+本节冻结应用作者与示例的消费规则；主入口签名和启动顺序归 coroutine 运行时契约，本文只规定 framework 侧的消费边界。
+
+- 应用作者写 `int bbtco_main()`、可选 `int bbtco_main_thread_hook()`（提交前短 hook）与可选的 `int bbtco_main_host_hook(bbt::coroutine::HostHookContext&)`（提交后主线程 hook，用来执行共享 Engine 的唯一一次 `Run`）；非默认启动参数使用 runtime §12.2 的值输入宏，在 Start 前消费，不把配置塞进 Start 后的 hook。不写 native `main`、不启动/停止 scheduler、不创建 runner 线程、不等待 future/CV/native join。退出码服从主任务的 int 返回值，不把所有正常 return 都称为成功；业务收口在 `bbtco_main` 内显式 `CoStop`，主任务返回后由 host hook 关闭共享 Engine，不依赖进程退出兜底。
+- framework 只消费 infra/runtime 的公开 Co seam 与组件/资源 owner 的 Co 命令面；`Engine::Run` 不由业务协程调用，唯一调用点是应用入口的 native host hook。共享 Engine 由应用根创建与持有，Redis/Mongo/发现/网络组件借用同一实例，只关闭自己拥有的客户端/连接；framework 不持有 runner/thread/future/join，也不在析构或业务路径阻塞 OS 线程。
+- 资源收束只有一条受管能力路径：Redis/Mongo 客户端经 `v2::RedisComponent`/`v2::MongoDBComponent` 安装并借用，`OnStop(const infra::CloseOptions&)` 把同一个关闭值转发给对应 infra 对象。产品 `RedisNetResource`/`MongoDbResource`、`CoApp::add_resource`、`ResourceSpec`、framework `ICoResource` 与 `ServiceContext::resource` 已删除；不得用同步 `Close()` 宣称已物理释放。
+- 所有 framework 示例（`getvalue`、`two_service`、`rpc_policy`、`lifecycle_matrix`、`component_services` 及资源示例）必须从 `bbtco_main` 展示真实任务；示例源码禁止 `g_scheduler->Start`、`std::thread` runner、`future.wait/get`、`join`。
+- 旧入口示例只作迁移兼容材料，不进入公共 example 索引，不得被新代码当作先例；示例索引与代码同步更新由示例责任节点完成，本节不替代其验证。

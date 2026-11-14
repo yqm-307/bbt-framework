@@ -20,6 +20,14 @@ message OrderRequest {
   int64 discount_cents = 4;
 }
 message LookupRequest { string order_id = 1; }
+// 同 App 内组件身份观察；pool_identity 只在返回它的 process_id 内可比较。
+message ComponentView {
+  string component_id = 1;
+  uint64 generation = 2;
+  string pool_identity = 3;
+  string process_id = 4;
+  bool connected = 5;
+}
 message BillRequest {
   OrderRequest order = 1;
   int64 total_cents = 2;

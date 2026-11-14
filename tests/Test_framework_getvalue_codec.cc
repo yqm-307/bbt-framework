@@ -15,14 +15,16 @@
 
 #include <bbt/example/v1/get_value.pb.h>
 
+#include <bbt/framework/App.hpp>
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/RpcMethods.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
 
+#include "framework_co_harness.hpp"
 #include "getvalue_service.hpp"
 
 namespace fw = bbt::framework;
+namespace v2 = bbt::framework::v2;
 
 namespace {
 
@@ -35,6 +37,35 @@ const std::vector<std::uint8_t> kGoldenRespAlpha = {
 bool PayloadEq(const std::vector<std::uint8_t>& p,
                const std::vector<std::uint8_t>& g) {
     return p.size() == g.size() && std::equal(p.begin(), p.end(), g.begin());
+}
+
+// 在受管协程内经 seam app 取一个真实受管 GetValueService 实例
+// （v2 受控构造：ConstructKey 为私有 passkey，不能栈构造）。
+template <class F>
+void WithService(F&& body) {
+    framework_test::EnsureRuntime();
+    bool ran = framework_test::RunInCoTask(
+        [&] {
+            auto app = v2::CoApp::Create(
+                fw::AppOptions{}
+                    .SetLimits(64, 64, 8, 16)
+                    .SetShutdownBudget(std::chrono::milliseconds{2000})
+                    .SetLifecycleBudget(std::chrono::milliseconds{2000}));
+            auto r = bbt_co_await
+                app->CoInstallService<getvalue::GetValueService>(
+                    fw::ServiceOptions{}.SetMaxInflight(8));
+            if (!r)
+                throw std::runtime_error("install failed");
+            auto inst = framework_test::ServiceInstance(
+                *app, getvalue::GetValueService::kServiceName);
+            if (!inst)
+                throw std::runtime_error("service missing");
+            body(static_cast<getvalue::GetValueService&>(*inst));
+            BOOST_REQUIRE(static_cast<bool>(bbt_co_await app->CoStop()));
+        },
+        std::chrono::seconds{30});
+    if (!ran)
+        throw std::runtime_error("service task did not settle");
 }
 
 } // namespace
@@ -100,33 +131,33 @@ BOOST_AUTO_TEST_CASE(proto_codec_golden_vectors_roundtrip) {
 }
 
 BOOST_AUTO_TEST_CASE(handler_known_miss_empty) {
-    getvalue::GetValueService svc;
+    WithService([](getvalue::GetValueService& svc) {
+        auto call_with_key = [&](const std::string& key) {
+            bbt::example::v1::GetValueRequest req;
+            req.set_key(key);
+            auto rq = fw::CoRpcReq::FromProto(req);
+            BOOST_REQUIRE(rq);
+            return svc.GetValue(rq.value());
+        };
 
-    auto call_with_key = [&](const std::string& key) {
-        bbt::example::v1::GetValueRequest req;
-        req.set_key(key);
-        auto rq = fw::CoRpcReq::FromProto(req);
-        BOOST_REQUIRE(rq);
-        return svc.GetValue(rq.value());
-    };
+        auto known = call_with_key("alpha");
+        BOOST_REQUIRE(known.ok());
+        auto kv = fw::CoRpcReq(known.payload())
+                      .ParseProto<bbt::example::v1::GetValueResponse>();
+        BOOST_REQUIRE(kv);
+        BOOST_CHECK(kv.value().found());
+        BOOST_CHECK_EQUAL(kv.value().value(), "value-alpha");
 
-    auto known = call_with_key("alpha");
-    BOOST_REQUIRE(known.ok());
-    auto kv = fw::CoRpcReq(known.payload())
-                  .ParseProto<bbt::example::v1::GetValueResponse>();
-    BOOST_REQUIRE(kv);
-    BOOST_CHECK(kv.value().found());
-    BOOST_CHECK_EQUAL(kv.value().value(), "value-alpha");
+        auto miss = call_with_key("no-such-key");
+        BOOST_REQUIRE(miss.ok());
+        auto mv = fw::CoRpcReq(miss.payload())
+                      .ParseProto<bbt::example::v1::GetValueResponse>();
+        BOOST_REQUIRE(mv);
+        BOOST_CHECK(!mv.value().found());
+        BOOST_CHECK_EQUAL(mv.value().value(), "");
 
-    auto miss = call_with_key("no-such-key");
-    BOOST_REQUIRE(miss.ok());
-    auto mv = fw::CoRpcReq(miss.payload())
-                  .ParseProto<bbt::example::v1::GetValueResponse>();
-    BOOST_REQUIRE(mv);
-    BOOST_CHECK(!mv.value().found());
-    BOOST_CHECK_EQUAL(mv.value().value(), "");
-
-    auto empty = call_with_key("");
-    BOOST_CHECK(!empty.ok());
-    BOOST_CHECK(empty.error().code == fw::ErrorCode::InvalidArgument);
+        auto empty = call_with_key("");
+        BOOST_CHECK(!empty.ok());
+        BOOST_CHECK(empty.error().code == fw::ErrorCode::InvalidArgument);
+    });
 }

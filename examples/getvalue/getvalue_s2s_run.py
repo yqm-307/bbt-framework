@@ -21,8 +21,8 @@
     → caller 得到 OutcomeUnknown(14)，非未提交传输错误；对端只被连接一次（无 retry），
     callee journal 无新 handler
   - s2s-badroute-{empty-service,empty-endpoint,duplicate}：
-    caller 以公开入口载入四类非法静态路由 → run 启动任何组件前拒绝
-    （rc=1=kExitRejected），lifecycle_failures 恰 1 条且为对应原因，bound_endpoint
+    caller 以公开入口载入四类非法静态路由 → co_start 在任何组件启动前拒绝
+    （rc=1=配置校验拒绝），lifecycle_failures 恰 1 条且为对应原因，bound_endpoint
     为空，资源工厂计数 0（拒绝断言由驱动器独立核对进程观测，不信任自报结论）
 
 结果完整性（本轮修复）：总体结论（tail）只在自有 caller/callee/blackhole 全部
@@ -68,12 +68,13 @@ TIMED_OUT = v2.ERR_TIMED_OUT
 NOT_FOUND = v2.ERR_NOT_FOUND
 OUTCOME_UNKNOWN = v2.ERR_OUTCOME_UNKNOWN
 
-# 三类非法静态路由 → 公开入口 run 前拒绝。期望的 lifecycle_failures
-# 单条子串来自 CoApp::_ValidateConfig 的对应校验分支。
+# 三类非法静态路由 → 公开入口 CoStart 前拒绝。期望的 lifecycle_failures
+# 子串来自 AppOptions::Validate 的统一拒绝文案（v2 把三类折叠为同一条
+# 「unique non-empty service and endpoint」判据）。
 BADROUTE_CASES = [
-    ("empty-service", "empty service_name"),
-    ("empty-endpoint", "has empty endpoint"),
-    ("duplicate", "duplicate static route service_name"),
+    ("empty-service", "unique non-empty service and endpoint"),
+    ("empty-endpoint", "unique non-empty service and endpoint"),
+    ("duplicate", "unique non-empty service and endpoint"),
 ]
 
 WIRE_VARINT = 0
@@ -366,7 +367,9 @@ def run_badroute(caller_bin, wd, kind, expect, timeout):
         except OSError:
             pass
         proc = subprocess.Popen(
-            [caller_bin, "badroute", kind, result_f],
+            [caller_bin],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="badroute",
+                     BBT_EXAMPLE_KIND=kind, BBT_EXAMPLE_RESULT_FILE=result_f),
             stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr)
         try:
             rc = proc.wait(timeout=timeout)
@@ -443,9 +446,13 @@ def main():
         blackhole = Blackhole()
 
         # 1) callee 进程（GetValueService）。
+        # 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
         callee = subprocess.Popen(
-            [args.callee_bin, "server", callee_port_f, callee_meta_f,
-             callee_jrnl_f],
+            [args.callee_bin],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="server",
+                     BBT_EXAMPLE_PORT_FILE=callee_port_f,
+                     BBT_EXAMPLE_META_FILE=callee_meta_f,
+                     BBT_EXAMPLE_JOURNAL_FILE=callee_jrnl_f),
             stdin=subprocess.PIPE, stdout=sys.stderr, stderr=sys.stderr)
         callee_port = wait_port(callee_port_f, callee, args.timeout)
         print(f"callee up port={callee_port}", file=sys.stderr)
@@ -454,8 +461,12 @@ def main():
         callee_ep = f"127.0.0.1:{callee_port}"
         black_ep = f"127.0.0.1:{blackhole.port}"
         caller = subprocess.Popen(
-            [args.caller_bin, "caller", caller_port_f, callee_ep, black_ep,
-             caller_meta_f],
+            [args.caller_bin],
+            env=dict(os.environ, BBT_EXAMPLE_MODE="caller",
+                     BBT_EXAMPLE_PORT_FILE=caller_port_f,
+                     BBT_EXAMPLE_CALLEE_EP=callee_ep,
+                     BBT_EXAMPLE_BLACKHOLE_EP=black_ep,
+                     BBT_EXAMPLE_META_FILE=caller_meta_f),
             stdin=subprocess.PIPE, stdout=sys.stderr, stderr=sys.stderr)
         caller_port = wait_port(caller_port_f, caller, args.timeout)
         print(f"caller up port={caller_port} blackhole={black_ep}",

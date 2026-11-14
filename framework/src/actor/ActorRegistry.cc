@@ -24,10 +24,10 @@ result<void> ActorRegistry::RegisterFactory(std::string service_name,
     return result<void>::ok();
 }
 
-result<std::shared_ptr<ICoService>> ActorRegistry::GetOrCreate(
+result<std::shared_ptr<v2::CoServiceBase>> ActorRegistry::GetOrCreate(
     std::string_view service_name, std::string_view actor_key) {
     if (actor_key.empty())
-        return result<std::shared_ptr<ICoService>>::err(MakeError(
+        return result<std::shared_ptr<v2::CoServiceBase>>::err(MakeError(
             ErrorCode::InvalidArgument,
             "ActorRegistry: empty actor_key"));
 
@@ -40,30 +40,30 @@ result<std::shared_ptr<ICoService>> ActorRegistry::GetOrCreate(
     std::lock_guard<std::mutex> lock(m_mtx);
     auto found = m_actors.find(id);
     if (found != m_actors.end())
-        return result<std::shared_ptr<ICoService>>::ok(found->second);
+        return result<std::shared_ptr<v2::CoServiceBase>>::ok(found->second);
 
     auto svc = m_services.find(id.first);
     if (svc == m_services.end())
-        return result<std::shared_ptr<ICoService>>::err(MakeError(
+        return result<std::shared_ptr<v2::CoServiceBase>>::err(MakeError(
             ErrorCode::NotFound,
             "ActorRegistry: service '" + id.first + "' not registered"));
     if (svc->second.live_actors >= svc->second.max_actors)
-        return result<std::shared_ptr<ICoService>>::err(MakeError(
+        return result<std::shared_ptr<v2::CoServiceBase>>::err(MakeError(
             ErrorCode::Overloaded,
             "ActorRegistry: service '" + id.first +
                 "' reached max_actors limit"));
 
-    std::shared_ptr<ICoService> instance;
+    std::shared_ptr<v2::CoServiceBase> instance;
     try {
         instance = svc->second.factory();
     } catch (...) {
-        return result<std::shared_ptr<ICoService>>::err(MakeError(
+        return result<std::shared_ptr<v2::CoServiceBase>>::err(MakeError(
             ErrorCode::InternalError,
             "ActorRegistry: factory threw while activating actor '" +
                 id.second + "'"));
     }
     if (!instance)
-        return result<std::shared_ptr<ICoService>>::err(MakeError(
+        return result<std::shared_ptr<v2::CoServiceBase>>::err(MakeError(
             ErrorCode::InternalError,
             "ActorRegistry: factory returned null for actor '" +
                 id.second + "'"));
@@ -71,7 +71,7 @@ result<std::shared_ptr<ICoService>> ActorRegistry::GetOrCreate(
     instance->_bind_actor_key(id.second);
     m_actors.emplace(id, instance);
     ++svc->second.live_actors;
-    return result<std::shared_ptr<ICoService>>::ok(std::move(instance));
+    return result<std::shared_ptr<v2::CoServiceBase>>::ok(std::move(instance));
 }
 
 std::size_t ActorRegistry::ActorCount(std::string_view service_name) const {

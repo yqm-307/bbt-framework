@@ -13,6 +13,27 @@
 namespace ecommerce {
 
 using namespace bbt::framework;
+namespace v2 = bbt::framework::v2;
+
+bbt::framework::result<void> OrderService::OnStart() {
+#ifdef EC_STORAGE_AVAILABLE
+    if (Storage().enabled) {
+        auto handle = GetComponent<bbt::framework::v2::MongoDBComponent>("orders");
+        if (!handle)
+            return bbt::framework::result<void>::err(handle.error());
+        auto borrow = handle.value().Borrow();
+        if (!borrow)
+            return bbt::framework::result<void>::err(borrow.error());
+        bbt::infra::CallOptions options;
+        options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+        // owner Start 只启动 worker；一次只读查询才证明后端可用于本服务。
+        auto probe = ReadRecord(borrow.value().Get().Collection(), "__readiness__", options);
+        if (!probe && probe.error().code != bbt::framework::ErrorCode::NotFound)
+            return bbt::framework::result<void>::err(probe.error());
+    }
+#endif
+    return bbt::framework::result<void>::ok();
+}
 
 CoRpcResp OrderService::Quote(CoRpcReq req) {
     HopRecord hop{kOrderService, "Quote", InboundRequestId(context()),
@@ -67,11 +88,16 @@ CoRpcResp OrderService::CreateOrder(CoRpcReq req) {
     if (!valid)
         return fail(valid.error());
 #ifdef EC_STORAGE_AVAILABLE
-    auto db = context().resource<MongoDbResource>("orders");
+    auto db = GetComponent<v2::MongoDBComponent>("orders");
     if (!Storage().enabled || !db)
         return fail(MakeError(ErrorCode::RuntimeUnavailable, "storage mode required"));
+    auto db_borrow = db.value().Borrow();
+    if (!db_borrow)
+        return fail(MakeError(db_borrow.error().code,
+                              "orders borrow failed: " + db_borrow.error().message));
+    auto& coll = db_borrow.value().Get().Collection();
     const auto budget = StorageBudget(context());
-    auto saved = ReadRecord(*db, order.order_id(), budget);
+    auto saved = ReadRecord(coll, order.order_id(), budget);
     if (!saved && saved.error().code != ErrorCode::NotFound)
         return fail(saved.error());
     if (!saved) {
@@ -98,7 +124,7 @@ CoRpcResp OrderService::CreateOrder(CoRpcReq req) {
         pending.set_state("pending");
         pending.set_catalog_instance(price.value().instance_id());
         pending.set_order_instance(Node().instance_id);
-        saved = InsertRecord(*db, pending, budget);
+        saved = InsertRecord(coll, pending, budget);
         if (!saved)
             return fail(saved.error());
     }
@@ -120,10 +146,10 @@ CoRpcResp OrderService::CreateOrder(CoRpcReq req) {
         auto settled = saved.value();
         settled.set_state("settled");
         settled.set_settlement_instance(bill.value().settlement_instance());
-        auto updated = MarkSettled(*db, settled, budget);
+        auto updated = MarkSettled(coll, settled, budget);
         if (!updated)
             return fail(updated.error());
-        saved = ReadRecord(*db, order.order_id(), budget);
+        saved = ReadRecord(coll, order.order_id(), budget);
         if (!saved)
             return fail(saved.error());
     }
@@ -138,9 +164,13 @@ CoRpcResp OrderService::GetOrder(CoRpcReq req) {
     if (!q)
         return CoRpcResp::Error(q.error());
 #ifdef EC_STORAGE_AVAILABLE
-    auto db = context().resource<MongoDbResource>("orders");
+    auto db = GetComponent<v2::MongoDBComponent>("orders");
     if (Storage().enabled && db) {
-        auto r = ReadRecord(*db, q.value().order_id(), StorageBudget(context()));
+        auto db_borrow = db.value().Borrow();
+        if (!db_borrow)
+            return CoRpcResp::Error(db_borrow.error());
+        auto r = ReadRecord(db_borrow.value().Get().Collection(),
+                            q.value().order_id(), StorageBudget(context()));
         if (!r)
             return CoRpcResp::Error(r.error());
         StorageHop(context(), "order", "GetOrder", q.value().order_id(), true);

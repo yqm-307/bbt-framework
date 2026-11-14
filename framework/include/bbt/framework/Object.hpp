@@ -3,7 +3,7 @@
 // framework v2 受管对象公共值层：id/generation/状态/info/handle/borrow/token。
 //
 // 本头只承载契约 §3 的值类型与句柄面；Registry/生命周期实现见
-// internal/Registry.hpp，CoApp 装配面见 CoApp.hpp（v2 面经 Framework.hpp
+// internal/Registry.hpp，v2::CoApp 装配面见 App.hpp（v2 面经 Framework.hpp
 // 透出）。所有 handle 只携带「Registry 弱引用 + id + generation + 失效位」，
 // 不持有对象所有权；对象由对应 Registry 强持有并最终归 CoApp。
 
@@ -22,10 +22,15 @@
 
 #include <bbt/coroutine/sync/WaitTypes.hpp>
 
+#include <bbt/infra/NetworkTypes.hpp>
+
 #include <bbt/framework/Address.hpp>
+#include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/Result.hpp>
 
 namespace bbt::framework {
+class RpcPolicy;
+class DynamicRouteTable;
 namespace v2 { class CoApp; class CoComponent; }
 
 /// @brief 受管对象的稳定逻辑标识；不是指针、fd 或协程 id。
@@ -237,7 +242,6 @@ private:
     ObjectKind                      m_kind = ObjectKind::App;
 
     friend class detail::Registry;
-    friend class CoApp;
     friend class ::bbt::framework::v2::CoApp;
     friend result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>
         detail::BorrowImpl(const ObjectHandle&, std::uint64_t, bool);
@@ -479,6 +483,25 @@ public:
     ServiceOptions& SetSerialQueueCapacity(std::size_t n) {
         m_serial_queue_capacity = n; return *this;
     }
+    /// @brief 设置服务执行策略；默认 Concurrent。
+    ServiceOptions& SetExecution(ExecutionPolicy p) {
+        m_execution = p; return *this;
+    }
+    /// @brief 将本服务配置为按 actor key 串行执行。
+    ServiceOptions& SetActorSerial() {
+        m_execution = ExecutionPolicy::ActorSerial; return *this;
+    }
+    /// @brief 设置有序入站及其有界终态缓存。
+    ServiceOptions& SetOrderedIngress(bool enabled,
+                                       std::size_t max_streams = 0,
+                                       std::size_t max_cached_results = 0,
+                                       std::size_t max_cached_result_bytes = 0) {
+        m_ordered_ingress = enabled;
+        m_max_ordered_streams = max_streams;
+        m_max_cached_results = max_cached_results;
+        m_max_cached_result_bytes = max_cached_result_bytes;
+        return *this;
+    }
 
     /**
      * @brief 声明本服务允许绑定组件 C（名 name）。
@@ -502,6 +525,28 @@ public:
     std::size_t SerialQueueCapacity() const noexcept {
         return m_serial_queue_capacity;
     }
+    /// @brief 服务执行策略。
+    ExecutionPolicy Execution() const noexcept { return m_execution; }
+    /// @brief ActorSerial 每实例邮箱容量。
+    std::size_t MailboxCapacity() const noexcept {
+        return m_execution == ExecutionPolicy::ActorSerial
+            ? m_serial_queue_capacity : 0;
+    }
+    /// @brief ActorSerial 最大实例数。
+    std::size_t MaxActors() const noexcept {
+        return m_execution == ExecutionPolicy::ActorSerial
+            ? m_max_serial_keys : 0;
+    }
+    bool OrderedIngress() const noexcept { return m_ordered_ingress; }
+    std::size_t MaxOrderedStreams() const noexcept {
+        return m_max_ordered_streams;
+    }
+    std::size_t MaxCachedResults() const noexcept {
+        return m_max_cached_results;
+    }
+    std::size_t MaxCachedResultBytes() const noexcept {
+        return m_max_cached_result_bytes;
+    }
     /// @brief 已声明的组件绑定列表。
     const std::vector<detail::ComponentBindingDecl>& ComponentBindings()
         const noexcept { return m_component_bindings; }
@@ -510,9 +555,14 @@ public:
     result<void> Validate() const;
 private:
     LifecycleOptions m_life;
+    ExecutionPolicy  m_execution = ExecutionPolicy::Concurrent;
     std::size_t      m_max_inflight = 0;          // 0 = 未设；Install 校验 >0
     std::size_t      m_max_serial_keys = 0;
     std::size_t      m_serial_queue_capacity = 0;
+    bool             m_ordered_ingress = false;
+    std::size_t      m_max_ordered_streams = 0;
+    std::size_t      m_max_cached_results = 0;
+    std::size_t      m_max_cached_result_bytes = 0;
     std::vector<detail::ComponentBindingDecl> m_component_bindings;
 };
 
@@ -591,10 +641,45 @@ private:
 };
 
 /**
- * @brief v2::CoApp 装配选项。
- *
- * Validate 要求 SetLimits 四项额度为有限正值、shutdown/lifecycle budget 为正。
+ * @brief v2 App 的网络装配值；只描述 infra 所需的边界，不拥有 Engine。
  */
+class AppNetworkOptions {
+public:
+    AppNetworkOptions& SetLimits(bbt::infra::NetworkLimits limits) {
+        m_limits = limits; return *this;
+    }
+    AppNetworkOptions& SetListenAddress(bbt::infra::ListenAddress listen) {
+        m_listen = std::move(listen); return *this;
+    }
+    AppNetworkOptions& SetLocalAppId(std::string id) {
+        m_local_identity = std::move(id); return *this;
+    }
+    AppNetworkOptions& SetTrustedNetworkPlaintext(bool enabled) {
+        m_trusted_network_plaintext = enabled; return *this;
+    }
+    const bbt::infra::NetworkLimits& Limits() const noexcept { return m_limits; }
+    const bbt::infra::ListenAddress& ListenAddress() const noexcept { return m_listen; }
+    const std::string& LocalAppId() const noexcept { return m_local_identity; }
+    bool TrustedNetworkPlaintext() const noexcept {
+        return m_trusted_network_plaintext;
+    }
+private:
+    bbt::infra::NetworkLimits m_limits{0, 0, 0, 0, std::chrono::milliseconds{0}};
+    bbt::infra::ListenAddress m_listen{"127.0.0.1", 0};
+    std::string m_local_identity;
+    bool m_trusted_network_plaintext = false;
+};
+
+/** @brief 显式 POST/protobuf 路由；HTTP 头不参与服务或 schema 选择。 */
+struct HttpServiceRoute {
+    std::string path;
+    std::string service;
+    std::string method;
+    std::string request_schema;
+    std::string response_schema;
+};
+
+/** @brief CoApp 构造期装配；额度与生命周期预算须为有限正值。 */
 class AppOptions {
 public:
     /// @brief 配置监听地址（本切片登记值，未接网络面）。
@@ -622,6 +707,39 @@ public:
     AppOptions& SetLifecycleBudget(std::chrono::milliseconds budget) {
         m_lifecycle_budget = budget; return *this;
     }
+    /// @brief 发布宿主 Create 所需的网络配置；未设置时不装配网络宿主。
+    AppOptions& SetNetworkOptions(AppNetworkOptions options) {
+        m_network = std::move(options); return *this;
+    }
+    /** @brief 构造期固定共享出站策略；空值保持默认放行。 */
+    AppOptions& SetRpcPolicy(std::shared_ptr<RpcPolicy> policy) {
+        m_rpc_policy = std::move(policy);
+        return *this;
+    }
+    /** @brief 构造期选择发现表；provider 后续只发布该表的快照。 */
+    AppOptions& SetDynamicRoutes(std::shared_ptr<DynamicRouteTable> routes) {
+        m_dynamic_routes = std::move(routes);
+        return *this;
+    }
+    const std::shared_ptr<RpcPolicy>& RpcPolicyOwner() const noexcept {
+        return m_rpc_policy;
+    }
+    const std::shared_ptr<DynamicRouteTable>& DynamicRoutes() const noexcept {
+        return m_dynamic_routes;
+    }
+    /** @brief 选择 HTTP 入站；复用默认 listener、受管分发和 RPC 出站。 */
+    AppOptions& AddHttpRoute(HttpServiceRoute route) {
+        m_http_routes.push_back(std::move(route));
+        return *this;
+    }
+    const std::vector<HttpServiceRoute>& HttpRoutes() const noexcept {
+        return m_http_routes;
+    }
+    /// @brief 添加一个显式逻辑服务路由。
+    AppOptions& AddRoute(std::string service, std::string endpoint) {
+        m_routes.emplace_back(std::move(service), std::move(endpoint));
+        return *this;
+    }
 
     /// @brief 监听地址（未设为空）。
     const std::optional<std::string>& ListenUri() const noexcept { return m_listen; }
@@ -643,6 +761,11 @@ public:
     std::chrono::milliseconds LifecycleBudget() const noexcept {
         return m_lifecycle_budget;
     }
+    const std::optional<AppNetworkOptions>& NetworkOptions() const noexcept {
+        return m_network;
+    }
+    const std::vector<std::pair<std::string, std::string>>& Routes()
+        const noexcept { return m_routes; }
 
     /// @brief 校验选项（额度与预算必须为有限正值）。
     result<void> Validate() const;
@@ -656,6 +779,11 @@ private:
     std::chrono::milliseconds m_shutdown_budget{0};
     // 未设 LifecycleOptions::SetDeadline 时各 lifecycle 步使用的总预算。
     std::chrono::milliseconds m_lifecycle_budget{0};
+    std::vector<HttpServiceRoute> m_http_routes;
+    std::shared_ptr<RpcPolicy> m_rpc_policy;
+    std::shared_ptr<DynamicRouteTable> m_dynamic_routes;
+    std::optional<AppNetworkOptions> m_network;
+    std::vector<std::pair<std::string, std::string>> m_routes;
 };
 
 // ---- 收尾/失败诊断（值快照，bounded ring 由 Registry 维持）----

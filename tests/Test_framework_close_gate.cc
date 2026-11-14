@@ -70,9 +70,10 @@
 #include <bbt/infra/rpc/Request.hpp>
 #include <bbt/infra/rpc/Response.hpp>
 
-#include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
+
+#include "framework_co_harness.hpp"
 
 namespace fw = bbt::framework;
 namespace inf = bbt::infra;
@@ -88,14 +89,12 @@ struct Gate {
     std::mutex m;
     std::condition_variable cv;
     bool open = false;
-    void Open()
-    {
+    void Open() {
         std::lock_guard<std::mutex> lk(m);
         open = true;
         cv.notify_all();
     }
-    void Wait()
-    {
+    void Wait() {
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [this] { return open; });
     }
@@ -144,24 +143,20 @@ struct Latch {
     std::mutex m;
     std::condition_variable cv;
     int count;
-    explicit Latch(int n) : count(n)
-    {
+    explicit Latch(int n) : count(n) {
     }
-    void Down()
-    {
+    void Down() {
         std::lock_guard<std::mutex> lk(m);
         if (--count == 0)
             cv.notify_all();
     }
-    bool WaitFor(std::chrono::milliseconds ms)
-    {
+    bool WaitFor(std::chrono::milliseconds ms) {
         std::unique_lock<std::mutex> lk(m);
         return cv.wait_for(lk, ms, [this] { return count == 0; });
     }
 };
 
-inf::NetworkLimits Limits()
-{
+inf::NetworkLimits Limits() {
     return inf::NetworkLimits{/*max_connections*/ 64,
                               /*max_inflight   */ 64,
                               /*max_header_bytes*/ 64 * 1024,
@@ -169,8 +164,7 @@ inf::NetworkLimits Limits()
                               /*incoming_timeout*/ 30s};
 }
 
-int Code(const fw::Error& e)
-{
+int Code(const fw::Error& e) {
     return static_cast<int>(e.code);
 }
 
@@ -198,14 +192,13 @@ struct CallerRuntime {
     void Start(std::string identity) {
         rt = std::make_shared<fw::InfraHttpHost>(
             Limits(), inf::ListenAddress{"127.0.0.1", 0}, std::move(identity));
-        BOOST_REQUIRE(rt->Create());
-        BOOST_REQUIRE(rt->Start());
+        BOOST_REQUIRE(framework_test::HostCreateStart(*rt));
         BOOST_REQUIRE(rt->rpc_client() != nullptr);
         egress = std::make_shared<fw::RpcEgress>(rt);
     }
     void Stop() {
         if (rt)
-            rt->Close();
+            (void)framework_test::HostClose(*rt);
     }
 };
 
@@ -268,10 +261,10 @@ struct InterruptStubHost final : fw::INetworkHost {
     std::atomic<bool> fail_first_with_timeout{false};
 
     fw::result<void> Create() override { return fw::result<void>::ok(); }
-    fw::result<void> Start() override { return fw::result<void>::ok(); }
+    bbt_co_async(fw::result<void>) Start(const co::WaitOptions&) override { return fw::result<void>::ok(); }
     void StopAccepting() noexcept override {}
-    fw::result<void> WaitHandlersDone(co::Deadline) override
-    {
+    bbt_co_async(fw::result<void>) WaitHandlersDone(
+        const co::WaitOptions&) override {
         ++wait_calls;
         if (fail_first_with_timeout.load() && wait_calls.load() == 1)
             return fw::result<void>::err(
@@ -280,12 +273,52 @@ struct InterruptStubHost final : fw::INetworkHost {
         return fw::result<void>::err(
             fw::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
     }
-    void Close() noexcept override { ++close_calls; }
-    std::optional<bbt::infra::Error> CloseReason() const noexcept override
-    {
+    bbt_co_async(fw::result<void>) Close(
+        const bbt::infra::CloseOptions&) override {
+        ++close_calls;
+        return fw::result<void>::ok();
+    }
+    bbt_co_async(fw::result<void>) WaitPhysicalReleased(
+        const co::WaitOptions&) override { return fw::result<void>::ok(); }
+    std::optional<bbt::infra::Error> CloseReason() const override {
         ++close_reason_calls;
-        if (!owner_closed.load()) return std::nullopt;
+        if (!owner_closed.load())
+            return std::nullopt;
         return fw::MakeError(fw::ErrorCode::Unavailable, "owner abort");
+    }
+};
+
+// 干净收口桩：排空/关闭/物理释放都成功，用于 F2/F6 的收口步失败与参数
+// 校验路径（不引入真实 socket）。
+struct CleanStubHost final : fw::INetworkHost {
+    std::atomic<int> wait_calls{0};
+    std::atomic<int> close_calls{0};
+    std::atomic<int> release_calls{0};
+    std::atomic<int> start_calls{0};
+
+    fw::result<void> Create() override { return fw::result<void>::ok(); }
+    bbt_co_async(fw::result<void>) Start(const co::WaitOptions&) override {
+        ++start_calls;
+        return fw::result<void>::ok();
+    }
+    void StopAccepting() noexcept override {}
+    bbt_co_async(fw::result<void>) WaitHandlersDone(
+        const co::WaitOptions&) override {
+        ++wait_calls;
+        return fw::result<void>::ok();
+    }
+    bbt_co_async(fw::result<void>) Close(
+        const bbt::infra::CloseOptions&) override {
+        ++close_calls;
+        return fw::result<void>::ok();
+    }
+    bbt_co_async(fw::result<void>) WaitPhysicalReleased(
+        const co::WaitOptions&) override {
+        ++release_calls;
+        return fw::result<void>::ok();
+    }
+    std::optional<bbt::infra::Error> CloseReason() const override {
+        return std::nullopt;
     }
 };
 
@@ -331,8 +364,7 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
             return fw::result<inf::rpc::Response>::ok(
                 inf::rpc::Response::FromRequest(request));
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     const auto endpoint = host->bound_endpoint();
     BOOST_REQUIRE(!endpoint.empty());
     BOOST_REQUIRE(host->rpc_server() != nullptr);
@@ -369,7 +401,7 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
     BOOST_CHECK_EQUAL(st->calls.load(), 1); // 拒绝发生在 handler 之前
 
     // WaitHandlersDone 不漏：已过门者仍在途 → 预算内不返回 ok。
-    auto r1 = host->WaitHandlersDone(Clock::now() + 150ms);
+    auto r1 = framework_test::HostWaitDrain(*host, Clock::now() + 150ms);
     BOOST_CHECK_MESSAGE(!r1, "drain must not report success with inflight>0");
     if (!r1)
         BOOST_CHECK(r1.error().code == fw::ErrorCode::TimedOut);
@@ -386,12 +418,12 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
 
     // 排空后 WaitHandlersDone 返回 ok。
-    BOOST_CHECK(host->WaitHandlersDone(Clock::now() + 2s));
+    BOOST_CHECK(framework_test::CoOk(framework_test::HostWaitDrain(*host, Clock::now() + 2s)));
 
     // Close 幂等：此处 StopAccepting 已闭门，故下面只证明「Close 之后仍拒绝」
     // 与幂等，不构成「不经 StopAccepting 的直接 Close」证据（由 T3 覆盖）。
-    host->Close();
-    host->Close();
+    (void)framework_test::HostClose(*host);
+    (void)framework_test::HostClose(*host);
     auto late2 = Call(caller.egress, endpoint, MakeRequest("rid-3"));
     BOOST_CHECK_MESSAGE(!late2, "entrant after Close must be refused");
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
@@ -417,8 +449,15 @@ BOOST_AUTO_TEST_CASE(direct_close_publishes_terminal_state) {
                 inf::rpc::Response::FromRequest(request));
         });
 
-    host.Close(bbt::infra::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
-    host.Close(); // 幂等
+    auto close_rc = framework_test::CoEvalVoid([&host] {
+        return bbt_co_await host.Close(bbt::infra::CloseOptions::Immediate(
+            bbt::infra::MakeError(fw::ErrorCode::Unavailable, "owner abort")));
+    });
+    BOOST_CHECK(framework_test::CoOk(close_rc));
+    BOOST_CHECK(framework_test::CoOk(framework_test::CoEvalVoid([&host] {
+        return bbt_co_await host.Close(bbt::infra::CloseOptions::Immediate(
+            bbt::infra::MakeError(fw::ErrorCode::Closed, "second close")));
+    }))); // 幂等
 
     auto reason = host.CloseReason();
     BOOST_REQUIRE(reason.has_value());
@@ -426,21 +465,21 @@ BOOST_AUTO_TEST_CASE(direct_close_publishes_terminal_state) {
     BOOST_CHECK_EQUAL(reason->message, "owner abort");
 
     // 关闭后进入排空路径：立即把同一关闭原因交给等待者，不进入收口。
-    auto drained = host.WaitHandlersDone(Clock::now() + 1s);
+    auto drained = framework_test::HostWaitDrain(host, Clock::now() + 1s);
     BOOST_CHECK_MESSAGE(!drained, "closed host must not report a clean drain");
     if (!drained) {
         BOOST_CHECK(drained.error().code == fw::ErrorCode::Unavailable);
         BOOST_CHECK_EQUAL(drained.error().message, "owner abort");
     }
-    BOOST_CHECK(host.rpc_server() == nullptr); // owner 已释放
+    // 该宿主从未 Create：Close 是空操作，不产生也不遗留 owner。
+    BOOST_CHECK(host.rpc_server() == nullptr);
     BOOST_CHECK(host.rpc_client() == nullptr);
     BOOST_CHECK_EQUAL(probe->calls.load(), 0); // handler 从未被触达
 }
 
 // T2（R2）：真实 infra loopback（HTTP）——已过门 handler 不被 StopAccepting 抢占，
 // 关闭序列等到它完成后 WaitHandlersDone 返回 ok，回复路径不被 StopAccepting 关断。
-BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
-{
+BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained) {
     if (!g_scheduler->IsInitialized()) {
         // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
@@ -461,15 +500,13 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
             return fw::result<inf::http::Response>::ok(
                 inf::http::Response{200, {}, "ok"});
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     const auto endpoint = host->bound_endpoint();
     BOOST_REQUIRE(!endpoint.empty());
 
     auto rt = std::make_shared<fw::InfraHttpHost>(
         Limits(), inf::ListenAddress{"127.0.0.1", 0}, "close-gate-http-client");
-    BOOST_REQUIRE(rt->Create());
-    BOOST_REQUIRE(rt->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*rt));
     auto client = rt->http_client();
     BOOST_REQUIRE(client);
 
@@ -495,7 +532,7 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
 
     host->StopAccepting();
     BOOST_CHECK(!st->returned.load());
-    auto r = host->WaitHandlersDone(Clock::now() + 150ms);
+    auto r = framework_test::HostWaitDrain(*host, Clock::now() + 150ms);
     BOOST_CHECK_MESSAGE(!r, "entered handler must keep drain pending");
     if (!r)
         BOOST_CHECK(r.error().code == fw::ErrorCode::TimedOut);
@@ -507,11 +544,12 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
     BOOST_CHECK_MESSAGE(bool(http_state->out.value()),
                         "reply path must stay open across StopAccepting");
     BOOST_CHECK(st->returned.load());
-    BOOST_CHECK(host->WaitHandlersDone(Clock::now() + 2s));
+    BOOST_CHECK(framework_test::CoOk(framework_test::HostWaitDrain(*host, Clock::now() + 2s)));
 
-    client->Close();
-    rt->Close();
-    host->Close();
+    client->Close(bbt::infra::CloseOptions::Immediate(
+        fw::MakeError(fw::ErrorCode::Closed, "test owner close")));
+    (void)framework_test::HostClose(*rt);
+    (void)framework_test::HostClose(*host);
 }
 
 // T4：handler 抛异常的框架侧判别（真实 V2 loopback）。infra 的 _RunRpc 边界
@@ -534,8 +572,7 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
             probe->calls.fetch_add(1);
             throw std::runtime_error("rpc handler boom");
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     const auto endpoint = host->bound_endpoint();
     BOOST_REQUIRE(!endpoint.empty());
 
@@ -561,7 +598,7 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
     BOOST_CHECK_EQUAL(ok_call.value().RequestId(), "rid-ok");
 
     // 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
-    auto drained = host->WaitHandlersDone(Clock::now() + 2s);
+    auto drained = framework_test::HostWaitDrain(*host, Clock::now() + 2s);
     BOOST_CHECK_MESSAGE(
         drained,
         "in-flight count must be released when the handler unwinds by exception");
@@ -569,7 +606,7 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
         BOOST_CHECK(drained.error().code == fw::ErrorCode::TimedOut);
 
     caller.Stop();
-    host->Close();
+    (void)framework_test::HostClose(*host);
 }
 
 // T5：handler 抛异常的框架侧判别（真实 infra loopback，HTTP）。
@@ -593,15 +630,13 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
             st->entered.Down();
             throw std::runtime_error("http handler boom"); // 越过 _InvokeHttp 调用点
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     const auto endpoint = host->bound_endpoint();
     BOOST_REQUIRE(!endpoint.empty());
 
     auto rt = std::make_shared<fw::InfraHttpHost>(
         Limits(), inf::ListenAddress{"127.0.0.1", 0}, "close-gate-http-exc-client");
-    BOOST_REQUIRE(rt->Create());
-    BOOST_REQUIRE(rt->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*rt));
     auto client = rt->http_client();
     BOOST_REQUIRE(client);
 
@@ -634,14 +669,15 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
         static_cast<int>(http_state->out.value().value().status_code), 500);
 
     // 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
-    auto drained = host->WaitHandlersDone(Clock::now() + 2s);
+    auto drained = framework_test::HostWaitDrain(*host, Clock::now() + 2s);
     BOOST_CHECK_MESSAGE(
         drained,
         "framework in-flight count must be released on handler exception");
 
-    client->Close();
-    rt->Close();
-    host->Close();
+    client->Close(bbt::infra::CloseOptions::Immediate(
+        fw::MakeError(fw::ErrorCode::Closed, "test owner close")));
+    (void)framework_test::HostClose(*rt);
+    (void)framework_test::HostClose(*host);
 }
 
 // T6（关闭收口责任移交回归）：迟到 handler/callback 排空收口责任由
@@ -654,8 +690,7 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
 //      （inflight 归零 → CoRpcServer::Shutdown 同步封口）；
 //   4) IsClosed() 为 true 证明封口已执行；随后宿主 Close() 释放
 //      owner（rpc_server() 置空）且 close_error() 为空。
-BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
-{
+BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -685,8 +720,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
             return fw::result<inf::rpc::Response>::ok(
                 inf::rpc::Response::FromRequest(request));
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     BOOST_REQUIRE(host->bound_address().has_value());
     BOOST_REQUIRE(host->rpc_server() != nullptr);
 
@@ -713,7 +747,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
     host->StopAccepting();
 
     // 有界期限：inflight>0 → TimedOut；此时 server 不得已被 Close/Stopped。
-    auto r1 = host->WaitHandlersDone(Clock::now() + 150ms);
+    auto r1 = framework_test::HostWaitDrain(*host, Clock::now() + 150ms);
     BOOST_CHECK_MESSAGE(!r1, "drain must fail while handler in-flight");
     if (!r1)
         BOOST_CHECK(r1.error().code == fw::ErrorCode::TimedOut);
@@ -723,19 +757,19 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
     // 放行 → Deadline::max 续等：inflight 归零 → Shutdown 封口。
     st->handler_gate.Open();
     BOOST_REQUIRE(st->done.WaitFor(5s));
-    auto r2 = host->WaitHandlersDone(co::Deadline::max());
+    auto r2 = framework_test::HostWaitDrain(*host, co::Deadline::max());
     BOOST_CHECK_MESSAGE(
         r2, "Deadline::max retry must complete full server drain+stop chain");
 
-    // 收口凭据：CoRpcServer 已逻辑关闭（IsClosed）。
+    // 排空只证明业务责任归零，不等于封口：RPC server 仍开放（封口归 Close）。
     BOOST_REQUIRE(host->rpc_server() != nullptr);
-    BOOST_CHECK(host->rpc_server()->IsClosed());
+    BOOST_CHECK(!host->rpc_server()->IsClosed());
 
-    // Close：取得收口凭据后停 Engine（Run 返回 + Phase==Stopped 实际检查）
-    // 并释放 owner——无 close_error 证明 Engine 未走「未达 Stopped 保留」路径。
-    host->Close();
-    BOOST_CHECK(!host->close_error().has_value());
-    BOOST_CHECK(host->rpc_server() == nullptr); // owner 已释放
+    // Close + WaitPhysicalReleased：Engine 达到 Stopped 且物理凭据到手后，
+    // 本对象的 server/client/Engine owner 才释放。
+    (void)framework_test::HostClose(*host);
+    BOOST_CHECK(host->egress_engine() == nullptr);
+    BOOST_CHECK(host->rpc_server() == nullptr);
 
     caller.Stop();
 }
@@ -743,8 +777,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
 // T7（直接 Close 兜底路径）：不经 StopAccepting/WaitHandlersDone 的裸
 // Close 也必须安全收口——同步 Shutdown 后正常释放（原同步关闭契约），
 // 不是把「未走 WaitHandlersDone」当永久失败保留 owner。
-BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
-{
+BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -764,23 +797,21 @@ BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
             return fw::result<inf::rpc::Response>::ok(
                 inf::rpc::Response::FromRequest(request));
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     BOOST_REQUIRE(host->bound_address().has_value());
 
     // 直接 Close：同步 Shutdown 必成功（无在途 handler/callback），
     // owner 正常释放，close_error 为空。
-    host->Close();
-    BOOST_CHECK(!host->close_error().has_value());
+    (void)framework_test::HostClose(*host);
+    BOOST_CHECK(host->egress_engine() == nullptr);
     BOOST_CHECK(host->rpc_server() == nullptr);
     // 幂等重入安全（不重复 join/get）。
-    host->Close();
+    (void)framework_test::HostClose(*host);
 }
 
 // T8：Close 立即返回（不等暂停的 handler），析构不因 joinable 线程 terminate；
 // 关闭原因经公共读口发布，handler 放行后安全返回（HandlerState 自持）。
-BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
-{
+BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -804,8 +835,7 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
             return fw::result<inf::rpc::Response>::ok(
                 inf::rpc::Response::FromRequest(request));
         });
-    BOOST_REQUIRE(host->Create());
-    BOOST_REQUIRE(host->Start());
+    BOOST_REQUIRE(framework_test::HostCreateStart(*host));
     BOOST_REQUIRE(host->bound_address().has_value());
 
     CallerRuntime caller;
@@ -827,7 +857,11 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
 
     const auto begin = Clock::now();
-    host->Close(fw::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
+    auto close_rc = framework_test::CoEvalVoid([&host] {
+        return bbt_co_await host->Close(bbt::infra::CloseOptions::Immediate(
+            fw::MakeError(fw::ErrorCode::Unavailable, "owner abort")));
+    });
+    BOOST_CHECK(framework_test::CoOk(close_rc));
     const auto close_cost = Clock::now() - begin;
     // handler 仍暂停：Close 的返回不得依赖它完成。
     BOOST_CHECK(!st->returned.load());
@@ -839,7 +873,7 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
     BOOST_CHECK_EQUAL(reason->message, "owner abort");
 
     // 迟到进入者路径已被 Close 封口：排空等待立即拿到同一原因（不是硬编码文案）。
-    auto late = host->WaitHandlersDone(Clock::now() + 1s);
+    auto late = framework_test::HostWaitDrain(*host, Clock::now() + 1s);
     BOOST_CHECK(!late);
     if (!late) {
         BOOST_CHECK(late.error().code == fw::ErrorCode::Unavailable);
@@ -864,28 +898,38 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
     caller.Stop();
 }
 
-// T9：HostLifecycle 用明确状态（CloseReason）识别「排空被 Close 打断」，
-// 不再 park：跳过 on_handlers_drained（handler 可能仍借业务对象），走
-// on_release，返回 kExitShutdownFailed。
-BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
-{
+// T9：Co 生命周期用明确状态（CloseReason）识别「排空被 Close 打断」——不把
+// 未证实的排空当成已排空：跳过 on_handlers_drained（handler 可能仍借业务
+// 对象），仍走 Close 与 on_release，并如实返回关闭原因。
+BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking) {
     auto host = std::make_shared<InterruptStubHost>();
     fw::HostLifecycle lifecycle(host, 100ms);
-    lifecycle.RequestShutdown();
     int drained = 0;
     int released = 0;
     fw::HostLifecycle::Hooks hooks;
-    hooks.on_handlers_drained = [&drained] { ++drained; };
+    hooks.on_handlers_drained =
+        [&drained](const bbt::infra::CloseOptions&) -> fw::result<void> {
+        ++drained;
+        return fw::result<void>::ok();
+    };
     hooks.on_release = [&released] { ++released; };
 
-    int rc = -1;
-    std::thread runner([&] { rc = lifecycle.Run(hooks); });
-    runner.join();
+    fw::result<void> stop_rc = fw::result<void>::err(fw::MakeError(
+        fw::ErrorCode::RuntimeUnavailable, "not run"));
+    const bool ran = framework_test::RunInCoTask([&] {
+        const auto started = bbt_co_await lifecycle.Start(hooks);
+        BOOST_REQUIRE(framework_test::CoOk(started));
+        stop_rc = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(Clock::now() + 100ms), hooks);
+    });
+    BOOST_REQUIRE(ran);
 
-    BOOST_CHECK_EQUAL(rc, fw::HostLifecycle::kExitShutdownFailed);
+    BOOST_CHECK(!framework_test::CoOk(stop_rc));
+    BOOST_CHECK(stop_rc.error().code == fw::ErrorCode::Unavailable);
     BOOST_CHECK_EQUAL(drained, 0);
     BOOST_CHECK_EQUAL(released, 1);
     BOOST_CHECK_EQUAL(host->close_calls.load(), 1);
+    BOOST_CHECK(lifecycle.State() == fw::ShutdownState::Closed);
     const auto failures = lifecycle.Failures();
     bool interrupted = false;
     for (const auto& failure : failures)
@@ -895,29 +939,118 @@ BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
                         "failure list must record the close interrupt");
 }
 
-// T10：第一次排空超时、无界续等期间被 Close 打断——迟到收尾按 kExitShutdownLate
-// 报告，而不是因失败项改报 Failed，也不是 park。
-BOOST_AUTO_TEST_CASE(lifecycle_close_during_unbounded_retry_reports_late)
-{
+// T10：首次排空超时 → 诚实未完成（ShutdownIncomplete、owner 保留、不 Close）；
+// 宿主随后发布关闭原因 → 再次显式收口走打断分支（不 park、不伪装排空）。
+BOOST_AUTO_TEST_CASE(lifecycle_timeout_then_close_interrupted) {
     auto host = std::make_shared<InterruptStubHost>();
     host->fail_first_with_timeout.store(true);
     fw::HostLifecycle lifecycle(host, 50ms);
-    lifecycle.RequestShutdown();
     int drained = 0;
     int released = 0;
     fw::HostLifecycle::Hooks hooks;
-    hooks.on_handlers_drained = [&drained] { ++drained; };
+    hooks.on_handlers_drained =
+        [&drained](const bbt::infra::CloseOptions&) -> fw::result<void> {
+        ++drained;
+        return fw::result<void>::ok();
+    };
     hooks.on_release = [&released] { ++released; };
 
-    int rc = -1;
-    std::thread runner([&] { rc = lifecycle.Run(hooks); });
-    runner.join();
+    fw::result<void> first_rc = fw::result<void>::err(fw::MakeError(
+        fw::ErrorCode::RuntimeUnavailable, "not run"));
+    const bool ran = framework_test::RunInCoTask([&] {
+        const auto started = bbt_co_await lifecycle.Start(hooks);
+        BOOST_REQUIRE(framework_test::CoOk(started));
+        first_rc = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(Clock::now() + 50ms), hooks);
+    });
+    BOOST_REQUIRE(ran);
+    BOOST_CHECK(!framework_test::CoOk(first_rc));
+    BOOST_CHECK(first_rc.error().code == fw::ErrorCode::TimedOut);
+    BOOST_CHECK(lifecycle.State() == fw::ShutdownState::ShutdownIncomplete);
+    BOOST_CHECK_EQUAL(host->wait_calls.load(), 1);
+    BOOST_CHECK_EQUAL(host->close_calls.load(), 0);
+    BOOST_CHECK_EQUAL(released, 0);
 
-    BOOST_CHECK_EQUAL(rc, fw::HostLifecycle::kExitShutdownLate);
+    // 第二次收口：宿主仍在（owner 保留），排空返回关闭原因 → 打断分支。
+    fw::result<void> second_rc = fw::result<void>::err(fw::MakeError(
+        fw::ErrorCode::RuntimeUnavailable, "not run"));
+    const bool ran2 = framework_test::RunInCoTask([&] {
+        second_rc = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(Clock::now() + 50ms), hooks);
+    });
+    BOOST_REQUIRE(ran2);
+    BOOST_CHECK(!framework_test::CoOk(second_rc));
     BOOST_CHECK_EQUAL(drained, 0);
     BOOST_CHECK_EQUAL(released, 1);
-    BOOST_CHECK(host->wait_calls.load() >= 2);
+    BOOST_CHECK_EQUAL(host->close_calls.load(), 1);
     BOOST_CHECK(lifecycle.IncompleteSteps().empty());
+    BOOST_CHECK(lifecycle.State() == fw::ShutdownState::Closed);
+}
+
+// T11（F6）：非法关闭组合在副作用前返回 InvalidArgument；宿主排空/关闭计数
+// 保持为零，下一次合法 Stop 正常收口。
+BOOST_AUTO_TEST_CASE(lifecycle_invalid_close_options_zero_side_effects) {
+    auto host = std::make_shared<CleanStubHost>();
+    fw::HostLifecycle lifecycle(host, 100ms);
+    fw::HostLifecycle::Hooks hooks;
+    BOOST_REQUIRE(framework_test::RunInCoTask([&] {
+        const auto started = bbt_co_await lifecycle.Start(hooks);
+        BOOST_REQUIRE(framework_test::CoOk(started));
+        auto bad = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(co::Deadline::max()), hooks);
+        BOOST_CHECK(!framework_test::CoOk(bad));
+        BOOST_CHECK(bad.error().code == fw::ErrorCode::InvalidArgument);
+        BOOST_CHECK(lifecycle.State() == fw::ShutdownState::Running);
+        BOOST_CHECK_EQUAL(host->wait_calls.load(), 0);
+        BOOST_CHECK_EQUAL(host->close_calls.load(), 0);
+        BOOST_CHECK_EQUAL(host->release_calls.load(), 0);
+        auto good = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(Clock::now() + 100ms), hooks);
+        BOOST_CHECK(framework_test::CoOk(good));
+        BOOST_CHECK(lifecycle.State() == fw::ShutdownState::Closed);
+    }));
+}
+
+// T12（F2）：资源收束失败保留 owner 与未完成步骤、不 Close 网络、不执行
+// on_release；第二次显式 Stop 用新的绝对期限完成真实收口。
+BOOST_AUTO_TEST_CASE(lifecycle_resource_failure_retains_owner_then_retries) {
+    auto host = std::make_shared<CleanStubHost>();
+    fw::HostLifecycle lifecycle(host, 100ms);
+    std::atomic<int> drained{0};
+    std::atomic<int> released{0};
+    fw::HostLifecycle::Hooks hooks;
+    hooks.on_handlers_drained =
+        [&drained](const bbt::infra::CloseOptions&) -> fw::result<void> {
+        if (drained.fetch_add(1) == 0)
+            return fw::result<void>::err(fw::MakeError(
+                fw::ErrorCode::RuntimeUnavailable, "resource close failed"));
+        return fw::result<void>::ok();
+    };
+    hooks.on_release = [&released] { ++released; };
+
+    BOOST_REQUIRE(framework_test::RunInCoTask([&] {
+        const auto started = bbt_co_await lifecycle.Start(hooks);
+        BOOST_REQUIRE(framework_test::CoOk(started));
+        auto first = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(Clock::now() + 100ms), hooks);
+        BOOST_CHECK(!framework_test::CoOk(first));
+        BOOST_CHECK(first.error().code == fw::ErrorCode::RuntimeUnavailable);
+        BOOST_CHECK(lifecycle.State() == fw::ShutdownState::ShutdownIncomplete);
+        BOOST_CHECK(!lifecycle.IncompleteSteps().empty());
+        BOOST_CHECK_EQUAL(host->close_calls.load(), 0);
+        BOOST_CHECK_EQUAL(host->release_calls.load(), 0);
+        BOOST_CHECK_EQUAL(released.load(), 0);
+
+        auto second = bbt_co_await lifecycle.Stop(
+            bbt::infra::CloseOptions::Graceful(Clock::now() + 100ms), hooks);
+        BOOST_CHECK(framework_test::CoOk(second));
+        BOOST_CHECK(lifecycle.State() == fw::ShutdownState::Closed);
+        BOOST_CHECK(lifecycle.IncompleteSteps().empty());
+        BOOST_CHECK_EQUAL(drained.load(), 2);
+        BOOST_CHECK_EQUAL(host->close_calls.load(), 1);
+        BOOST_CHECK_EQUAL(host->release_calls.load(), 1);
+        BOOST_CHECK_EQUAL(released.load(), 1);
+    }));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

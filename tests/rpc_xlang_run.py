@@ -29,8 +29,11 @@ def main():
         port_file = tf.name
     os.unlink(port_file)
 
+    # 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
     server = subprocess.Popen(
-        [args.server_bin, "server", port_file],
+        [args.server_bin],
+        env=dict(os.environ, BBT_EXAMPLE_MODE="server",
+                 BBT_EXAMPLE_PORT_FILE=port_file),
         stdin=subprocess.PIPE,
         stdout=sys.stderr, stderr=sys.stderr)
     try:

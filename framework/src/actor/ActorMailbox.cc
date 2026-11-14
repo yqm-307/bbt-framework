@@ -17,32 +17,46 @@ ActorMailbox::ActorMailbox(std::size_t capacity, ErrorHook on_abnormal)
 result<void> ActorMailbox::TryEnqueue(Task task) {
     if (!task)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorMailbox::TryEnqueue: empty task"));
+                                           "ActorMailbox::TryEnqueue: empty task"));
 
-    std::lock_guard<std::mutex> lock(m_mtx);
-    if (m_closed)
-        return result<void>::err(MakeError(ErrorCode::Closed,
-            "ActorMailbox is closed"));
-    if (m_queue.size() >= m_capacity)
-        return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "ActorMailbox waiting queue full (mailbox_capacity)"));
-    m_queue.push_back(std::move(task));
-    if (m_draining)
+    // 协程栈分配可能挂起，登记绝不在 m_mtx 内执行：锁内只做接纳校验、入队
+    // 与「预约唯一 drain」，锁外登记；登记失败时按失败终态清空本次队列。
+    bool need_drain = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        if (m_closed)
+            return result<void>::err(MakeError(ErrorCode::Closed,
+                                               "ActorMailbox is closed"));
+        if (m_queue.size() >= m_capacity)
+            return result<void>::err(MakeError(ErrorCode::Overloaded,
+                                               "ActorMailbox waiting queue full (mailbox_capacity)"));
+        m_queue.push_back(std::move(task));
+        if (!m_draining) {
+            // 预约：并发 TryEnqueue 看到 draining=true 时只入队，不再登记。
+            m_draining = true;
+            need_drain = true;
+        }
+    }
+    if (!need_drain)
         return result<void>::ok();
 
-    // 空转→活跃边沿：注册本邮箱唯一 drain 协程。注册放在持锁临界区内，
-    // 保证 m_draining 置位先于协程起跑被观测；注册失败回滚本次接纳
-    // （刚 push 的项仍在队尾、draining 尚未置位，pop_back 即收回），
-    // 不留孤儿项、不占用容量。
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [self = shared_from_this()]() { self->_Drain(); }, succ);
-    if (!succ) {
-        m_queue.pop_back();
-        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "ActorMailbox: coroutine scheduler unavailable"));
+    try {
+        g_scheduler->RegistCoroutineTask(
+            [self = shared_from_this()]() { self->_Drain(); }, succ);
+    } catch (...) {
+        succ = false;
     }
-    m_draining = true;
+    if (!succ) {
+        std::deque<Task> dropped;
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_draining = false;
+            dropped.swap(m_queue);
+        }
+        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+                                           "ActorMailbox: coroutine scheduler unavailable"));
+    }
     return result<void>::ok();
 }
 

@@ -1,4 +1,4 @@
-// ICoService::call 的机器面半身。
+// CoServiceBase::call 的机器面半身。
 //
 // 公共头的 call<Reply> 模板只做编译期 codec 选择与请求编码；本文件
 // 承接类型擦除后的发送路径：受管校验、隐式请求上下文、envelope 组装、
@@ -6,7 +6,7 @@
 // deadline 经 CallOptionsAdapter 适配、宿主注入点发送与回复
 // 封包校验。成功返回回复 payload 字节，解码回公共头完成。
 
-#include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/internal/ServiceBase.hpp>
 
 #include <optional>
 #include <utility>
@@ -14,9 +14,32 @@
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/internal/CallOptionsAdapter.hpp>
 
-namespace bbt::framework {
+namespace bbt::framework::v2 {
 
-result<std::vector<std::uint8_t>> ICoService::_CallSend(
+std::string CoServiceBase::_NextRequestId() {
+    return "req-" + std::to_string(m_object_info.id) + "-" +
+        std::to_string(s_call_seq.fetch_add(1, std::memory_order_relaxed) + 1);
+}
+
+result<CoRpcResp> CoServiceBase::call(
+    std::string_view service_name,
+    std::string_view method_name,
+    const CoRpcReq& request,
+    const RouteFields& custom,
+    const CallOptions& options) {
+    auto reply = _CallSend(service_name, method_name,
+                           kCoRpcPositionalSchema,
+                           kCoRpcPositionalSchema,
+                           std::vector<std::uint8_t>(request.payload().begin(),
+                                                     request.payload().end()),
+                           custom, options);
+    if (!reply)
+        return result<CoRpcResp>::err(std::move(reply.error()));
+    return result<CoRpcResp>::ok(CoRpcResp::FromPayload(
+        std::move(reply.value())));
+}
+
+result<std::vector<std::uint8_t>> CoServiceBase::_CallSend(
     std::string_view service_name,
     std::string_view method_name,
     std::string_view request_schema,
@@ -126,4 +149,4 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
     return Err::ok(reply_env->Payload());
 }
 
-} // namespace bbt::framework
+} // namespace bbt::framework::v2

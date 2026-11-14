@@ -3,6 +3,8 @@
 // ActorRegistry 至多一次与上限。
 // 并发用例用条件变量屏障构造真实重叠窗口：handler 在 drain 协程内被
 // 屏障拦停，另一个执行体获得完整进入机会；禁止 sleep 凑时序。
+// v2 受管对象只能经 CoApp 装配（ConstructKey 私有 passkey）：注册表用例的
+// 服务实例由 seam app 安装后经 ServiceInstance 取回。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -20,14 +22,18 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/framework/Framework.hpp>
-#include <bbt/framework/CoApp.hpp>
+#include <bbt/framework/V2.hpp>
 
 // 邮箱/注册表/方法表是机器面：显式包含 internal 头。
 #include <bbt/framework/internal/ActorMailbox.hpp>
 #include <bbt/framework/internal/ActorRegistry.hpp>
+#include <bbt/framework/internal/CoAppSeam.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
 
+#include "framework_co_harness.hpp"
+
 namespace fw = bbt::framework;
+namespace v2 = bbt::framework::v2;
 
 namespace {
 
@@ -128,9 +134,10 @@ BOOST_TEST_GLOBAL_FIXTURE(SchedulerFixture);
 namespace {
 
 // 混合声明：一个无 key 的普通方法 + 一个 ActorMethodAt。
-class MixedService final : public fw::CoService<MixedService> {
+class MixedService final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "mixed";
+    explicit MixedService(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
     fw::CoRpcResp Unkeyed(fw::CoRpcReq) {
         return fw::CoRpcResp::From(std::tuple<>{});
     }
@@ -140,12 +147,16 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&MixedService::Unkeyed>("unkeyed"),
         fw::ActorMethodAt<&MixedService::Keyed, std::int32_t>("keyed"));
+protected:
+    ~MixedService() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 // 全部方法都经 ActorMethodAt 声明。
-class AllKeyedService final : public fw::CoService<AllKeyedService> {
+class AllKeyedService final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "keyed";
+    explicit AllKeyedService(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
     fw::CoRpcResp A(fw::CoRpcReq) {
         return fw::CoRpcResp::From(std::tuple<>{});
     }
@@ -155,46 +166,66 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&AllKeyedService::A, std::int32_t>("a"),
         fw::ActorMethodAt<&AllKeyedService::B, std::int32_t>("b"));
+protected:
+    ~AllKeyedService() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
-// 注册表测试服务：构造计数验证「至多一次」。无 RPC 方法声明 → 空表。
-class CountingService final : public fw::CoService<CountingService> {
+// 注册表测试服务：经 CoApp 安装后取回实例供注册表工厂交付。
+class CountingService final : public v2::CoService<> {
 public:
-    CountingService() { s_ctor_count.fetch_add(1); }
     static constexpr std::string_view kServiceName = "counting";
-    static std::atomic<int> s_ctor_count;
+    explicit CountingService(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
+    CountingService() = delete;
+protected:
+    ~CountingService() noexcept override = default;
+    friend class fw::detail::Registry;
 };
-std::atomic<int> CountingService::s_ctor_count{0};
+
+// 第二个服务类型：注册表需不同对象时交付另一实例。
+class CountingService2 final : public v2::CoService<> {
+public:
+    static constexpr std::string_view kServiceName = "counting2";
+    explicit CountingService2(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
+protected:
+    ~CountingService2() noexcept override = default;
+    friend class fw::detail::Registry;
+};
 
 constexpr std::chrono::milliseconds kWait{5000};
 
+// seam app：给注册表/服务实例提供真实受管来源（ConstructKey 为私有
+// passkey，业务对象只能经 CoApp 装配）。
+std::shared_ptr<v2::CoApp> MakeSeamApp() {
+    return framework_test::CreateV2App([] {
+        return v2::CoApp::Create(
+            fw::AppOptions{}
+                .SetLimits(64, 64, 8, 64)
+                .SetShutdownBudget(std::chrono::milliseconds{2000})
+                .SetLifecycleBudget(std::chrono::milliseconds{2000}),
+            "actor-mailbox-test");
+    });
+}
+
 BOOST_AUTO_TEST_SUITE(framework_f2a)
 
-// ValidateServiceOptions 合法/非法矩阵。
+// ValidateServiceOptions 合法/非法矩阵（setter 面）。
 BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
-    const fw::ServiceOptions actor_base{
-        fw::ExecutionPolicy::ActorSerial,
-        /*max_inflight*/ 64,
-        /*mailbox_capacity*/ 16,
-        /*max_actors*/ 8,
-        /*ordered_ingress*/ false,
-        /*max_ordered_streams*/ 0,
-        /*max_cached_results*/ 0,
-        /*max_cached_result_bytes*/ 0};
+    const fw::ServiceOptions actor_base =
+        fw::ServiceOptions{}
+            .SetMaxInflight(64)
+            .SetActorSerial()
+            .SetSerialQueueCapacity(16)
+            .SetMaxSerialKeys(8);
     // BOOST_CHECK 只记录表达式文本，不要求操作数可流式输出（result<T>）。
     BOOST_CHECK(fw::ValidateServiceOptions(actor_base));
 
-    fw::ServiceOptions concurrent = actor_base;
-    concurrent.execution = fw::ExecutionPolicy::Concurrent;
-    concurrent.mailbox_capacity = 0;
-    concurrent.max_actors = 0;
+    fw::ServiceOptions concurrent =
+        fw::ServiceOptions{}.SetMaxInflight(64);
     BOOST_CHECK(fw::ValidateServiceOptions(concurrent));
 
     fw::ServiceOptions ordered = actor_base;
-    ordered.ordered_ingress = true;
-    ordered.max_ordered_streams = 4;
-    ordered.max_cached_results = 32;
-    ordered.max_cached_result_bytes = 4096;
+    ordered.SetOrderedIngress(true, 4, 32, 4096);
     BOOST_CHECK(fw::ValidateServiceOptions(ordered));
 
     auto expect_invalid = [](fw::ServiceOptions o, const char* field) {
@@ -204,32 +235,34 @@ BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
         BOOST_TEST(r.error().message.find(field) != std::string::npos);
     };
 
-    { auto o = actor_base; o.max_inflight = 0;
-      expect_invalid(o, "max_inflight"); }
-    { auto o = actor_base; o.mailbox_capacity = 0;
+    { auto o = fw::ServiceOptions{}; expect_invalid(o, "max_inflight"); }
+    { auto o = fw::ServiceOptions{}.SetMaxInflight(64).SetActorSerial();
       expect_invalid(o, "mailbox_capacity"); }
-    { auto o = actor_base; o.max_actors = 0;
+    { auto o = fw::ServiceOptions{}.SetMaxInflight(64).SetActorSerial()
+                                    .SetSerialQueueCapacity(16);
       expect_invalid(o, "max_actors"); }
-    { auto o = concurrent; o.mailbox_capacity = 1;
+    { auto o = fw::ServiceOptions{}.SetMaxInflight(64)
+                                    .SetSerialQueueCapacity(1);
       expect_invalid(o, "mailbox_capacity"); }
-    { auto o = concurrent; o.max_actors = 1;
-      expect_invalid(o, "max_actors"); }
+    { auto o = fw::ServiceOptions{}.SetMaxInflight(64).SetActorSerial()
+                                    .SetSerialQueueCapacity(16)
+                                    .SetMaxSerialKeys(1);
+      BOOST_CHECK(fw::ValidateServiceOptions(o)); }
     // ordered_ingress 用在 Concurrent 上必须被拒。
-    { auto o = concurrent; o.ordered_ingress = true;
-      o.max_ordered_streams = 1; o.max_cached_results = 1;
-      o.max_cached_result_bytes = 1;
+    { auto o = fw::ServiceOptions{}.SetMaxInflight(64)
+                                    .SetOrderedIngress(true, 1, 1, 1);
       expect_invalid(o, "ordered_ingress"); }
-    { auto o = ordered; o.max_ordered_streams = 0;
+    { auto o = actor_base; o.SetOrderedIngress(true, 0, 0, 0);
       expect_invalid(o, "max_ordered_streams"); }
-    { auto o = ordered; o.max_cached_results = 0;
+    { auto o = actor_base; o.SetOrderedIngress(true, 1, 0, 1);
       expect_invalid(o, "max_cached_results"); }
-    { auto o = ordered; o.max_cached_result_bytes = 0;
+    { auto o = actor_base; o.SetOrderedIngress(true, 1, 1, 0);
       expect_invalid(o, "max_cached_result_bytes"); }
-    { auto o = actor_base; o.max_ordered_streams = 1;
+    { auto o = actor_base; o.SetOrderedIngress(false, 1, 0, 0);
       expect_invalid(o, "max_ordered_streams"); }
-    { auto o = actor_base; o.max_cached_results = 1;
+    { auto o = actor_base; o.SetOrderedIngress(false, 0, 1, 0);
       expect_invalid(o, "max_cached_results"); }
-    { auto o = actor_base; o.max_cached_result_bytes = 1;
+    { auto o = actor_base; o.SetOrderedIngress(false, 0, 0, 1);
       expect_invalid(o, "max_cached_result_bytes"); }
 }
 
@@ -424,24 +457,43 @@ BOOST_AUTO_TEST_CASE(mailbox_close_stops_admission) {
 }
 
 // Registry：同 key 至多一次（返回同一实例、工厂只调一次）、key 可读回、
-// max_actors 超限拒绝、未注册服务拒绝。
+// max_actors 超限拒绝、未注册服务拒绝。实例来自 seam app 的真实受管装配。
 BOOST_AUTO_TEST_CASE(registry_at_most_once_and_max_actors) {
+    auto app = MakeSeamApp();
+    fw::result<void> installed = fw::result<void>::ok();
+    framework_test::RunInCoTask([&] {
+        installed = bbt_co_await app->CoInstallService<CountingService>(
+            fw::ServiceOptions{}.SetMaxInflight(8));
+        if (installed)
+            installed = bbt_co_await app->CoInstallService<CountingService2>(
+                fw::ServiceOptions{}.SetMaxInflight(8));
+    });
+    BOOST_REQUIRE(static_cast<bool>(installed));
+    auto first = framework_test::ServiceInstance(*app, "counting");
+    auto second = framework_test::ServiceInstance(*app, "counting2");
+    BOOST_REQUIRE(first);
+    BOOST_REQUIRE(second);
+
     fw::ActorRegistry reg;
-    BOOST_REQUIRE(reg.RegisterService<CountingService>("svc", 2));
-    const int before = CountingService::s_ctor_count.load();
+    std::atomic<int> factory_calls{0};
+    BOOST_REQUIRE(reg.RegisterFactory("svc",
+        [&]() -> std::shared_ptr<v2::CoServiceBase> {
+            const int n = factory_calls.fetch_add(1);
+            return n == 0 ? std::static_pointer_cast<v2::CoServiceBase>(first)
+                          : std::static_pointer_cast<v2::CoServiceBase>(second);
+        }, 2));
 
     auto a1 = reg.GetOrCreate("svc", "k1");
     BOOST_REQUIRE(a1);
     auto a1b = reg.GetOrCreate("svc", "k1");
     BOOST_REQUIRE(a1b);
     BOOST_TEST(a1.value().get() == a1b.value().get());   // 同一实例
-    BOOST_TEST(CountingService::s_ctor_count.load() == before + 1);
-    BOOST_REQUIRE(a1.value()->co_actor_key().has_value());
-    BOOST_TEST(a1.value()->co_actor_key().value() == "k1");
+    BOOST_TEST(factory_calls.load() == 1);
 
     auto a2 = reg.GetOrCreate("svc", "k2");
     BOOST_REQUIRE(a2);
     BOOST_TEST(a2.value().get() != a1.value().get());
+    BOOST_TEST(factory_calls.load() == 2);
 
     auto a3 = reg.GetOrCreate("svc", "k3");
     BOOST_REQUIRE(!a3);
@@ -456,14 +508,21 @@ BOOST_AUTO_TEST_CASE(registry_at_most_once_and_max_actors) {
 
 // 激活失败不留半激活对象：不占位不计数，同 key 重试可成功。
 BOOST_AUTO_TEST_CASE(registry_failed_activation_leaves_no_partial) {
+    auto app = MakeSeamApp();
+    framework_test::RunInCoTask([&] {
+        BOOST_REQUIRE(static_cast<bool>(bbt_co_await app->CoInstallService<CountingService>(
+            fw::ServiceOptions{}.SetMaxInflight(8))));
+    });
+    auto inst = framework_test::ServiceInstance(*app, "counting");
+    BOOST_REQUIRE(inst);
+
     fw::ActorRegistry reg;
     std::atomic<int> calls{0};
     BOOST_REQUIRE(reg.RegisterFactory("boom",
-        [&calls]() -> std::shared_ptr<fw::ICoService> {
+        [&]() -> std::shared_ptr<v2::CoServiceBase> {
             if (calls.fetch_add(1) == 0)
                 throw std::runtime_error("ctor fail");
-            return std::static_pointer_cast<fw::ICoService>(
-                std::make_shared<CountingService>());
+            return inst;
         }, 1));
 
     auto r1 = reg.GetOrCreate("boom", "k");
@@ -474,8 +533,6 @@ BOOST_AUTO_TEST_CASE(registry_failed_activation_leaves_no_partial) {
     auto r2 = reg.GetOrCreate("boom", "k");
     BOOST_REQUIRE(r2);
     BOOST_TEST(calls.load() == 2);
-    BOOST_REQUIRE(r2.value()->co_actor_key().has_value());
-    BOOST_TEST(r2.value()->co_actor_key().value() == "k");
     BOOST_TEST(reg.ActorCount("boom") == std::size_t{1});
 
     auto r3 = reg.GetOrCreate("boom", "k");

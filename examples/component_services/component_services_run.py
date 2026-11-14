@@ -119,10 +119,19 @@ def read_journal(path):
     return entries
 
 
-def run_child(argv, timeout_s=CASE_TIMEOUT_S):
+def child_env(mode, journal, price=None):
+    """生成式入口（bbtco_main）不暴露 argv：场景参数经环境变量传入。"""
+    env = dict(os.environ, BBT_EXAMPLE_MODE=mode, BBT_EXAMPLE_JOURNAL=journal)
+    if price is not None:
+        env["BBT_EXAMPLE_PRICE"] = str(price)
+    return env
+
+
+def run_child(argv, timeout_s=CASE_TIMEOUT_S, env=None):
     """运行自有子进程，返回 (rc, stdout, stderr)；超时即杀并记失败。"""
     proc = subprocess.Popen(
         argv,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -181,7 +190,7 @@ def verify_checks(entries, required, scenario):
 def scenario_shared(binary, tmpdir):
     print("\n=== shared: 同进程组件复用 + 热拔插 + hook/observer ===")
     journal = os.path.join(tmpdir, "shared.journal")
-    rc, out, err = run_child([binary, "shared", "--journal", journal])
+    rc, out, err = run_child([binary], env=child_env("shared", journal))
     spool(out, err)
     entries = read_journal(journal)
     check(rc == 0, "shared.exit_code", f"rc={rc}")
@@ -269,16 +278,16 @@ def scenario_price_args(binary, tmpdir):
                        ("int_max", str(2**31 - 1)),
                        ("overflow", "9" * 100)]:
         journal = os.path.join(tmpdir, f"price-{tag}.journal")
-        rc, out, err = run_child(
-            [binary, "node", "--journal", journal, "--price", value])
+        rc, out, err = run_child([binary],
+                                 env=child_env("node", journal, value))
         check(rc == 90, f"price.{tag}_rejected", f"rc={rc} stderr={err.strip()}")
         check(not os.path.exists(journal), f"price.{tag}_no_journal",
               "journal_not_opened")
 
     for tag, price in [("zero", 0), ("upper_bound", (2**31 - 1) // 2)]:
         journal = os.path.join(tmpdir, f"price-{tag}.journal")
-        rc, out, err = run_child(
-            [binary, "node", "--journal", journal, "--price", str(price)])
+        rc, out, err = run_child([binary],
+                                 env=child_env("node", journal, price))
         entries = read_journal(journal)
         node = name_or_none([e for e in entries
                              if e.get("event") == "cross_process_node"])
@@ -300,8 +309,7 @@ def scenario_nodes(binary, tmpdir):
                     price,
                     journal,
                     subprocess.Popen(
-                        [binary, "node", "--journal", journal,
-                         "--price", str(price)],
+                        [binary], env=child_env("node", journal, price),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,

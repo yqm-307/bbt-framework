@@ -10,13 +10,15 @@
 #include <type_traits>
 #include <typeinfo>
 
+#include <bbt/infra/CloseOptions.hpp>
+
 #include <bbt/framework/Object.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/internal/ObjectBase.hpp>
 
 namespace bbt::framework {
 
-class MonitorWriter;   // 监控写端（后续切片；仅前置声明）
+class MonitorWriter; // 监控写端（后续切片；仅前置声明）
 
 namespace v2 {
 
@@ -40,7 +42,7 @@ public:
     /// @brief 返回本组件的非拥有对象句柄。
     ObjectHandle Handle() const { return _ObjectHandle(); }
     /// @brief 返回本组件当前身份与状态的值快照。
-    ObjectInfo   Info() const;
+    ObjectInfo Info() const;
 
 protected:
     /// @brief 受控构造，只接受 Registry 发放的 ConstructKey。
@@ -89,10 +91,17 @@ protected:
      *
      * 调用点：v2::CoApp::CoStop 的逆序收口与 CoUninstallComponent。在受管协程
      * 中执行；失败记入 LifecycleFailures 且保留 owner 待再次收口，不销毁对象。
+     * 组件只关闭自己拥有的客户端/连接：同一 CloseOptions 原样转发给对应 infra
+     * 对象，不换算模式、不按组件重置 deadline、不在 hook 内新建等待线程。
+     * 参数校验必须先于任何副作用；非法组合返回 InvalidArgument/InvalidContext。
      *
+     * @param options 本次收口的关闭选项（同一值传给按登记逆序收口的每个组件）。
      * @return 成功返回 ok；失败返回的错误即停止失败原因。
      */
-    virtual result<void> OnStop() { return result<void>::ok(); }
+    virtual result<void> OnStop(const bbt::infra::CloseOptions& options) {
+        (void)options;
+        return result<void>::ok();
+    }
     /**
      * @brief 卸载钩子，在组件登记移除前执行。
      *
@@ -132,7 +141,7 @@ result<ComponentHandle<C>> CoComponent::GetComponent(
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "GetComponent: C must derive from framework::v2::CoComponent");
+                  "GetComponent: C must derive from framework::v2::CoComponent");
     BoundComponent b;
     if (!_FindBoundCopy(typeid(C), name, &b))
         return result<ComponentHandle<C>>::err(MakeError(

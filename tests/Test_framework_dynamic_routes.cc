@@ -1,8 +1,11 @@
-// DynamicRouteTable 与 CoApp::find_route 的动态优先语义。
+// DynamicRouteTable 与出站 FindRoute/Send 的动态优先语义。
 //
 // 不联网、不启动 Scheduler：只断言公共面（Replace/Resolve/MarkUnavailable/
-// HasService 与 find_route 的静态回退边界）。真实注册中心链路由
-// examples.ecommerce_cluster 在真实 Consul 上验收。
+// HasService 与 AppRuntimeState::FindRoute/Send 的静态回退边界）。
+// v2 CoApp 的路由在装配时写入 AppRuntimeState::routes，动态表由发现组件
+// （ecommerce_cluster）在运行期 Replace——本文件按机器面真源直接填同一份
+// 状态（AppRuntimeState 是 internal 机器面，不是业务 API）。
+// 真实注册中心链路由 examples.ecommerce_cluster 在真实 Consul 上验收。
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -13,8 +16,9 @@
 #include <thread>
 #include <vector>
 
-#include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/DynamicRouteTable.hpp>
+#include <bbt/framework/Object.hpp>
+#include <bbt/framework/RpcPolicy.hpp>
 #include <bbt/framework/internal/AppRuntimeState.hpp>
 
 namespace fw = bbt::framework;
@@ -182,39 +186,32 @@ BOOST_AUTO_TEST_CASE(table_revision_regression_installs_snapshot) {
     BOOST_CHECK_EQUAL(second.value(), "127.0.0.1:7002");
 }
 
-BOOST_AUTO_TEST_CASE(coapp_find_route_prefers_dynamic_without_static_fallback) {
+BOOST_AUTO_TEST_CASE(find_route_prefers_dynamic_without_static_fallback) {
     auto table = std::make_shared<fw::DynamicRouteTable>();
 
-    fw::CoAppOptions options;
-    options.network_limits = bbt::infra::NetworkLimits{
-        8, 8, 16 * 1024, 64 * 1024, milliseconds{5000}};
-    options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = milliseconds{1000};
-    options.static_routes = {
-        fw::StaticRoute{"catalog", Endpoint(4999)},
-        fw::StaticRoute{"order", Endpoint(4998)},
-    };
-    options.dynamic_routes = table;
-    fw::CoApp app(options);
+    fw::AppRuntimeState state;
+    state.dynamic_routes = table;
+    state.routes.emplace("catalog", Endpoint(4999));
+    state.routes.emplace("order", Endpoint(4998));
 
     // 静态路由语义保持：未进动态表的名字走静态项。
-    auto order = app.find_route("order");
+    auto order = state.FindRoute("order");
     BOOST_REQUIRE(order);
     BOOST_CHECK_EQUAL(order.value(), "127.0.0.1:4998");
 
-    auto unknown = app.find_route("inventory");
+    auto unknown = state.FindRoute("inventory");
     BOOST_REQUIRE(!unknown);
     BOOST_CHECK(unknown.error().code == fw::ErrorCode::NotFound);
 
     // 动态表配置了同名服务 → 动态优先，静态 endpoint 不再可见。
     BOOST_REQUIRE(table->Replace("catalog", 1, {Endpoint(5001)}));
-    auto dynamic_hit = app.find_route("catalog");
+    auto dynamic_hit = state.FindRoute("catalog");
     BOOST_REQUIRE(dynamic_hit);
     BOOST_CHECK_EQUAL(dynamic_hit.value(), "127.0.0.1:5001");
 
     // 已配置动态服务变空 → NotFound，绝不回退到静态 4999。
     BOOST_REQUIRE(table->Replace("catalog", 2, {}));
-    auto empty = app.find_route("catalog");
+    auto empty = state.FindRoute("catalog");
     BOOST_REQUIRE(!empty);
     BOOST_CHECK(empty.error().code == fw::ErrorCode::NotFound);
     BOOST_CHECK_NE(empty.error().message.find("no healthy instance"),
@@ -223,7 +220,7 @@ BOOST_AUTO_TEST_CASE(coapp_find_route_prefers_dynamic_without_static_fallback) {
     // 动态视图被标记不可用 → RuntimeUnavailable（同样不回退）。
     BOOST_REQUIRE(table->Replace("catalog", 3, Endpoints(5001, 5002)));
     table->MarkUnavailable("catalog");
-    auto unavailable = app.find_route("catalog");
+    auto unavailable = state.FindRoute("catalog");
     BOOST_REQUIRE(!unavailable);
     BOOST_CHECK(unavailable.error().code == fw::ErrorCode::RuntimeUnavailable);
 }
@@ -310,6 +307,51 @@ BOOST_AUTO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
     BOOST_CHECK(rejected.error().code == fw::ErrorCode::Overloaded);
     BOOST_CHECK_EQUAL(policy->calls, 5);
     BOOST_CHECK_EQUAL(sent.size(), 4u);
+}
+
+BOOST_AUTO_TEST_CASE(public_app_options_own_policy_and_discovery_table) {
+    class Allow final : public fw::RpcPolicy {
+        fw::result<fw::RpcPolicyDecision> Preflight(const fw::RpcCallView&) override {
+            return fw::result<fw::RpcPolicyDecision>::ok(fw::RpcPolicyDecision{});
+        }
+    };
+    auto policy = std::make_shared<Allow>();
+    std::weak_ptr<fw::RpcPolicy> weak = policy;
+    fw::AppOptions options;
+    auto table = std::make_shared<fw::DynamicRouteTable>();
+    options.SetRpcPolicy(policy).SetDynamicRoutes(table);
+    auto snapshot = options;
+    policy.reset();
+    options.SetRpcPolicy(nullptr).SetDynamicRoutes(nullptr);
+    BOOST_CHECK(!weak.expired());
+    BOOST_CHECK(snapshot.RpcPolicyOwner() == weak.lock());
+    BOOST_CHECK(snapshot.DynamicRoutes() == table);
+    BOOST_CHECK(!options.RpcPolicyOwner());
+    snapshot.SetRpcPolicy(nullptr);
+    BOOST_CHECK(weak.expired());
+}
+
+BOOST_AUTO_TEST_CASE(http_service_routes_validate_before_start) {
+    fw::AppNetworkOptions network;
+    network.SetLimits({8, 8, 1024, 4096, milliseconds{1000}})
+        .SetLocalAppId("http-options");
+    fw::AppOptions options;
+    options.SetLimits(8, 8, 8, 8).SetShutdownBudget(milliseconds{1000}).SetLifecycleBudget(milliseconds{1000}).SetNetworkOptions(network);
+    fw::HttpServiceRoute route{"/checkout", "gateway", "CreateOrder", "req", "resp"};
+    options.AddHttpRoute(route);
+    BOOST_REQUIRE(options.Validate());
+    auto duplicate = options;
+    duplicate.AddHttpRoute(route);
+    BOOST_CHECK(!duplicate.Validate());
+    for (const auto& path : {"", "checkout", "/checkout?service=other", "/bad path"}) {
+        auto invalid = options;
+        route.path = path;
+        invalid.AddHttpRoute(route);
+        BOOST_CHECK(!invalid.Validate());
+    }
+    fw::AppOptions no_network;
+    no_network.SetLimits(8, 8, 8, 8).SetShutdownBudget(milliseconds{1000}).SetLifecycleBudget(milliseconds{1000}).AddHttpRoute({"/ok", "s", "m", "q", "r"});
+    BOOST_CHECK(!no_network.Validate());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

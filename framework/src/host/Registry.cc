@@ -733,47 +733,6 @@ void Registry::NoteHookSettled(const ObjectId& id) noexcept {
     if (w) w->Notify();
 }
 
-// ---- 组件依赖拓扑 ----
-
-std::vector<ObjectId> Registry::ComponentStartOrderLocked(
-    bool* had_cycle) const {
-    // 依赖图：X 的依赖 = 所有「subject==X」的 binding 指向的目标组件。
-    // DFS 后序：依赖先于使用者。按登记顺序遍历保持稳定。
-    std::unordered_map<ObjectId, std::vector<ObjectId>> deps;
-    for (const auto& e : m_entries) {
-        if (e.kind != ObjectKind::Component) continue;
-        auto& out = deps[e.id];
-        for (const auto& ce : m_entries) {
-            if (ce.kind != ObjectKind::Component) continue;
-            for (const auto& b : ce.bindings) {
-                if (b.subject_id == e.id) out.push_back(ce.id);
-            }
-        }
-    }
-
-    std::vector<ObjectId> order;
-    std::unordered_map<ObjectId, int> mark;   // 0=未访，1=栈中，2=完成
-    bool cycle = false;
-    std::function<void(const ObjectId&)> dfs = [&](const ObjectId& id) {
-        mark[id] = 1;
-        for (const auto& d : deps[id]) {
-            const auto it = mark.find(d);
-            if (it != mark.end() && it->second == 2) continue;
-            if (it != mark.end() && it->second == 1) { cycle = true; continue; }
-            if (deps.count(d) == 0) continue;   // 目标非组件（防御）
-            dfs(d);
-        }
-        mark[id] = 2;
-        order.push_back(id);
-    };
-    for (const auto& e : m_entries) {
-        if (e.kind != ObjectKind::Component) continue;
-        if (mark.count(e.id) == 0) dfs(e.id);
-    }
-    if (had_cycle) *had_cycle = cycle;
-    return order;
-}
-
 // ---- Uninstall ----
 
 result<RegistryEntry*> Registry::BeginDestroyLocked(std::string_view id) {

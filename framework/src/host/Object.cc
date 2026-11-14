@@ -2,19 +2,19 @@
 // Registry 委托、AppObjectAddress 校验、ComponentBorrow 释放。
 
 #include <bbt/framework/Address.hpp>
+#include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/Object.hpp>
 #include <bbt/framework/Service.hpp>
 #include <bbt/framework/internal/Registry.hpp>
+
+#include <set>
 
 namespace bbt::framework {
 
 // ---- Options::Validate ----
 
 result<void> ServiceOptions::Validate() const {
-    if (m_max_inflight == 0)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ServiceOptions: max_inflight must be a finite positive value"));
-    return result<void>::ok();
+    return ValidateServiceOptions(*this);
 }
 
 result<void> ActorOptions::Validate() const {
@@ -41,6 +41,34 @@ result<void> AppOptions::Validate() const {
     if (m_lifecycle_budget.count() <= 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
             "AppOptions: SetLifecycleBudget must be a finite positive value"));
+    if (m_network) {
+        if (auto network = bbt::infra::ValidateNetworkLimits(m_network->Limits());
+            !network)
+            return network;
+        if (m_network->ListenAddress().host.empty())
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "AppOptions: network listen host must not be empty"));
+        if (m_network->LocalAppId().empty())
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "AppOptions: network local app id must not be empty"));
+    }
+    std::set<std::string> http_paths;
+    for (const auto& route : m_http_routes) {
+        if (!m_network || route.path.empty() || route.path.front() != '/' ||
+            route.path.find_first_of("?# \r\n") != std::string::npos ||
+            route.service.empty() || route.method.empty() ||
+            route.request_schema.empty() || route.response_schema.empty() ||
+            !http_paths.insert(route.path).second)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                                               "AppOptions: invalid or duplicate HTTP route"));
+    }
+    std::set<std::string> route_names;
+    for (const auto& [service, endpoint] : m_routes) {
+        if (service.empty() || endpoint.empty() ||
+            !route_names.insert(service).second)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "AppOptions: routes must have unique non-empty service and endpoint"));
+    }
     return result<void>::ok();
 }
 

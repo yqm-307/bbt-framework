@@ -5,7 +5,8 @@
 #include <cstdio>
 #include "services/common/storage.hpp"
 #ifdef EC_STORAGE_AVAILABLE
-#include <bbt/framework/RedisNetResource.hpp>
+#include <bbt/framework/RedisComponent.hpp>
+#include "services/catalog/cache_view.hpp"
 #endif
 #include <string>
 #include <string_view>
@@ -18,6 +19,7 @@
 namespace ecommerce {
 
 using namespace bbt::framework;
+namespace v2 = bbt::framework::v2;
 
 namespace {
 
@@ -30,6 +32,12 @@ std::int64_t UnitPriceCents(std::string_view sku) {
 }
 
 } // namespace
+
+#ifdef EC_STORAGE_AVAILABLE
+CoRpcResp CatalogService::Inspect(CoRpcReq) {
+    return InspectCache(GetComponent<v2::RedisComponent>("cache"));
+}
+#endif
 
 CoRpcResp CatalogService::Price(CoRpcReq req) {
     HopRecord hop{kCatalogService, "Price", InboundRequestId(context()), {}, {},
@@ -52,12 +60,16 @@ CoRpcResp CatalogService::Price(CoRpcReq req) {
     std::int64_t unit = UnitPriceCents(sku);
 #ifdef EC_STORAGE_AVAILABLE
     if (Storage().enabled && unit > 0) {
-        auto cache = context().resource<RedisNetResource>("cache");
+        auto cache = GetComponent<v2::RedisComponent>("cache");
         if (!cache)
-            return fail(MakeError(ErrorCode::RuntimeUnavailable, "cache resource missing"));
+            return fail(MakeError(ErrorCode::RuntimeUnavailable, "cache component missing"));
+        auto borrow = cache.value().Borrow();
+        if (!borrow)
+            return fail(MakeError(borrow.error().code,
+                                  "cache borrow failed: " + borrow.error().message));
         const auto budget = StorageBudget(context());
         const std::string key = Storage().key_prefix + ":price:" + sku;
-        auto value = bbt_co_await cache->Get(key, budget);
+        auto value = bbt_co_await borrow.value().Get().Pool().Get(key, budget);
         if (!value)
             return fail(value.error());
         if (value.value()) {
@@ -66,7 +78,7 @@ CoRpcResp CatalogService::Price(CoRpcReq req) {
             if (parsed_price.ec != std::errc{} || parsed_price.ptr != text.data() + text.size() || unit <= 0)
                 return fail(MakeError(ErrorCode::ProtocolError, "invalid cached price"));
         } else {
-            auto set = bbt_co_await cache->Set(key, std::to_string(unit), budget);
+            auto set = bbt_co_await borrow.value().Get().Pool().Set(key, std::to_string(unit), budget);
             if (!set)
                 return fail(set.error());
         }

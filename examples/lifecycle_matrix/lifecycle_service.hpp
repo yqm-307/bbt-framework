@@ -28,10 +28,10 @@
 #include <bbt/example/v1/get_value.pb.h>
 
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
+#include <bbt/framework/Service.hpp>
 
 // ProtoCodec<GetValueRequest/Response> 特化 + in-memory store（getvalue 唯一真源）。
 #include "getvalue_service.hpp"
@@ -94,10 +94,13 @@ inline OpenGate& Gate() {
 
 // ── 验收服务：Hold（挂起/容量）+ Fast（即时）───────────────────────────────
 class LifecycleGateService final
-    : public fw::CoService<LifecycleGateService> {
+    : public fw::v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.LifecycleGateService";
+
+    explicit LifecycleGateService(fw::detail::ConstructKey k)
+        : fw::v2::CoService<>(k) {}
 
     // Hold：快照受管上下文 → 记录 entered → 在验收闩上以无界期限挂起
     // （让出 worker、保持物理在途、占服务容量）→ 放行后重取上下文并记录
@@ -163,6 +166,10 @@ public:
                         pb::GetValueRequest, pb::GetValueResponse>("Hold"),
         fw::ProtoMethod<&LifecycleGateService::Fast,
                         pb::GetValueRequest, pb::GetValueResponse>("Fast"));
+
+protected:
+    ~LifecycleGateService() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 } // namespace lifecycle

@@ -1,17 +1,14 @@
 // examples/dual_service/storage_main.cc — svc_a：存储服务进程。
 //
-// 业务形态：单进程托管一个 Concurrent 服务 "storage"，真实后端经
-// CoApp::add_resource 工厂装配为命名资源——Redis（"cache"，新 net 入口
-// bbt::infra::redis::CoRedisCli，经框架 RedisNetResource 适配进
-// ICoCloseable 关闭序列）与 MongoDB（"docs"，新 owner/句柄入口
-// bbt::infra::mongo::CoMongoDb + CoMongoColl，经框架 MongoDbResource
-// 适配进同一关闭序列；owner Close 返回即 ops 清空 + worker 全退），
-// handler 内 context().resource 取用。不再使用进程内 KvStore 替身：
-// put/get/del 落到真实后端往返，两端地址由命令行显式传入（无可达
-// 后端 → 工厂 Create 失败 → run 拒绝）。Redis 侧只接受数值
-// IPv4/IPv6（net::Address::Ip 不解析主机名，非法地址在装配期如实失败）。
-// 跨进程对端（gateway 经 static_routes 指向本进程）与 driver 都按 V2 会话
-// （SessionFrame + u32be + Hello/HelloAck）真实接入。
+// 业务形态：单进程托管一个 Concurrent 服务 "storage"，真实后端经 v2 组件
+// 装配为命名能力——Redis（"cache"，v2::RedisComponent：借用共享
+// net::Engine 的 CoRedisPool）与 MongoDB（"docs"，v2::MongoDBComponent：
+// 自有 worker 的 CoMongoDb + CoMongoColl）。handler 内 GetComponent + Borrow
+// 取用。不再使用进程内 KvStore 替身：put/get/del 落到真实后端往返，两端
+// 地址由命令行显式传入（无可达后端 → 组件 OnStart 失败 → CoStart 回退）。
+// Redis 侧只接受数值 IPv4/IPv6（net::Address::Ip 不解析主机名，非法地址
+// 在装配期如实失败）。跨进程对端（gateway 经静态路由指向本进程）与
+// driver 都按 V2 会话（SessionFrame + u32be + Hello/HelloAck）真实接入。
 //
 // 方法表：
 //   put(key, value)   写 Redis SET + Mongo upsert；空 key → InvalidArgument。
@@ -25,23 +22,24 @@
 // deadline（V2 入站已按 min(传输硬看门, now+budget) 收敛），不使用无限
 // deadline——调用方预算耗尽时后端调用随之受限，不悬挂在无界等待上。
 //
-// 优雅关闭：SIGINT/SIGTERM → watcher 线程调用 request_shutdown →
-// CoApp::run 返回生命周期返回码（0 = kExitOk 按期收束）；关闭序列经
-// _CloseResources 把两个后端资源收束到 IsClosed 终态（RedisNetResource
-// 的 Close 内完成 client 逻辑封口 + Engine RequestClose/join/Stopped 核验；
-// MongoDbResource 的 Close 内完成集合句柄门禁 + owner 同步物理收口——
-// 与新入口关闭契约一致）。
+// 优雅关闭：SIGINT/SIGTERM → 信号处理只置位标志，业务主协程在 Co 域观察到后
+// RequestShutdown → CoStop（不建 native watcher 线程、不 join）；组件
+// OnStop 把同一 CloseOptions 转发给各自 infra 对象（Redis 池 / Mongo owner
+// 都只关闭自己拥有的连接与 worker），共享 Engine 由入口 host hook 在主任务
+// 结束后 RequestClose，组件不关闭它。
+//
+// 入口是 runtime 的生成式 `bbtco_main`：进程不写 native main、不启动/停止
+// scheduler、不建 runner 线程、不等待 future。参数经环境变量传入：
+//   BBT_EXAMPLE_LISTEN_PORT / BBT_EXAMPLE_REDIS_ADDR / BBT_EXAMPLE_MONGO_URI
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
-#include <future>
 #include <memory>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <vector>
 
 #include <bbt/coroutine/coroutine.hpp>
@@ -50,13 +48,16 @@
 
 #include <bbt/infra/mongo/Client.hpp>
 #include <bbt/infra/net/Address.hpp>
+#include <bbt/infra/redis/CoRedisPool.hpp>
 
 #include <bbt/framework/Framework.hpp>
-#include <bbt/framework/CoApp.hpp>
-#include <bbt/framework/MongoDbResource.hpp>
-#include <bbt/framework/RedisNetResource.hpp>
+#include <bbt/framework/HostGate.hpp>
+#include <bbt/framework/MongoDBComponent.hpp>
+#include <bbt/framework/RedisComponent.hpp>
+#include <bbt/framework/V2.hpp>
 
 namespace fw  = bbt::framework;
+namespace v2  = bbt::framework::v2;
 namespace co  = bbt::coroutine;
 namespace inf = bbt::infra;
 
@@ -67,12 +68,12 @@ fw::CoRpcResp ArgErr(const char* what) {
         fw::MakeError(fw::ErrorCode::InvalidArgument, what));
 }
 
-// 缺资源统一错误：资源缝在 run 期已装配成功才分发，缺失即框架 invariant
+// 组件缺失统一错误：绑定在装配期已建立，GetComponent 缺失即框架 invariant
 // 被破坏，如实 RuntimeUnavailable。
 fw::CoRpcResp ResErr(const char* name) {
     return fw::CoRpcResp::Error(fw::MakeError(
         fw::ErrorCode::RuntimeUnavailable,
-        std::string("storage: resource '") + name + "' missing"));
+        std::string("storage: component '") + name + "' missing"));
 }
 
 // Mongo 值文档：把 string value 编进 {_id:key, v:value} 的最小 BSON。
@@ -127,12 +128,16 @@ inf::mongo::MongoDocument DocSet(std::string_view val) {
     return doc;
 }
 
-// 资源调用统一取入站预算：Redis/Mongo 出站不得用无限 deadline——本请求从
+// 组件借用统一取入站预算：Redis/Mongo 出站不得用无限 deadline——本请求从
 // wire 继承来的 deadline（上游已按 min(传输硬看门, now+budget) 收敛）就是
 // 后端调用的上限；无受管请求上下文即如实失败，不退化为无限等待。
-class StorageSvc final : public fw::CoService<StorageSvc> {
+class StorageSvc final
+    : public v2::CoService<v2::RedisComponent, v2::MongoDBComponent> {
 public:
     static constexpr std::string_view kServiceName = "storage";
+
+    explicit StorageSvc(fw::detail::ConstructKey k)
+        : v2::CoService<v2::RedisComponent, v2::MongoDBComponent>(k) {}
 
     fw::result<inf::CallOptions> ResourceBudget() {
         auto ctx = context().request();
@@ -150,17 +155,26 @@ public:
         if (!args) return fw::CoRpcResp::Error(args.error());
         auto& [key, value] = args.value();
         if (key.empty()) return ArgErr("storage.put: empty key");
-        auto cache = context().resource<fw::RedisNetResource>("cache");
-        auto docs  = context().resource<fw::MongoDbResource>("docs");
+        auto cache = GetComponent<v2::RedisComponent>("cache");
+        auto docs  = GetComponent<v2::MongoDBComponent>("docs");
         if (!cache) return ResErr("cache");
         if (!docs)  return ResErr("docs");
         auto budget = ResourceBudget();
         if (!budget) return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
-        // 真实双写：Redis SET 与 Mongo upsert 都成功才回写好的值。
-        if (auto r = bbt_co_await cache->Set(key, value, o); !r)
+        // 真实双写：Redis SET 与 Mongo upsert 都成功才回写好的值；借用在同一
+        // ComponentBorrow 寿命内完成，不持裸指针越过 borrow。
+        auto cache_borrow = cache.value().Borrow();
+        auto docs_borrow  = docs.value().Borrow();
+        if (!cache_borrow || !docs_borrow)
+            return ResErr("borrow");
+        if (auto r = bbt_co_await cache_borrow.value().Get().Pool().Set(
+                key, value, o);
+            !r)
             return fw::CoRpcResp::Error(r.error());
-        if (auto r = bbt_co_await docs->UpdateOne(DocKey(key), DocSet(value), o); !r)
+        if (auto r = bbt_co_await docs_borrow.value().Get().Collection().UpdateOne(
+                DocKey(key), DocSet(value), o);
+            !r)
             return fw::CoRpcResp::Error(r.error());
         std::printf("[svc_a] put key=%s (redis+mongo)\n", key.c_str());
         return fw::CoRpcResp::From(value);
@@ -170,19 +184,25 @@ public:
         auto args = req.Parse<std::string>();
         if (!args) return fw::CoRpcResp::Error(args.error());
         if (args.value().empty()) return ArgErr("storage.get: empty key");
-        auto cache = context().resource<fw::RedisNetResource>("cache");
-        auto docs  = context().resource<fw::MongoDbResource>("docs");
+        auto cache = GetComponent<v2::RedisComponent>("cache");
+        auto docs  = GetComponent<v2::MongoDBComponent>("docs");
         if (!cache) return ResErr("cache");
         if (!docs)  return ResErr("docs");
         auto budget = ResourceBudget();
         if (!budget) return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
         // 真实读路径：Redis GET 命中即回；miss 回退 Mongo FindOne。
-        auto hit = bbt_co_await cache->Get(args.value(), o);
+        auto cache_borrow = cache.value().Borrow();
+        auto docs_borrow  = docs.value().Borrow();
+        if (!cache_borrow || !docs_borrow)
+            return ResErr("borrow");
+        auto hit = bbt_co_await cache_borrow.value().Get().Pool().Get(
+            args.value(), o);
         if (!hit) return fw::CoRpcResp::Error(hit.error());
         if (hit.value().has_value())
             return fw::CoRpcResp::From(hit.value().value());
-        auto doc = bbt_co_await docs->FindOne(DocKey(args.value()), o);
+        auto doc = bbt_co_await docs_borrow.value().Get().Collection().FindOne(
+            DocKey(args.value()), o);
         if (!doc) return fw::CoRpcResp::Error(doc.error());
         if (doc.value().has_value()) {
             // 命中 Mongo 即算命中（值本体在文档字节里，示例只证真实往返）。
@@ -198,16 +218,22 @@ public:
     fw::CoRpcResp Del(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
         if (!args) return fw::CoRpcResp::Error(args.error());
-        auto cache = context().resource<fw::RedisNetResource>("cache");
-        auto docs  = context().resource<fw::MongoDbResource>("docs");
+        auto cache = GetComponent<v2::RedisComponent>("cache");
+        auto docs  = GetComponent<v2::MongoDBComponent>("docs");
         if (!cache) return ResErr("cache");
         if (!docs)  return ResErr("docs");
         auto budget = ResourceBudget();
         if (!budget) return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
-        auto rn = bbt_co_await cache->Delete({args.value()}, o);
+        auto cache_borrow = cache.value().Borrow();
+        auto docs_borrow  = docs.value().Borrow();
+        if (!cache_borrow || !docs_borrow)
+            return ResErr("borrow");
+        auto rn = bbt_co_await cache_borrow.value().Get().Pool().Delete(
+            {args.value()}, o);
         if (!rn) return fw::CoRpcResp::Error(rn.error());
-        auto mn = bbt_co_await docs->DeleteOne(DocKey(args.value()), o);
+        auto mn = bbt_co_await docs_borrow.value().Get().Collection().DeleteOne(
+            DocKey(args.value()), o);
         if (!mn) return fw::CoRpcResp::Error(mn.error());
         const bool removed = (rn.value() + mn.value()) > 0;
         return fw::CoRpcResp::From(static_cast<std::int32_t>(removed ? 1 : 0));
@@ -239,10 +265,14 @@ public:
         fw::Method<&StorageSvc::Get>("get"),
         fw::Method<&StorageSvc::Del>("del"),
         fw::Method<&StorageSvc::SleepMs>("sleep_ms"));
+
+protected:
+    ~StorageSvc() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 // signal → flag：handler 只做 async-signal-safe 的 atomic store；
-// watcher 线程轮询后调用 request_shutdown（避免在信号上下文里
+// watcher 线程轮询后调用 RequestShutdown（避免在信号上下文里
 // 触碰 condition_variable）。
 std::atomic_bool g_stop{false};
 
@@ -278,186 +308,179 @@ std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     return {addr.substr(0, pos), port};
 }
 
-// Redis 建连预算与工厂等待窗口：预算给 Connect 本身，窗口 = 预算 + 1s 宽限。
-// 两者等宽时「拨号在预算内刚成功」与「等待窗口到期」会同刻判定，把成功建连
-// 误判成超时（协程落定 promise 还要再被调度线程推进一格）。失败/超时路径的
-// 收尾由 RedisNetResource::Close 承担：client 逻辑封口 + Engine
-// RequestClose/join/Phase==Stopped 核验一次完成（幂等、任意线程可调）；被
-// 投递的协程按值持有 shared_ptr，故 Close 后迟到的 Connect 回调不会踩到
-// 已释放对象。
 constexpr auto kRedisConnectBudget = std::chrono::milliseconds{5000};
-constexpr auto kRedisConnectWait   = std::chrono::milliseconds{6000};
+
+std::string Env(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string{} : std::string{value};
+}
+
+// 生命周期结果 → 进程退出码：0 优雅关闭 / 1 校验拒绝 / 2 启动失败回退 /
+// 3 关闭曾超预算 / 4 关闭收尾存在失败项。
+int CoRc(const fw::result<void>& r) {
+    if (r)
+        return 0;
+    switch (r.error().code) {
+    case fw::ErrorCode::InvalidArgument:
+        return 1;
+    case fw::ErrorCode::TimedOut:
+        return 3;
+    default:
+        return 4;
+    }
+}
 
 } // namespace
 
-int main(int argc, char** argv) {
-    // 用法: svc_a <listen_port> <redis_addr host:port> <mongo_uri>
-    if (argc != 4) {
+// handler 经组件借用发起真实 Redis/Mongo 出站，嵌套出站链需要更大的协程栈；
+// 默认 12KB 触底。static worker 槽位 = 4（最小充分值）：每个 net::Engine 绑定
+// slot_count = max(1, num_event_loop) + (server ? 1 : 0)，槽位在 Run 时从 static
+// worker 绑定。本进程：共享 Engine 上 RPC server 2 槽（1 sub + 1 main）
+// + client 1 槽 = 3。
+void setup_runtime() {
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
+    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+}
+
+int bbtco_main() {
+    // 参数（生成式入口不暴露 argv）：BBT_EXAMPLE_LISTEN_PORT /
+    // BBT_EXAMPLE_REDIS_ADDR / BBT_EXAMPLE_MONGO_URI。
+    const std::string port_text = Env("BBT_EXAMPLE_LISTEN_PORT");
+    const std::string redis_text = Env("BBT_EXAMPLE_REDIS_ADDR");
+    const std::string mongo_uri = Env("BBT_EXAMPLE_MONGO_URI");
+    if (port_text.empty() || redis_text.empty() || mongo_uri.empty()) {
         std::fprintf(stderr,
-            "usage: svc_a <listen_port> <redis_addr host:port> <mongo_uri>\n");
+            "usage: svc_a with env BBT_EXAMPLE_LISTEN_PORT=<port> "
+            "BBT_EXAMPLE_REDIS_ADDR=<host:port> BBT_EXAMPLE_MONGO_URI=<uri>\n");
         return 64;   // EX_USAGE
     }
     std::uint16_t port = 0;
-    if (!ParsePort(argv[1], &port)) {
+    if (!ParsePort(port_text.c_str(), &port)) {
         std::fprintf(stderr,
             "[svc_a] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
-            argv[1]);
+            port_text.c_str());
         return 64;   // EX_USAGE
     }
-    const auto [rhost, rport] = SplitAddr(argv[2]);
+    const auto [rhost, rport] = SplitAddr(redis_text);
     if (rhost.empty() || rport == 0) {
         std::fprintf(stderr,
             "[svc_a] FATAL: 非法 redis_addr \"%s\"（需要 host:port，端口 1..65535）\n",
-            argv[2]);
+            redis_text.c_str());
         return 64;   // EX_USAGE
     }
-    const std::string mongo_uri = argv[3];
 
-    // 嵌套出站链的协程栈需求见实测记录：默认 12KB 触底，
-    // 本进程 handler 经资源缝发起真实 Redis/Mongo 出站，与对端保持同一配置。
-    // static worker 槽位 = 3（最小充分值）：每个 net::Engine 绑定
-    // slot_count = max(1, num_event_loop) + (server ? 1 : 0)，槽位在 Run 时
-    // 从 static worker 绑定。本进程：RedisNetResource 的 client-only Engine
-    // 1 槽 + RPC server Engine 2 槽（1 sub + 1 main）= 3；2 worker 时 bind 报
-    // no_buffer_space，InfraHttpHost::Start 失败。
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
-    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+    fw::AppNetworkOptions network;
+    network.SetLimits(inf::NetworkLimits{
+                          /*max_connections*/ 128,
+                          /*max_inflight*/    64,
+                          /*max_header_bytes*/16384,
+                          /*max_body_bytes*/  65536,
+                          /*incoming_timeout*/
+                          std::chrono::milliseconds{30000}})
+        .SetListenAddress(inf::ListenAddress{"127.0.0.1", port})
+        // V2 会话：入站预算经 wire 的 remaining_budget_ms 与本地
+        // incoming_timeout 取 local-min 后才对 handler 可见。
+        .SetLocalAppId("dual-storage");
 
-    fw::CoAppOptions opts;
-    opts.network_limits = bbt::infra::NetworkLimits{
-        /*max_connections*/ 128,
-        /*max_inflight*/    64,
-        /*max_header_bytes*/16384,
-        /*max_body_bytes*/  65536,
-        /*incoming_timeout*/std::chrono::milliseconds{30000}};
-    opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
-    // V2 会话：入站预算经 wire 的 remaining_budget_ms 与本地 incoming_timeout
-    // 取 local-min 后才对 handler 可见，资源调用据此获得有限预算。
-    opts.local_identity = "dual-storage";
-    opts.static_routes = {};                    // 纯被调方：无出站 RPC 路由
-    opts.shutdown_step_budget = std::chrono::milliseconds{2000};
+    auto app = v2::CoApp::Create(
+        fw::AppOptions{}
+            .SetLimits(64, 64, 8, 64)
+            .SetShutdownBudget(std::chrono::milliseconds{2000})
+            .SetLifecycleBudget(std::chrono::milliseconds{2000})
+            .SetNetworkOptions(std::move(network)),
+        "dual-storage");
 
-    fw::CoApp app{opts};
-    if (auto r = app.add_service<StorageSvc>(fw::ServiceOptions{
-            fw::ExecutionPolicy::Concurrent,
-            /*max_inflight*/ 64, 0, 0, false, 0, 0, 0});
-        !r) {
-        std::fprintf(stderr, "[svc_a] add_service failed: %s\n",
-                     r.error().message.c_str());
-        return 65;
-    }
-
-    // 真实后端：工厂形态装配。RedisNetResource::Create 在控制线程完成
-    // Engine Run 线程拉起 + 等 Running + client 装配（新入口：
-    // net::Engine + 数值 net::Address）；显式 Connect 只允许协程上下文。
-    // Mongo 的 Create 走旧 ICoCloseable 工厂形态不变——两个后端在
-    // on_scheduler_started 相位各自装配，关闭序列统一收束到 IsClosed。
-    // Redis 地址只接受数值 IPv4/IPv6：host:port 注入若含主机名/非法段在
-    // 装配前如实退出（EX_USAGE），不静默猜测。
+    // 真实后端组件：v2::RedisComponent 借用共享 Engine（app->engine()，由
+    // CoApp 持有并在入口 host hook 执行唯一一次 Run；组件不 Run/不关闭它），
+    // OnStart 在有限预算内全池建连——不可达后端即 CoStart 失败。Mongo 组件
+    // 自有 worker，不借 Engine。
     std::error_code raddr_ec;
     auto redis_address = inf::net::Address::Ip(rhost, rport, raddr_ec);
     if (raddr_ec || !redis_address.Valid()) {
         std::fprintf(stderr,
             "[svc_a] FATAL: 非法 redis_addr \"%s\"（新入口只接受数值 "
             "IPv4/IPv6: %s）\n",
-            argv[2], raddr_ec.message().c_str());
+            redis_text.c_str(), raddr_ec.message().c_str());
         return 64;   // EX_USAGE
     }
-    // Redis 工厂：Create 只建对象（含 Engine Run 线程）；命令要求先 Connect，
-    // 而 Connect 只允许在协程上下文调用。故工厂投递一个显式 Connect 到
-    // Scheduler，并在控制线程等它结束（与 tests live 验收同口径）——只有
-    // Connected 实例才交框架绑定 Service，使 ready 先于入站接纳；交付前任何
-    // 失败路径都同步 Close，不留半装配句柄。（否则 handler 首次命令会得到
-    // RuntimeUnavailable "redis: not connected"。）
-    if (auto r = app.add_resource<fw::RedisNetResource>("cache",
-            [redis_address]() -> inf::result<std::shared_ptr<fw::RedisNetResource>> {
-            auto created = fw::RedisNetResource::Create(redis_address);
-            if (!created)
-                return created;
-            auto client = created.value();
-            bool delivered = false;
-            struct CloseUnlessDelivered {
-                std::shared_ptr<fw::RedisNetResource> client;
-                const bool*                           released;
-                ~CloseUnlessDelivered() { if (!*released) client->Close(); }
-            } guard{client, &delivered};
-            auto promise = std::make_shared<std::promise<inf::result<void>>>();
-            auto done    = promise->get_future();
-            const inf::CallOptions call_options{
-                std::chrono::steady_clock::now() + kRedisConnectBudget};
-            bool submitted = false;
-            g_scheduler->RegistCoroutineTask(
-                [client, promise, call_options] {
-                    try {
-                        promise->set_value(
-                            bbt_co_await client->Connect(call_options));
-                    } catch (...) {
-                        promise->set_exception(std::current_exception());
-                    }
-                }, submitted);
-            if (!submitted)
-                return inf::result<std::shared_ptr<fw::RedisNetResource>>::err(
-                    fw::MakeError(fw::ErrorCode::Unavailable,
-                        "redis connect task registration failed"));
-            if (done.wait_for(kRedisConnectWait) !=
-                std::future_status::ready)
-                return inf::result<std::shared_ptr<fw::RedisNetResource>>::err(
-                    fw::MakeError(fw::ErrorCode::TimedOut,
-                        "redis connect wait timed out"));
-            auto connected = done.get();
-            if (!connected)
-                return inf::result<std::shared_ptr<fw::RedisNetResource>>::err(
-                    connected.error());
-            delivered = true;
-            return created;
-        }); !r) {
-        std::fprintf(stderr, "[svc_a] add_resource(cache) failed: %s\n",
+    v2::RedisComponent::Options redis_options;
+    redis_options.engine = app->engine();
+    redis_options.address = redis_address;
+    redis_options.pool.connections = 2;
+    redis_options.connect_timeout = kRedisConnectBudget;
+    if (auto r = bbt_co_await app->CoInstallComponent<v2::RedisComponent>(
+            "cache", redis_options);
+        !r) {
+        std::fprintf(stderr, "[svc_a] install cache failed: %s\n",
                      r.error().message.c_str());
         return 65;
     }
-
-    // Mongo：新 owner/句柄入口——MongoRuntimeConfig 只携带连接预算，
-    // database/collection 目标值由 MongoDbResource 绑定为集合句柄
-    // （target 不再走旧 MongoClientConfig 的 database/collection 字段）。
-    // MongoDbResource::Create 在控制线程完成 Validate + owner Create/Start +
-    // Collection 绑定；owner Close 是同步物理收口（ops 清空 + worker 全退）。
-    inf::mongo::MongoRuntimeConfig mcfg;
-    mcfg.uri                      = mongo_uri;
-    mcfg.worker_threads           = 2;
-    mcfg.max_queue                = 256;
-    mcfg.server_selection_timeout = std::chrono::milliseconds{5000};
-    mcfg.connect_timeout          = std::chrono::milliseconds{5000};
-    mcfg.socket_timeout           = std::chrono::milliseconds{5000};
-    mcfg.wait_queue_timeout       = std::chrono::milliseconds{5000};
-    const inf::mongo::MongoTarget mtarget{"bbt_dual_service", "kv"};
-    if (auto r = app.add_resource<fw::MongoDbResource>("docs",
-            [mcfg, mtarget] {
-                return fw::MongoDbResource::Create(mcfg, mtarget);
-            });
+    v2::MongoDBComponent::Options mongo_options;
+    mongo_options.config.uri = mongo_uri;
+    mongo_options.config.worker_threads = 2;
+    mongo_options.config.max_queue = 256;
+    mongo_options.config.server_selection_timeout =
+        std::chrono::milliseconds{5000};
+    mongo_options.config.connect_timeout = std::chrono::milliseconds{5000};
+    mongo_options.config.socket_timeout = std::chrono::milliseconds{5000};
+    mongo_options.config.wait_queue_timeout = std::chrono::milliseconds{5000};
+    mongo_options.target.database = "bbt_dual_service";
+    mongo_options.target.collection = "kv";
+    if (auto r = bbt_co_await app->CoInstallComponent<v2::MongoDBComponent>(
+            "docs", mongo_options);
         !r) {
-        std::fprintf(stderr, "[svc_a] add_resource(docs) failed: %s\n",
+        std::fprintf(stderr, "[svc_a] install docs failed: %s\n",
+                     r.error().message.c_str());
+        return 65;
+    }
+    if (auto r = bbt_co_await app->CoInstallService<StorageSvc>(
+            fw::ServiceOptions{}
+                .SetMaxInflight(64)
+                .BindComponent<v2::RedisComponent>("cache")
+                .BindComponent<v2::MongoDBComponent>("docs"));
+        !r) {
+        std::fprintf(stderr, "[svc_a] CoInstallService failed: %s\n",
                      r.error().message.c_str());
         return 65;
     }
 
     InstallSignals();
-    std::thread watcher([&app] {
-        while (!g_stop.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds{20});
-        app.request_shutdown();
-    });
+
+    auto started = bbt_co_await app->CoStart();
+    if (!started) {
+        std::fprintf(stderr, "[svc_a] start failed: %s\n",
+                     started.error().message.c_str());
+        return CoRc(started);
+    }
 
     std::printf("[svc_a] storage service on 127.0.0.1:%u "
                 "(redis=%s mongo=%s)\n",
-                port, argv[2], mongo_uri.c_str());
+                port, redis_text.c_str(), mongo_uri.c_str());
     std::fflush(stdout);
-    const int rc = app.run();   // 0 = kExitOk
-    g_stop.store(true, std::memory_order_release);
-    watcher.join();
-    std::printf("[svc_a] run() returned %d, shutdown_state=%d\n",
-                rc, static_cast<int>(app.shutdown_state()));
-    for (const auto& f : app.lifecycle_failures())
-        std::fprintf(stderr, "[svc_a] lifecycle_failure: %s\n", f.c_str());
+
+    // 关闭触发只有信号：处理函数只置位标志，主协程在 Co 域轮询到后请求关闭。
+    while (!g_stop.load(std::memory_order_acquire))
+        bbtco_sleep(20);
+    app->RequestShutdown();
+    auto requested = bbt_co_await app->CoWaitShutdownRequest();
+    if (!requested) {
+        std::fprintf(stderr, "[svc_a] wait shutdown request failed: %s\n",
+                     requested.error().message.c_str());
+    }
+    auto stopped = bbt_co_await app->CoStop();
+    const int rc = CoRc(stopped);
+    std::printf("[svc_a] CoStop returned %d, state=%d\n",
+                rc, static_cast<int>(app->State()));
+    for (const auto& f : app->LifecycleFailures())
+        std::fprintf(stderr, "[svc_a] lifecycle_failure: %s\n",
+                     f.message.c_str());
     std::fflush(stdout);
     return rc;
 }
+
+// 入口 native host hook：共享 Engine 的 Engine::Run 在主线程执行一次。
+int bbtco_main_host_hook(bbt::coroutine::HostHookContext& ctx) {
+    return bbt::framework::HostGate::RunHostGate(ctx);
+}
+
+BBTCO_MAIN_WITH_SETUP_AND_HOST_HOOK();

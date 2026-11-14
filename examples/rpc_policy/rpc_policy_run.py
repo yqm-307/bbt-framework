@@ -4,20 +4,24 @@
 由 ctest 调用：
   rpc_policy_run.py --bin <rpc_policy> --results <json>
 
-每场景独立 spawn 一个 fixture 子进程（一 CoApp 一策略），经唯一 V2 codec
+每场景独立 spawn 一个 fixture 子进程（一 v2::CoApp 一策略），经唯一 V2 codec
 （tests/rpc_v2_wire.py）真实 Call 打 caller 服务，读 fixture journal 断言：
 
   1. allow     —— 策略放行：调用成功、Preflight 恰一次、callee handler 恰一次；
   2. reject    —— 策略拒绝（Cancelled）：调用报错、Preflight 一次、callee 零 hit
-                  （观测；「出站未发送」由 CoApp 在 Send 前返回的源码结构保证）；
+                  （观测；「出站未发送」由 AppRuntimeState::Send 在发送前返回
+                  的源码结构保证）；
   3. tighten   —— 收紧期限只缩不放：callee 可见剩余预算 ≤ 收紧值且 < 原预算；
   4. widen     —— 策略放大期限被框架忽略：剩余预算仍≈原预算（绝不放大到上限）；
   5. expired   —— 收紧到已过期：调用方 I/O 前 TimedOut、callee 零 hit；
   6. decorator —— 外层包内层：两个虚 Preflight 各一次、顺序固定（outer→inner）；
   7. noroute   —— 未配置静态路由：NotFound、Preflight 计数为 0（路由先于策略）；
-  8. shutdown  —— stdin EOF → 收束 rc=0/state=Closed/owner 同步 Close，且 fixture
-                  在 `app.run()` 返回后、进程退出前对自己 bound 端口发一次有界
-                  探针（journal event=listener_probe），driver 核该事件为 refused。
+  8. shutdown  —— stdin EOF → 收束 rc=0/state=Stopped/owner 同步 OnStop，且
+                  fixture 在 `CoStop()` 返回后、进程退出前对自己 bound 端口发
+                  一次有界探针（journal event=listener_probe），driver 核该事件
+                  为 refused。
+
+策略经 AppOptions.SetRpcPolicy 真实装配，所有策略断言必须执行。
 
 关闭后断言的对象是**存活期探针事件**（B1）：进程回收后再 connect 必然
 ECONNREFUSED，与框架是否关闭 listener 无关，那种断言恒真、不构成证据。本驱动
@@ -231,8 +235,13 @@ def scenario(fixture, mode, work_root, calls, assert_fn, timeout):
     proc = None
     entries, shutdown_rec = [], {}
     try:
+        # 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
         proc = subprocess.Popen(
-            [fixture, mode, port_file, meta_file, journal_file],
+            [fixture],
+            env=dict(os.environ, BBT_EXAMPLE_MODE=mode,
+                     BBT_EXAMPLE_PORT_FILE=port_file,
+                     BBT_EXAMPLE_META_FILE=meta_file,
+                     BBT_EXAMPLE_JOURNAL_FILE=journal_file),
             stdin=subprocess.PIPE,
             stdout=sys.stderr,
             stderr=sys.stderr,
@@ -262,7 +271,7 @@ def scenario(fixture, mode, work_root, calls, assert_fn, timeout):
         ok = (
             rc == 0
             and shutdown_rec.get("rc") == "0"
-            and shutdown_rec.get("state") == "3"  # ShutdownState::Closed
+            and shutdown_rec.get("state") == "6"  # AppState::Stopped
             and shutdown_rec.get("owner_closed") == "1"
             and count_event(entries, "resource_close") == 1
         )
@@ -279,14 +288,14 @@ def scenario(fixture, mode, work_root, calls, assert_fn, timeout):
             f"{mode}.after-close",
         )
         finish(f"{mode}.after-close", ok_probe)
-        RESULTS[f"{mode}.after-close"] = {
+        RESULTS[f"{mode}.after-close"].update({
             "listener_probe": (
                 {k: probe.get(k) for k in ("phase", "port", "result", "errno")}
                 if probe
                 else None
             ),
             "auth_state": AUTH_STATE,
-        }
+        })
         proc = None
         return entries, shutdown_rec, port
     finally:

@@ -5,19 +5,32 @@
 // 能力集合的运行时判定与绑定表。类型化的 v2::CoService<Components...> 与
 // GetComponent 在 Service.hpp 中；这里不引入第二套服务抽象。
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <typeinfo>
 #include <vector>
 
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
+
+#include <bbt/framework/CallOptions.hpp>
+#include <bbt/framework/CoRpc.hpp>
 #include <bbt/framework/Object.hpp>
+#include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/Result.hpp>
+#include <bbt/framework/Route.hpp>
+#include <bbt/framework/ServiceContext.hpp>
 #include <bbt/framework/internal/ObjectBase.hpp>
 
 namespace bbt::framework {
 
 class MonitorWriter;   // 监控写端（后续切片；仅前置声明）
+class ActorRegistry;
 
 namespace v2 {
 
@@ -46,6 +59,41 @@ protected:
     /// @brief 受控构造，只接受 Registry 发放的 ConstructKey。
     explicit CoServiceBase(detail::ConstructKey) {}
     ~CoServiceBase() noexcept override = default;   // 仅经 Registry 类型化 deleter
+
+    /// @brief 受管出站调用；协议、预算、路由和发送均由 App 内部完成。
+    [[nodiscard]] result<CoRpcResp> call(
+        std::string_view service_name,
+        std::string_view method_name,
+        const CoRpcReq& request,
+        const RouteFields& custom = {},
+        const CallOptions& options = {});
+
+    /// @brief typed proto 出站调用，复用同一受管发送路径。
+    template <class Req, class Resp>
+    [[nodiscard]] result<Resp> call(
+        std::string_view service_name,
+        std::string_view method_name,
+        const Req& request,
+        const RouteFields& custom = {},
+        const CallOptions& options = {}) {
+        static_assert(rpc_detail::is_proto_codec_v<Req> &&
+                      rpc_detail::is_proto_codec_v<Resp>,
+            "typed call requires ProtoCodec<Req>/ProtoCodec<Resp> specializations");
+        auto encoded = rpc_detail::ProtoCodec<Req>::Encode(request);
+        if (!encoded)
+            return result<Resp>::err(std::move(encoded.error()));
+        auto reply = _CallSend(
+            service_name, method_name,
+            Req::descriptor()->full_name(), Resp::descriptor()->full_name(),
+            std::move(encoded.value()), custom, options);
+        if (!reply)
+            return result<Resp>::err(std::move(reply.error()));
+        return rpc_detail::ProtoCodec<Resp>::Decode(reply.value());
+    }
+
+    /// @brief 当前受管请求上下文。
+    ServiceContext& context() noexcept { return m_context; }
+    const ServiceContext& context() const noexcept { return m_context; }
 
     // 业务 hook 约定：OnInstall/OnUninstall 在调用协程内宿主域执行；
     // OnStart/OnPause/OnResume/OnStop 在受管协程执行（hook 任务持有对象
@@ -147,11 +195,42 @@ protected:
     virtual bool _AllowsComponent(const std::type_info& t) const noexcept = 0;
 
 private:
+    using RpcSendFn = std::function<result<bbt::infra::rpc::Response>(
+        const bbt::infra::rpc::Request&, const bbt::infra::CallOptions&)>;
+
+    void _bind_runtime(bbt::coroutine::CoObjectInfo info,
+                       std::optional<std::string> actor_key,
+                       RpcSendFn send) {
+        m_object_info = std::move(info);
+        m_actor_key = std::move(actor_key);
+        m_send = std::move(send);
+    }
+    void _bind_actor_key(std::optional<std::string> actor_key) {
+        m_actor_key = std::move(actor_key);
+    }
+    std::string _NextRequestId();
+    result<std::vector<std::uint8_t>> _CallSend(
+        std::string_view service_name,
+        std::string_view method_name,
+        std::string_view request_schema,
+        std::string_view response_schema,
+        std::vector<std::uint8_t> payload,
+        const RouteFields& custom,
+        const CallOptions& options);
+
+    bbt::coroutine::CoObjectInfo m_object_info{};
+    std::optional<std::string> m_actor_key;
+    RpcSendFn m_send;
+    ServiceContext m_context;
+    inline static std::atomic<std::uint64_t> s_call_seq{0};
+
+private:
     // subject 绑定表与 _FindBoundCopy/_BindComponentEntry 等簿记由
     // detail::ObjectBase 承载（CoComponent/CoActor/CoService 共用同一份实现）。
 
     friend class detail::Registry;
     friend class ::bbt::framework::v2::CoApp;
+    friend class ::bbt::framework::ActorRegistry;
 };
 
 } // namespace v2

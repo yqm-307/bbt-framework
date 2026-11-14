@@ -77,6 +77,27 @@ if(TARGET bbt::infra_redis_net AND TARGET bbt::infra_mongo)
     target_compile_definitions(ecommerce_cluster PRIVATE EC_STORAGE_AVAILABLE=1)
 endif()
 
+# 发现组件的 Co 资源生命周期回归（无后端）：直接编译同一份 discovery.cc，
+# 用测试自持的不可达 loopback 地址验证启动失败收口；不注册 live 用例、
+# 不连接任何 Consul/Redis/Mongo 后端。
+add_executable(Test_framework_discovery_co_lifecycle
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/Test_framework_discovery_co_lifecycle.cc"
+    discovery.cc)
+target_include_directories(Test_framework_discovery_co_lifecycle PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
+target_link_libraries(Test_framework_discovery_co_lifecycle PRIVATE
+    bbt::framework
+    bbt::infra_consul
+    Boost::boost
+    Threads::Threads)
+target_compile_options(Test_framework_discovery_co_lifecycle
+    PRIVATE -Wall -Wextra)
+add_test(NAME examples.discovery_co_lifecycle
+    COMMAND Test_framework_discovery_co_lifecycle)
+set_tests_properties(examples.discovery_co_lifecycle PROPERTIES
+    TIMEOUT 60 LABELS "integration")
+
 # CTest 只在显式给出 consul 可执行文件时注册（与 Redis/Mongo live 门禁同一口径：
 # 没有后端就不假装有 live 门禁）。驱动器仍可手工直接跑，见 README。
 set(BBT_CONSUL_BINARY "" CACHE FILEPATH

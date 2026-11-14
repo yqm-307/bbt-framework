@@ -1,40 +1,37 @@
 #pragma once
-// 宿主生命周期状态机与网络宿主注入点（机器面，internal/）。
+// Co 宿主生命周期状态机与网络宿主注入点（机器面，internal/）。
+//
 // 固定资源顺序（本仓验收矩阵与 HostLifecycle 实现为真源）：
-//   coroutine runtime 初始化（一次 Start，已初始化则复用）→ 网络组件
-//   Create/Start（开始接纳）→ 运行 → StopAccepting → 等 handler 结束
-//   → 资源 Close（同步）→ 网络 Close（同步收口）→ 释放网络/业务对象
-//   → run 返回。
-// 每个等待步先使用有限预算；当前关闭等待步为 WaitHandlersDone。预算耗尽
-// （TimedOut）或排空返回**非超时错误**都表示「排空未被证实」：一律进入
-// ShutdownIncomplete——控制线程仍在 Run 内继续等待迟到收尾，不提前走
-// 「关闭/释放/返回」三步，不假装成功，不 _Exit/abort、不强杀线程。
-// 未证实排空复用同一条「无界期限（Deadline::max）续等一次」路径：续等成功
-// 即证明迟到收尾完成，照常走完整收束（预算耗尽的迟到完成 → Run 返回
-// kExitShutdownLate；非超时错误的迟到完成 → kExitShutdownFailed）。
-// 若续等仍失败（永久排空失败），则 fail-closed：保持 ShutdownIncomplete、
-// 保留 owner 与资源、run 返回前**绝不** Close/release、Run 永不返回；不
-// busy retry、不提供公共恢复 API，结束由外部终止进程负责。资源收束
-// （on_handlers_drained → 网络 Close → on_release）只在「排空被证实」
-// （WaitHandlersDone 返回 ok）之后发生。
+//   coroutine runtime 已由 runtime main 启动（本状态机不 Start/不 Stop runtime）
+//   → 资源创建/启动 + 业务对象绑定（on_scheduler_started）
+//   → 网络组件 Create（Engine Idle 装配）→ 网络 Start 并经
+//     Engine::CoWaitRunning 等入口 host hook 在主线程执行的 Run 发布 Ready
+//     （开始接纳）→ 运行
+//   → StopAccepting（封业务门）→ 等 handler 排空 → on_handlers_drained
+//     （调用方自己的收束挂接点）→ 网络 Co Close
+//   → 等 PhysicalReleased → 释放业务对象。
 //
-// 例外是宿主 Close 打断排空：INetworkHost::CloseReason() 已发布原因时，
-// 排空等待立即结束，**不再 park**——这不是「排空被证实」，所以资源收束
-// 挂接点 on_handlers_drained 不执行（业务 handler 可能仍借用业务对象），
-// 只走网络 Close 与 on_release，记失败项并返回 kExitShutdownFailed
-// （预算曾耗尽则按 kExitShutdownLate 报告迟到收尾）。
+// 全部步骤在调用方的受管协程内执行：等待一律 CoWaiter + 持久谓词（50ms 分片由
+// 各等待点实现），不建 control/reaper 线程，不使用 std::thread / future /
+// promise / condition_variable，也不在业务路径阻塞 OS 线程。Engine 的 native
+// 执行只由应用入口 host hook 调一次 `Engine::Run`；本状态机只观察
+// `CoWaitRunning`/`Phase()`，不持有 runner/线程/join。
 //
-// coroutine runtime 是进程寿命单例：没有 Stop/restart，也不改代际；本
-// 状态机只在未初始化时 Start 一次，已初始化（他人启动或上一次 run 复用）
-// 直接复用，不叠加 Start。
+// 关闭语义（诚实终态）：CoStop 用调用方给的同一绝对期限收口；排空未被证实
+// （期限耗尽）时进入 StopIncomplete、保留 owner/资源并如实返回 TimedOut，
+// 允许再次以更晚期限调用推进。首因固定、步骤幂等；不发「已排空」信号，也不把
+// 网络 Close 的成功当作业务排空。
 //
-// 可测性：网络组件的创建/启动/停止接纳/等待排空/同步关闭全部经过
-// INetworkHost 抽象接口（注入点），测试可用桩组件断言调用顺序、异常路径
-// 与超时路径，不需要真实 socket；真实 HTTP 适配见 InfraHttpHost。
+// 关闭打断：网络宿主已发布关闭原因（INetworkHost::CloseReason）时，排空立即
+// 结束且不进入资源收束挂接点（业务 handler 可能仍借用业务对象），只走网络
+// Close 与释放，记失败项并如实返回原因——这不是「排空被证实」。
+//
+// 可测性：宿主组件的全部步骤经过 INetworkHost 抽象接口（注入点），测试可用
+// Co 桩组件断言调用顺序与失败路径，不需要真实 socket；真实 HTTP/RPC 适配见
+// InfraHttpHost。
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -42,158 +39,163 @@
 #include <string>
 #include <vector>
 
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/sync/WaitTypes.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
+
+#include <bbt/infra/CloseOptions.hpp>
 
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/ShutdownState.hpp>
 
 namespace bbt::framework {
 
-// INetworkHost：CoApp 的网络依赖组件（Server/Client/连接池由它拥有，
-// 不是 Service 的父类）。全部方法在宿主控制线程（Run 所在线程）
-// 调用；实现不得依赖「运行在协程内」。真实实现在内部桥接 infra
-// net::Engine/http::Server 的同步关闭语义；桩实现用于断言顺序与异常路径。
+// INetworkHost：CoApp 的网络依赖组件（Engine/Server/Client 由它拥有，不是
+// Service 的父类）。全部方法只允许在宿主控制协程（co_start/co_stop 调用者）
+// 内调用；实现不得依赖「运行在 native 控制线程上」。真实实现在内部消费
+// infra net::Engine（CoWaitRunning/Phase/物理凭据）/ http::Server /
+// rpc::CoRpcServer 的 Co 面；
+// 桩实现用于断言顺序与失败路径。
 //
 // 实现约束：
 //  - Create 成功后，无论 Start 是否成功，关闭序列（StopAccepting →
-//    WaitHandlersDone → Close）必须安全可调（未启动部分视为空操作）；
-//  - WaitHandlersDone 在 deadline 耗尽时必须返回超时（TimedOut），
-//    不得无限阻塞；宿主在预算耗尽后会以 Deadline::max() 再次调用同一
-//    入口等待迟到收尾；非预算性错误按 err(其它 code) 如实返回，宿主
-//    不得把任何错误当作「已排空」；
-//  - StopAccepting/Close 幂等、noexcept。Close 同步完成物理释放
-//    （对应 infra ICoCloseable::Close：返回即资源已释放、后端不再访问）。
-//  - Close(reason) 是「立即关闭、不先排空」的同义入口：默认丢弃原因转
-//    Close()，需要把原因发布给排空等待者的实现覆盖。
+//    WaitHandlersDone → Close → WaitPhysicalReleased）必须安全可调（未启动
+//    部分视为空操作）；
+//  - Start/WaitHandlersDone/Close/WaitPhysicalReleased 先做 Co 域 gate：非受管
+//    协程返回 err(InvalidContext)，且无副作用；等待用 CoWaiter 与持久谓词按
+//    min(deadline, now+50ms) 分片，绝不退回 native CV；
+//  - WaitHandlersDone 在期限耗尽返回 TimedOut，不得无界阻塞；非预算性错误按
+//    err(其它 code) 如实返回，宿主不得把任何错误当作「已排空」；
+//  - StopAccepting 幂等、noexcept（只封业务门，不等在途）；
+//  - Close 是逻辑封口 + 首因发布（幂等、不可重开），不证明物理释放；
+//    WaitPhysicalReleased 才是物理凭据。
 class INetworkHost {
 public:
     virtual ~INetworkHost() = default;
 
-    // 创建网络组件（真实实现对应 InfraHttpHost::Create + 监听装配）。
+    // 创建网络组件（真实实现对应 Engine Idle 装配 + listener 安装）。
     virtual result<void> Create() = 0;
-    // 启动组件并开始接纳。同一实例至多成功一次。
-    virtual result<void> Start() = 0;
+    // 启动并等待真实 Ready（真实实现经 Engine::CoWaitRunning；Run 由应用
+    // 入口 host hook 执行一次）。
+    virtual bbt_co_async(result<void>) Start(
+        const bbt::coroutine::WaitOptions& wait) = 0;
     // 停止新入站接纳；不取消已接纳 handler、不断开其回复路径。
     virtual void StopAccepting() noexcept = 0;
     // 等已接纳 handler 结束（排空）。超时 → err(TimedOut)；宿主已被
-    // Close 打断 → 立即返回关闭原因，不无限等。
-    virtual result<void> WaitHandlersDone(
-        bbt::coroutine::Deadline deadline) = 0;
-    // 同步关闭并释放网络组件：返回即物理资源已释放、后端不再访问。
-    // 幂等、noexcept；在控制线程调用（真实实现对应 InfraHttpHost::Close）。
-    virtual void Close() noexcept = 0;
-    // 带原因的立即关闭；默认丢弃原因转 Close()，既有桩实现保持源兼容。
-    virtual void Close(bbt::infra::Error reason) noexcept {
-        (void)reason;
-        Close();
-    }
+    // Close 打断 → 立即返回关闭原因，不等满期限。
+    virtual bbt_co_async(result<void>) WaitHandlersDone(
+        const bbt::coroutine::WaitOptions& wait) = 0;
+    // 逻辑封口并发布首因；不等待业务 handler 返回，也不等物理释放。
+    virtual bbt_co_async(result<void>) Close(
+        const bbt::infra::CloseOptions& options) = 0;
+    // 等本代网络资源与 native runner 责任都收口（infra 物理凭据）。
+    virtual bbt_co_async(result<void>) WaitPhysicalReleased(
+        const bbt::coroutine::WaitOptions& wait) = 0;
     // Close 发布的原因；未 Close 为空。HostLifecycle 用「原因是否存在」这个
-    // 明确状态判断「排空被关闭打断」，不按具体 ErrorCode 猜测（自定义原因
-    // 也可能是任意 code）。
-    virtual std::optional<bbt::infra::Error> CloseReason() const noexcept {
-        return std::nullopt;
-    }
+    // 明确状态判断「排空被关闭打断」，不按具体 ErrorCode 猜测。
+    virtual std::optional<bbt::infra::Error> CloseReason() const = 0;
 };
 
-// HostLifecycle：把启动/关闭顺序实现为可断言状态机。单实例、单线程使用
-// （Run 在控制线程调用；RequestShutdown/State/IncompleteSteps 可由外部
-// 监督线程调用）。
+// HostLifecycle：把启动/关闭顺序实现为可断言的 Co 状态机。单实例、单控制
+// 协程使用（Start/Stop 在同一 owner 协程序列调用）；RequestShutdown/State 可由
+// 任意线程观察。
 class HostLifecycle {
 public:
     // 比对外枚举更细的可观测相位；State() 归并到 ShutdownState 四态。
-    // Failed：启动失败已回退、或关闭收尾存在硬性失败项；对外归并为 Closed
-    // （不再运行），真实原因经 Failures()/IncompleteSteps() 与返回码表达。
+    // Failed：启动失败已回退、或关闭收尾存在硬性失败项；对外归并为 Closed。
     enum class Phase {
         Idle,
         Starting,
         Running,
-        Closing,
+        Stopping,
         ShutdownIncomplete,
         Closed,
         Failed,
     };
 
-    // Run 返回码（CoApp::run 沿用同一组）。
-    static constexpr int kExitOk             = 0;  // 按期优雅关闭
-    static constexpr int kExitRejected       = 1;  // 前置/校验失败，未启动任何组件
-    static constexpr int kExitStartFailed    = 2;  // 启动中途失败，已按序回退
-    static constexpr int kExitShutdownLate   = 3;  // 关闭曾超预算，迟到收尾已全部完成
-    static constexpr int kExitShutdownFailed = 4;  // 关闭收尾存在失败项
-
     // 启动/关闭期挂接点（CoApp 用）：
-    //  - on_scheduler_started：coroutine runtime Start 之后、网络 Create
-    //    之前执行（资源创建/启动 + 服务身份绑定等）；失败按启动失败回退；
+    //  - on_scheduler_started：网络 Create 之前执行（资源创建/启动 + 业务身份
+    //    绑定等）；失败按启动失败回退。wait 是本次 Start 的有限期限，资源
+    //    CoStart 必须消费同一预算，不另设第二套；
     //  - on_handlers_drained：StopAccepting → WaitHandlersDone 之后、网络
-    //    Close 之前执行（资源同步 Close 收束）。仅在网络组件已立起
-    //    （Create 成功）的关闭序列中调用。不得抛异常（抛出按失败项记录）；
-    //  - on_release：网络 Close 之后执行（业务对象回收 + 启动失败回退时的
-    //    资源收束兜底）。不得抛异常。
+    //    Close 之前执行（资源收束）。仅在排空被证实时调用；CloseOptions 与
+    //    本次收口相同，失败如实返回而不是吞掉；不得抛异常（抛出按失败项记录）；
+    //  - on_release：网络 Close 之后执行（业务对象回收 + 启动失败回退时的资源
+    //    收束兜底）。不得抛异常。
     struct Hooks {
-        std::function<result<void>()> on_scheduler_started;
-        std::function<void()>         on_handlers_drained;
-        std::function<void()>         on_release;
+        std::function<result<void>(const bbt::coroutine::WaitOptions&)>
+            on_scheduler_started;
+        // 网络 Create 成功后、Start 之前执行（测试/入口在宿主原生线程启动共享
+        // Engine 的等价 host hook）；不得抛异常。
+        std::function<void()> on_host_created;
+        std::function<result<void>(const bbt::infra::CloseOptions&)>
+            on_handlers_drained;
+        std::function<void()> on_release;
     };
 
-    // step_budget：每个等待步的有限预算（WaitHandlersDone 获得一次
-    // now()+step_budget 的期限）。external_request 为可选外部
-    // 关闭请求位（CoApp::request_shutdown 的早于 Run 的调用经它传达）；
-    // 非空时其置位与 RequestShutdown 等效。
+    // step_budget：单次 Co Stop 未显式给期限时的有限上限（默认收口预算）。
     HostLifecycle(std::shared_ptr<INetworkHost> host,
-                  std::chrono::milliseconds step_budget,
-                  const std::atomic_bool* external_request = nullptr);
+                  std::chrono::milliseconds step_budget);
 
-    // 控制线程入口：执行完整生命周期。至多重入一次（重复调用 → kExitRejected）。
-    // 阻塞至关闭请求到来并完成收束；ShutdownIncomplete 期间不返回。
-    int Run(const Hooks& hooks);
+    // 控制协程入口：装配 → Start → 等 Ready。已在启动/运行/已关闭 → err(Busy/
+    // Closed)。启动失败按固定顺序回退并返回原错误（不留半启动状态）。
+    bbt_co_async(result<void>) Start(const Hooks& hooks);
 
-    // 幂等、noexcept：请求关闭。可在 Run 之前/之中由任意线程调用。
+    // 控制协程入口：按 options 的绝对期限收口。Graceful 必须给有限期限；
+    // 排空未被证实 → ShutdownIncomplete + err(TimedOut)，owner/资源保留。
+    bbt_co_async(result<void>) Stop(const bbt::infra::CloseOptions& options,
+                                    const Hooks& hooks);
+
+    // 单一 shutdown-request 等待槽：持久请求谓词，先请求后等待不丢；第二个
+    // 活动 waiter → err(Busy)；期限耗尽 → err(TimedOut) 且不清请求。
+    bbt_co_async(result<void>) WaitShutdownRequest(
+        const bbt::coroutine::WaitOptions& wait);
+
+    // 幂等、noexcept：请求关闭。可在任意线程/域调用；只置位并唤醒等待槽，
+    // 不执行 hook、不调用 Stop、不等待自身。
     void RequestShutdown() noexcept;
 
-    Phase         PhaseNow() const noexcept;
+    Phase PhaseNow() const noexcept;
     ShutdownState State() const noexcept;
     // 曾进入且尚未完成的清理步名（可观察未完成项）。
     std::vector<std::string> IncompleteSteps() const;
-    // 收尾失败步名与原因（预算超时不算失败，算 kExitShutdownLate）。
+    // 收尾失败步名与原因（期限耗尽不算失败，按 TimedOut 返回）。
     std::vector<std::string> Failures() const;
 
 private:
-    // 排空等待结果：Drained 才允许 Close/release；Interrupted 表示宿主已被
-    // Close（明确状态，不看错误码），照常收束但业务资源排空未获证实；
-    // Undrained 是永久失败，调用方 fail-closed。
-    enum class DrainOutcome { Drained, Interrupted, Undrained };
-
+    result<void> _CheckCoContext(const char* entry) const;
     result<void> _StartUp(const Hooks& hooks);
-    void         _WaitShutdownRequest();
-    int          _ShutDown(const Hooks& hooks);   // 返回 kExit*，固定顺序收束
-    // 预算内等待 + 一次无界续等；Drained 表示排空已被证实（此时才允许
-    // Close/release），Interrupted 表示 Close 打断（不 park），Undrained 表示
-    // 排空未被证实（调用方须 fail-closed）。
-    DrainOutcome _WaitHandlersDone();
-    // 排空未被证实时的 fail-closed 保活：不 Close/release、Run 永不返回，
-    // 保持 ShutdownIncomplete 与 owner/资源；无公共恢复 API、不 busy retry。
-    void         _ParkUndrained();
-    void         _OnHandlersDrained(const Hooks& hooks);  // 资源同步关闭挂接点
-    bbt::coroutine::Deadline _StepDeadline() const;
-    void         _EnterIncomplete(const char* step);
-    void         _LeaveIncomplete(const char* step);
-    void         _AddFailure(std::string what);
-    void         _SetPhase(Phase p) noexcept;
+    result<void> _Stop(const bbt::infra::CloseOptions& options,
+                       const Hooks& hooks);
+    // 收口实现（不含异常边界）：_Stop 把宿主/hook 抛出的异常收口为可观察失败项。
+    result<void> _StopInner(const bbt::infra::CloseOptions& options,
+                            const Hooks& hooks);
+    // 启动失败回退：固定顺序、Immediate 封口、不掩盖原错误。
+    void _Rollback(const Hooks& hooks) noexcept;
+    result<void> _OnHandlersDrained(const Hooks& hooks,
+                                    const bbt::infra::CloseOptions& options);
+    bool _CoPending() const noexcept;
+    void _EnterIncomplete(const char* step);
+    void _LeaveIncomplete(const char* step);
+    void _AddFailure(std::string what);
+    void _SetPhase(Phase p) noexcept;
 
-    std::shared_ptr<INetworkHost>      m_host;
-    const std::chrono::milliseconds    m_step_budget;
-    const std::atomic_bool* const      m_external_request;
+    const std::shared_ptr<INetworkHost> m_host;
+    const std::chrono::milliseconds m_step_budget;
 
-    std::atomic_bool                   m_started{false};
-    std::atomic_bool                   m_shutdown_req{false};
-    std::atomic_bool                   m_host_created{false};
-    std::atomic_bool                   m_exceeded_budget{false};
-    std::atomic<Phase>                 m_phase{Phase::Idle};
-    std::atomic<ShutdownState>         m_state{ShutdownState::Running};
+    // 请求位与等待槽：位是持久事实，槽只容纳一个活动 waiter。
+    std::atomic_bool m_shutdown_req{false};
+    mutable std::mutex m_waiter_mtx;
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> m_waiter;
+    bool m_waiter_taken{false};
 
-    mutable std::mutex                 m_mtx;      // 仅护未完成项/失败清单与 CV
-    std::condition_variable            m_cv;
-    std::vector<std::string>           m_incomplete;
-    std::vector<std::string>           m_failures;
+    std::atomic<bool> m_started{false};
+    std::atomic<bool> m_host_created{false};
+    std::atomic<Phase> m_phase{Phase::Idle};
+
+    mutable std::mutex m_mtx; // 仅护未完成项/失败清单
+    std::vector<std::string> m_incomplete;
+    std::vector<std::string> m_failures;
 };
 
 } // namespace bbt::framework

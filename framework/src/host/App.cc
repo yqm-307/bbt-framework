@@ -20,7 +20,14 @@
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
+#include <bbt/framework/internal/ActorRegistry.hpp>
+#include <bbt/framework/internal/CloseOptionsCheck.hpp>
+
 #include <bbt/framework/App.hpp>
+#include <bbt/framework/internal/CoAppSeam.hpp>
+#include <bbt/framework/internal/InboundDispatcher.hpp>
+#include <bbt/framework/internal/InfraHttpHost.hpp>
+#include <bbt/framework/internal/RpcBridge.hpp>
 
 namespace bbt::framework::v2 {
 
@@ -33,7 +40,7 @@ result<void> RunHookCaught(F&& fn) {
         return fn();
     } catch (const std::exception& ex) {
         Error e = MakeError(ErrorCode::InternalError,
-            std::string("hook threw: ") + ex.what());
+                            std::string("hook threw: ") + ex.what());
         e.domain = "framework";
         return result<void>::err(std::move(e));
     } catch (...) {
@@ -58,18 +65,73 @@ CoApp::CoApp(AppOptions options)
     limits.lifecycle_budget = m_options.LifecycleBudget();
     limits.shutdown_budget = m_options.ShutdownBudget();
     m_registry = std::make_shared<detail::Registry>(limits);
+    m_runtime = std::make_shared<AppRuntimeState>();
+    m_runtime->rpc_policy = m_options.RpcPolicyOwner();
+    m_runtime->dynamic_routes = m_options.DynamicRoutes();
+    m_actor_registry = std::make_shared<ActorRegistry>();
+    for (const auto& [service, endpoint] : m_options.Routes())
+        m_runtime->routes.emplace(service, endpoint);
+    if (m_options.NetworkOptions()) {
+        try {
+            m_engine = bbt::infra::net::Engine::Create(
+                std::shared_ptr<bbt::infra::net::RawHandler>{});
+        } catch (const std::exception& e) {
+            m_engine_error = e.what();
+        }
+        m_gate_wake = std::make_shared<HostGateWakeLink>();
+        m_gate_wake->Attach([this] { RequestShutdown(); });
+        const auto& network = *m_options.NetworkOptions();
+        if (m_engine) {
+            m_default_host = std::make_shared<InfraHttpHost>(
+                m_engine, network.Limits(), network.ListenAddress(),
+                network.LocalAppId());
+            m_network_host = m_default_host;
+            m_runtime->default_egress =
+                std::make_shared<RpcEgress>(m_default_host);
+            if (m_options.HttpRoutes().empty())
+                InstallRpcAdmission(*m_default_host, m_runtime);
+            else
+                InstallHttpAdmission(*m_default_host, m_runtime, m_options.HttpRoutes());
+        }
+    }
     auto registered = _RegisterAppObject();
-    if (!registered) throw std::runtime_error(registered.error().message);
+    if (!registered)
+        throw std::runtime_error(registered.error().message);
 }
 
-CoApp::~CoApp() = default; // 只释放自身 owner，不隐式执行 hook 或等待。
+CoApp::CoApp(AppOptions options, ::bbt::framework::CoAppSeam seam)
+    : CoApp(std::move(options)) {
+    // 只有显式提供宿主时才替换网络宿主；仅注入出站（rpc_send）的测试缝
+    // 保留产品默认宿主作为入站面。
+    if (seam.host) {
+        m_network_host = std::move(seam.host);
+        m_default_host.reset();
+        m_engine.reset();
+    }
+    m_runtime->seam_send = std::move(seam.rpc_send);
+    // 测试缝宿主为 framework 宿主且尚未安装任何入站 handler 时，入站 admission
+    // 与产品默认宿主同源装配；已装配 HTTP/RPC handler 的宿主保持测试自定接线。
+    auto* http_host = dynamic_cast<InfraHttpHost*>(m_network_host.get());
+    if (http_host && !http_host->http_handler_installed() &&
+        !http_host->rpc_handler_installed())
+        if (m_options.HttpRoutes().empty())
+            InstallRpcAdmission(*http_host, m_runtime);
+        else
+            InstallHttpAdmission(*http_host, m_runtime, m_options.HttpRoutes());
+}
+
+CoApp::~CoApp() {
+    if (m_gate_wake)
+        m_gate_wake->Detach();
+}
 
 result<void> CoApp::_RegisterAppObject() {
     std::unique_lock<std::mutex> lk(m_registry->Mutex());
     auto r = m_registry->CreateEntryLocked(
         ObjectKind::App, "app", "", ComponentScope::App, {},
         typeid(CoApp), std::shared_ptr<void>{});
-    if (!r) return result<void>::err(std::move(r.error()));
+    if (!r)
+        return result<void>::err(std::move(r.error()));
     auto* e = r.value();
     auto events = m_registry->SetStateLocked(*e, ObjectState::Running);
     m_self = m_registry->MakeHandleLocked(*e);
@@ -79,6 +141,148 @@ result<void> CoApp::_RegisterAppObject() {
     return result<void>::ok();
 }
 
+CoServiceBase::RpcSendFn CoApp::_MakeEgress() {
+    auto runtime = m_runtime;
+    return [runtime = std::move(runtime)](
+               const bbt::infra::rpc::Request& request,
+               const bbt::infra::CallOptions& options)
+               -> result<bbt::infra::rpc::Response> {
+        return runtime->Send(request, options);
+    };
+}
+
+result<void> CoApp::_PublishNetworkState(bool bind_runtime) {
+    std::map<std::string, std::shared_ptr<const RpcMethodTable>> tables;
+    std::map<std::string, ServiceOptions> options;
+    {
+        std::lock_guard<std::mutex> lock(m_network_mtx);
+        tables = m_service_tables;
+        options = m_service_options;
+    }
+
+    std::map<std::string, std::shared_ptr<CoServiceBase>> instances;
+    std::map<std::string, InboundDispatcher::ServiceEntry> dispatch;
+    {
+        std::lock_guard<std::mutex> lock(m_registry->Mutex());
+        for (const auto& id :
+             m_registry->ListIdsByKindLocked(ObjectKind::Service)) {
+            auto* entry = m_registry->FindEntryLocked(id);
+            if (!entry || !entry->object)
+                continue;
+            auto option = options.find(entry->name);
+            if (option == options.end())
+                continue;
+            auto table = tables.find(entry->name);
+            if (table == tables.end())
+                table = tables.emplace(
+                    entry->name,
+                    std::make_shared<const RpcMethodTable>()).first;
+            auto instance = std::static_pointer_cast<CoServiceBase>(
+                entry->object);
+            if (bind_runtime)
+                instance->_bind_runtime(
+                    bbt::coroutine::CreateObjectInfo("service", entry->name),
+                    std::nullopt, _MakeEgress());
+            instances.emplace(entry->name, instance);
+            dispatch.emplace(
+                entry->name,
+                InboundDispatcher::ServiceEntry{
+                    option->second, table->second, instance,
+                    option->second.Execution() ==
+                            ExecutionPolicy::ActorSerial
+                        ? m_actor_registry
+                        : nullptr,
+                    nullptr});
+        }
+    }
+    m_runtime->Publish(
+        std::make_shared<InboundDispatcher>(std::move(dispatch)),
+        std::move(tables), std::move(instances), m_actor_registry);
+    return result<void>::ok();
+}
+
+bbt_co_async(result<void>) CoApp::_StartNetwork(
+    bbt::coroutine::Deadline deadline) {
+    if (!m_network_host)
+        return result<void>::ok();
+    if (!m_engine_error.empty())
+        return result<void>::err(MakeError(
+            ErrorCode::RuntimeUnavailable,
+            "CoApp: shared engine create failed: " + m_engine_error));
+    if (auto created = m_network_host->Create(); !created)
+        return created;
+
+    if (m_default_host && m_engine) {
+        HostGate::Publication publication;
+        publication.engine = m_engine;
+        publication.config = m_default_host->engine_config();
+        if (m_gate_wake)
+            publication.wake_main = [wake = m_gate_wake] { wake->Wake(); };
+        HostGate::Publish(std::move(publication));
+    }
+
+    bbt::coroutine::WaitOptions wait;
+    wait.deadline = deadline;
+    auto started = bbt_co_await m_network_host->Start(wait);
+    if (!started) {
+        // 只完成逻辑封口；物理释放可能依赖入口 Run 返回，交给后续
+        // CoStop 在同一生命周期责任上继续观察，不能在主任务内自等待。
+        auto close = bbt::infra::CloseOptions::Immediate(started.error());
+        close.deadline = deadline;
+        close.wait_release = false;
+        auto rolled_back = bbt_co_await m_network_host->Close(close);
+        if (!rolled_back)
+            return started;
+        return started;
+    }
+    return result<void>::ok();
+}
+
+bbt_co_async(result<void>) CoApp::_StopNetwork(
+    const bbt::infra::CloseOptions& options,
+    bbt::coroutine::Deadline deadline) {
+    if (!m_network_host)
+        return result<void>::ok();
+    try {
+        m_network_host->StopAccepting();
+        bbt::coroutine::WaitOptions wait;
+        wait.deadline = deadline;
+        if (auto drained = bbt_co_await m_network_host->WaitHandlersDone(wait);
+            !drained)
+            return drained;
+        if (auto closed = bbt_co_await m_network_host->Close(options);
+            !closed)
+            return closed;
+        return bbt_co_await m_network_host->WaitPhysicalReleased(wait);
+    } catch (const std::exception& e) {
+        // 宿主收口等待抛异常：收口为失败项，不逃出生命周期入口。
+        return result<void>::err(MakeError(
+            ErrorCode::InternalError,
+            std::string("StopNetwork: host threw: ") + e.what()));
+    } catch (...) {
+        return result<void>::err(MakeError(
+            ErrorCode::InternalError, "StopNetwork: host threw (non-std)"));
+    }
+}
+
+result<std::string> CoApp::FindRoute(std::string_view service) const {
+    if (!m_runtime)
+        return result<std::string>::err(MakeError(
+            ErrorCode::NotFound, "FindRoute: no network state"));
+    return m_runtime->FindRoute(service);
+}
+
+std::string CoApp::BoundEndpoint() const {
+    return m_default_host && m_state.load() == AppState::Running
+               ? m_default_host->bound_endpoint()
+               : std::string{};
+}
+
+result<bbt::infra::rpc::Response> CoApp::_DispatchInbound(
+    const bbt::infra::rpc::Request& request) {
+    return m_runtime->Dispatch(request);
+}
+
 // ---- Find ----
 
 result<ObjectHandle> CoApp::FindService(std::string_view service) const {
@@ -86,7 +290,7 @@ result<ObjectHandle> CoApp::FindService(std::string_view service) const {
     auto* e = m_registry->FindByTypeNameLocked(ObjectKind::Service, service);
     if (!e)
         return result<ObjectHandle>::err(MakeError(ErrorCode::NotFound,
-            "FindService: not found"));
+                                                   "FindService: not found"));
     return result<ObjectHandle>::ok(m_registry->MakeHandleLocked(*e));
 }
 
@@ -95,7 +299,7 @@ result<ObjectHandle> CoApp::FindActor(const ActorId& id) const {
     auto* e = m_registry->FindActorLocked(id.first, id.second);
     if (!e)
         return result<ObjectHandle>::err(MakeError(ErrorCode::NotFound,
-            "FindActor: not found"));
+                                                   "FindActor: not found"));
     return result<ObjectHandle>::ok(m_registry->MakeHandleLocked(*e));
 }
 
@@ -111,21 +315,23 @@ result<ObjectHandle> CoApp::_FindComponentImpl(
                                               ctype, name);
     if (!e)
         return result<ObjectHandle>::err(MakeError(ErrorCode::NotFound,
-            "FindComponent: not found"));
+                                                   "FindComponent: not found"));
     return result<ObjectHandle>::ok(m_registry->MakeHandleLocked(*e));
 }
 
 // ---- Observe/Handle/诊断 ----
 
 bbt_co_async(result<ObserverToken>) CoApp::CoObserve(const ObjectHandle& observer,
-                                     const ObjectHandle& target,
-                                     ObjectObserver callback) {
+                                                     const ObjectHandle& target,
+                                                     ObjectObserver callback) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<ObserverToken>::err(std::move(ctx.error()));
     return m_registry->Observe(observer, target, std::move(callback));
 }
 
-ObjectHandle CoApp::Handle() const { return m_self; }
+ObjectHandle CoApp::Handle() const {
+    return m_self;
+}
 
 std::vector<CleanupInfo> CoApp::PendingCleanup() const {
     return m_registry->PendingCleanup();
@@ -141,10 +347,10 @@ result<void> CoApp::_CheckCoContext() const {
     const auto co = bbt::coroutine::GetLocalCoroutineId();
     if (co == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: Co* entry points require a managed coroutine context"));
+                                           "lifecycle: Co* entry points require a managed coroutine context"));
     if (m_hook_co->load(std::memory_order_acquire) == co)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: a lifecycle entry point called by its own hook would wait on itself"));
+                                           "lifecycle: a lifecycle entry point called by its own hook would wait on itself"));
     return result<void>::ok();
 }
 
@@ -152,9 +358,9 @@ result<void> CoApp::_CheckCoContext() const {
 // worker），hook 协程结束写 rc/done 并 Notify。deadline 语义与宿主
 // 使用同一绝对 deadline；超时只结束等待。
 struct CoHookSlot {
-    std::mutex                    mtx;
-    bool                          done = false;
-    result<void>                  rc = result<void>::ok();
+    std::mutex mtx;
+    bool done = false;
+    result<void> rc = result<void>::ok();
     bbt::coroutine::sync::CoWaiter::SPtr waiter =
         bbt::coroutine::sync::CoWaiter::Create();
 };
@@ -186,22 +392,22 @@ result<void> FinishCoHookWait(const std::shared_ptr<CoHookSlot>& slot,
     }
     case WS::TimedOut:
         return result<void>::err(MakeError(ErrorCode::TimedOut,
-            "lifecycle hook deadline exceeded"));
+                                           "lifecycle hook deadline exceeded"));
     case WS::Cancelled:
         return result<void>::err(MakeError(ErrorCode::Cancelled,
-            "lifecycle hook wait cancelled"));
+                                           "lifecycle hook wait cancelled"));
     case WS::InvalidContext:
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: CoWaiter must be awaited from a managed coroutine"));
+                                           "lifecycle: CoWaiter must be awaited from a managed coroutine"));
     case WS::AlreadyWaiting:
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "lifecycle: hook wait slot already occupied"));
+                                           "lifecycle: hook wait slot already occupied"));
     case WS::RuntimeUnavailable:
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "lifecycle: coroutine wait runtime unavailable"));
+                                           "lifecycle: coroutine wait runtime unavailable"));
     }
     return result<void>::err(MakeError(ErrorCode::InternalError,
-        "lifecycle: unknown wait status"));
+                                       "lifecycle: unknown wait status"));
 }
 
 // 在受管协程内等待指定对象 hooks_in_flight 归零，deadline 与本次
@@ -231,7 +437,8 @@ result<void> WaitHooksSettledCo(
             auto* e = reg->FindEntryLocked(id);
             settled = (!e || e->hooks_in_flight == 0);
         }
-        if (settled) w->Notify();
+        if (settled)
+            w->Notify();
         return true;
     });
     switch (ws) {
@@ -239,35 +446,35 @@ result<void> WaitHooksSettledCo(
         return result<void>::ok();
     case WS::TimedOut:
         return result<void>::err(MakeError(ErrorCode::TimedOut,
-            "lifecycle: prior hook still in flight at deadline"));
+                                           "lifecycle: prior hook still in flight at deadline"));
     case WS::Cancelled:
         return result<void>::err(MakeError(ErrorCode::Cancelled,
-            "lifecycle: hook-settle wait cancelled"));
+                                           "lifecycle: hook-settle wait cancelled"));
     case WS::InvalidContext:
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "lifecycle: hook-settle wait requires a managed coroutine"));
+                                           "lifecycle: hook-settle wait requires a managed coroutine"));
     case WS::AlreadyWaiting:
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "lifecycle: another coroutine is already waiting for this object’s hooks to settle"));
+                                           "lifecycle: another coroutine is already waiting for this object’s hooks to settle"));
     case WS::RuntimeUnavailable:
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "lifecycle: coroutine wait runtime unavailable"));
+                                           "lifecycle: coroutine wait runtime unavailable"));
     }
     return result<void>::err(MakeError(ErrorCode::InternalError,
-        "lifecycle: unknown wait status"));
+                                       "lifecycle: unknown wait status"));
 }
 
 bbt_co_async(result<void>) CoApp::CoStart(const LifecycleOptions& life) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
-    return _StartImpl(life);
+    return bbt_co_await _StartImpl(life);
 }
 
-result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
+bbt_co_async(result<void>) CoApp::_StartImpl(const LifecycleOptions& life) {
     // 协程入口不得阻塞 worker 等转换锁：冲突转换进行中 → Busy。
     if (m_lifecycle_active.exchange(true, std::memory_order_acq_rel))
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "Start: lifecycle transition in progress"));
+                                           "Start: lifecycle transition in progress"));
     struct Release {
         std::atomic_bool& active;
         ~Release() { active.store(false, std::memory_order_release); }
@@ -275,36 +482,30 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
     const AppState s = m_state.load();
     if (s == AppState::Stopped || s == AppState::StopIncomplete)
         return result<void>::err(MakeError(ErrorCode::Closed,
-            "Start: app already stopped"));
+                                           "Start: app already stopped"));
     if (s != AppState::Created && s != AppState::Paused)
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "Start: app not in Created/Paused state"));
-    if (auto r = m_options.Validate(); !r) return r;
+                                           "Start: app not in Created/Paused state"));
+    if (auto r = m_options.Validate(); !r)
+        return r;
 
     m_state.store(AppState::Starting);
     const auto deadline = m_registry->ResolveDeadline(life);
 
-    // 组件先启动：按依赖拓扑（依赖先于使用者）；服务随后按安装顺序。
+    // 组件 OnStart 会经共享 Engine 建连：先发布并启动宿主，业务分发表仍未
+    // 发布，提前到达的请求只会失败，不能进入尚未启动的 Service。
+    if (m_default_host) {
+        if (auto network = bbt_co_await _StartNetwork(deadline); !network) {
+            m_state.store(AppState::StopIncomplete);
+            return network;
+        }
+    }
+    // 组件和服务按登记顺序启动；绑定只表达可用能力，不驱动自动拓扑。
     std::vector<ObjectId> comps, svcs;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        bool had_cycle = false;
-        auto order = m_registry->ComponentStartOrderLocked(&had_cycle);
-        if (had_cycle) {
-            LifecycleFailure f;
-            f.operation = "start";
-            f.phase = "topo";
-            f.code = ErrorCode::InternalError;
-            f.at = std::chrono::system_clock::now();
-            f.message = "component dependency cycle residual";
-            m_registry->RecordFailure(std::move(f));
-        }
-        // 只启动 Installed 态组件（保留拓扑序）。
-        for (const auto& id : order) {
-            auto* e = m_registry->FindEntryLocked(id);
-            if (e && e->state == ObjectState::Installed)
-                comps.push_back(id);
-        }
+        comps = m_registry->ListIdsLocked(ObjectKind::Component,
+                                           ObjectState::Installed);
         svcs = m_registry->ListIdsLocked(ObjectKind::Service,
                                          ObjectState::Installed);
     }
@@ -316,8 +517,8 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
             m_registry->SetStateAndDispatch(
                 id, ObjectState::Failed,
                 ObjectError{r.error().code, "start",
-                                    r.error().message});
-            m_state.store(AppState::Running);   // 部分启动：诚实反映
+                            r.error().message});
+            m_state.store(AppState::Running); // 部分启动：诚实反映
             return r;
         }
         m_registry->SetStateAndDispatch(id, ObjectState::Running);
@@ -330,11 +531,21 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
             m_registry->SetStateAndDispatch(
                 id, ObjectState::Failed,
                 ObjectError{r.error().code, "start",
-                                    r.error().message});
+                            r.error().message});
             m_state.store(AppState::Running);
             return r;
         }
         m_registry->SetStateAndDispatch(id, ObjectState::Running);
+    }
+    if (auto published = _PublishNetworkState(); !published) {
+        m_state.store(AppState::StopIncomplete);
+        return published;
+    }
+    if (!m_default_host) {
+        if (auto network = bbt_co_await _StartNetwork(deadline); !network) {
+            m_state.store(AppState::StopIncomplete);
+            return network;
+        }
     }
     m_state.store(AppState::Running);
     return result<void>::ok();
@@ -349,14 +560,14 @@ bbt_co_async(result<void>) CoApp::CoPause(const LifecycleOptions& life) {
 result<void> CoApp::_PauseImpl(const LifecycleOptions& life) {
     if (m_lifecycle_active.exchange(true, std::memory_order_acq_rel))
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "Pause: lifecycle transition in progress"));
+                                           "Pause: lifecycle transition in progress"));
     struct Release {
         std::atomic_bool& active;
         ~Release() { active.store(false, std::memory_order_release); }
     } release{m_lifecycle_active};
     if (m_state.load() != AppState::Running)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "Pause: app not Running"));
+                                           "Pause: app not Running"));
     const auto deadline = m_registry->ResolveDeadline(life);
 
     std::vector<ObjectId> svcs;
@@ -372,7 +583,7 @@ result<void> CoApp::_PauseImpl(const LifecycleOptions& life) {
             m_registry->SetStateAndDispatch(
                 id, ObjectState::Failed,
                 ObjectError{r.error().code, "pause",
-                                    r.error().message});
+                            r.error().message});
             return r;
         }
         m_registry->SetStateAndDispatch(id, ObjectState::Paused);
@@ -390,14 +601,14 @@ bbt_co_async(result<void>) CoApp::CoResume(const LifecycleOptions& life) {
 result<void> CoApp::_ResumeImpl(const LifecycleOptions& life) {
     if (m_lifecycle_active.exchange(true, std::memory_order_acq_rel))
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "Resume: lifecycle transition in progress"));
+                                           "Resume: lifecycle transition in progress"));
     struct Release {
         std::atomic_bool& active;
         ~Release() { active.store(false, std::memory_order_release); }
     } release{m_lifecycle_active};
     if (m_state.load() != AppState::Paused)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "Resume: app not Paused"));
+                                           "Resume: app not Paused"));
     const auto deadline = m_registry->ResolveDeadline(life);
 
     std::vector<ObjectId> svcs;
@@ -413,7 +624,7 @@ result<void> CoApp::_ResumeImpl(const LifecycleOptions& life) {
             m_registry->SetStateAndDispatch(
                 id, ObjectState::Failed,
                 ObjectError{r.error().code, "resume",
-                                    r.error().message});
+                            r.error().message});
             return r;
         }
         m_registry->SetStateAndDispatch(id, ObjectState::Running);
@@ -425,24 +636,55 @@ result<void> CoApp::_ResumeImpl(const LifecycleOptions& life) {
 bbt_co_async(result<void>) CoApp::CoStop(const LifecycleOptions& life) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
-    return _StopImpl(life);
+    const auto deadline = m_registry->ResolveDeadline(life);
+    // 默认 CoStop 保持「简单 Close」：立即封口，但仍用同一解析后的绝对
+    // 期限约束 borrow 排空与 hook 等待；组件 OnStop 收到同一值。
+    auto options = bbt::infra::CloseOptions::Immediate(MakeError(
+        ErrorCode::Closed, "app stop: owner requested close"));
+    options.deadline = deadline;
+    return bbt_co_await _StopImpl(deadline, options);
 }
 
-result<void> CoApp::_StopImpl(const LifecycleOptions& life) {
+bbt_co_async(result<void>) CoApp::CoStop(
+    const bbt::infra::CloseOptions& options) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    // 参数校验先于任何副作用：非法组合不得改变 App/对象状态。
+    if (auto valid = bbt::framework::internal::ValidateCloseValue(options); !valid)
+        return result<void>::err(std::move(valid.error()));
+    bbt::coroutine::Deadline deadline = options.deadline;
+    if (deadline == bbt::coroutine::Deadline::max()) {
+        // Immediate 本身不读 deadline；排空与 hook 等待仍需一个有限预算，
+        // 未显式给出时沿用 App 的 lifecycle budget，而不是自行制造无限等待。
+        deadline = m_registry->ResolveDeadline(LifecycleOptions{});
+    }
+    return bbt_co_await _StopImpl(deadline, options);
+}
+
+bbt_co_async(result<void>) CoApp::_StopImpl(
+    bbt::coroutine::Deadline deadline,
+    const bbt::infra::CloseOptions& options) {
     if (m_lifecycle_active.exchange(true, std::memory_order_acq_rel))
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "Stop: lifecycle transition in progress"));
+                                           "Stop: lifecycle transition in progress"));
     struct Release {
         std::atomic_bool& active;
         ~Release() { active.store(false, std::memory_order_release); }
     } release{m_lifecycle_active};
     const AppState s = m_state.load();
-    if (s == AppState::Stopped) return result<void>::ok();
+    if (s == AppState::Stopped)
+        return result<void>::ok();
     m_state.store(AppState::Stopping);
-    const auto deadline = m_registry->ResolveDeadline(life);
-    _StopAll(deadline);
+    if (auto network = bbt_co_await _StopNetwork(options, deadline);
+        !network) {
+        m_state.store(AppState::StopIncomplete);
+        return network;
+    }
+    _StopAll(deadline, options);
     const bool incomplete = !m_registry->PendingCleanup().empty();
     m_state.store(incomplete ? AppState::StopIncomplete : AppState::Stopped);
+    if (!incomplete)
+        m_runtime->Release();
     return result<void>::ok();
 }
 
@@ -453,54 +695,58 @@ void CoApp::RequestShutdown() noexcept {
         m_shutdown_req.store(true, std::memory_order_release);
         waiter = m_shutdown_waiter;
     }
-    if (waiter) waiter->Notify();
+    if (waiter)
+        waiter->Notify();
 }
 
 bbt_co_async(result<void>) CoApp::CoWaitShutdownRequest(
     const bbt::coroutine::WaitOptions& wait) {
-    if (auto ctx = _CheckCoContext(); !ctx) return ctx;
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return ctx;
     auto waiter = bbt::coroutine::sync::CoWaiter::Create();
     {
         std::lock_guard<std::mutex> lk(m_run_mtx);
         if (m_shutdown_waiter)
             return result<void>::err(MakeError(ErrorCode::Overloaded,
-                "shutdown request already has a waiter"));
-        if (m_shutdown_req.load(std::memory_order_acquire)) return result<void>::ok();
+                                               "shutdown request already has a waiter"));
+        if (m_shutdown_req.load(std::memory_order_acquire))
+            return result<void>::ok();
         m_shutdown_waiter = waiter;
     }
     const auto status = waiter->WaitWithCallback(wait, [this, waiter] {
-        if (m_shutdown_req.load(std::memory_order_acquire)) waiter->Notify();
+        if (m_shutdown_req.load(std::memory_order_acquire))
+            waiter->Notify();
         return true;
     });
     {
         std::lock_guard<std::mutex> lk(m_run_mtx);
         m_shutdown_waiter.reset();
     }
-    if (status == bbt::coroutine::WaitStatus::Completed) return result<void>::ok();
+    if (status == bbt::coroutine::WaitStatus::Completed)
+        return result<void>::ok();
     if (status == bbt::coroutine::WaitStatus::TimedOut)
         return result<void>::err(MakeError(ErrorCode::TimedOut, "shutdown request timed out"));
     if (status == bbt::coroutine::WaitStatus::Cancelled)
         return result<void>::err(MakeError(ErrorCode::Cancelled, "shutdown request cancelled"));
     return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-        "shutdown request wait unavailable"));
+                                       "shutdown request wait unavailable"));
 }
 
-void CoApp::_StopAll(bbt::coroutine::Deadline deadline) {
+void CoApp::_StopAll(bbt::coroutine::Deadline deadline,
+                     const bbt::infra::CloseOptions& options) {
     // 逆序收口：Service → Actor 实例 → scoped Component → App Component。
-    // 组件按依赖逆拓扑（使用者先于依赖）。各分支独立推进；
+    // 组件按登记顺序的逆序收口；绑定不建立自动依赖拓扑。
     // 对象列表取 id 快照，跨锁不持指针。
     std::vector<ObjectId> svcs, actors, scoped, app_scope;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        svcs   = m_registry->ListIdsByKindLocked(ObjectKind::Service);
+        svcs = m_registry->ListIdsByKindLocked(ObjectKind::Service);
         actors = m_registry->ListIdsByKindLocked(ObjectKind::Actor);
-        bool had_cycle = false;
-        auto order = m_registry->ComponentStartOrderLocked(&had_cycle);
-        // 逆拓扑：依赖图后序反转。scoped 先收、App scope 后收
-        // （contract：scoped Component → App Component）。
-        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        auto components = m_registry->ListIdsByKindLocked(ObjectKind::Component);
+        for (auto it = components.rbegin(); it != components.rend(); ++it) {
             auto* e = m_registry->FindEntryLocked(*it);
-            if (!e) continue;
+            if (!e)
+                continue;
             if (e->scope == ComponentScope::App)
                 app_scope.push_back(*it);
             else
@@ -508,11 +754,14 @@ void CoApp::_StopAll(bbt::coroutine::Deadline deadline) {
         }
     }
 
-    for (const auto& id : svcs)   _DestroyService(id, deadline);
-    for (const auto& id : actors) _DestroyActor(id);
-    for (const auto& id : scoped) _DestroyComponent(id, deadline);
+    for (const auto& id : svcs)
+        _DestroyService(id, deadline);
+    for (const auto& id : actors)
+        _DestroyActor(id);
+    for (const auto& id : scoped)
+        _DestroyComponent(id, deadline, options);
     for (const auto& id : app_scope)
-        _DestroyComponent(id, deadline);
+        _DestroyComponent(id, deadline, options);
 }
 
 // 收口步失败统一出口：记 LifecycleFailure、标 incomplete 态、EndOp 后返回。
@@ -546,7 +795,8 @@ void CoApp::_DestroyService(const ObjectId& id,
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e || !m_registry->BeginOpLocked(*e)) return;
+        if (!e || !m_registry->BeginOpLocked(*e))
+            return;
         e->destroy_phase = "stop";
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Stopping);
         // 本 service 作为 subject 的全部 binding 封口并标 retiring；
@@ -554,7 +804,8 @@ void CoApp::_DestroyService(const ObjectId& id,
         for (const auto& cid :
              m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
             auto* x = m_registry->FindEntryLocked(cid);
-            if (!x) continue;
+            if (!x)
+                continue;
             for (const auto& b : x->bindings) {
                 if (b.subject_id == id && !b.retiring) {
                     (void)m_registry->BeginUnbindLocked(*x, id, nullptr);
@@ -576,7 +827,8 @@ void CoApp::_DestroyService(const ObjectId& id,
         for (const auto& cid :
              m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
             auto* x = m_registry->FindEntryLocked(cid);
-            if (!x) continue;
+            if (!x)
+                continue;
             for (const auto& b : x->bindings) {
                 if (b.subject_id == id && b.retiring) {
                     retiring_edges.emplace_back(cid, b.generation);
@@ -586,14 +838,20 @@ void CoApp::_DestroyService(const ObjectId& id,
     }
     for (const auto& [cid, gen] : retiring_edges) {
         auto r = m_registry->WaitBindingDrained(cid, id, gen, deadline);
-        if (!r) { _AbortDestroy(id, "stop", "borrow_drain", r.error(),
-                               ObjectState::StopIncomplete); return; }
+        if (!r) {
+            _AbortDestroy(id, "stop", "borrow_drain", r.error(),
+                          ObjectState::StopIncomplete);
+            return;
+        }
     }
     {
         auto r = _RunServiceHookCo(id, &CoServiceBase::OnStop, "stop",
                                    deadline);
-        if (!r) { _AbortDestroy(id, "stop", "onstop", r.error(),
-                               ObjectState::StopIncomplete); return; }
+        if (!r) {
+            _AbortDestroy(id, "stop", "onstop", r.error(),
+                          ObjectState::StopIncomplete);
+            return;
+        }
     }
     // hook 未达真实终态（上一句已保证本次 hook 完成或超时——超时同样
     // 保留 owner 不继续收口）。
@@ -602,7 +860,7 @@ void CoApp::_DestroyService(const ObjectId& id,
         auto* e = m_registry->FindEntryLocked(id);
         if (e && e->hooks_in_flight > 0) {
             Error err = MakeError(ErrorCode::TimedOut,
-                "stop: prior hook still in flight");
+                                  "stop: prior hook still in flight");
             lk.unlock();
             _AbortDestroy(id, "stop", "hook_in_flight", err,
                           ObjectState::StopIncomplete);
@@ -632,14 +890,15 @@ void CoApp::_DestroyService(const ObjectId& id,
             e->destroy_phase.clear();
             m_registry->EndOpLocked(*e);
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o); events = std::move(ev);
+            obj = std::move(o);
+            events = std::move(ev);
         }
     }
     // 在途 observer 回调 lease 先排空再释放 owner（回调闭包的捕获对象
     // 寿命不得短于被观察对象）。
     m_registry->DrainInactiveObservers();
     m_registry->DispatchEvents(std::move(events));
-    obj.reset();   // 业务析构锁外
+    obj.reset(); // 业务析构锁外
 }
 
 void CoApp::_DestroyActor(const ObjectId& id) {
@@ -652,7 +911,8 @@ void CoApp::_DestroyActor(const ObjectId& id) {
         auto* e = m_registry->FindEntryLocked(id);
         if (e) {
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o); events = std::move(ev);
+            obj = std::move(o);
+            events = std::move(ev);
         }
     }
     m_registry->DrainInactiveObservers();
@@ -661,11 +921,13 @@ void CoApp::_DestroyActor(const ObjectId& id) {
 }
 
 void CoApp::_DestroyComponent(const ObjectId& id,
-                              bbt::coroutine::Deadline deadline) {
+                              bbt::coroutine::Deadline deadline,
+                              const bbt::infra::CloseOptions& options) {
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e || !m_registry->BeginOpLocked(*e)) return;
+        if (!e || !m_registry->BeginOpLocked(*e))
+            return;
         e->destroy_phase = "stop";
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Stopping);
         lk.unlock();
@@ -676,14 +938,19 @@ void CoApp::_DestroyComponent(const ObjectId& id,
     // 保留 owner、不继续收口。
     {
         auto r = m_registry->WaitBorrowsDrained(id, deadline);
-        if (!r) { _AbortDestroy(id, "stop", "borrow_drain", r.error(),
-                               ObjectState::StopIncomplete); return; }
+        if (!r) {
+            _AbortDestroy(id, "stop", "borrow_drain", r.error(),
+                          ObjectState::StopIncomplete);
+            return;
+        }
     }
     {
-        auto r = _RunComponentHookCo(id, &CoComponent::OnStop, "stop",
-                                     deadline);
-        if (!r) { _AbortDestroy(id, "stop", "onstop", r.error(),
-                               ObjectState::StopIncomplete); return; }
+        auto r = _RunComponentStopHookCo(id, options, deadline);
+        if (!r) {
+            _AbortDestroy(id, "stop", "onstop", r.error(),
+                          ObjectState::StopIncomplete);
+            return;
+        }
     }
     // hook 未达真实终态 → 不跑 OnUninstall、不销毁（owner 保留）。
     {
@@ -691,7 +958,7 @@ void CoApp::_DestroyComponent(const ObjectId& id,
         auto* e = m_registry->FindEntryLocked(id);
         if (e && e->hooks_in_flight > 0) {
             Error err = MakeError(ErrorCode::TimedOut,
-                "stop: prior hook still in flight");
+                                  "stop: prior hook still in flight");
             lk.unlock();
             _AbortDestroy(id, "stop", "hook_in_flight", err,
                           ObjectState::StopIncomplete);
@@ -710,7 +977,8 @@ void CoApp::_DestroyComponent(const ObjectId& id,
             e->destroy_phase.clear();
             m_registry->EndOpLocked(*e);
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o); events = std::move(ev);
+            obj = std::move(o);
+            events = std::move(ev);
         }
     }
     m_registry->DrainInactiveObservers();
@@ -738,7 +1006,8 @@ result<void> CoApp::_RunServiceHookCo(
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
 
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return result<void>::ok();   // 已消失：跳过
+        if (!e)
+            return result<void>::ok(); // 已消失：跳过
         svc = static_cast<CoServiceBase*>(e->object.get());
         owner = e->object;
         ++e->hooks_in_flight;
@@ -762,7 +1031,7 @@ result<void> CoApp::_RunServiceHookCo(
     auto hook_co = m_hook_co;
     auto task = [svc, hook, slot, reg, id, hook_co, owner]() {
         hook_co->store(bbt::coroutine::GetLocalCoroutineId(),
-                        std::memory_order_release);
+                       std::memory_order_release);
         auto r = RunHookCaught([&] { return (svc->*hook)(); });
         hook_co->store(0, std::memory_order_release);
         reg->NoteHookSettled(id);
@@ -774,17 +1043,17 @@ result<void> CoApp::_RunServiceHookCo(
         if (!submitted) {
             m_registry->NoteHookSettled(id);
             return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-                "lifecycle: hook task rejected"));
+                                               "lifecycle: hook task rejected"));
         }
     } catch (const std::exception& e) {
         m_registry->NoteHookSettled(id);
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            std::string("lifecycle: hook task regist failed: ") +
-            e.what()));
+                                           std::string("lifecycle: hook task regist failed: ") +
+                                               e.what()));
     } catch (...) {
         m_registry->NoteHookSettled(id);
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "lifecycle: hook task regist failed (non-std)"));
+                                           "lifecycle: hook task regist failed (non-std)"));
     }
 
     // 同一绝对 deadline：挂起到 hook 完成或到期；on_registered 在
@@ -794,11 +1063,13 @@ result<void> CoApp::_RunServiceHookCo(
     wo.deadline = deadline;
     const auto ws = slot->waiter->WaitWithCallback(wo, [slot] {
         std::lock_guard<std::mutex> lk(slot->mtx);
-        if (slot->done) slot->waiter->Notify();
+        if (slot->done)
+            slot->waiter->Notify();
         return true;
     });
     auto r = FinishCoHookWait(slot, ws);
-    if (!r) record_fail(r);
+    if (!r)
+        record_fail(r);
     return r;
 }
 
@@ -816,7 +1087,8 @@ result<void> CoApp::_RunComponentHookCo(
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
 
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return result<void>::ok();
+        if (!e)
+            return result<void>::ok();
         c = static_cast<CoComponent*>(e->object.get());
         owner = e->object;
         ++e->hooks_in_flight;
@@ -839,7 +1111,7 @@ result<void> CoApp::_RunComponentHookCo(
     auto hook_co = m_hook_co;
     auto task = [c, hook, slot, reg, id, hook_co, owner]() {
         hook_co->store(bbt::coroutine::GetLocalCoroutineId(),
-                        std::memory_order_release);
+                       std::memory_order_release);
         auto r = RunHookCaught([&] { return (c->*hook)(); });
         hook_co->store(0, std::memory_order_release);
         reg->NoteHookSettled(id);
@@ -851,28 +1123,102 @@ result<void> CoApp::_RunComponentHookCo(
         if (!submitted) {
             m_registry->NoteHookSettled(id);
             return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-                "lifecycle: hook task rejected"));
+                                               "lifecycle: hook task rejected"));
         }
     } catch (const std::exception& e) {
         m_registry->NoteHookSettled(id);
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            std::string("lifecycle: hook task regist failed: ") +
-            e.what()));
+                                           std::string("lifecycle: hook task regist failed: ") +
+                                               e.what()));
     } catch (...) {
         m_registry->NoteHookSettled(id);
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "lifecycle: hook task regist failed (non-std)"));
+                                           "lifecycle: hook task regist failed (non-std)"));
     }
 
     bbt::coroutine::WaitOptions wo;
     wo.deadline = deadline;
     const auto ws = slot->waiter->WaitWithCallback(wo, [slot] {
         std::lock_guard<std::mutex> lk(slot->mtx);
-        if (slot->done) slot->waiter->Notify();
+        if (slot->done)
+            slot->waiter->Notify();
         return true;
     });
     auto r = FinishCoHookWait(slot, ws);
-    if (!r) record_fail(r);
+    if (!r)
+        record_fail(r);
+    return r;
+}
+
+result<void> CoApp::_RunComponentStopHookCo(
+    const ObjectId& id, const bbt::infra::CloseOptions& options,
+    bbt::coroutine::Deadline deadline) {
+    CoComponent* c = nullptr;
+    std::shared_ptr<void> owner;
+    auto slot = std::make_shared<CoHookSlot>();
+    if (auto r = WaitHooksSettledCo(m_registry, id, deadline); !r)
+        return r;
+    {
+        std::unique_lock<std::mutex> lk(m_registry->Mutex());
+        auto* e = m_registry->FindEntryLocked(id);
+        if (!e)
+            return result<void>::ok();
+        c = static_cast<CoComponent*>(e->object.get());
+        owner = e->object;
+        ++e->hooks_in_flight;
+    }
+    auto record_fail = [&](const result<void>& r) {
+        LifecycleFailure f;
+        f.object_id = id;
+        f.operation = "stop";
+        f.phase = "stop";
+        f.code = r.error().code;
+        f.at = std::chrono::system_clock::now();
+        f.message = r.error().message;
+        std::unique_lock<std::mutex> lk(m_registry->Mutex());
+        m_registry->RecordFailure(std::move(f));
+    };
+
+    auto reg = m_registry;
+    auto hook_co = m_hook_co;
+    auto task = [c, options, slot, reg, id, hook_co, owner]() {
+        hook_co->store(bbt::coroutine::GetLocalCoroutineId(),
+                       std::memory_order_release);
+        auto r = RunHookCaught([&] { return c->OnStop(options); });
+        hook_co->store(0, std::memory_order_release);
+        reg->NoteHookSettled(id);
+        SettleCoHookSlot(slot, std::move(r));
+    };
+    try {
+        bool submitted = false;
+        g_scheduler->RegistCoroutineTask(task, submitted);
+        if (!submitted) {
+            m_registry->NoteHookSettled(id);
+            return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+                                               "lifecycle: hook task rejected"));
+        }
+    } catch (const std::exception& e) {
+        m_registry->NoteHookSettled(id);
+        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+                                           std::string("lifecycle: hook task regist failed: ") +
+                                               e.what()));
+    } catch (...) {
+        m_registry->NoteHookSettled(id);
+        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+                                           "lifecycle: hook task regist failed (non-std)"));
+    }
+
+    bbt::coroutine::WaitOptions wo;
+    wo.deadline = deadline;
+    const auto ws = slot->waiter->WaitWithCallback(wo, [slot] {
+        std::lock_guard<std::mutex> lk(slot->mtx);
+        if (slot->done)
+            slot->waiter->Notify();
+        return true;
+    });
+    auto r = FinishCoHookWait(slot, ws);
+    if (!r)
+        record_fail(r);
     return r;
 }
 
@@ -880,11 +1226,12 @@ result<void> CoApp::_RunServiceHook(
     const ObjectId& id, result<void> (CoServiceBase::*hook)(),
     const char* phase) {
     CoServiceBase* svc = nullptr;
-    std::shared_ptr<void> owner;   // callback lease：锁外 hook 期保活对象
+    std::shared_ptr<void> owner; // callback lease：锁外 hook 期保活对象
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return result<void>::ok();   // 已消失：跳过
+        if (!e)
+            return result<void>::ok(); // 已消失：跳过
         svc = static_cast<CoServiceBase*>(e->object.get());
         owner = e->object;
     }
@@ -911,7 +1258,8 @@ result<void> CoApp::_RunComponentHook(
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return result<void>::ok();
+        if (!e)
+            return result<void>::ok();
         c = static_cast<CoComponent*>(e->object.get());
         owner = e->object;
     }
@@ -938,7 +1286,8 @@ void CoApp::_RunServiceVoidHook(
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return;
+        if (!e)
+            return;
         svc = static_cast<CoServiceBase*>(e->object.get());
         owner = e->object;
     }
@@ -975,7 +1324,8 @@ void CoApp::_RunComponentVoidHook(
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return;
+        if (!e)
+            return;
         c = static_cast<CoComponent*>(e->object.get());
         owner = e->object;
     }
@@ -1010,13 +1360,15 @@ void CoApp::_RunActorDestroy(const ObjectId& id) noexcept {
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
-        if (!e) return;
+        if (!e)
+            return;
         a = static_cast<CoActor*>(e->object.get());
         owner = e->object;
     }
-    if (!a) return;   // Actor type 登记条目无实例：无 OnDestroy 可跑，
-                      // 条目收口由 _DestroyActor 的 FinishDestroyLocked
-                      // 完成（type entry 同样进入 Destroyed/移除）。
+    if (!a)
+        return; // Actor type 登记条目无实例：无 OnDestroy 可跑，
+                // 条目收口由 _DestroyActor 的 FinishDestroyLocked
+                // 完成（type entry 同样进入 Destroyed/移除）。
     try {
         a->OnDestroy();
     } catch (...) {
@@ -1040,12 +1392,13 @@ result<void> CoApp::_RunActorCreate(const ObjectId& id) {
         auto* e = m_registry->FindEntryLocked(id);
         if (!e)
             return result<void>::err(MakeError(ErrorCode::NotFound,
-                "OnCreate: actor entry gone"));
+                                               "OnCreate: actor entry gone"));
         a = static_cast<CoActor*>(e->object.get());
         owner = e->object;
     }
-    if (!a) return result<void>::err(MakeError(ErrorCode::NotFound,
-        "OnCreate: actor type has no instance"));
+    if (!a)
+        return result<void>::err(MakeError(ErrorCode::NotFound,
+                                           "OnCreate: actor type has no instance"));
     return RunHookCaught([&] { return a->OnCreate(); });
 }
 
@@ -1058,67 +1411,32 @@ result<void> CoApp::_ValidateOwner(const ComponentOptions& placement,
     if (scope == ComponentScope::App) {
         if (placement.Owner().has_value())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ComponentOptions: App scope does not allow an explicit owner"));
+                                               "ComponentOptions: App scope does not allow an explicit owner"));
         return result<void>::ok();
     }
     if (!placement.Owner().has_value())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: Service/Actor scope requires an explicit owner"));
+                                           "ComponentOptions: Service/Actor scope requires an explicit owner"));
 
     const ObjectHandle& owner = placement.Owner().value();
     // 跨 App 句柄拒绝：owner 必须属于本 Registry（局部 id/generation
     // 可能与他 App 句柄巧合相同，身份校验不可省）。
     if (!m_registry->OwnsHandle(owner))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: owner handle belongs to another Registry"));
+                                           "ComponentOptions: owner handle belongs to another Registry"));
     std::unique_lock<std::mutex> lk(m_registry->Mutex());
     const auto* e = m_registry->FindEntryLocked(owner.Id());
     if (!e || e->generation != owner.Generation())
         return result<void>::err(MakeError(ErrorCode::NotFound,
-            "ComponentOptions: owner is not registered or its generation changed"));
+                                           "ComponentOptions: owner is not registered or its generation changed"));
     if (scope == ComponentScope::Service && e->kind != ObjectKind::Service)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: Service scope owner must be a Service"));
+                                           "ComponentOptions: Service scope owner must be a Service"));
     if (scope == ComponentScope::Actor && e->kind != ObjectKind::Actor)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ComponentOptions: Actor scope owner must be an Actor"));
+                                           "ComponentOptions: Actor scope owner must be an Actor"));
     *out_owner_id = owner.Id();
     return result<void>::ok();
-}
-
-// ---- 组件→组件依赖环 ----
-//
-// 依赖方向：subject（绑定发起方）依赖 target（被绑组件）。沿依赖边做
-// DFS：target 能回到 subject 即成环。在 m_registry->Mutex() 已持锁的
-// 临界区内调用（只读 m_entries/bindings，无锁外访问）。
-bool CoApp::_WouldFormCycleLocked(const ObjectId& subject_id,
-                                  const ObjectId& target_id) const {
-    if (subject_id == target_id) return true;
-    // 从 target 出发沿「X 的依赖」DFS，看能否回到 subject。
-    // 调用方已持 Registry 锁：经 ListIdsLocked + FindEntryLocked 构图。
-    std::unordered_map<ObjectId, std::vector<ObjectId>> deps;
-    std::vector<ObjectId> ids =
-        m_registry->ListIdsByKindLocked(ObjectKind::Component);
-    for (const auto& x : ids) {
-        auto& out = deps[x];
-        for (const auto& y : ids) {
-            auto* ye = m_registry->FindEntryLocked(y);
-            if (!ye) continue;
-            for (const auto& b : ye->bindings)
-                if (b.subject_id == x) out.push_back(y);
-        }
-    }
-    std::unordered_map<ObjectId, int> mark;
-    std::function<bool(const ObjectId&)> reach = [&](const ObjectId& id) {
-        if (id == subject_id) return true;
-        mark[id] = 1;
-        for (const auto& d : deps[id]) {
-            if (mark.count(d)) continue;
-            if (reach(d)) return true;
-        }
-        return false;
-    };
-    return reach(target_id);
 }
 
 // ---- InstallComponent ----
@@ -1131,13 +1449,14 @@ result<void> CoApp::_InstallComponentImpl(
     (void)life;
     if (m_state.load() == AppState::Stopped)
         return result<void>::err(MakeError(ErrorCode::Closed,
-            "InstallComponent: app stopped"));
+                                           "InstallComponent: app stopped"));
     if (name.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "InstallComponent: empty name"));
+                                           "InstallComponent: empty name"));
 
     ObjectId owner_id;
-    if (auto r = _ValidateOwner(placement, &owner_id); !r) return r;
+    if (auto r = _ValidateOwner(placement, &owner_id); !r)
+        return r;
 
     std::shared_ptr<void> obj;
     try {
@@ -1148,10 +1467,10 @@ result<void> CoApp::_InstallComponentImpl(
             });
     } catch (const std::exception& e) {
         return result<void>::err(MakeError(ErrorCode::InternalError,
-            std::string("InstallComponent: ctor threw: ") + e.what()));
+                                           std::string("InstallComponent: ctor threw: ") + e.what()));
     } catch (...) {
         return result<void>::err(MakeError(ErrorCode::InternalError,
-            "InstallComponent: ctor threw (non-std)"));
+                                           "InstallComponent: ctor threw (non-std)"));
     }
 
     ObjectId id;
@@ -1160,11 +1479,12 @@ result<void> CoApp::_InstallComponentImpl(
         if (m_registry->FindComponentLocked(placement.Scope(), owner_id,
                                             ctype, name))
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "InstallComponent: duplicate component '" + name + "'"));
+                                               "InstallComponent: duplicate component '" + name + "'"));
         auto r = m_registry->CreateEntryLocked(
             ObjectKind::Component, ctype.name(), name, placement.Scope(),
             owner_id, ctype, std::move(obj));
-        if (!r) return result<void>::err(std::move(r.error()));
+        if (!r)
+            return result<void>::err(std::move(r.error()));
         auto* e = r.value();
         id = e->id;
         static_cast<CoComponent*>(e->object.get())
@@ -1179,7 +1499,7 @@ result<void> CoApp::_InstallComponentImpl(
         m_registry->SetStateAndDispatch(
             id, ObjectState::InstallFailed,
             ObjectError{r.error().code, "install",
-                                r.error().message});
+                        r.error().message});
         return r;
     }
     m_registry->SetStateAndDispatch(id, ObjectState::Installed);
@@ -1192,7 +1512,7 @@ result<void> CoApp::_InstallComponentImpl(
             m_registry->SetStateAndDispatch(
                 id, ObjectState::Failed,
                 ObjectError{r.error().code, "start",
-                                    r.error().message});
+                            r.error().message});
             return r;
         }
         m_registry->SetStateAndDispatch(id, ObjectState::Running);
@@ -1204,7 +1524,8 @@ result<void> CoApp::_UninstallComponentImpl(
     const std::type_info& ctype, std::string_view name,
     const ComponentOptions& placement, const LifecycleOptions& life) {
     ObjectId owner_id;
-    if (auto r = _ValidateOwner(placement, &owner_id); !r) return r;
+    if (auto r = _ValidateOwner(placement, &owner_id); !r)
+        return r;
 
     ObjectId id;
     {
@@ -1213,9 +1534,10 @@ result<void> CoApp::_UninstallComponentImpl(
                                                   owner_id, ctype, name);
         if (!e)
             return result<void>::err(MakeError(ErrorCode::NotFound,
-                "UninstallComponent: not found"));
+                                               "UninstallComponent: not found"));
         auto r = m_registry->BeginDestroyLocked(e->id);
-        if (!r) return result<void>::err(std::move(r.error()));
+        if (!r)
+            return result<void>::err(std::move(r.error()));
         id = e->id;
         e->destroy_phase = "uninstall";
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Uninstalling);
@@ -1234,8 +1556,10 @@ result<void> CoApp::_UninstallComponentImpl(
         }
     }
     {
-        auto r = _RunComponentHookCo(id, &CoComponent::OnStop, "stop",
-                                     deadline);
+        bbt::infra::CloseOptions options = bbt::infra::CloseOptions::Immediate(
+            MakeError(ErrorCode::Closed, "component uninstall"));
+        options.deadline = deadline;
+        auto r = _RunComponentStopHookCo(id, options, deadline);
         if (!r) {
             _AbortDestroy(id, "uninstall", "onstop", r.error(),
                           ObjectState::UninstallIncomplete);
@@ -1248,7 +1572,7 @@ result<void> CoApp::_UninstallComponentImpl(
         auto* e = m_registry->FindEntryLocked(id);
         if (e && e->hooks_in_flight > 0) {
             Error err = MakeError(ErrorCode::TimedOut,
-                "uninstall: prior hook still in flight");
+                                  "uninstall: prior hook still in flight");
             lk.unlock();
             _AbortDestroy(id, "uninstall", "hook_in_flight", err,
                           ObjectState::UninstallIncomplete);
@@ -1267,7 +1591,8 @@ result<void> CoApp::_UninstallComponentImpl(
             e->destroy_phase.clear();
             m_registry->EndOpLocked(*e);
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o); events = std::move(ev);
+            obj = std::move(o);
+            events = std::move(ev);
         }
     }
     m_registry->DrainInactiveObservers();
@@ -1286,7 +1611,12 @@ result<void> CoApp::_InstallServiceImpl(
     const std::vector<detail::ComponentBindingDecl>& decls) {
     if (m_state.load() == AppState::Stopped)
         return result<void>::err(MakeError(ErrorCode::Closed,
-            "InstallService: app stopped"));
+                                           "InstallService: app stopped"));
+
+    // ActorSerial 按-key 实例与主实例共用构造/销毁函数；主实例随后会移走
+    // destroy，这里先留一份给惰性工厂。
+    auto make_actor = make;
+    auto destroy_actor = destroy;
 
     std::shared_ptr<void> obj;
     try {
@@ -1297,10 +1627,10 @@ result<void> CoApp::_InstallServiceImpl(
             });
     } catch (const std::exception& e) {
         return result<void>::err(MakeError(ErrorCode::InternalError,
-            std::string("InstallService: ctor threw: ") + e.what()));
+                                           std::string("InstallService: ctor threw: ") + e.what()));
     } catch (...) {
         return result<void>::err(MakeError(ErrorCode::InternalError,
-            "InstallService: ctor threw (non-std)"));
+                                           "InstallService: ctor threw (non-std)"));
     }
 
     ObjectId id;
@@ -1308,20 +1638,45 @@ result<void> CoApp::_InstallServiceImpl(
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         if (m_registry->FindByTypeNameLocked(ObjectKind::Service,
-                                           service_name))
+                                             service_name))
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "InstallService: duplicate service '" + service_name + "'"));
+                                               "InstallService: duplicate service '" + service_name + "'"));
         auto r = m_registry->CreateEntryLocked(
             ObjectKind::Service, service_name, service_name,
             ComponentScope::App, {}, stype, std::move(obj));
-        if (!r) return result<void>::err(std::move(r.error()));
+        if (!r)
+            return result<void>::err(std::move(r.error()));
         auto* e = r.value();
         id = e->id;
         svc_handle = m_registry->MakeHandleLocked(*e);
-        static_cast<CoServiceBase*>(e->object.get())->_Bind(svc_handle);
+        auto* service = static_cast<CoServiceBase*>(e->object.get());
+        service->_Bind(svc_handle);
+        service->_bind_runtime(
+            bbt::coroutine::CreateObjectInfo("service", service_name),
+            std::nullopt, _MakeEgress());
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Installing);
         lk.unlock();
         m_registry->DispatchEvents(std::move(ev));
+    }
+
+    if (options.Execution() == ExecutionPolicy::ActorSerial) {
+        // ActorSerial 实例由 dispatcher 按 (service, key) 惰性激活；工厂在
+        // 安装期登记，实例与主实例同一受管类型并绑定同一出站发送闭包。
+        auto egress = _MakeEgress();
+        auto factory = [make_actor, destroy_actor, service_name,
+                        egress = std::move(egress)]()
+            -> std::shared_ptr<CoServiceBase> {
+            auto instance = std::shared_ptr<CoServiceBase>(
+                make_actor(detail::ConstructKey{}), destroy_actor);
+            instance->_bind_runtime(
+                bbt::coroutine::CreateObjectInfo("service", service_name),
+                std::nullopt, egress);
+            return instance;
+        };
+        if (auto r = m_actor_registry->RegisterFactory(
+                service_name, std::move(factory), options.MaxActors());
+            !r)
+            return r;
     }
 
     if (auto r = _ApplyServiceBindings(svc_handle, decls, options.Life());
@@ -1329,7 +1684,7 @@ result<void> CoApp::_InstallServiceImpl(
         m_registry->SetStateAndDispatch(
             id, ObjectState::InstallFailed,
             ObjectError{r.error().code, "install",
-                                r.error().message});
+                        r.error().message});
         return r;
     }
 
@@ -1338,7 +1693,7 @@ result<void> CoApp::_InstallServiceImpl(
         m_registry->SetStateAndDispatch(
             id, ObjectState::InstallFailed,
             ObjectError{r.error().code, "install",
-                                r.error().message});
+                        r.error().message});
         return r;
     }
     m_registry->SetStateAndDispatch(id, ObjectState::Installed);
@@ -1351,7 +1706,7 @@ result<void> CoApp::_InstallServiceImpl(
             m_registry->SetStateAndDispatch(
                 id, ObjectState::Failed,
                 ObjectError{r.error().code, "start",
-                                    r.error().message});
+                            r.error().message});
             return r;
         }
         m_registry->SetStateAndDispatch(id, ObjectState::Running);
@@ -1364,7 +1719,7 @@ result<void> CoApp::_ApplyServiceBindings(
     const std::vector<detail::ComponentBindingDecl>& decls,
     const LifecycleOptions& life) {
     CoServiceBase* svc = nullptr;
-    std::shared_ptr<void> owner;   // callback lease：声明绑定展开期保活 service
+    std::shared_ptr<void> owner; // callback lease：声明绑定展开期保活 service
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(svc_handle.Id());
@@ -1375,7 +1730,7 @@ result<void> CoApp::_ApplyServiceBindings(
     }
     if (!svc)
         return result<void>::err(MakeError(ErrorCode::InternalError,
-            "_ApplyServiceBindings: service entry vanished"));
+                                           "_ApplyServiceBindings: service entry vanished"));
 
     std::vector<const detail::ComponentBindingDecl*> done;
     for (const auto& d : decls) {
@@ -1384,7 +1739,7 @@ result<void> CoApp::_ApplyServiceBindings(
                 (void)_UnbindComponentImpl(*x->component_type, svc_handle,
                                            x->name, {}, life);
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "BindComponent: component type is not declared in this Service’s allowed set"));
+                                               "BindComponent: component type is not declared in this Service’s allowed set"));
         }
         auto r = _BindComponentImpl(*d.component_type, svc_handle,
                                     d.name, {}, life);
@@ -1402,7 +1757,7 @@ result<void> CoApp::_ApplyServiceBindings(
 }
 
 result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
-                                        const LifecycleOptions& life) {
+                                          const LifecycleOptions& life) {
     ObjectId id;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
@@ -1410,9 +1765,10 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
                                                    type_name);
         if (!e)
             return result<void>::err(MakeError(ErrorCode::NotFound,
-                "UninstallService: not found"));
+                                               "UninstallService: not found"));
         auto r = m_registry->BeginDestroyLocked(e->id);
-        if (!r) return result<void>::err(std::move(r.error()));
+        if (!r)
+            return result<void>::err(std::move(r.error()));
         id = e->id;
         e->destroy_phase = "uninstall";
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Uninstalling);
@@ -1429,7 +1785,8 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
         for (const auto& cid :
              m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
             auto* x = m_registry->FindEntryLocked(cid);
-            if (!x) continue;
+            if (!x)
+                continue;
             // 本 subject 在该组件上的边全部进收口集合：active 边先封门，
             // 上次收口超时留下的 retiring 边沿用原 generation 续等——
             // 重试跳过旧边会让未归还的 borrow 在 OnStop 之后继续使用同一
@@ -1438,9 +1795,13 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
             bool has_active = false;
             std::vector<std::uint64_t> retiring;
             for (const auto& b : x->bindings) {
-                if (b.subject_id != id) continue;
-                if (b.retiring) retiring.push_back(b.generation);
-                else { has_active = true; }
+                if (b.subject_id != id)
+                    continue;
+                if (b.retiring)
+                    retiring.push_back(b.generation);
+                else {
+                    has_active = true;
+                }
             }
             if (has_active &&
                 m_registry->BeginUnbindLocked(*x, id, &active_gen)) {
@@ -1489,7 +1850,7 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
         auto* e = m_registry->FindEntryLocked(id);
         if (e && e->hooks_in_flight > 0) {
             Error err = MakeError(ErrorCode::TimedOut,
-                "uninstall: prior hook still in flight");
+                                  "uninstall: prior hook still in flight");
             lk.unlock();
             _AbortDestroy(id, "uninstall", "hook_in_flight", err,
                           ObjectState::UninstallIncomplete);
@@ -1508,12 +1869,19 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
             e->destroy_phase.clear();
             m_registry->EndOpLocked(*e);
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o); events = std::move(ev);
+            obj = std::move(o);
+            events = std::move(ev);
         }
     }
     m_registry->DrainInactiveObservers();
     m_registry->DispatchEvents(std::move(events));
     obj.reset();
+    // 运行态还强持有该服务实例（instances 与 immutable dispatcher 的
+    // ServiceEntry）；重建分发表但不再重绑其它服务，释放最后一个 owner，
+    // 让 OnUninstall 后的对象真实销毁。App 仍为 Created 时从未发布过运行态，
+    // 无需重建。
+    if (m_state.load() != AppState::Created)
+        (void)_PublishNetworkState(false);
     return result<void>::ok();
 }
 
@@ -1524,20 +1892,22 @@ result<void> CoApp::_InstallActorTypeImpl(
     const ActorOptions& options,
     std::function<CoActor*(detail::ConstructKey)> make,
     std::function<void(CoActor*)> destroy) {
-    (void)make; (void)destroy;
+    (void)make;
+    (void)destroy;
     if (m_state.load() == AppState::Stopped)
         return result<void>::err(MakeError(ErrorCode::Closed,
-            "InstallActor: app stopped"));
+                                           "InstallActor: app stopped"));
 
     std::unique_lock<std::mutex> lk(m_registry->Mutex());
     if (m_registry->FindByTypeNameLocked(ObjectKind::Actor, actor_type))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "InstallActor: duplicate actor type '" + actor_type + "'"));
+                                           "InstallActor: duplicate actor type '" + actor_type + "'"));
 
     auto r = m_registry->CreateEntryLocked(
         ObjectKind::Actor, actor_type, "", ComponentScope::App, {},
         atype, std::shared_ptr<void>{});
-    if (!r) return result<void>::err(std::move(r.error()));
+    if (!r)
+        return result<void>::err(std::move(r.error()));
     auto* e = r.value();
     auto ev = m_registry->SetStateLocked(*e, ObjectState::Installed);
     lk.unlock();
@@ -1556,17 +1926,19 @@ result<void> CoApp::_UninstallActorTypeImpl(std::string_view actor_type,
                                                    actor_type);
         if (!e)
             return result<void>::err(MakeError(ErrorCode::NotFound,
-                "UninstallActor: type not registered"));
+                                               "UninstallActor: type not registered"));
         for (const auto& xid :
              m_registry->ListIdsByKindLocked(ObjectKind::Actor)) {
-            if (xid == e->id) continue;
+            if (xid == e->id)
+                continue;
             auto* x = m_registry->FindEntryLocked(xid);
             if (x && x->type_name == actor_type && !x->name.empty())
                 return result<void>::err(MakeError(ErrorCode::Overloaded,
-                    "UninstallActor: live actor instances remain"));
+                                                   "UninstallActor: live actor instances remain"));
         }
         auto r = m_registry->BeginDestroyLocked(e->id);
-        if (!r) return result<void>::err(std::move(r.error()));
+        if (!r)
+            return result<void>::err(std::move(r.error()));
         id = e->id;
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Uninstalling);
         lk.unlock();
@@ -1582,7 +1954,8 @@ result<void> CoApp::_UninstallActorTypeImpl(std::string_view actor_type,
             e->destroy_phase.clear();
             m_registry->EndOpLocked(*e);
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o); events = std::move(ev);
+            obj = std::move(o);
+            events = std::move(ev);
         }
     }
     m_registry->DispatchEvents(std::move(events));
@@ -1601,7 +1974,7 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
     if (!m_registry->OwnsHandle(subject))
         return result<std::pair<ObjectHandle, std::uint64_t>>::err(
             MakeError(ErrorCode::InvalidArgument,
-                "BindComponent: subject handle belongs to another Registry"));
+                      "BindComponent: subject handle belongs to another Registry"));
     ObjectId owner_id;
     if (auto r = _ValidateOwner(placement, &owner_id); !r)
         return result<std::pair<ObjectHandle, std::uint64_t>>::err(
@@ -1611,7 +1984,7 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
     std::uint64_t gen = 0;
     BindingEvent be;
     void* subj_obj = nullptr;
-    std::shared_ptr<void> subj_owner;   // callback lease：锁外 hook 期保活
+    std::shared_ptr<void> subj_owner; // callback lease：锁外 hook 期保活
     ObjectKind subj_kind;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
@@ -1619,17 +1992,17 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
         if (!subj || subj->generation != subject.Generation())
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 MakeError(ErrorCode::NotFound,
-                    "BindComponent: subject stale"));
+                          "BindComponent: subject stale"));
         if (subj->kind == ObjectKind::App)
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 MakeError(ErrorCode::InvalidArgument,
-                    "BindComponent: subject cannot be an App handle"));
+                          "BindComponent: subject cannot be an App handle"));
         if (subj->kind == ObjectKind::Service) {
             auto* svc = static_cast<CoServiceBase*>(subj->object.get());
             if (!svc->_AllowsComponent(ctype))
                 return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                     MakeError(ErrorCode::InvalidArgument,
-                        "BindComponent: component type is not declared in this Service’s allowed set"));
+                              "BindComponent: component type is not declared in this Service’s allowed set"));
         }
 
         auto* comp = m_registry->FindComponentLocked(placement.Scope(),
@@ -1637,20 +2010,14 @@ result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
         if (!comp)
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 MakeError(ErrorCode::NotFound,
-                    "BindComponent: component not found"));
-        // 组件→组件依赖：加边不得成环（subject 依赖 target）。
-        if (subj->kind == ObjectKind::Component &&
-            _WouldFormCycleLocked(subject.Id(), comp->id))
-            return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                    "BindComponent: dependency would form a cycle"));
+                          "BindComponent: component not found"));
         if (auto r = m_registry->BindLocked(*comp, *subj, subject.Id(), &gen); !r)
             return result<std::pair<ObjectHandle, std::uint64_t>>::err(
                 std::move(r.error()));
 
         comp_handle = m_registry->MakeHandleLocked(*comp);
         subj_obj = subj->object.get();
-        subj_owner = subj->object;   // 锁外 OnBindingChanged 的保活 lease
+        subj_owner = subj->object; // 锁外 OnBindingChanged 的保活 lease
         subj_kind = subj->kind;
         // subject 绑定表回填：Service/Component/Actor 统一（
         // GetComponent 只读；对象析构由 Registry owner 保证）。
@@ -1694,9 +2061,10 @@ result<void> CoApp::_UnbindComponentImpl(
     // 跨 App 句柄拒绝：subject 必须属于本 Registry。
     if (!m_registry->OwnsHandle(subject))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "UnbindComponent: subject handle belongs to another Registry"));
+                                           "UnbindComponent: subject handle belongs to another Registry"));
     ObjectId owner_id;
-    if (auto r = _ValidateOwner(placement, &owner_id); !r) return r;
+    if (auto r = _ValidateOwner(placement, &owner_id); !r)
+        return r;
 
     ObjectId comp_id;
     std::uint64_t gen = 0;
@@ -1706,7 +2074,7 @@ result<void> CoApp::_UnbindComponentImpl(
                                                      owner_id, ctype, name);
         if (!comp)
             return result<void>::err(MakeError(ErrorCode::NotFound,
-                "UnbindComponent: component not found"));
+                                               "UnbindComponent: component not found"));
         comp_id = comp->id;
         auto r = m_registry->BeginUnbindLocked(*comp, subject.Id(), &gen);
         if (!r) {
@@ -1724,7 +2092,7 @@ result<void> CoApp::_UnbindComponentImpl(
 
     const auto deadline = m_registry->ResolveDeadline(life);
     auto r = m_registry->WaitBindingDrained(comp_id, subject.Id(), gen,
-                                          deadline);
+                                            deadline);
     if (!r) {
         LifecycleFailure f;
         f.object_id = comp_id;
@@ -1785,21 +2153,38 @@ result<void> CoApp::_UnbindComponentImpl(
 }
 
 bbt_co_async(result<void>) CoApp::CoBindObject(const ObjectHandle& subject,
-                               const ObjectHandle& target) {
+                                               const ObjectHandle& target) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
-    (void)subject; (void)target;
+    (void)subject;
+    (void)target;
     return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
-        "BindObject: non-owning relationship edges are not supported"));
+                                       "BindObject: non-owning relationship edges are not supported"));
 }
 
 bbt_co_async(result<void>) CoApp::CoUnbindObject(const ObjectHandle& subject,
-                                 const ObjectHandle& target) {
+                                                 const ObjectHandle& target) {
     if (auto ctx = _CheckCoContext(); !ctx)
         return result<void>::err(std::move(ctx.error()));
-    (void)subject; (void)target;
+    (void)subject;
+    (void)target;
     return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
-        "UnbindObject: non-owning relationship edges are not supported"));
+                                       "UnbindObject: non-owning relationship edges are not supported"));
+}
+
+result<bbt::infra::rpc::Response> DispatchInboundForTest(
+    CoApp& app, const bbt::infra::rpc::Request& request) {
+    return app._DispatchInbound(request);
 }
 
 } // namespace bbt::framework::v2
+
+namespace bbt::framework {
+
+std::unique_ptr<v2::CoApp> MakeCoAppForTest(
+    AppOptions options, CoAppSeam seam) {
+    return std::unique_ptr<v2::CoApp>(
+        new v2::CoApp(std::move(options), std::move(seam)));
+}
+
+} // namespace bbt::framework

@@ -166,10 +166,14 @@ trap cleanup EXIT
 # ── 场景 0：两进程启动 ────────────────────────────────────────────────
 echo
 echo "== 0. start svc_a(storage :$PORT_A) + svc_b(gateway :$PORT_B) =="
-"$SVC_A" "$PORT_A" "$REDIS_ADDR" "$MONGO_URI" \
-    >"$LOG_SVC_A" 2>&1 &
+# 生成式入口（bbtco_main）不暴露 argv：参数经环境变量传入。
+BBT_EXAMPLE_LISTEN_PORT="$PORT_A" BBT_EXAMPLE_REDIS_ADDR="$REDIS_ADDR" \
+BBT_EXAMPLE_MONGO_URI="$MONGO_URI" \
+    "$SVC_A" >"$LOG_SVC_A" 2>&1 &
 PID_A=$!
-"$SVC_B" "$PORT_B" "127.0.0.1:$PORT_A" >"$LOG_SVC_B" 2>&1 &
+BBT_EXAMPLE_LISTEN_PORT="$PORT_B" \
+BBT_EXAMPLE_STORAGE_ENDPOINT="127.0.0.1:$PORT_A" \
+    "$SVC_B" >"$LOG_SVC_B" 2>&1 &
 PID_B=$!
 
 # 等监听就绪：轮询端口可连通（真实 TCP connect 作就绪判据）。就绪标志必须
@@ -203,7 +207,8 @@ echo
 echo "== 1..6. driver 正常+错误+服务端预算超时+未路由+清理 =="
 DRIVER_RC=0; DRIVER_TEE_RC=0
 set +e
-"$DRIVER" "127.0.0.1:$PORT_B" | tee "$LOG_DRIVER"
+BBT_EXAMPLE_GATEWAY_ENDPOINT="127.0.0.1:$PORT_B" \
+    "$DRIVER" | tee "$LOG_DRIVER"
 driver_pipe_rc=("${PIPESTATUS[@]}")
 set -e
 DRIVER_RC="${driver_pipe_rc[0]}"
@@ -221,7 +226,9 @@ A_RC="$STOP_RC"; PID_A=""
 echo "[demo] svc_a exit code: $A_RC"
 DOWN_RC=0; DOWN_TEE_RC=0
 set +e
-"$DRIVER" "127.0.0.1:$PORT_B" --expect-storage-down | tee "$LOG_DRIVER_DOWN"
+BBT_EXAMPLE_GATEWAY_ENDPOINT="127.0.0.1:$PORT_B" \
+    BBT_EXAMPLE_EXPECT_STORAGE_DOWN=1 \
+    "$DRIVER" | tee "$LOG_DRIVER_DOWN"
 down_pipe_rc=("${PIPESTATUS[@]}")
 set -e
 DOWN_RC="${down_pipe_rc[0]}"

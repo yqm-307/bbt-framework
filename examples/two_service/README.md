@@ -29,13 +29,17 @@ self-connection 约束，也走完整的握手与 epoch 协商。
 `.proto` 真源 + `ProtoCodec` 特化 + `ProtoMethod` 声明糖）；#5 不另造第二套
 schema、协议、错误信封或跨语言 client。
 
-严格遵守 #5 边界：框架消费面只使用公开头（`CoApp.hpp`/`CoService.hpp`/
-`ICoService` 的 `call`/`RpcMethods.hpp`/`ICoCloseable.hpp`）；另按 #4 已验收
+严格遵守 #5 边界：框架消费面只使用公开头（`V2.hpp`/`Service.hpp`/
+`CoServiceBase::call`/`RpcMethods.hpp`）；另按 #4 已验收
 示例口径使用 coroutine 的进程级启动配置访问头
-`bbt/coroutine/detail/GlobalConfig.hpp`，仅在调度器启动前设置示例所需的栈大小和
-静态线程数。除此之外不使用 `framework/internal/`、Binder、`CoAppSeam`、
-`MakeCoAppForTest`、`DispatchInboundForTest`、`INetworkHost` 桩或发送函数注入；
-不创建额外 `io_thread`（只调用公开 `CoApp::run()` / `request_shutdown()`）。
+`bbt/coroutine/detail/GlobalConfig.hpp`，在 runtime 的 `setup_runtime()` 阶段（Start
+之前）设置示例所需的栈大小和静态线程数。除此之外不使用 `framework/internal/`、
+Binder、`CoAppSeam`、`MakeCoAppForTest`、`DispatchInboundForTest`、`INetworkHost`
+桩或发送函数注入；不创建额外 `io_thread`（只调用公开 `v2::CoApp::CoStart` /
+`CoWaitShutdownRequest` / `CoStop` / `RequestShutdown`）。入口是 runtime
+的生成式 `bbtco_main`：两个进程都不写 native main、不启停 scheduler、不建 runner
+线程；参数经环境变量传入（`BBT_EXAMPLE_MODE` / `BBT_EXAMPLE_PORT_FILE` /
+`BBT_EXAMPLE_CALLEE_EP` / `BBT_EXAMPLE_META_FILE` / `BBT_EXAMPLE_JOURNAL_FILE`）。
 
 ## 构建与运行（一条路径）
 
@@ -66,7 +70,7 @@ BIN=build-deps/project-build/examples/two_service/two_service
 # 读 /tmp/callee.port 得 PORT，然后：
 "$BIN" caller /tmp/caller.port 127.0.0.1:PORT /tmp/caller.meta /tmp/journal &
 # 读 /tmp/caller.port 后按正式 V2 会话发请求（或用 ctest 的驱动器）；
-# 先关 caller stdin 触发 request_shutdown()，再关 callee stdin。
+# 先关 caller stdin 触发 RequestShutdown()，再关 callee stdin。
 ```
 
 `examples.two_service`（ctest）会 spawn 两个自有进程、等 port 文件就绪、用
@@ -104,5 +108,5 @@ journal 交叉对照：只有真正到达 callee handler 的 3 个请求（known
 - **协程栈**：handler 内做 protobuf 编解码 + 入站分发 + 真实出站；默认 12KB 栈
   不足以承载（同 #4 实测记录）；两个 fixture 进程都经 coroutine 公开配置宏
   `g_bbt_coroutine_config` 把栈调到 512KB 并给 4 个静态线程（该配置
-  process-global 且须在调度器 Start 前设置）。512KB 只范围化覆盖本示例负载；
+  process-global，且只能在 `setup_runtime()`（runtime Start 前）写）。512KB 只范围化覆盖本示例负载；
   框架默认栈对任意 protobuf 业务不保证安全，属框架层待办。

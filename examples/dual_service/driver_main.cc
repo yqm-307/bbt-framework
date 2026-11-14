@@ -1,10 +1,13 @@
 // examples/dual_service/driver_main.cc — driver：演示客户端进程。
 //
-// 独立进程：自起 Scheduler + net::Engine + infra 公开的 V2 会话客户端
-// (bbt::infra::rpc::CoRpcClient)，向 gateway 发真实 RPC。只依赖 infra 公开头
-// （net/Engine、rpc/CoRpcClient、rpc/Request、rpc/Response）与 framework 公开面
-// （CoRpc 位置参数 codec）——不引用 framework internal 头，也不手写第二套
-// SessionFrame/u32be/Hello 编解码：wire 的唯一实现是 infra 的 V2 会话。
+// 独立进程：业务主协程（runtime 的生成式 `bbtco_main`）里装配 net::Engine +
+// infra 公开的 V2 会话客户端 (bbt::infra::rpc::CoRpcClient)，向 gateway 发真实
+// RPC；共享 Engine 的唯一一次 `Engine::Run` 经 framework `HostGate` 发布给
+// 入口 `bbtco_main_host_hook` 在主线程执行，业务侧不建线程、不 join、不等待
+// future。只依赖 infra 公开头（net/Engine、rpc/CoRpcClient、rpc/Request、
+// rpc/Response）与 framework 公开面（HostGate、CoRpc 位置参数 codec）——
+// 不引用 framework internal 头，也不手写第二套 SessionFrame/u32be/Hello
+// 编解码：wire 的唯一实现是 infra 的 V2 会话。
 //
 // V2 会话的预算语义：CallOptions.deadline 同时是客户端等待上限与 wire
 // remaining_budget_ms 的来源，服务端据此把入站预算收敛为
@@ -25,23 +28,21 @@
 // 自己的键，不覆盖共享后端的固定键。未设前缀时退化为 "color"/"absent"
 // （仅手工调试，run_demo.sh 总是显式给前缀）。
 //
-// 用法: driver <gateway_endpoint host:port> [--expect-storage-down]
+// 参数（生成式入口不暴露 argv，参数经环境变量传入）：
+//   BBT_EXAMPLE_GATEWAY_ENDPOINT=<host:port>（必填）
+//   BBT_EXAMPLE_EXPECT_STORAGE_DOWN=1（可选：只跑 storage 不可达的失败路径）
 //   BBT_DEMO_KEY_PREFIX  本轮 key 前缀（可选）
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
-#include <thread>
 
 #include <bbt/coroutine/coroutine.hpp>
 
@@ -52,6 +53,7 @@
 #include <bbt/infra/rpc/Response.hpp>
 
 #include <bbt/framework/Framework.hpp> // CoRpcReq/位置参数 codec（公开面）
+#include <bbt/framework/HostGate.hpp>
 
 namespace fw = bbt::framework;
 namespace co = bbt::coroutine;
@@ -97,55 +99,26 @@ const char* CodeName(fw::ErrorCode c) {
     return "?";
 }
 
-// 全局运行态：main 建立；协程里执行 Call。
-// 必须是可显式释放的全局：若留在静态析构阶段，Engine/Client 的析构会发生在
-// g_scheduler->Stop() 之后，访问已停调度器导致崩溃。main 返回前 reset()。
+// 全局运行态：bbtco_main 装配，场景协程里执行 Call。
+// 必须是可显式释放的全局：静态析构阶段销毁 Engine/Client 会发生在业务收口之后
+// 的任意时刻。主协程返回前 reset()。
 struct DriverRuntime {
     std::shared_ptr<net::Engine> engine;
     std::shared_ptr<rpc::CoRpcClient> client;
-    std::thread runner;
-    std::shared_future<std::error_code> finished;
 };
 std::shared_ptr<DriverRuntime> g_runtime;
 std::string g_endpoint;
 std::uint32_t g_seq = 0;
 
 // 启动 client-only Engine（本代网络资源）并装配 V2 会话客户端。
+// 与生产 App 同一形态：Idle 装配完成后经 HostGate 发布 {engine, config}，由
+// 入口 host hook 在主线程执行一次 Run；本协程经 CoWaitRunning 观察 Ready。
+// Run 由 bbtco_main_host_hook 执行——见文件尾；不建 runner 线程、不 join。
 bool StartRuntime() {
     auto rt = std::make_shared<DriverRuntime>();
     rt->engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     if (!rt->engine)
         return false;
-
-    net::EngineConfig config;
-    config.runtime_progress = net::RuntimeProgress::Independent;
-    config.options.num_event_loop = 1;
-    auto done = std::make_shared<std::promise<std::error_code>>();
-    rt->finished = done->get_future().share();
-    rt->runner = std::thread([engine = rt->engine, config, done]() mutable {
-        try {
-            done->set_value(engine->Run(config));
-        } catch (...) {
-            done->set_value(std::make_error_code(std::errc::io_error));
-        }
-    });
-
-    const auto until = Clock::now() + std::chrono::seconds{5};
-    while (rt->engine->Phase() != net::EnginePhase::Running) {
-        if (rt->finished.wait_for(std::chrono::milliseconds{0}) ==
-            std::future_status::ready) {
-            std::fprintf(stderr, "[driver] engine Run failed before Running\n");
-            rt->runner.join();
-            return false;
-        }
-        if (Clock::now() >= until) {
-            std::fprintf(stderr, "[driver] engine startup timed out\n");
-            rt->engine->RequestClose();
-            rt->runner.join();
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
 
     rpc::ClientOptions options;
     options.SetLocalIdentity("dual-service-driver")
@@ -157,10 +130,30 @@ bool StartRuntime() {
         std::fprintf(stderr, "[driver] rpc client create failed: %s\n",
                      client.error().message.c_str());
         rt->engine->RequestClose();
-        rt->runner.join();
         return false;
     }
     rt->client = std::move(client).value();
+
+    // Idle 装配完成 → 发布给入口 host hook；client-only 无 listen_addresses。
+    bbt::framework::HostGate::Publication publication;
+    publication.engine = rt->engine;
+    publication.config.runtime_progress = net::RuntimeProgress::Independent;
+    publication.config.options.num_event_loop = 1;
+    bbt::framework::HostGate::Publish(std::move(publication));
+
+    bbt::coroutine::WaitOptions wait;
+    wait.deadline = Clock::now() + std::chrono::seconds{5};
+    auto ready = rt->engine->CoWaitRunning(wait);
+    if (!ready) {
+        std::fprintf(stderr, "[driver] engine not running: %s\n",
+                     ready.error().message.c_str());
+        auto closed = bbt_co_await rt->client->Close(
+            bbt::infra::CloseOptions::Graceful(Clock::now() +
+                                               std::chrono::seconds{5}));
+        (void)closed;
+        rt->engine->RequestClose();
+        return false;
+    }
     g_runtime = std::move(rt);
     return true;
 }
@@ -168,14 +161,19 @@ bool StartRuntime() {
 void StopRuntime() {
     if (!g_runtime)
         return;
-    // 控制线程不在协程域：统一关闭入口的协程 Close 不可直接消费，用同步
-    // Shutdown 立即封口；连接物理回收由 Engine RequestClose 后 Run 返回收口。
-    if (g_runtime->client)
-        g_runtime->client->Shutdown();
-    if (g_runtime->engine)
+    if (g_runtime->client) {
+        // 客户端自己的会话责任先收：统一关闭入口在 Co 域 await。
+        auto closed = bbt_co_await g_runtime->client->Close(
+            bbt::infra::CloseOptions::Graceful(Clock::now() +
+                                               std::chrono::seconds{5}));
+        (void)closed;
+    }
+    if (g_runtime->engine) {
+        // Engine 的物理凭据只有「入口 host hook 的 Run 已返回」；主任务结束时
+        // hook 经 OnMainTaskDone 调一次 RequestClose。这里显式同值收口，使
+        // 主协程返回前 Run 必然已在收口路径上（幂等）。
         g_runtime->engine->RequestClose();
-    if (g_runtime->runner.joinable())
-        g_runtime->runner.join();
+    }
     g_runtime->client.reset();
     g_runtime->engine.reset();
     g_runtime.reset();
@@ -199,43 +197,22 @@ Reply Send(const std::string& service, const std::string& method,
         .SetPayload(req.payload());
     const std::string want_request_id = request.RequestId();
 
-    // Client::Call 只在协程内合法；控制线程这边用 latch（mutex+CV）收协程结果。
-    struct Slot {
-        std::mutex              m;
-        std::condition_variable cv;
-        bool                    done = false;
-        Reply                   reply;
-    };
-    auto slot = std::make_shared<Slot>();
-    bbtco[request, slot, budget, want_request_id]() mutable {
-        inf::CallOptions o;
-        o.deadline = Clock::now() + budget;
-        auto res = bbt_co_await g_runtime->client->Call(
-            "tcp://" + g_endpoint, std::move(request), o);
-        Reply r;
-        if (!res) {
-            r.ok    = false;
-            r.error = std::move(res.error());
-        } else if (res.value().RequestId() != want_request_id) {
-            r.error = fw::MakeError(fw::ErrorCode::ProtocolError,
-                                    "v2 reply: request_id mismatch");
-        } else {
-            r.ok = true;
-            r.payload = res.value().Payload();
-        }
-        std::lock_guard<std::mutex> lk(slot->m);
-        slot->reply = std::move(r);
-        slot->done  = true;
-        slot->cv.notify_all();
-    };
-    std::unique_lock<std::mutex> lk(slot->m);
-    // 有界等待：协程未在预算+5s 内落定即记 InternalError（不无限等）。
-    if (!slot->cv.wait_for(lk, budget + std::chrono::seconds{5},
-                           [&] { return slot->done; })) {
-        out.error = fw::MakeError(fw::ErrorCode::InternalError,
-                                  "driver: send coroutine did not finish");
+    // Client::Call 只在协程内合法：Send 本身就在业务主协程里，直接 await，
+    // 不再投递协程 + 用 CV 把结果搬回 native 线程。预算已由 CallOptions 承载，
+    // 客户端等待上限与 wire remaining_budget_ms 共用同一个 deadline。
+    inf::CallOptions o;
+    o.deadline = Clock::now() + budget;
+    auto res = bbt_co_await g_runtime->client->Call(
+        "tcp://" + g_endpoint, std::move(request), o);
+    if (!res) {
+        out.ok = false;
+        out.error = std::move(res.error());
+    } else if (res.value().RequestId() != want_request_id) {
+        out.error = fw::MakeError(fw::ErrorCode::ProtocolError,
+                                  "v2 reply: request_id mismatch");
     } else {
-        out = slot->reply;
+        out.ok = true;
+        out.payload = res.value().Payload();
     }
     out.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - t0);
@@ -270,26 +247,33 @@ std::string ErrDetail(const Reply& r) {
 
 } // namespace
 
-int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) {
+// 客户端命令面是单一协程流，Engine 的 Run 由入口 host hook 承担、
+// CoWaitRunning 与 Client Close 都要 await，故用 runtime 默认栈位即可；
+// 这里只钉 worker 数（业务 1 + Engine 2 槽）。
+void setup_runtime() {
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+}
+
+int bbtco_main() {
+    // 参数（生成式入口不暴露 argv）：BBT_EXAMPLE_GATEWAY_ENDPOINT 必填，
+    // BBT_EXAMPLE_EXPECT_STORAGE_DOWN=1 时只跑 storage 不可达的失败路径。
+    const char* endpoint = std::getenv("BBT_EXAMPLE_GATEWAY_ENDPOINT");
+    if (endpoint == nullptr || *endpoint == '\0') {
         std::fprintf(stderr,
-            "usage: driver <gateway_endpoint host:port> "
-            "[--expect-storage-down]\n");
+                     "usage: driver with env BBT_EXAMPLE_GATEWAY_ENDPOINT=<host:port> "
+                     "[BBT_EXAMPLE_EXPECT_STORAGE_DOWN=1]\n");
         return 64;
     }
-    g_endpoint = argv[1];
-    const bool storage_down =
-        (argc == 3 && std::strcmp(argv[2], "--expect-storage-down") == 0);
+    g_endpoint = endpoint;
+    const char* down_flag = std::getenv("BBT_EXAMPLE_EXPECT_STORAGE_DOWN");
+    const bool storage_down = down_flag != nullptr && *down_flag != '\0' &&
+                              std::strcmp(down_flag, "0") != 0;
     if (const char* p = std::getenv("BBT_DEMO_KEY_PREFIX"))
         g_key_prefix = p;
 
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
-    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
-    g_scheduler->Start();
-
     if (!StartRuntime())
         return 70;
-
     std::printf("[driver] gateway=%s key_prefix=\"%s\"\n\n",
                 g_endpoint.c_str(), g_key_prefix.c_str());
 
@@ -399,8 +383,15 @@ int main(int argc, char** argv) {
     std::printf("\n[driver] %d passed, %d failed\n", g_pass, g_fail);
     std::fflush(stdout);
 
-    // 收口：Client Shutdown 后 Engine RequestClose，Run 返回才表示本代网络资源
-    // 收口；显式 reset 后于 Close 即可（coroutine Scheduler 无 Stop）。
+    // 收口：Client Close → Engine RequestClose（入口 host hook 的 Run 在主任务
+    // 结束后必然返回；Run 返回即物理凭据）。收口后显式 reset 全局运行态。
     StopRuntime();
     return g_fail == 0 ? 0 : 1;
 }
+
+// 入口 native host hook：共享 Engine 的 Engine::Run 在主线程执行一次。
+int bbtco_main_host_hook(bbt::coroutine::HostHookContext& ctx) {
+    return bbt::framework::HostGate::RunHostGate(ctx);
+}
+
+BBTCO_MAIN_WITH_SETUP_AND_HOST_HOOK();

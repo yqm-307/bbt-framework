@@ -115,6 +115,14 @@ set_tests_properties(framework.coapp_lifecycle PROPERTIES
 add_executable(Test_framework_inbound_http Test_framework_inbound_http.cc)
 target_link_libraries(Test_framework_inbound_http PRIVATE bbt::framework)
 target_compile_options(Test_framework_inbound_http PRIVATE -Wall -Wextra)
+# T17 验收用 helper：真实生成式入口子进程（bbtco_main + bbtco_main_host_hook），
+# 由测试按编译期注入的绝对路径 spawn（无环境变量依赖）。
+add_executable(hostgate_child hostgate_child.cc)
+target_link_libraries(hostgate_child PRIVATE bbt::framework)
+target_compile_options(hostgate_child PRIVATE -Wall -Wextra)
+add_dependencies(Test_framework_inbound_http hostgate_child)
+target_compile_definitions(Test_framework_inbound_http PRIVATE
+    BBT_HOSTGATE_CHILD_BIN="$<TARGET_FILE:hostgate_child>")
 add_test(NAME framework.inbound_http COMMAND Test_framework_inbound_http)
 set_tests_properties(framework.inbound_http PROPERTIES
     TIMEOUT 60 LABELS "smoke;integration")
@@ -155,15 +163,30 @@ set_tests_properties(framework.rpc_codec PROPERTIES
 # request_phase/OutcomeUnknown 由 framework.egress_request_phase 承担，
 # Close/排空由 framework.shutdown 与 framework.close_gate 承担。
 
-# 命名资源 Registry：工厂装配、Create/Start 相位、失败回滚与
-# 关闭序列下的同步 Close 收束（INetworkHost 桩驱动）。
-add_executable(Test_framework_resource_lifecycle
-    Test_framework_resource_lifecycle.cc)
-target_link_libraries(Test_framework_resource_lifecycle PRIVATE bbt::framework)
-target_compile_options(Test_framework_resource_lifecycle PRIVATE -Wall -Wextra)
-add_test(NAME framework.resource_lifecycle
-    COMMAND Test_framework_resource_lifecycle)
-set_tests_properties(framework.resource_lifecycle PROPERTIES
+# 组件化资源路径：RedisComponent/MongoDBComponent 装配、共享 Engine 借用、
+# 5 Service 3+2 绑定身份/隔离/逆序关闭与 CoStop(CloseOptions) 转发。
+# 不连接真实后端（Redis 池 Idle 装配、Mongo owner 只 Create/Close）。
+add_executable(Test_framework_component_lifecycle
+    Test_framework_component_lifecycle.cc)
+target_link_libraries(Test_framework_component_lifecycle PRIVATE bbt::framework)
+target_compile_options(Test_framework_component_lifecycle PRIVATE -Wall -Wextra)
+# Redis net / Mongo 头与实现只在对应 infra 模块在场时链接；缺模块的配置
+# 保持原状，不静默把未编译当作通过。
+if(TARGET bbt::infra_redis_net)
+    target_link_libraries(Test_framework_component_lifecycle PRIVATE
+        bbt::infra_redis_net)
+    target_compile_definitions(Test_framework_component_lifecycle PRIVATE
+        BBT_FRAMEWORK_HAS_REDIS_NET=1)
+endif()
+if(TARGET bbt::infra_mongo)
+    target_link_libraries(Test_framework_component_lifecycle PRIVATE
+        bbt::infra_mongo)
+    target_compile_definitions(Test_framework_component_lifecycle PRIVATE
+        BBT_FRAMEWORK_HAS_MONGO=1)
+endif()
+add_test(NAME framework.component_lifecycle
+    COMMAND Test_framework_component_lifecycle)
+set_tests_properties(framework.component_lifecycle PROPERTIES
     TIMEOUT 30 LABELS "smoke;unit")
 
 # 强制 live 验收开关（默认 OFF）：live runner/CI 显式
@@ -186,15 +209,14 @@ if(BBT_REQUIRE_RESOURCE_LIVE_TESTS)
     endif()
 endif()
 
-# live 验收：真实 Redis/MongoDB 容器经工厂装配 + service 资源缝
-# 消费 + 关闭收束到 IsClosed。Redis 与 Mongo 是两个独立 target/CTest 用例，
-# 各自显式要求对应 infra 模块已构建（缺 target → 编译期失败而不是静默
-# 消失）；环境变量缺失时进程以 77 退出，配合 SKIP_RETURN_CODE 标为
-# CTest Skipped——缺后端必须显式 skipped 或非零失败，不得记为 Passed。
-# Redis 用例消费新 net 入口（framework/include/bbt/framework/
-# RedisNetResource.hpp），不再走旧 bbt::infra::CoRedisCli 栈；Mongo 用例
-# 消费新 owner/句柄入口（framework/include/bbt/framework/
-# MongoDbResource.hpp），不再走旧 bbt::infra::CoMongoCli 栈。
+# live 验收：真实 Redis/MongoDB 后端经 framework 唯一受管能力路径
+# `v2::RedisComponent` / `v2::MongoDBComponent` 消费（Service 经
+# ComponentHandle::Borrow 在 borrow 寿命内使用真实命令面）。测试源只有
+# Test_framework_resource_live.cc，三种 target 由编译开关选择后端组合。
+# Redis 与 Mongo 是两个独立 target/CTest 用例，各自显式要求对应 infra 模块
+# 已构建（缺 target → 不注册而不是静默通过）；环境变量缺失时进程以 77 退出，
+# 配合 SKIP_RETURN_CODE 标为 CTest Skipped——缺后端必须显式 skipped 或非零
+# 失败，不得记为 Passed。
 if(TARGET bbt::infra_redis_net)
     add_executable(Test_framework_resource_live_redis
         Test_framework_resource_live.cc)
@@ -237,17 +259,13 @@ else()
         "(BBT_MONGOC_PREFIX+BBT_MONGOCXX_PREFIX)，本配置无 Mongo live 门禁")
 endif()
 
-# 联合 live 验收：真实 V2 会话 → 框架入站 → 业务 Service →
-# 真实 Redis + Mongo 联合消费。要求两个 infra 资源模块都在场（任一缺失
-# 即不注册本 target——单资源 live 不能替代联合验收），缺环境时进程 77
-# 退出配合 SKIP_RETURN_CODE 标 Skipped。
+# 联合 live 验收：同一 App 上 2 个 RedisComponent + 1 个 MongoDBComponent +
+# 5 个 Service 的 3+2 绑定 → 真实 Redis PING/SET/GET 与 Mongo Insert/Find
+# 联合消费。要求两个 infra 资源模块都在场（任一缺失即不注册本 target——单
+# 资源 live 不能替代联合验收），缺环境时进程 77 退出配合 SKIP_RETURN_CODE。
 if(TARGET bbt::infra_redis_net AND TARGET bbt::infra_mongo)
-    # 业务 Service 在独立 TU framework_resource_service.cc 中实现（只 include
-    # framework/infra/coroutine 公开头），与测试宿主分属不同编译单元——这是
-    # 「干净消费者 Service 只公共头即可按名称使用资源」的真实编译证据。
     add_executable(Test_framework_resource_live_combined
-        Test_framework_resource_combined.cc
-        framework_resource_service.cc)
+        Test_framework_resource_live.cc)
     target_link_libraries(Test_framework_resource_live_combined PRIVATE
         bbt::framework bbt::infra_redis_net bbt::infra_mongo)
     target_compile_options(Test_framework_resource_live_combined PRIVATE
@@ -334,7 +352,8 @@ if(TARGET getvalue_proto)
 endif()
 
 # V2 正式会话路径上的并发隔离/容量/迟到寿命与关闭矩阵。
-# 服务端：公开 CoApp（local_identity 必填）+ 真实 InfraHttpHost 监听
+# 服务端：公开 v2::CoApp（AppNetworkOptions::SetLocalAppId 必填）+ 真实
+# InfraHttpHost 监听
 # 127.0.0.1 动态端口；客户端：第二个 InfraHttpHost（互异 identity）的
 # rpc_client owner + RpcEgress::Call，走真实 TCP loopback 的 SessionFrame +
 # Hello/HelloAck。不使用 MakeCoAppForTest / DispatchInboundForTest /

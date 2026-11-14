@@ -4,24 +4,12 @@
 // ValidateServiceOptions 落实装配期规则；「容量耗尽返回 Overloaded」
 // 属运行期行为，不在此检查。
 
-#include <cstddef>
-
 #include <bbt/framework/Result.hpp>
 
 namespace bbt::framework {
 
 enum class ExecutionPolicy { Concurrent, ActorSerial };
-
-struct ServiceOptions {
-    ExecutionPolicy execution;
-    std::size_t max_inflight;
-    std::size_t mailbox_capacity;
-    std::size_t max_actors;
-    bool ordered_ingress;
-    std::size_t max_ordered_streams;
-    std::size_t max_cached_results;
-    std::size_t max_cached_result_bytes;
-};
+class ServiceOptions;
 
 // 装配期校验：
 //  - max_inflight 必须 > 0；

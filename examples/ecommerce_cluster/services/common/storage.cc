@@ -77,19 +77,21 @@ result<MongoDocument> Filter(const std::string& id) {
     return MongoDocument::FromJson("{\"_id\":\"" + id + "\"}");
 }
 } // namespace
-result<v1::Record> ReadRecord(MongoDbResource& db, const std::string& id,
+result<v1::Record> ReadRecord(bbt::infra::mongo::CoMongoColl& coll,
+                              const std::string& id,
                               const bbt::infra::CallOptions& options) {
     auto filter = Filter(id);
     if (!filter)
         return result<v1::Record>::err(filter.error());
-    auto found = bbt_co_await db.FindOne(filter.value(), options);
+    auto found = bbt_co_await coll.FindOne(filter.value(), options);
     if (!found)
         return result<v1::Record>::err(found.error());
     if (!found.value())
         return result<v1::Record>::err(MakeError(ErrorCode::NotFound, "record not found"));
     return Decode(*found.value());
 }
-result<v1::Record> InsertRecord(MongoDbResource& db, const v1::Record& r,
+result<v1::Record> InsertRecord(bbt::infra::mongo::CoMongoColl& coll,
+                                const v1::Record& r,
                                 const bbt::infra::CallOptions& options) {
     auto filter = Filter(r.order_id());
     if (!filter)
@@ -98,15 +100,16 @@ result<v1::Record> InsertRecord(MongoDbResource& db, const v1::Record& r,
                                        "\",\"record\":\"" + Encode(r) + "\"}");
     if (!doc)
         return result<v1::Record>::err(doc.error());
-    auto inserted = bbt_co_await db.InsertOne(doc.value(), options);
+    auto inserted = bbt_co_await coll.InsertOne(doc.value(), options);
     if (inserted)
         return result<v1::Record>::ok(r);
     // 只在确认重复键时读回，未知结果和其他错误原样返回。
     if (inserted.error().backend_code != 11000)
         return result<v1::Record>::err(inserted.error());
-    return ReadRecord(db, r.order_id(), options);
+    return ReadRecord(coll, r.order_id(), options);
 }
-result<void> MarkSettled(MongoDbResource& db, const v1::Record& r,
+result<void> MarkSettled(bbt::infra::mongo::CoMongoColl& coll,
+                         const v1::Record& r,
                          const bbt::infra::CallOptions& options) {
     auto filter = Filter(r.order_id());
     if (!filter)
@@ -114,7 +117,7 @@ result<void> MarkSettled(MongoDbResource& db, const v1::Record& r,
     auto update = MongoDocument::FromJson("{\"$set\":{\"state\":\"settled\",\"record\":\"" + Encode(r) + "\"}}");
     if (!update)
         return result<void>::err(update.error());
-    auto changed = bbt_co_await db.UpdateOne(filter.value(), update.value(), options);
+    auto changed = bbt_co_await coll.UpdateOne(filter.value(), update.value(), options);
     if (!changed)
         return result<void>::err(changed.error());
     if (changed.value().matched != 1)

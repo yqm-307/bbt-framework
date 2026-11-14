@@ -11,10 +11,15 @@
 #include <utility>
 #include <vector>
 
+#include <bbt/coroutine/coroutine.hpp>
 #include <bbt/framework/Framework.hpp>
+#include <bbt/framework/V2.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
 
+#include "framework_co_harness.hpp"
+
 namespace fw = bbt::framework;
+namespace v2 = bbt::framework::v2;
 
 namespace {
 
@@ -101,9 +106,11 @@ static_assert(std::is_same_v<
         std::declval<const FakeProto&>())),
     fw::result<fw::CoRpcReq>>);
 
-class Calculator final : public fw::CoService<Calculator> {
+class Calculator final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "calculator";
+
+    explicit Calculator(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
 
     fw::CoRpcResp Add(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t, std::string>();
@@ -128,12 +135,18 @@ public:
         fw::Method<&Calculator::Add>("add"),
         fw::Method<&Calculator::Reject>("reject"),
         fw::Method<&Calculator::ProtoEcho>("proto_echo"));
+
+protected:
+    ~Calculator() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 // ActorMethodAt 位置 key：index>0 的字符串 key 与默认 index=0 的整型 key。
-class Directory final : public fw::CoService<Directory> {
+class Directory final : public v2::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "directory";
+
+    explicit Directory(fw::detail::ConstructKey k) : v2::CoService<>(k) {}
 
     fw::CoRpcResp Lookup(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t, std::string>();
@@ -149,6 +162,10 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&Directory::Lookup, std::string, 1>("lookup"),
         fw::ActorMethodAt<&Directory::ById, std::int32_t>("by_id"));
+
+protected:
+    ~Directory() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 fw::CoRpcReq Request(std::int32_t n, std::string name) {
@@ -157,24 +174,51 @@ fw::CoRpcReq Request(std::int32_t n, std::string name) {
     return std::move(req).value();
 }
 
+// 在受管协程内经 seam app 取一个真实受管 S 实例供 invoke。
+template <class S, class F>
+void WithService(F&& body) {
+    framework_test::EnsureRuntime();
+    bool ran = framework_test::RunInCoTask(
+        [&] {
+            auto app = v2::CoApp::Create(
+                fw::AppOptions{}
+                    .SetLimits(64, 64, 8, 16)
+                    .SetShutdownBudget(std::chrono::milliseconds{2000})
+                    .SetLifecycleBudget(std::chrono::milliseconds{2000}));
+            auto r = bbt_co_await app->CoInstallService<S>(
+                fw::ServiceOptions{}.SetMaxInflight(8));
+            if (!r)
+                throw std::runtime_error("install failed");
+            auto inst = framework_test::ServiceInstance(*app, S::kServiceName);
+            if (!inst)
+                throw std::runtime_error("service missing");
+            body(static_cast<S&>(*inst));
+            BOOST_REQUIRE(static_cast<bool>(bbt_co_await app->CoStop()));
+        },
+        std::chrono::seconds{30});
+    if (!ran)
+        throw std::runtime_error("service task did not settle");
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(positional_roundtrip_and_method_table) {
-    Calculator service;
     const auto table = fw::BuildMethodTable<Calculator>();
     BOOST_REQUIRE(table.find("add") != nullptr);
     BOOST_TEST(table.find("add")->request_schema ==
                std::string(fw::kCoRpcPositionalSchema));
 
-    auto out = table.find("add")->invoke(service,
-        Request(41, "answer").payload());
-    BOOST_REQUIRE(out);
-    fw::CoRpcReq response(std::move(out.value()));
-    auto values = response.Parse<std::int32_t, std::string>();
-    BOOST_REQUIRE(values);
-    const auto& [n, name] = values.value();
-    BOOST_TEST(n == 42);
-    BOOST_TEST(name == "answer!");
+    WithService<Calculator>([&](Calculator& service) {
+        auto out = table.find("add")->invoke(service,
+            Request(41, "answer").payload());
+        BOOST_REQUIRE(out);
+        fw::CoRpcReq response(std::move(out.value()));
+        auto values = response.Parse<std::int32_t, std::string>();
+        BOOST_REQUIRE(values);
+        const auto& [n, name] = values.value();
+        BOOST_TEST(n == 42);
+        BOOST_TEST(name == "answer!");
+    });
 }
 
 BOOST_AUTO_TEST_CASE(trailing_payload_is_protocol_error) {
@@ -189,13 +233,14 @@ BOOST_AUTO_TEST_CASE(trailing_payload_is_protocol_error) {
 }
 
 BOOST_AUTO_TEST_CASE(business_error_is_preserved) {
-    Calculator service;
     const auto table = fw::BuildMethodTable<Calculator>();
-    auto out = table.find("reject")->invoke(service, {});
-    BOOST_REQUIRE(!out);
-    BOOST_TEST(static_cast<int>(out.error().code) ==
-               static_cast<int>(fw::ErrorCode::InvalidArgument));
-    BOOST_TEST(out.error().message == "rejected");
+    WithService<Calculator>([&](Calculator& service) {
+        auto out = table.find("reject")->invoke(service, {});
+        BOOST_REQUIRE(!out);
+        BOOST_TEST(static_cast<int>(out.error().code) ==
+                   static_cast<int>(fw::ErrorCode::InvalidArgument));
+        BOOST_TEST(out.error().message == "rejected");
+    });
 }
 
 BOOST_AUTO_TEST_CASE(parse_error_mapping) {
@@ -215,12 +260,13 @@ BOOST_AUTO_TEST_CASE(parse_error_mapping) {
                static_cast<int>(fw::ErrorCode::InvalidArgument));
 
     // 分发边界：handler 内 Parse 失败经 CoRpcResp::Error 原样透出。
-    Calculator service;
     const auto table = fw::BuildMethodTable<Calculator>();
-    auto out = table.find("add")->invoke(service, {0xFF});
-    BOOST_REQUIRE(!out);
-    BOOST_TEST(static_cast<int>(out.error().code) ==
-               static_cast<int>(fw::ErrorCode::ProtocolError));
+    WithService<Calculator>([&](Calculator& service) {
+        auto out = table.find("add")->invoke(service, {0xFF});
+        BOOST_REQUIRE(!out);
+        BOOST_TEST(static_cast<int>(out.error().code) ==
+                   static_cast<int>(fw::ErrorCode::ProtocolError));
+    });
 }
 
 BOOST_AUTO_TEST_CASE(proto_codec_seam) {
@@ -273,15 +319,15 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     BOOST_TEST(bad.error().message == "fake proto payload truncated");
 
     // 经方法表分发的整包回路：同一服务上 proto 方法与位置方法共存。
-    Calculator service;
     const auto table = fw::BuildMethodTable<Calculator>();
-    auto out = table.find("proto_echo")->invoke(service, via_from.payload());
-    BOOST_REQUIRE(out);
-    BOOST_TEST(out.value() == via_from.payload());
+    WithService<Calculator>([&](Calculator& service) {
+        auto out = table.find("proto_echo")->invoke(service, via_from.payload());
+        BOOST_REQUIRE(out);
+        BOOST_TEST(out.value() == via_from.payload());
+    });
 }
 
 BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
-    Directory service;
     const auto table = fw::BuildMethodTable<Directory>();
     const fw::RpcMethod* lookup = table.find("lookup");
     BOOST_REQUIRE(lookup != nullptr);

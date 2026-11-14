@@ -59,19 +59,20 @@ result<bbt::infra::rpc::Response> AppRuntimeState::Send(
                           "rpc policy tightened deadline already expired"));
     }
 
+    // 测试缝出站显式替代产品默认出站：仍先经路由门与公开策略 Preflight。
+    if (seam_send)
+        return seam_send(target, env, opt);
     if (default_egress)
         return default_egress->Call(target, env, opt);
-    if (!seam_send)
-        return result<bbt::infra::rpc::Response>::err(MakeError(
-            ErrorCode::RuntimeUnavailable,
-            "CoApp: rpc_send egress not configured"));
-    return seam_send(target, env, opt);
+    return result<bbt::infra::rpc::Response>::err(MakeError(
+        ErrorCode::RuntimeUnavailable,
+        "CoApp: rpc_send egress not configured"));
 }
 
 void AppRuntimeState::Publish(
     std::shared_ptr<InboundDispatcher> d,
     std::map<std::string, std::shared_ptr<const RpcMethodTable>> t,
-    std::map<std::string, std::shared_ptr<ICoService>> inst,
+    std::map<std::string, std::shared_ptr<v2::CoServiceBase>> inst,
     std::shared_ptr<ActorRegistry> reg) {
     std::lock_guard<std::mutex> lock(mtx);
     tables   = std::move(t);
@@ -90,7 +91,8 @@ void AppRuntimeState::Release() noexcept {
 }
 
 result<bbt::infra::rpc::Response> AppRuntimeState::Dispatch(
-    const bbt::infra::rpc::Request& request, const std::function<void()>& on_dispatched) {
+    const bbt::infra::rpc::Request& request, const std::function<void()>& on_dispatched,
+    const bbt::infra::IncomingCallContext* http_context) {
     std::shared_ptr<InboundDispatcher> dispatcher;
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -100,7 +102,7 @@ result<bbt::infra::rpc::Response> AppRuntimeState::Dispatch(
         return result<bbt::infra::rpc::Response>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "dispatch runtime not published or already released"));
-    return dispatcher->Dispatch(request, on_dispatched);
+    return dispatcher->Dispatch(request, on_dispatched, http_context);
 }
 
 } // namespace bbt::framework

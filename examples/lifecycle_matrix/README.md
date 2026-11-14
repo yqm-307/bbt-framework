@@ -21,17 +21,23 @@ driver ──V2 会话──▶ fixture(自有进程, 动态 loopback)
 
 ## 为什么不是「测试缝/桩」
 
-严格遵守 #5 边界：只使用公开头（`CoApp.hpp`/`CoService.hpp`/`ICoService` 的
-`call`/`RpcMethods.hpp`/`ICoCloseable.hpp`），另按 #4 已验收示例口径使用
-coroutine 的进程级启动配置访问头 `bbt/coroutine/detail/GlobalConfig.hpp`（仅在
-调度器启动前设置栈大小/静态线程数）与公开同步原语
+严格遵守 #5 边界：只使用公开头（`V2.hpp`/`Service.hpp`/`CoServiceBase` 的
+`call`/`RpcMethods.hpp`），另按 #4 已验收示例口径使用
+coroutine 的进程级启动配置访问头 `bbt/coroutine/detail/GlobalConfig.hpp`（在
+runtime 的 `setup_runtime()` 阶段、Start 之前设置栈大小/静态线程数）与公开同步原语
 `bbt/coroutine/sync/CoWaiter.hpp`（handler 的验收挂起点）。**不使用**
 `framework/internal/`、Binder、`CoAppSeam`、`MakeCoAppForTest`、
 `DispatchInboundForTest`、`INetworkHost` 桩或任何发送函数注入；不创建额外
-`io_thread`（只调用公开 `CoApp::run()`/`request_shutdown()`）。
+`io_thread`（只调用公开 `v2::CoApp::CoStart` / `CoWaitShutdownRequest` /
+`CoStop` / `RequestShutdown`）。入口是 runtime 的生成式 `bbtco_main`：
+fixture 不写 native main、不启停 scheduler、不建 runner 线程；关闭状态迁移由同一
+runtime 内的第二个协程观察后写 journal。参数经环境变量传入
+（`BBT_EXAMPLE_MODE` / `BBT_EXAMPLE_PORT_FILE` / `BBT_EXAMPLE_META_FILE` /
+`BBT_EXAMPLE_JOURNAL_FILE` / `BBT_EXAMPLE_MAX_INFLIGHT` /
+`BBT_EXAMPLE_STEP_BUDGET_MS`）。
 
 验收控制面（**仅验收用**，不是生产注入）：fixture 的 stdin 逐行命令
-`shutdown` → `request_shutdown()`；`open` → 放行进程内验收闩 `OpenGate`；
+`shutdown` → `RequestShutdown()`；`open` → 放行进程内验收闩 `OpenGate`；
 `quit`/EOF → 收尾。断言全部基于 journal 事件、V2 响应与进程退出码，
 驱动器不用固定 sleep 猜时序：先等 journal 里的可观察握手（`handler_entered`/
 `handler_resumed`/`shutdown_state`）再推进。
