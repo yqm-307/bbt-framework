@@ -1,10 +1,12 @@
 #pragma once
-// 业务 payload codec：wire 字节即 protobuf 序列化。
-//
-// 三个服务共用同一口径：schema 由生成物的 descriptor 推导，代码里不手写
-// schema 字符串，也不复制第二套字节规则。特化必须留在 framework 的
-// rpc_detail 命名空间（那是框架公开的 trait seam），所以本头是唯一允许
-// 触碰 rpc_detail 的业务文件。
+/**
+ * 业务 payload codec：wire 字节即 protobuf 序列化。
+ *
+ * 三个服务共用同一口径：schema 由生成物的 descriptor 推导，代码里不手写
+ * schema 字符串，也不复制第二套字节规则。特化必须留在 framework 的
+ * rpc_detail 命名空间（那是框架公开的 trait seam），所以本头是唯一允许
+ * 触碰 rpc_detail 的业务文件。
+ */
 
 #include <cstdint>
 #include <string>
@@ -20,7 +22,9 @@ namespace bbt::framework::rpc_detail {
 
 namespace ecommerce_codec {
 
-// 每个消息的编解码只有一份实现；具体消息用下面的显式特化接进 ProtoCodec。
+/**
+ * 每个消息的编解码只有一份实现；具体消息用下面的显式特化接进 ProtoCodec。
+ */
 template <class T>
 struct MessageCodec {
     static constexpr bool kDefined = true;

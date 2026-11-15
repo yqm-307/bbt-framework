@@ -1,10 +1,12 @@
-// GetValue 业务切片的 C++ 侧单测。
-//
-// 机器断言：
-//  - 唯一 schema 真源 = .proto：descriptor full_name / 字段号 / 字段类型；
-//  - 方法表 schema 从 descriptor 推导，与手写常量一致（无漂移）；
-//  - ProtoCodec golden vectors：C++ 侧字节与 Python 客户端独立断言同一串；
-//  - handler 的 known/miss/empty 分支（纯逻辑，不经网络）。
+/**
+ * GetValue 业务切片的 C++ 侧单测。
+ *
+ * 机器断言：
+ * - 唯一 schema 真源 = .proto：descriptor full_name / 字段号 / 字段类型；
+ * - 方法表 schema 从 descriptor 推导，与手写常量一致（无漂移）；
+ * - ProtoCodec golden vectors：C++ 侧字节与 Python 客户端独立断言同一串；
+ * - handler 的 known/miss/empty 分支（纯逻辑，不经网络）。
+ */
 
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
@@ -48,7 +50,10 @@ BOOST_AUTO_TEST_CASE(schema_truth_is_proto_descriptor) {
     BOOST_CHECK_EQUAL(req->full_name(), "bbt.example.v1.GetValueRequest");
     BOOST_CHECK_EQUAL(resp->full_name(), "bbt.example.v1.GetValueResponse");
 
-    const auto* f1 = req->field(0);   // 声明顺序即字段号 1
+    /**
+     * 声明顺序即字段号 1
+     */
+    const auto* f1 = req->field(0);
     BOOST_CHECK_EQUAL(f1->number(), 1);
     BOOST_CHECK_EQUAL(f1->name(), "key");
     BOOST_CHECK(f1->type() == google::protobuf::FieldDescriptor::TYPE_STRING);

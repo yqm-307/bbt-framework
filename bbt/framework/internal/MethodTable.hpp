@@ -1,12 +1,14 @@
 #pragma once
-// RPC 方法表（机器面，internal/）。
-// 业务用 fw::Method / fw::ActorMethodAt / fw::RpcMethods 声明方法清单
-// （声明糖见公共头 RpcMethods.hpp，业务在 CoService<T>::kRpcMethods
-// 上书写），本头把声明展开为类型擦除的分发闭包：handler 签名统一
-// CoRpcResp(CoRpcReq)，负载经位置参数 codec（CoRpc.hpp）；actor key
-// 取自位置参数下标（ActorMethodAt），不再有手写提取 lambda。
-// 非法签名走模板推导失败的编译错误；重复/空方法名在方法表构建期抛
-// std::invalid_argument，不等首个请求才失败。
+/**
+ * RPC 方法表（机器面，internal/）。
+ * 业务用 fw::Method / fw::ActorMethodAt / fw::RpcMethods 声明方法清单
+ * （声明糖见公共头 RpcMethods.hpp，业务在 CoService<T>::kRpcMethods
+ * 上书写），本头把声明展开为类型擦除的分发闭包：handler 签名统一
+ * CoRpcResp(CoRpcReq)，负载经位置参数 codec（CoRpc.hpp）；actor key
+ * 取自位置参数下标（ActorMethodAt），不再有手写提取 lambda。
+ * 非法签名走模板推导失败的编译错误；重复/空方法名在方法表构建期抛
+ * std::invalid_argument，不等首个请求才失败。
+ */
 
 #include <cstdint>
 #include <functional>
@@ -28,8 +30,10 @@
 
 namespace bbt::framework {
 
-// ---- 成员函数指针 traits：提取 request/reply 类型与编解码绑定 ----
-// 主模板只声明不实现；不受支持的签名实例化即编译错误。
+/**
+ * ---- 成员函数指针 traits：提取 request/reply 类型与编解码绑定 ----
+ * 主模板只声明不实现；不受支持的签名实例化即编译错误。
+ */
 
 template <class MemberPtr>
 struct rpc_traits;
@@ -50,9 +54,11 @@ struct rpc_traits<CoRpcResp (Service::*)(const CoRpcReq&)> {
     static constexpr bool kCoRpc = true;
 };
 
-// ---- 单方法描述：类型擦除后的分发与 key 提取闭包 ----
-// invoke：解码负载 → 在传入的真实 Service 实例上调用成员指针 → 编码回复。
-// extract_key：仅 ActorMethod 安装，从解码后的 Request 声明字段取 key。
+/**
+ * ---- 单方法描述：类型擦除后的分发与 key 提取闭包 ----
+ * invoke：解码负载 → 在传入的真实 Service 实例上调用成员指针 → 编码回复。
+ * extract_key：仅 ActorMethod 安装，从解码后的 Request 声明字段取 key。
+ */
 
 struct RpcMethod {
     using Invoker = std::function<result<std::vector<std::uint8_t>>(
@@ -68,7 +74,9 @@ struct RpcMethod {
     KeyExtractor extract_key;
 };
 
-// 同类服务共享的静态方法描述；所有实例使用同一份，不随实例可变状态改变。
+/**
+ * 同类服务共享的静态方法描述；所有实例使用同一份，不随实例可变状态改变。
+ */
 class RpcMethodTable {
 public:
     const RpcMethod* find(std::string_view name) const noexcept {
@@ -80,7 +88,9 @@ public:
     const std::vector<RpcMethod>& methods() const noexcept { return m_methods; }
     std::size_t size() const noexcept { return m_methods.size(); }
 
-    // 构建期追加：空名/重名 → std::invalid_argument（启动期暴露）。
+    /**
+     * 构建期追加：空名/重名 → std::invalid_argument（启动期暴露）。
+     */
     void Add(RpcMethod m) {
         if (m.name.empty())
             throw std::invalid_argument("method table: empty method name");
@@ -95,11 +105,15 @@ private:
 
 namespace detail {
 
-// 声明条目类型（MethodDecl/PositionalActorMethodDecl/MethodList）在公共头
-// RpcMethods.hpp 定义——业务经 fw::Method/fw::ActorMethodAt/fw::RpcMethods
-// 构造，本头只消费已声明的清单。
+/**
+ * 声明条目类型（MethodDecl/PositionalActorMethodDecl/MethodList）在公共头
+ * RpcMethods.hpp 定义——业务经 fw::Method/fw::ActorMethodAt/fw::RpcMethods
+ * 构造，本头只消费已声明的清单。
+ */
 
-// ---- key 字段值 → 字符串（声明式 key 的换算规则） ----
+/**
+ * ---- key 字段值 → 字符串（声明式 key 的换算规则） ----
+ */
 
 template <class K>
 result<std::string> ActorKeyToString(const K& key) {
@@ -123,7 +137,9 @@ result<std::string> ActorKeyToString(const K& key) {
     return result<std::string>::ok(std::move(s));
 }
 
-// ---- 分发闭包构造 ----
+/**
+ * ---- 分发闭包构造 ----
+ */
 
 template <class MemberPtr>
 RpcMethod::Invoker MakeCoRpcInvoker(MemberPtr handler) {
@@ -171,7 +187,9 @@ RpcMethod::KeyExtractor MakePositionalKeyExtractor() {
     };
 }
 
-// ---- 声明条目 → RpcMethod 展开 ----
+/**
+ * ---- 声明条目 → RpcMethod 展开 ----
+ */
 
 template <class Decl>
 struct MethodDeclBuilder;
@@ -210,10 +228,12 @@ struct MethodDeclBuilder<PositionalActorMethodDecl<Ptr, Key, Index>> {
     }
 };
 
-// proto schema 方法。request/response_schema 从生成 message 的
-// descriptor full_name 推导——.proto 是唯一真源，杜绝手写漂移。本特化只在
-// 业务以真实 protobuf 类型实例化 ProtoMethod 时展开，框架库本体不依赖
-// protobuf 头。
+/**
+ * proto schema 方法。request/response_schema 从生成 message 的
+ * descriptor full_name 推导——.proto 是唯一真源，杜绝手写漂移。本特化只在
+ * 业务以真实 protobuf 类型实例化 ProtoMethod 时展开，框架库本体不依赖
+ * protobuf 头。
+ */
 template <auto Ptr, class Req, class Resp>
 struct MethodDeclBuilder<ProtoMethodDecl<Ptr, Req, Resp>> {
     static RpcMethod Build(const ProtoMethodDecl<Ptr, Req, Resp>& d) {
@@ -232,7 +252,9 @@ struct MethodDeclBuilder<ProtoMethodDecl<Ptr, Req, Resp>> {
 
 } // namespace detail
 
-// 声明清单 → 方法表；重名/空名在构建期抛 std::invalid_argument。
+/**
+ * 声明清单 → 方法表；重名/空名在构建期抛 std::invalid_argument。
+ */
 template <class... D>
 RpcMethodTable BuildMethodTable(const detail::MethodList<D...>& list) {
     RpcMethodTable table;
@@ -253,9 +275,11 @@ RpcMethodTable BuildMethodTable() {
         return RpcMethodTable{};
 }
 
-// 启动期校验——ActorSerial 服务的每个方法都必须经 ActorMethod 安装
-// key 提取器。缺失 → err(InvalidArgument)，message 指明方法名。
-// Concurrent 不要求提取器；Concurrent 下声明 ActorMethod 此处不拒绝。
+/**
+ * 启动期校验——ActorSerial 服务的每个方法都必须经 ActorMethod 安装
+ * key 提取器。缺失 → err(InvalidArgument)，message 指明方法名。
+ * Concurrent 不要求提取器；Concurrent 下声明 ActorMethod 此处不拒绝。
+ */
 result<void> ValidateActorKeying(const RpcMethodTable& table,
                                  ExecutionPolicy execution);
 

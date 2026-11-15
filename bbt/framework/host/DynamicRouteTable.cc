@@ -1,8 +1,10 @@
-// DynamicRouteTable 实现：锁内整体替换不可变快照，数据面只读。
-//
-// 不在此层发任何注册中心请求，也不缓存「失败」：provider 只在拿到权威结果时
-// Replace，查询失败什么都不做——last-known-good 仍按 observed_at 在
-// stale_limit 内可用，失败不刷新新鲜度。
+/**
+ * DynamicRouteTable 实现：锁内整体替换不可变快照，数据面只读。
+ *
+ * 不在此层发任何注册中心请求，也不缓存「失败」：provider 只在拿到权威结果时
+ * Replace，查询失败什么都不做——last-known-good 仍按 observed_at 在
+ * stale_limit 内可用，失败不刷新新鲜度。
+ */
 
 #include <bbt/framework/DynamicRouteTable.hpp>
 
@@ -39,7 +41,9 @@ result<void> DynamicRouteTable::Replace(
                 "DynamicRouteTable::Replace: service '" + service +
                     "' has endpoint with empty endpoint"));
     }
-    // 去重保序：同一 endpoint 重复出现只保留一份，否则 round-robin 会偏向它。
+    /**
+     * 去重保序：同一 endpoint 重复出现只保留一份，否则 round-robin 会偏向它。
+     */
     std::vector<std::string> unique;
     unique.reserve(endpoints.size());
     for (auto& ep : endpoints) {

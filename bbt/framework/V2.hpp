@@ -8,7 +8,7 @@
  * runtime）。本头只做聚合包含，具体契约在各类型自己的头里：
  *
  *   v2::CoApp        装配根（Create 唯一入口，走 coroutine 创建观测）
- *   v2::CoService<C…> 类型化服务基类（ServiceBase 是它的 internal 实现名）
+ *   v2::CoService\<C…\> 类型化服务基类（ServiceBase 是它的 internal 实现名）
  *   v2::CoComponent  能力组件基类
  *   v2::CoActor      Actor 基类
  *

@@ -1,7 +1,9 @@
-// OrderedIngress 真实 V2 会话接线验收。
-// 覆盖无票拒绝、grant、成功执行、重复重放、内容冲突与序号缺口；
-// 入站经真实 InfraHttpHost + InstallRpcAdmission + V2 Call（SessionFrame），
-// 出站客户端是互异身份的第二个会话 owner；不直接调用 InboundDispatcher。
+/**
+ * OrderedIngress 真实 V2 会话接线验收。
+ * 覆盖无票拒绝、grant、成功执行、重复重放、内容冲突与序号缺口；
+ * 入站经真实 InfraHttpHost + InstallRpcAdmission + V2 Call（SessionFrame），
+ * 出站客户端是互异身份的第二个会话 owner；不直接调用 InboundDispatcher。
+ */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -78,7 +80,9 @@ fw::CoRpcReq MakeRequest(const std::string& actor, std::int32_t value) {
     return std::move(req).value();
 }
 
-// V2 Call 请求：五关联字段 + 有序流 fw.* 元数据（framework 白名单内）。
+/**
+ * V2 Call 请求：五关联字段 + 有序流 fw.* 元数据（framework 白名单内）。
+ */
 inf::rpc::Request MakeEnvelope(const std::string& rid,
                                const std::string& actor,
                                std::int32_t value,
@@ -155,13 +159,17 @@ struct Fixture {
         grant.producer_id = "producer.test";
         grant.producer_epoch = "producer-epoch-1";
         grant.receiver_epoch = "receiver-epoch-1";
-        // Infra HTTP loopback has no authenticated principal; empty means the
-        // anonymous loopback identity and is matched exactly by the ingress.
+        /**
+         * Infra HTTP loopback has no authenticated principal; empty means the
+         * anonymous loopback identity and is matched exactly by the ingress.
+         */
         grant.peer_principal.clear();
         BOOST_REQUIRE(app->grant_ordered_stream(std::move(grant)));
         fw::InstallRpcAdmission(*host, *app);
 
-        // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+        /**
+         * Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+         */
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         run_thread = std::thread([this] {
@@ -209,7 +217,9 @@ struct Fixture {
         return std::move(*state->out);
     }
 
-    // 直接派发（机器面）：Context 由 infra 填充，测试不伪造入站事实。
+    /**
+     * 直接派发（机器面）：Context 由 infra 填充，测试不伪造入站事实。
+     */
     fw::result<inf::rpc::Response> CallDirect(
         fw::InboundDispatcher& dispatcher, const inf::rpc::Request& env) {
         auto state = std::make_shared<CallState>();
@@ -231,7 +241,9 @@ struct Fixture {
     }
 
     ~Fixture() {
-        // infra 关闭是同步契约：Close() 返回即物理释放。
+        /**
+         * infra 关闭是同步契约：Close() 返回即物理释放。
+         */
         if (client_runtime)
             client_runtime->Close();
         if (app)

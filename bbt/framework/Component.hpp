@@ -1,9 +1,11 @@
 #pragma once
-// framework v2 组件基类 CoComponent（契约 §5）。
-//
-// CoComponent 本身就是带默认 hook 的能力基类，不另设 IComponent/ComponentBase
-// 抽象层。本头只声明身份观察面与生命周期/绑定 hook；受管构造、销毁与 borrow
-// 由 Registry、v2::CoApp 和 ComponentHandle 控制。
+/**
+ * framework v2 组件基类 CoComponent（契约 §5）。
+ *
+ * CoComponent 本身就是带默认 hook 的能力基类，不另设 IComponent/ComponentBase
+ * 抽象层。本头只声明身份观察面与生命周期/绑定 hook；受管构造、销毁与 borrow
+ * 由 Registry、v2::CoApp 和 ComponentHandle 控制。
+ */
 
 #include <string>
 #include <string_view>
@@ -16,7 +18,10 @@
 
 namespace bbt::framework {
 
-class MonitorWriter;   // 监控写端（后续切片；仅前置声明）
+/**
+ * 监控写端（后续切片；仅前置声明）
+ */
+class MonitorWriter;
 
 namespace v2 {
 
@@ -37,13 +42,19 @@ namespace v2 {
  */
 class CoComponent : public detail::ObjectBase {
 public:
-    /// @brief 返回本组件的非拥有对象句柄。
+    /**
+     * @brief 返回本组件的非拥有对象句柄。
+     */
     ObjectHandle Handle() const { return _ObjectHandle(); }
-    /// @brief 返回本组件当前身份与状态的值快照。
+    /**
+     * @brief 返回本组件当前身份与状态的值快照。
+     */
     ObjectInfo   Info() const;
 
 protected:
-    /// @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+    /**
+     * @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+     */
     explicit CoComponent(detail::ConstructKey) {}
     ~CoComponent() noexcept override = default;
 
@@ -123,7 +134,9 @@ private:
     friend class ::bbt::framework::v2::CoApp;
 };
 
-// ---- CoComponent 模板定义 ----
+/**
+ * ---- CoComponent 模板定义 ----
+ */
 
 template <class C>
 result<ComponentHandle<C>> CoComponent::GetComponent(

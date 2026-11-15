@@ -1,23 +1,25 @@
-// bbt-framework 容量 / 并发上下文 / 关闭生命周期验收 fixture。
-//
-// 形态：**一个自有进程**（真实公开 `CoApp` + 真实 loopback V2 会话宿主）注册一个
-// 公开 `CoService<T>`（lifecycle::LifecycleGateService，复用 getvalue 切片
-// schema/codec）。外部 Python 驱动器复用唯一 V2 codec（`tests/rpc_v2_wire.py`）
-// 走真实 `SessionFrame` 会话（Hello/HelloAck + u32be）发起 Call。
-//
-// 覆盖（真实公开入口；不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
-// DispatchInboundForTest、INetworkHost 桩或任何发送注入；不额外创建 io_thread）：
-//   R3 并发挂起 / 上下文跨 worker 不串 / 迟到完成不悬空；
-//   R4 服务容量（max_inflight）耗尽 → Overloaded（不无界排队）/ 字节上限；
-//   R5 正常拒新→drain→同步 Close→release；ShutdownIncomplete 保留强持有、
-//      迟到完成；外部 supervisor 硬杀只留「未完成」证据、不称优雅。
-//
-// 验收控制面（**仅验收用**，不是生产注入）：stdin 逐行命令
-//   `shutdown` → request_shutdown()；`open` → 放行验收闩；`quit`/EOF → 收尾。
-// 断言全部基于 journal 事件与进程退出码，不用固定 sleep 猜时序。
-//
-// argv: fixture <port_file> <meta_file> <journal_file> <max_inflight> <step_budget_ms>
-// 全部结构化结果标注 auth_state=unauthenticated_loopback。
+/**
+ * bbt-framework 容量 / 并发上下文 / 关闭生命周期验收 fixture。
+ *
+ * 形态：**一个自有进程**（真实公开 `CoApp` + 真实 loopback V2 会话宿主）注册一个
+ * 公开 `CoService<T>`（lifecycle::LifecycleGateService，复用 getvalue 切片
+ * schema/codec）。外部 Python 驱动器复用唯一 V2 codec（`tests/rpc_v2_wire.py`）
+ * 走真实 `SessionFrame` 会话（Hello/HelloAck + u32be）发起 Call。
+ *
+ * 覆盖（真实公开入口；不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
+ * DispatchInboundForTest、INetworkHost 桩或任何发送注入；不额外创建 io_thread）：
+ * R3 并发挂起 / 上下文跨 worker 不串 / 迟到完成不悬空；
+ * R4 服务容量（max_inflight）耗尽 → Overloaded（不无界排队）/ 字节上限；
+ * R5 正常拒新→drain→同步 Close→release；ShutdownIncomplete 保留强持有、
+ * 迟到完成；外部 supervisor 硬杀只留「未完成」证据、不称优雅。
+ *
+ * 验收控制面（**仅验收用**，不是生产注入）：stdin 逐行命令
+ * `shutdown` → request_shutdown()；`open` → 放行验收闩；`quit`/EOF → 收尾。
+ * 断言全部基于 journal 事件与进程退出码，不用固定 sleep 猜时序。
+ *
+ * argv: fixture <port_file> <meta_file> <journal_file> <max_inflight> <step_budget_ms>
+ * 全部结构化结果标注 auth_state=unauthenticated_loopback。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -42,7 +44,10 @@
 
 #include <bbt/framework/CoApp.hpp>
 
-#include "lifecycle_service.hpp"   // 验收服务 + 验收闩（复用 getvalue 切片 codec）
+/**
+ * 验收服务 + 验收闩（复用 getvalue 切片 codec）
+ */
+#include "lifecycle_service.hpp"
 
 namespace fw  = bbt::framework;
 namespace inf = bbt::infra;
@@ -60,9 +65,11 @@ void Journal(const std::string& line) {
     g_journal.flush();
 }
 
-// 生命周期观测资源（公开 add_resource<ICoCloseable> 面）：断言关闭序列在
-// handler 排空后**同步** Close 一次；ShutdownIncomplete 期间不得被 Close。
-// 不伪造任何后端。
+/**
+ * 生命周期观测资源（公开 add_resource<ICoCloseable> 面）：断言关闭序列在
+ * handler 排空后**同步** Close 一次；ShutdownIncomplete 期间不得被 Close。
+ * 不伪造任何后端。
+ */
 class CloseJournal final : public inf::ICoCloseable {
 public:
     void Close() noexcept override {
@@ -82,8 +89,10 @@ private:
     bool               m_closed = false;
 };
 
-// 动态 loopback 端口：内核分配后立即释放，供 listen 使用。就绪后严格核对
-// bound_endpoint 端口等于所选端口，不符即失败（竞态落败报错，不假通过）。
+/**
+ * 动态 loopback 端口：内核分配后立即释放，供 listen 使用。就绪后严格核对
+ * bound_endpoint 端口等于所选端口，不符即失败（竞态落败报错，不假通过）。
+ */
 std::uint16_t PickLoopbackPort() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return 0;
@@ -126,7 +135,10 @@ std::string Trim(const std::string& s) {
 
 int main(int argc, char* argv[]) {
     if (argc < 7 || std::strcmp(argv[1], "fixture") != 0)
-        return 90;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 90;
     const std::string port_file     = argv[2];
     const std::string meta_file     = argv[3];
     const std::string journal_path  = argv[4];
@@ -141,10 +153,12 @@ int main(int argc, char* argv[]) {
     }
     lifecycle::SetJournal(&Journal);
 
-    // handler 内做 protobuf 编解码 + 入站分发，默认 12KB 协程栈不足；经
-    // coroutine 公开配置宏（须在调度器 Start 前设置；process-global）放大到
-    // 512KB 并给足静态线程（4），使并发挂起与入站接纳互不阻塞。本进程在
-    // app.run() 前设置——此刻调度器尚未初始化（同 getvalue 切片口径）。
+    /**
+     * handler 内做 protobuf 编解码 + 入站分发，默认 12KB 协程栈不足；经
+     * coroutine 公开配置宏（须在调度器 Start 前设置；process-global）放大到
+     * 512KB 并给足静态线程（4），使并发挂起与入站接纳互不阻塞。本进程在
+     * app.run() 前设置——此刻调度器尚未初始化（同 getvalue 切片口径）。
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size        = 512 * 1024;
 
@@ -159,12 +173,20 @@ int main(int argc, char* argv[]) {
     options.network_limits = inf::NetworkLimits{
         /*max_connections*/ 64, /*max_inflight*/ 64,
         /*max_header_bytes*/ 16 * 1024,
-        /*max_body_bytes*/ 4096,   // R4「字节上限」维度（功能检查非压测）
+        /**
+         * R4「字节上限」维度（功能检查非压测）
+         */
+        /*max_body_bytes*/ 4096,
         /*incoming_timeout*/ std::chrono::milliseconds{30000}};
     options.listen               = inf::ListenAddress{"127.0.0.1", port};
-    options.static_routes        = {};   // 无出站目标：未配置即 NotFound
+    /**
+     * 无出站目标：未配置即 NotFound
+     */
+    options.static_routes = {};
     options.shutdown_step_budget = std::chrono::milliseconds{step_budget};
-    // V2 会话身份必填。
+    /**
+     * V2 会话身份必填。
+     */
     options.local_identity = "lifecycle-fixture";
 
     fw::CoApp app{options};
@@ -233,8 +255,10 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "lifecycle fixture up endpoint=%s max_inflight=%zu\n",
                  endpoint.c_str(), max_inflight);
 
-    // 关闭相位观测线程：轮询 shutdown_state 并在**变化时**记录（观察即成事件，
-    // 驱动器据 journal 事件推进，不靠固定 sleep 猜时序）。run 结束即退出。
+    /**
+     * 关闭相位观测线程：轮询 shutdown_state 并在**变化时**记录（观察即成事件，
+     * 驱动器据 journal 事件推进，不靠固定 sleep 猜时序）。run 结束即退出。
+     */
     std::thread observer([&] {
         int last = -1;
         while (!run_done.load(std::memory_order_acquire) ||
@@ -251,7 +275,9 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // 验收控制面：stdin 逐行命令（见文件头）。
+    /**
+     * 验收控制面：stdin 逐行命令（见文件头）。
+     */
     std::string line;
     while (std::getline(std::cin, line)) {
         const std::string cmd = Trim(line);
@@ -265,7 +291,9 @@ int main(int argc, char* argv[]) {
             Journal(std::string("event=gate_opened auth_state=") + kAuthState);
             lifecycle::Gate().Open();
         }
-        // 未知命令忽略（不改变状态）。
+        /**
+         * 未知命令忽略（不改变状态）。
+         */
     }
 
     app.request_shutdown();

@@ -34,9 +34,11 @@ result<std::shared_ptr<ICoService>> ActorRegistry::GetOrCreate(
     const std::pair<std::string, std::string> id{
         std::string(service_name), std::string(actor_key)};
 
-    // 「查重 → 上限 → 构造 → 登记」在同一临界区完成：
-    // 至多一次语义无竞态窗口；工厂异常经由 catch 转出，登记尚未发生，
-    // 不留下半激活对象。
+    /**
+     * 「查重 → 上限 → 构造 → 登记」在同一临界区完成：
+     * 至多一次语义无竞态窗口；工厂异常经由 catch 转出，登记尚未发生，
+     * 不留下半激活对象。
+     */
     std::lock_guard<std::mutex> lock(m_mtx);
     auto found = m_actors.find(id);
     if (found != m_actors.end())

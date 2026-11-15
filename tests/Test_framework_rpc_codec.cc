@@ -1,5 +1,7 @@
-// CoRpcReq/CoRpcResp 公共面：位置参数、尾部协议错误、业务错误原样传递、
-// protobuf codec seam 与 ActorMethodAt 位置 key。
+/**
+ * CoRpcReq/CoRpcResp 公共面：位置参数、尾部协议错误、业务错误原样传递、
+ * protobuf codec seam 与 ActorMethodAt 位置 key。
+ */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -18,9 +20,11 @@ namespace fw = bbt::framework;
 
 namespace {
 
-// protobuf codec seam 的替身：真实适配经 rpc_detail::ProtoCodec<T> 特化
-// 接入（CoRpc.hpp 头注释），本测试用确定性字节格式验证 seam 本身——
-// [id:4 字节小端][tag 原始字节]，不引入 protobuf 依赖。
+/**
+ * protobuf codec seam 的替身：真实适配经 rpc_detail::ProtoCodec<T> 特化
+ * 接入（CoRpc.hpp 头注释），本测试用确定性字节格式验证 seam 本身——
+ * [id:4 字节小端][tag 原始字节]，不引入 protobuf 依赖。
+ */
 struct FakeProto {
     std::int32_t id = 0;
     std::string  tag;
@@ -28,8 +32,10 @@ struct FakeProto {
 
 } // namespace
 
-// 特化必须写在包络被特化模板的命名空间（匿名命名空间类型可在全局域特化，
-// 同 rpc_surface 用例的 RouteTraits 写法）。
+/**
+ * 特化必须写在包络被特化模板的命名空间（匿名命名空间类型可在全局域特化，
+ * 同 rpc_surface 用例的 RouteTraits 写法）。
+ */
 template <>
 struct bbt::framework::rpc_detail::ProtoCodec<FakeProto> {
     static constexpr bool kDefined = true;
@@ -66,11 +72,13 @@ struct bbt::framework::rpc_detail::ProtoCodec<FakeProto> {
 
 namespace {
 
-// Parse 返回类型契约（编译期钉死）：
-// 位置参数路径：单参 Parse<T> → result<T>（裸值）；多参 Parse<Ts...>
-// → result<tuple<Ts...>>；proto codec 路径 Parse<Proto>/ParseProto<Proto>
-// → result<Proto> 整包直出，不包 tuple。错误体系唯一：ErrorType 即
-// bbt::infra::Error。
+/**
+ * Parse 返回类型契约（编译期钉死）：
+ * 位置参数路径：单参 Parse<T> → result<T>（裸值）；多参 Parse<Ts...>
+ * → result<tuple<Ts...>>；proto codec 路径 Parse<Proto>/ParseProto<Proto>
+ * → result<Proto> 整包直出，不包 tuple。错误体系唯一：ErrorType 即
+ * bbt::infra::Error。
+ */
 static_assert(std::is_same_v<
     decltype(std::declval<const fw::CoRpcReq&>().Parse<std::int32_t>()),
     fw::result<std::int32_t>>);
@@ -87,7 +95,9 @@ static_assert(std::is_same_v<
 static_assert(
     std::is_same_v<fw::CoRpcResp::ErrorType, bbt::infra::Error>);
 
-// 请求编码工厂返回类型（编译期钉死）：编码失败经 result 而非异常透出。
+/**
+ * 请求编码工厂返回类型（编译期钉死）：编码失败经 result 而非异常透出。
+ */
 static_assert(std::is_same_v<
     decltype(fw::CoRpcReq::From(
         std::declval<const std::int32_t&>())),
@@ -117,7 +127,9 @@ public:
             fw::MakeError(fw::ErrorCode::InvalidArgument, "rejected"));
     }
 
-    // proto 整包路径：一个方法内只走 Parse<Proto>/FromProto，不混位置参数。
+    /**
+     * proto 整包路径：一个方法内只走 Parse<Proto>/FromProto，不混位置参数。
+     */
     fw::CoRpcResp ProtoEcho(fw::CoRpcReq req) {
         auto msg = req.Parse<FakeProto>();
         if (!msg) return fw::CoRpcResp::Error(msg.error());
@@ -130,7 +142,9 @@ public:
         fw::Method<&Calculator::ProtoEcho>("proto_echo"));
 };
 
-// ActorMethodAt 位置 key：index>0 的字符串 key 与默认 index=0 的整型 key。
+/**
+ * ActorMethodAt 位置 key：index>0 的字符串 key 与默认 index=0 的整型 key。
+ */
 class Directory final : public fw::CoService<Directory> {
 public:
     static constexpr std::string_view kServiceName = "directory";
@@ -199,13 +213,17 @@ BOOST_AUTO_TEST_CASE(business_error_is_preserved) {
 }
 
 BOOST_AUTO_TEST_CASE(parse_error_mapping) {
-    // 空 payload → 头部截断 → ProtocolError。
+    /**
+     * 空 payload → 头部截断 → ProtocolError。
+     */
     auto empty = fw::CoRpcReq{}.Parse<std::int32_t>();
     BOOST_REQUIRE(!empty);
     BOOST_TEST(static_cast<int>(empty.error().code) ==
                static_cast<int>(fw::ErrorCode::ProtocolError));
 
-    // 声明参数个数 > 实际个数 → InvalidArgument。
+    /**
+     * 声明参数个数 > 实际个数 → InvalidArgument。
+     */
     auto two = fw::CoRpcReq::From(
         std::tuple{std::int32_t{1}, std::int32_t{2}});
     BOOST_REQUIRE(two);
@@ -214,7 +232,9 @@ BOOST_AUTO_TEST_CASE(parse_error_mapping) {
     BOOST_TEST(static_cast<int>(fewer.error().code) ==
                static_cast<int>(fw::ErrorCode::InvalidArgument));
 
-    // 分发边界：handler 内 Parse 失败经 CoRpcResp::Error 原样透出。
+    /**
+     * 分发边界：handler 内 Parse 失败经 CoRpcResp::Error 原样透出。
+     */
     Calculator service;
     const auto table = fw::BuildMethodTable<Calculator>();
     auto out = table.find("add")->invoke(service, {0xFF});
@@ -229,7 +249,9 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     static_assert(!fw::rpc_detail::is_proto_codec_v<std::int32_t>);
 
     const FakeProto msg{7, "seven"};
-    // From(proto)/FromProto 均走 ProtoCodec::Encode，不经位置 codec。
+    /**
+     * From(proto)/FromProto 均走 ProtoCodec::Encode，不经位置 codec。
+     */
     auto via_from  = fw::CoRpcResp::From(msg);
     auto via_named = fw::CoRpcResp::FromProto(msg);
     BOOST_REQUIRE(via_from.ok());
@@ -237,8 +259,10 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     BOOST_TEST(via_from.payload() == via_named.payload());
     BOOST_TEST(via_from.payload().size() == 4 + msg.tag.size());
 
-    // 请求侧对称工厂：CoRpcReq::From(proto)/FromProto 共用同一 Encode，
-    // 产出的 payload 与响应侧逐字节一致。
+    /**
+     * 请求侧对称工厂：CoRpcReq::From(proto)/FromProto 共用同一 Encode，
+     * 产出的 payload 与响应侧逐字节一致。
+     */
     auto req_from  = fw::CoRpcReq::From(msg);
     auto req_named = fw::CoRpcReq::FromProto(msg);
     BOOST_REQUIRE(req_from);
@@ -246,7 +270,9 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     BOOST_TEST(req_from.value().payload() == via_from.payload());
     BOOST_TEST(req_named.value().payload() == via_from.payload());
 
-    // 位置参数请求工厂与响应编码产出同一线格式。
+    /**
+     * 位置参数请求工厂与响应编码产出同一线格式。
+     */
     auto positional = fw::CoRpcReq::From(
         std::tuple{std::int32_t{3}, std::string{"k"}});
     BOOST_REQUIRE(positional);
@@ -255,7 +281,9 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     BOOST_TEST(std::get<0>(roundtrip.value()) == 3);
     BOOST_TEST(std::get<1>(roundtrip.value()) == "k");
 
-    // Parse<Proto>/ParseProto 整包解码为 result<Proto>。
+    /**
+     * Parse<Proto>/ParseProto 整包解码为 result<Proto>。
+     */
     auto direct = fw::CoRpcReq(via_from.payload()).Parse<FakeProto>();
     BOOST_REQUIRE(direct);
     BOOST_TEST(direct.value().id == 7);
@@ -265,14 +293,18 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     BOOST_TEST(named.value().id == 7);
     BOOST_TEST(named.value().tag == "seven");
 
-    // codec 自带错误原样透出，不被位置 codec 的错误语义改写。
+    /**
+     * codec 自带错误原样透出，不被位置 codec 的错误语义改写。
+     */
     auto bad = fw::CoRpcReq({0x01}).Parse<FakeProto>();
     BOOST_REQUIRE(!bad);
     BOOST_TEST(static_cast<int>(bad.error().code) ==
                static_cast<int>(fw::ErrorCode::ProtocolError));
     BOOST_TEST(bad.error().message == "fake proto payload truncated");
 
-    // 经方法表分发的整包回路：同一服务上 proto 方法与位置方法共存。
+    /**
+     * 经方法表分发的整包回路：同一服务上 proto 方法与位置方法共存。
+     */
     Calculator service;
     const auto table = fw::BuildMethodTable<Calculator>();
     auto out = table.find("proto_echo")->invoke(service, via_from.payload());
@@ -290,7 +322,9 @@ BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
                std::string(fw::kCoRpcPositionalSchema));
     BOOST_REQUIRE(lookup->extract_key != nullptr);
 
-    // index=1：key 取第二个位置参数而非第一个。
+    /**
+     * index=1：key 取第二个位置参数而非第一个。
+     */
     auto req = fw::CoRpcReq::From(
         std::tuple{std::int32_t{5}, std::string{"acct-7"}});
     BOOST_REQUIRE(req);
@@ -298,7 +332,9 @@ BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
     BOOST_REQUIRE(key);
     BOOST_TEST(key.value() == "acct-7");
 
-    // 整型 key → to_string。
+    /**
+     * 整型 key → to_string。
+     */
     const fw::RpcMethod* by_id = table.find("by_id");
     BOOST_REQUIRE(by_id != nullptr);
     auto id_req = fw::CoRpcReq::From(std::int32_t{42});
@@ -307,7 +343,9 @@ BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
     BOOST_REQUIRE(id_key);
     BOOST_TEST(id_key.value() == "42");
 
-    // 位置缺失（wanted >= count）→ InvalidArgument。
+    /**
+     * 位置缺失（wanted >= count）→ InvalidArgument。
+     */
     auto short_req = fw::CoRpcReq::From(std::int32_t{5});
     BOOST_REQUIRE(short_req);
     auto missing = lookup->extract_key(short_req.value().payload());
@@ -315,7 +353,9 @@ BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
     BOOST_TEST(static_cast<int>(missing.error().code) ==
                static_cast<int>(fw::ErrorCode::InvalidArgument));
 
-    // 截断 payload → ProtocolError。
+    /**
+     * 截断 payload → ProtocolError。
+     */
     auto truncated = req.value().payload();
     truncated.pop_back();
     auto bad_wire = lookup->extract_key(truncated);
@@ -323,7 +363,9 @@ BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
     BOOST_TEST(static_cast<int>(bad_wire.error().code) ==
                static_cast<int>(fw::ErrorCode::ProtocolError));
 
-    // key 位置 wire 类型不符 → TypeMismatch。
+    /**
+     * key 位置 wire 类型不符 → TypeMismatch。
+     */
     auto wrong_type = fw::CoRpcReq::From(
         std::tuple{std::string{"x"}, std::int32_t{5}});
     BOOST_REQUIRE(wrong_type);
@@ -332,7 +374,9 @@ BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
     BOOST_TEST(static_cast<int>(mismatched.error().code) ==
                static_cast<int>(fw::ErrorCode::TypeMismatch));
 
-    // 空字符串 key → InvalidArgument。
+    /**
+     * 空字符串 key → InvalidArgument。
+     */
     auto empty_req = fw::CoRpcReq::From(
         std::tuple{std::int32_t{5}, std::string{}});
     BOOST_REQUIRE(empty_req);

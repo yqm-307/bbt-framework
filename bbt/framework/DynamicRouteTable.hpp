@@ -33,9 +33,14 @@
 
 namespace bbt::framework {
 
-/// @brief 一次权威发现结果的不可变视图（provider 发布、数据面消费）。
+/**
+ * @brief 一次权威发现结果的不可变视图（provider 发布、数据面消费）。
+ */
 struct DynamicRouteSnapshot {
-    std::uint64_t revision{0};   ///< 注册中心 revision；不跨 provider 比较
+    /**
+     * 注册中心 revision；不跨 provider 比较
+     */
+    std::uint64_t revision{0};
     std::chrono::steady_clock::time_point observed_at{};
     std::vector<std::string> endpoints;
 };
@@ -78,10 +83,14 @@ public:
      */
     result<std::string> Resolve(std::string_view service) const;
 
-    /// @brief 标记该服务视图不可用（保留已配置事实），Resolve 立即失败。
+    /**
+     * @brief 标记该服务视图不可用（保留已配置事实），Resolve 立即失败。
+     */
     void MarkUnavailable(std::string_view service) noexcept;
 
-    /// @brief 该服务是否曾被 provider 配置（决定是否回退静态路由）。
+    /**
+     * @brief 该服务是否曾被 provider 配置（决定是否回退静态路由）。
+     */
     bool HasService(std::string_view service) const noexcept;
 
 private:
@@ -93,7 +102,9 @@ private:
 
     const std::chrono::milliseconds m_stale_limit;
     mutable std::mutex              m_mtx;
-    // round-robin 游标随解析推进，故 const Resolve 仍需可变表。
+    /**
+     * round-robin 游标随解析推进，故 const Resolve 仍需可变表。
+     */
     mutable std::unordered_map<std::string, Entry> m_entries;
 };
 

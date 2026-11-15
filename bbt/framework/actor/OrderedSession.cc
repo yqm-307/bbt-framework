@@ -1,4 +1,6 @@
-// OrderedSession 发送侧实现。语义见头注释。
+/**
+ * OrderedSession 发送侧实现。语义见头注释。
+ */
 
 #include <bbt/framework/OrderedSession.hpp>
 
@@ -15,10 +17,12 @@ std::vector<OrderedSession::RegistryEntry> OrderedSession::s_registry;
 
 namespace {
 
-// 六个错误统一 RemoteError + domain="framework.actor"。
-// 本函数是 actor 域错误的真实构造边界，经
-// ValidateErrorAtBoundary 落实域保留键归属/格式校验后才返回；
-// 校验失败整体降级为 ProtocolError，不放行非法 actor 错误。
+/**
+ * 六个错误统一 RemoteError + domain="framework.actor"。
+ * 本函数是 actor 域错误的真实构造边界，经
+ * ValidateErrorAtBoundary 落实域保留键归属/格式校验后才返回；
+ * 校验失败整体降级为 ProtocolError，不放行非法 actor 错误。
+ */
 Error OrderedDomainError(const char* domain_code, std::string message) {
     Error e = MakeError(ErrorCode::RemoteError, std::move(message));
     e.domain = kOrderedErrorDomain;
@@ -26,7 +30,9 @@ Error OrderedDomainError(const char* domain_code, std::string message) {
     return e;
 }
 
-// 带 details 的 actor 域错误：构造后即过边界校验，非法形态不进入调用方。
+/**
+ * 带 details 的 actor 域错误：构造后即过边界校验，非法形态不进入调用方。
+ */
 Error OrderedDomainErrorWithDetails(const char* domain_code,
                                     std::string message, ErrorDetails details) {
     Error e = OrderedDomainError(domain_code, std::move(message));
@@ -36,7 +42,9 @@ Error OrderedDomainErrorWithDetails(const char* domain_code,
     return e;
 }
 
-// 会话实例序号：request_id 唯一性分量之一，不依赖墙钟。
+/**
+ * 会话实例序号：request_id 唯一性分量之一，不依赖墙钟。
+ */
 std::atomic<std::uint64_t> g_session_instance{0};
 
 } // namespace
@@ -47,8 +55,10 @@ OrderedSession::OrderedSession(OrderedGrant grant, std::uint64_t first_sequence)
       next_sequence_(first_sequence) {}
 
 OrderedSession::~OrderedSession() {
-    // 会话析构即释放 grant 占位；本对象 shared_ptr 归零时其 weak_ptr
-    // 已 expired，顺带清扫其他失效项。
+    /**
+     * 会话析构即释放 grant 占位；本对象 shared_ptr 归零时其 weak_ptr
+     * 已 expired，顺带清扫其他失效项。
+     */
     std::lock_guard<std::mutex> lk(s_registry_mtx);
     for (auto it = s_registry.begin(); it != s_registry.end();) {
         it = it->session.expired() ? s_registry.erase(it) : std::next(it);
@@ -76,7 +86,10 @@ result<OrderedSession::SPtr> OrderedSession::OpenImpl(
         if (auto live = it->session.lock()) {
             if (SameOrderedStreamId(it->grant, grant)) {
                 if (it->grant == grant) {
-                    return result<SPtr>::ok(live);  // 同一完整 grant → 共享会话
+                    /**
+                     * 同一完整 grant → 共享会话
+                     */
+                    return result<SPtr>::ok(live);
                 }
                 return result<SPtr>::err(OrderedDomainError(
                     ordered_domain_code::kStreamRejected,
@@ -84,7 +97,10 @@ result<OrderedSession::SPtr> OrderedSession::OpenImpl(
             }
             ++it;
         } else {
-            it = s_registry.erase(it);  // 清扫已销毁会话占位
+            /**
+             * 清扫已销毁会话占位
+             */
+            it = s_registry.erase(it);
         }
     }
     auto session = SPtr(new OrderedSession(grant, first_sequence));
@@ -93,8 +109,10 @@ result<OrderedSession::SPtr> OrderedSession::OpenImpl(
 }
 
 std::string OrderedSession::MakeRequestId(std::uint64_t sequence) const {
-    // 唯一性由 (grant 流标识, 会话实例序号, sequence) 保证；不依赖墙钟、
-    // 不依赖客户端自增。
+    /**
+     * 唯一性由 (grant 流标识, 会话实例序号, sequence) 保证；不依赖墙钟、
+     * 不依赖客户端自增。
+     */
     return grant_.producer_id + "/" + grant_.producer_epoch + "/" +
            grant_.receiver_epoch + "/" + std::to_string(instance_id_) + "/" +
            std::to_string(sequence);
@@ -109,7 +127,10 @@ result<OrderedStamp> OrderedSession::prepare() {
     }
     const std::uint64_t seq = next_sequence_;
     if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
-        exhausted_ = true;  // 分配最后一个序号后关闭，不回绕到 0/1
+        /**
+         * 分配最后一个序号后关闭，不回绕到 0/1
+         */
+        exhausted_ = true;
     } else {
         ++next_sequence_;
     }
@@ -117,8 +138,10 @@ result<OrderedStamp> OrderedSession::prepare() {
     tickets_.emplace(ticket->request_id(), ticket);
     auto state = std::make_shared<OrderedStamp::State>();
     state->ticket  = std::move(ticket);
-    // 票据回指签发会话：co_rpc_call 经它执行 BindForSend；
-    // 弱指针不影响会话生命周期语义（析构即释放 grant 占位）。
+    /**
+     * 票据回指签发会话：co_rpc_call 经它执行 BindForSend；
+     * 弱指针不影响会话生命周期语义（析构即释放 grant 占位）。
+     */
     state->session = shared_from_this();
     return result<OrderedStamp>::ok(OrderedStamp(std::move(state)));
 }
@@ -144,13 +167,17 @@ result<void> OrderedSession::BindForSend(
             "ordered stamp not issued by this session"));
     }
     if (ticket->IsSent()) {
-        // 复用票据只能重发同一请求；内容不一致本地拒绝，不发出。
+        /**
+         * 复用票据只能重发同一请求；内容不一致本地拒绝，不发出。
+         */
         if (ticket->BindOrCheck(content)) return result<void>::ok();
         return result<void>::err(OrderedDomainError(
             ordered_domain_code::kSequenceConflict,
             "ordered ticket already bound to a different request"));
     }
-    // 首次发送不得越过仍未发送的更小序号票据。
+    /**
+     * 首次发送不得越过仍未发送的更小序号票据。
+     */
     if (ticket->sequence() != bind_watermark_ + 1) {
         return result<void>::err(OrderedDomainErrorWithDetails(
             ordered_domain_code::kSequenceGap,
@@ -158,7 +185,10 @@ result<void> OrderedSession::BindForSend(
             {{std::string(kErrorDetailExpectedSequence),
               std::to_string(bind_watermark_ + 1)}}));
     }
-    ticket->BindOrCheck(content);  // 未绑定，必然成功
+    /**
+     * 未绑定，必然成功
+     */
+    ticket->BindOrCheck(content);
     ++bind_watermark_;
     return result<void>::ok();
 }

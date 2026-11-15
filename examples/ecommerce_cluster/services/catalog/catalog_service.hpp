@@ -1,8 +1,10 @@
 #pragma once
-// 目录服务：按 sku 返回单价（分）。
-//
-// 本头只声明业务面，实现见 catalog_service.cc。被 order 经动态发现调用；
-// 进程里没有实例地址，落点由宿主 find_route 解析。
+/**
+ * 目录服务：按 sku 返回单价（分）。
+ *
+ * 本头只声明业务面，实现见 catalog_service.cc。被 order 经动态发现调用；
+ * 进程里没有实例地址，落点由宿主 find_route 解析。
+ */
 
 #include <string>
 #include <string_view>
@@ -25,7 +27,9 @@ using bbt::framework::CoService;
 using bbt::framework::ProtoMethod;
 using bbt::framework::RpcMethods;
 
-/// @brief 目录服务：`Price` 返回 sku 单价与本实例身份。
+/**
+ * @brief 目录服务：`Price` 返回 sku 单价与本实例身份。
+ */
 class CatalogService final : public CoService<CatalogService> {
 public:
     static constexpr std::string_view kServiceName = kCatalogService;

@@ -30,10 +30,12 @@ result<void> ActorMailbox::TryEnqueue(Task task) {
     if (m_draining)
         return result<void>::ok();
 
-    // 空转→活跃边沿：注册本邮箱唯一 drain 协程。注册放在持锁临界区内，
-    // 保证 m_draining 置位先于协程起跑被观测；注册失败回滚本次接纳
-    // （刚 push 的项仍在队尾、draining 尚未置位，pop_back 即收回），
-    // 不留孤儿项、不占用容量。
+    /**
+     * 空转→活跃边沿：注册本邮箱唯一 drain 协程。注册放在持锁临界区内，
+     * 保证 m_draining 置位先于协程起跑被观测；注册失败回滚本次接纳
+     * （刚 push 的项仍在队尾、draining 尚未置位，pop_back 即收回），
+     * 不留孤儿项、不占用容量。
+     */
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [self = shared_from_this()]() { self->_Drain(); }, succ);
@@ -71,16 +73,20 @@ bool ActorMailbox::IsDraining() const {
 }
 
 void ActorMailbox::_Drain() {
-    // 唯一消费者：m_draining 保证同一时刻至多一个 _Drain 协程。
-    // 每条 task 内联在本协程执行——task 挂起（等待远端/依赖项）时本协程
-    // 随之挂起，worker 被让出，但执行资格（m_draining）仍被持有，
-    // 下一条不会被取出。handler 正常或异常退出后才取下一条。
+    /**
+     * 唯一消费者：m_draining 保证同一时刻至多一个 _Drain 协程。
+     * 每条 task 内联在本协程执行——task 挂起（等待远端/依赖项）时本协程
+     * 随之挂起，worker 被让出，但执行资格（m_draining）仍被持有，
+     * 下一条不会被取出。handler 正常或异常退出后才取下一条。
+     */
     for (;;) {
         Task task;
         {
             std::lock_guard<std::mutex> lock(m_mtx);
             if (m_queue.empty()) {
-                // 释放执行资格：此后首个 TryEnqueue 会注册新 drain。
+                /**
+                 * 释放执行资格：此后首个 TryEnqueue 会注册新 drain。
+                 */
                 m_draining = false;
                 return;
             }

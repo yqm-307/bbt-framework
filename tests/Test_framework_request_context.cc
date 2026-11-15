@@ -1,8 +1,10 @@
-// RequestContext/RequestScope 与
-// CallOptionsAdapter 的 deadline 继承语义测试。业务取消由流程按 CoXxx
-// 返回值决定，框架不提供单操作业务取消；协程等待结果按 coroutine 契约处理。
-// 全部确定性可测：通过注入点断言「未发起 I/O / 未消耗序号」，
-// 不用 sleep 凑时序、无空断言。
+/**
+ * RequestContext/RequestScope 与
+ * CallOptionsAdapter 的 deadline 继承语义测试。业务取消由流程按 CoXxx
+ * 返回值决定，框架不提供单操作业务取消；协程等待结果按 coroutine 契约处理。
+ * 全部确定性可测：通过注入点断言「未发起 I/O / 未消耗序号」，
+ * 不用 sleep 凑时序、无空断言。
+ */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -28,8 +30,10 @@ namespace fw = bbt::framework;
 namespace co = bbt::coroutine;
 using Clock = std::chrono::steady_clock;
 
-// 用例 9 的编译期部分：framework::CallOptions 与 infra::CallOptions
-// 是分层类型，不可直接互换（分层类型契约）。
+/**
+ * 用例 9 的编译期部分：framework::CallOptions 与 infra::CallOptions
+ * 是分层类型，不可直接互换（分层类型契约）。
+ */
 static_assert(!std::is_same<fw::CallOptions, bbt::infra::CallOptions>::value,
     "framework::CallOptions and infra::CallOptions must be distinct types");
 static_assert(
@@ -37,8 +41,10 @@ static_assert(
     !std::is_convertible<bbt::infra::CallOptions, fw::CallOptions>::value,
     "framework::CallOptions and infra::CallOptions must not be convertible");
 
-// 取消令牌已从 framework/infra 的 CallOptions 与 RequestContext 移除：
-// 编译期断言无 cancel 字段，防止回退引入单操作业务取消。
+/**
+ * 取消令牌已从 framework/infra 的 CallOptions 与 RequestContext 移除：
+ * 编译期断言无 cancel 字段，防止回退引入单操作业务取消。
+ */
 template <class T, class = void>
 struct HasCancelField : std::false_type {};
 template <class T>
@@ -63,8 +69,10 @@ std::shared_ptr<const fw::RequestContext> MakeCtx(
     return ctx;
 }
 
-// 注入点记录仪：io_calls/seq_calls 断言「动作是否发生」，
-// last_io_options 捕获实际传给下游的 infra::CallOptions。
+/**
+ * 注入点记录仪：io_calls/seq_calls 断言「动作是否发生」，
+ * last_io_options 捕获实际传给下游的 infra::CallOptions。
+ */
 struct SpyHooks {
     int                     io_calls = 0;
     int                     seq_calls = 0;
@@ -104,8 +112,10 @@ private:
     int                     m_count;
 };
 
-// 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测）。
-// runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
+/**
+ * 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测）。
+ * runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
+ */
 struct SchedulerFixture {
     SchedulerFixture() {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
@@ -131,7 +141,9 @@ BOOST_TEST_GLOBAL_FIXTURE(SchedulerFixture);
 
 BOOST_AUTO_TEST_SUITE(framework_f1a)
 
-// 用例 1：缺省 deadline 继承父请求剩余预算；父预算变小后取到的值随之变小。
+/**
+ * 用例 1：缺省 deadline 继承父请求剩余预算；父预算变小后取到的值随之变小。
+ */
 BOOST_AUTO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
     SpyHooks spy;
     const auto d_far  = Clock::now() + std::chrono::seconds{60};
@@ -139,7 +151,10 @@ BOOST_AUTO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
     auto parent_far  = MakeCtx("r-far",  d_far);
     auto parent_near = MakeCtx("r-near", d_near);
 
-    fw::CallOptions opt;    // deadline 缺省
+    /**
+     * deadline 缺省
+     */
+    fw::CallOptions opt;
     auto r1 = fw::AdaptCallOptions(parent_far.get(), opt, spy.hooks);
     BOOST_REQUIRE(r1);
     BOOST_CHECK(r1.value().deadline == d_far);
@@ -150,7 +165,9 @@ BOOST_AUTO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
     BOOST_CHECK(spy.io_calls == 2);
 }
 
-// 用例 2：显式期限不得延长父预算（取最小值）；短于父预算则取显式值。
+/**
+ * 用例 2：显式期限不得延长父预算（取最小值）；短于父预算则取显式值。
+ */
 BOOST_AUTO_TEST_CASE(explicit_deadline_cannot_extend_parent_budget) {
     SpyHooks spy;
     const auto parent_d = Clock::now() + std::chrono::seconds{10};
@@ -169,7 +186,9 @@ BOOST_AUTO_TEST_CASE(explicit_deadline_cannot_extend_parent_budget) {
     BOOST_CHECK(r2.value().deadline == *shorter.deadline);
 }
 
-// 用例 3：顶层入口无有限期限 → 配置失败（明确错误，不是默认无限）。
+/**
+ * 用例 3：顶层入口无有限期限 → 配置失败（明确错误，不是默认无限）。
+ */
 BOOST_AUTO_TEST_CASE(top_level_requires_finite_deadline) {
     SpyHooks spy;
 
@@ -181,14 +200,19 @@ BOOST_AUTO_TEST_CASE(top_level_requires_finite_deadline) {
     BOOST_CHECK(spy.seq_calls == 0);
 
     fw::CallOptions inf;
-    inf.deadline = co::Deadline::max();   // 显式无限同样拒绝
+    /**
+     * 显式无限同样拒绝
+     */
+    inf.deadline = co::Deadline::max();
     auto r2 = fw::AdaptCallOptions(nullptr, inf, spy.hooks);
     BOOST_REQUIRE(!r2);
     BOOST_CHECK(r2.error().code == fw::ErrorCode::InvalidArgument);
     BOOST_CHECK(spy.io_calls == 0);
 }
 
-// 用例 4：已过期 → TimedOut，且下游 I/O 未发起、序号未消耗。
+/**
+ * 用例 4：已过期 → TimedOut，且下游 I/O 未发起、序号未消耗。
+ */
 BOOST_AUTO_TEST_CASE(expired_returns_timedout_before_any_io) {
     SpyHooks spy;
     auto parent = MakeCtx("p", Clock::now() - std::chrono::milliseconds{1});
@@ -199,7 +223,9 @@ BOOST_AUTO_TEST_CASE(expired_returns_timedout_before_any_io) {
     BOOST_CHECK(spy.io_calls == 0);
     BOOST_CHECK(spy.seq_calls == 0);
 
-    // 顶层显式期限已过期同样 TimedOut。
+    /**
+     * 顶层显式期限已过期同样 TimedOut。
+     */
     fw::CallOptions past;
     past.deadline = Clock::now() - std::chrono::milliseconds{1};
     auto r2 = fw::AdaptCallOptions(nullptr, past, spy.hooks);
@@ -208,19 +234,28 @@ BOOST_AUTO_TEST_CASE(expired_returns_timedout_before_any_io) {
     BOOST_CHECK(spy.io_calls == 0);
 }
 
-// 取消相关的旧用例已删除：framework 不经出站装配表达业务级取消；等待中的
-// 协程级取消由 coroutine 自身契约处理，业务级取消由 CoXxx 返回值决定。
+/**
+ * 取消相关的旧用例已删除：framework 不经出站装配表达业务级取消；等待中的
+ * 协程级取消由 coroutine 自身契约处理，业务级取消由 CoXxx 返回值决定。
+ */
 
-// 用例 7：非受管执行 → InvalidContext；受管作用域登记后可取出，
-// 嵌套内层遮蔽外层、退出后恢复。
+/**
+ * 用例 7：非受管执行 → InvalidContext；受管作用域登记后可取出，
+ * 嵌套内层遮蔽外层、退出后恢复。
+ */
 BOOST_AUTO_TEST_CASE(unmanaged_context_returns_invalid_context) {
     auto r0 = fw::CurrentRequestContext();
     BOOST_REQUIRE(!r0);
     BOOST_CHECK(r0.error().code == fw::ErrorCode::InvalidContext);
 
-    // 非受管协程同样 InvalidContext。
+    /**
+     * 非受管协程同样 InvalidContext。
+     */
     TestLatch latch(1);
-    std::atomic<int> seen{0};   // 0=未运行 1=InvalidContext 2=其它
+    /**
+     * 0=未运行 1=InvalidContext 2=其它
+     */
+    std::atomic<int> seen{0};
     bbtco_ref {
         auto r = fw::CurrentRequestContext();
         seen.store(!r && r.error().code == fw::ErrorCode::InvalidContext
@@ -230,7 +265,9 @@ BOOST_AUTO_TEST_CASE(unmanaged_context_returns_invalid_context) {
     latch.Wait();
     BOOST_CHECK(seen.load() == 1);
 
-    // 受管作用域：登记后可取出且字段一致；嵌套遮蔽与退出恢复。
+    /**
+     * 受管作用域：登记后可取出且字段一致；嵌套遮蔽与退出恢复。
+     */
     auto outer = MakeCtx("outer", Clock::now() + std::chrono::seconds{30});
     {
         fw::RequestScope scope_outer(outer);
@@ -253,7 +290,9 @@ BOOST_AUTO_TEST_CASE(unmanaged_context_returns_invalid_context) {
     BOOST_REQUIRE(!r4);
     BOOST_CHECK(r4.error().code == fw::ErrorCode::InvalidContext);
 
-    // 协程内建立的受管上下文经协程 id 绑定，可取出。
+    /**
+     * 协程内建立的受管上下文经协程 id 绑定，可取出。
+     */
     TestLatch latch2(1);
     std::atomic<int> seen2{0};
     bbtco_ref {
@@ -268,11 +307,15 @@ BOOST_AUTO_TEST_CASE(unmanaged_context_returns_invalid_context) {
     BOOST_CHECK(seen2.load() == 1);
 }
 
-// 用例 8（已移除）：原用例验证旧取消装配注入点的异常边界。取消装配已从
-// framework 公共面删除，当前适配器只负责 deadline、顺序票据与 I/O 注入。
+/**
+ * 用例 8（已移除）：原用例验证旧取消装配注入点的异常边界。取消装配已从
+ * framework 公共面删除，当前适配器只负责 deadline、顺序票据与 I/O 注入。
+ */
 
-// 用例 9：分层类型不可互换（编译期 static_assert 见文件头，
-// 此处给出运行期可报告断言）。
+/**
+ * 用例 9：分层类型不可互换（编译期 static_assert 见文件头，
+ * 此处给出运行期可报告断言）。
+ */
 BOOST_AUTO_TEST_CASE(layered_types_not_interchangeable) {
     BOOST_CHECK(
         (!std::is_same<fw::CallOptions, bbt::infra::CallOptions>::value));
@@ -281,9 +324,11 @@ BOOST_AUTO_TEST_CASE(layered_types_not_interchangeable) {
                               bbt::infra::CallOptions>::value));
 }
 
-// 补充正路径：成功装配 → 消耗序号（真实票据绑定）→ 发起 I/O，
-// infra::CallOptions 只承载 deadline；出站装配成功路径验证 budget、
-// sequence 绑定和 I/O 注入。
+/**
+ * 补充正路径：成功装配 → 消耗序号（真实票据绑定）→ 发起 I/O，
+ * infra::CallOptions 只承载 deadline；出站装配成功路径验证 budget、
+ * sequence 绑定和 I/O 注入。
+ */
 BOOST_AUTO_TEST_CASE(success_path_consumes_sequence_and_initiates_io) {
     auto session_r = fw::OrderedSession::Open(MakeGrant("f1a9"));
     BOOST_REQUIRE(session_r);

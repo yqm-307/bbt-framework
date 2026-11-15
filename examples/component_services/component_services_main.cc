@@ -1,24 +1,26 @@
-// bbt-framework 组件式服务示例：共享组件、运行期热拔插、hook 与观察者。
-//
-// 形态：普通 main 启动 coroutine runtime，再把场景投递进受管协程；场景内部
-// 只使用公开 v2 面（v2::CoApp::Create、CoInstall/CoUninstall/CoBind/CoUnbind、
-// CoStart/CoStop/CoObserve、ComponentHandle::Borrow）。不使用 internal/ 缝、
-// 不启网络、不依赖 RPC/protobuf。
-//
-// 模式：
-//   component_services shared --journal <path>
-//     一个 App 内：安装 PriceBook("pricing")；CatalogService 安装时声明式绑定，
-//     CartService 运行期显式绑定；两个服务写同一个组件实例。随后解绑、卸载、
-//     用同一逻辑名重装新实例并重新绑定；断言旧 handle 失效、缺失槽位报
-//     NotFound、ObserverToken 生效/撤销。
-//     再启动一个独立 App，让组件 OnStart 失败，断言 Failed 状态、错误相位与
-//     App::LifecycleFailures 记录，最后有限 deadline 收口。
-//   component_services node --journal <path> --price <cents>
-//     独立进程装配同一业务模块（store.hpp）与自己的组件实例；由 Python
-//     驱动器以不同价格并发启动两个进程，断言 PID 不同、各自总额独立。
-//
-// 边界（不宣称）：进程内热拔插换的是受管组件实例，不是 dlopen/代码热更新；
-// 跨进程只复用代码/协议，不共享 C++ 对象；没有注册中心或动态发现。
+/**
+ * bbt-framework 组件式服务示例：共享组件、运行期热拔插、hook 与观察者。
+ *
+ * 形态：普通 main 启动 coroutine runtime，再把场景投递进受管协程；场景内部
+ * 只使用公开 v2 面（v2::CoApp::Create、CoInstall/CoUninstall/CoBind/CoUnbind、
+ * CoStart/CoStop/CoObserve、ComponentHandle::Borrow）。不使用 internal/ 缝、
+ * 不启网络、不依赖 RPC/protobuf。
+ *
+ * 模式：
+ * component_services shared --journal <path>
+ * 一个 App 内：安装 PriceBook("pricing")；CatalogService 安装时声明式绑定，
+ * CartService 运行期显式绑定；两个服务写同一个组件实例。随后解绑、卸载、
+ * 用同一逻辑名重装新实例并重新绑定；断言旧 handle 失效、缺失槽位报
+ * NotFound、ObserverToken 生效/撤销。
+ * 再启动一个独立 App，让组件 OnStart 失败，断言 Failed 状态、错误相位与
+ * App::LifecycleFailures 记录，最后有限 deadline 收口。
+ * component_services node --journal <path> --price <cents>
+ * 独立进程装配同一业务模块（store.hpp）与自己的组件实例；由 Python
+ * 驱动器以不同价格并发启动两个进程，断言 PID 不同、各自总额独立。
+ *
+ * 边界（不宣称）：进程内热拔插换的是受管组件实例，不是 dlopen/代码热更新；
+ * 跨进程只复用代码/协议，不共享 C++ 对象；没有注册中心或动态发现。
+ */
 
 #include <atomic>
 #include <algorithm>
@@ -66,7 +68,9 @@ void Journal(const std::string& line) {
     }
 }
 
-// detail 必须无空格：Python 驱动器按空格切分 `k=v`。
+/**
+ * detail 必须无空格：Python 驱动器按空格切分 `k=v`。
+ */
 void Check(bool ok, const std::string& name, const std::string& detail) {
     ++g_checks;
     if (!ok) ++g_failures;
@@ -78,7 +82,9 @@ void Check(bool ok, const std::string& name, const std::string& detail) {
 
 std::string Int(long long v) { return std::to_string(v); }
 
-// 稳定错误码的短名不逐个枚举：示例只关心比较 code，名字用于人读细节。
+/**
+ * 稳定错误码的短名不逐个枚举：示例只关心比较 code，名字用于人读细节。
+ */
 std::string Err(const fw::Error& e) {
     return "code_" + Int(int(e.code));
 }
@@ -101,7 +107,9 @@ fw::ServiceOptions ServiceOpts() {
     return fw::ServiceOptions{}.SetMaxInflight(4);
 }
 
-// ---- 场景 1：同进程共享 + 热拔插 + hook/observer ----
+/**
+ * ---- 场景 1：同进程共享 + 热拔插 + hook/observer ----
+ */
 void RunHookFailureScenario();
 
 void RunSharedScenario() {
@@ -167,7 +175,9 @@ void RunSharedScenario() {
     Check(bool(catalog_h) && bool(cart_h), "find_services",
           bool(catalog_h) && bool(cart_h) ? "ok" : "missing");
 
-    // 运行期显式绑定：CartService 在 OnBindingChanged 里借用同一实例写购物车。
+    /**
+     * 运行期显式绑定：CartService 在 OnBindingChanged 里借用同一实例写购物车。
+     */
     auto cart_binding = bbt_co_await app->CoBindComponent<shop::PriceBook>(
         cart_h.value(), std::string(shop::kPricingSlot));
     Check(bool(cart_binding), "runtime_bind_cart",
@@ -201,7 +211,9 @@ void RunSharedScenario() {
           "missing_slot_not_found",
           "code=" + Int(int(missing.error().code)));
 
-    // ---- 热拔插：解绑两个 subject → 卸载旧实例 → 同名重装 ----
+    /**
+     * ---- 热拔插：解绑两个 subject → 卸载旧实例 → 同名重装 ----
+     */
     auto unbind_catalog = bbt_co_await app->CoUnbindComponent<shop::PriceBook>(
         catalog_h.value(), std::string(shop::kPricingSlot));
     auto unbind_cart = bbt_co_await app->CoUnbindComponent<shop::PriceBook>(
@@ -233,7 +245,9 @@ void RunSharedScenario() {
         observed.end();
     Check(saw_destroyed, "observer_saw_destroyed",
           "events=" + Int(observed.size()));
-    // token 的生命周期由观察者持有：显式 Revoke 后 IsActive 为 false。
+    /**
+     * token 的生命周期由观察者持有：显式 Revoke 后 IsActive 为 false。
+     */
     if (token) token.value().Revoke();
     Check(token ? !token.value().IsActive() : false,
           "observer_token_revoke", token ? "ok" : "no_token");
@@ -303,7 +317,9 @@ void RunSharedScenario() {
         }
     }
 
-    // 显式撤销 + 收口：token 撤销后不再派发，CoStop 有限 deadline 干净收尾。
+    /**
+     * 显式撤销 + 收口：token 撤销后不再派发，CoStop 有限 deadline 干净收尾。
+     */
     int svc_events = 0;
     auto cart_token = bbt_co_await app->CoObserve(
         app->Handle(), cart_h.value(),
@@ -334,7 +350,9 @@ void RunSharedScenario() {
           "stop=" + Int(shop::PriceBook::s_stop.load()) +
               " uninstall=" + Int(shop::PriceBook::s_uninstall.load()));
 
-    // 释放第一个 App 后再跑失败 hook 段落：两个 App 不同时活跃。
+    /**
+     * 释放第一个 App 后再跑失败 hook 段落：两个 App 不同时活跃。
+     */
     app.reset();
     RunHookFailureScenario();
 
@@ -342,7 +360,9 @@ void RunSharedScenario() {
          " checks=" + Int(g_checks) + " failures=" + Int(g_failures));
 }
 
-// ---- 场景 2：hook 失败仍被记录，有限 deadline 收口 ----
+/**
+ * ---- 场景 2：hook 失败仍被记录，有限 deadline 收口 ----
+ */
 void RunHookFailureScenario() {
     Emit("event=scenario_start mode=hook_failure pid=" + Pid());
     auto app = v2::CoApp::Create(MakeAppOptions());
@@ -407,7 +427,9 @@ void RunHookFailureScenario() {
                   : Err(stopped.error()));
 }
 
-// ---- 场景 3：独立进程装配同一业务模块 ----
+/**
+ * ---- 场景 3：独立进程装配同一业务模块 ----
+ */
 void RunNodeScenario(int price_cents) {
     Emit("event=scenario_start mode=node pid=" + Pid() +
          " price=" + Int(price_cents));
@@ -471,7 +493,9 @@ void RunNodeScenario(int price_cents) {
          " checks=" + Int(g_checks) + " failures=" + Int(g_failures));
 }
 
-// 把场景投递进受管协程，宿主线程用限时 CV 等它结束（不阻塞 worker）。
+/**
+ * 把场景投递进受管协程，宿主线程用限时 CV 等它结束（不阻塞 worker）。
+ */
 bool RunInManagedCoroutine(const std::function<void()>& fn,
                            std::chrono::milliseconds budget) {
     struct Slot {
@@ -541,7 +565,10 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "usage: %s shared|node --journal <path> [--price <cents>]\n",
                      argv[0]);
-        return 90;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 90;
     }
 
     g_journal.open(args.journal, std::ios::out | std::ios::trunc);
@@ -552,8 +579,10 @@ int main(int argc, char* argv[]) {
     }
     shop::SetJournal(&Journal);
 
-    // 普通 main + 协程入口：先配置并启动 runtime，再把场景投递进受管协程。
-    // hook 内含字符串/容器操作，默认 12KB 栈偏紧，显式放大。
+    /**
+     * 普通 main + 协程入口：先配置并启动 runtime，再把场景投递进受管协程。
+     * hook 内含字符串/容器操作，默认 12KB 栈偏紧，显式放大。
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
     g_bbt_coroutine_config->m_cfg_stack_size        = 256 * 1024;
     g_scheduler->Start();

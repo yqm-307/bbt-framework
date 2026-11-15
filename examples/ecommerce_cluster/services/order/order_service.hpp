@@ -1,8 +1,10 @@
 #pragma once
-// 订单服务：按 sku/qty 向 catalog 取单价并算出总额。
-//
-// 本头只声明业务面，实现见 order_service.cc。出站目标是逻辑服务名
-// kCatalogService，地址由宿主 find_route 按动态路由表解析。
+/**
+ * 订单服务：按 sku/qty 向 catalog 取单价并算出总额。
+ *
+ * 本头只声明业务面，实现见 order_service.cc。出站目标是逻辑服务名
+ * kCatalogService，地址由宿主 find_route 按动态路由表解析。
+ */
 
 #include <string>
 #include <string_view>
@@ -25,7 +27,9 @@ using bbt::framework::CoService;
 using bbt::framework::ProtoMethod;
 using bbt::framework::RpcMethods;
 
-/// @brief 订单服务：`Quote` 调用 catalog.Price 并回带两侧实例身份。
+/**
+ * @brief 订单服务：`Quote` 调用 catalog.Price 并回带两侧实例身份。
+ */
 class OrderService final : public CoService<OrderService> {
 public:
     static constexpr std::string_view kServiceName = kOrderService;

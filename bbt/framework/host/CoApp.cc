@@ -21,9 +21,11 @@ namespace bbt::framework {
 
 namespace {
 
-// 进程内活跃宿主登记：默认一个进程共享现有单例 Scheduler，不宣称
-// 多个 CoApp 可各自创建独立 Scheduler。本实现口径：同一时刻至多一个
-// CoApp 处于 run 内；完整收束后允许另一实例顺序复用同一单例。
+/**
+ * 进程内活跃宿主登记：默认一个进程共享现有单例 Scheduler，不宣称
+ * 多个 CoApp 可各自创建独立 Scheduler。本实现口径：同一时刻至多一个
+ * CoApp 处于 run 内；完整收束后允许另一实例顺序复用同一单例。
+ */
 std::mutex g_active_app_mtx;
 CoApp*     g_active_app = nullptr;
 
@@ -39,15 +41,36 @@ result<void> FailInvalid(std::string what) {
                                        std::move(what)));
 }
 
+/**
+ * 服务级有序入口的懒装配：ordered_ingress 启用且尚未创建时按其
+ * 三项服务级上限实例化；grant 与 bind 两条路径共用同一配置来源，
+ * 不各自映射一份。
+ */
+result<void> EnsureOrderedIngress(const ServiceOptions& opts,
+                                  const std::string& name,
+                                  std::shared_ptr<OrderedIngress>* out) {
+    if (!*out) {
+        auto created = OrderedIngress::Create(OrderedIngressConfig{
+            name, opts.max_ordered_streams, opts.max_cached_results,
+            opts.max_cached_result_bytes});
+        if (!created)
+            return result<void>::err(std::move(created.error()));
+        *out = std::move(created.value());
+    }
+    return result<void>::ok();
+}
+
 } // namespace
 
 CoApp::CoApp(CoAppOptions options)
     : m_options(std::move(options)),
       m_state(std::make_shared<AppRuntimeState>()) {
-    // 默认装配：真实网络宿主 + 入站线桥 + 默认出站。InstallHandler/
-    // InstallRpcHandler 只存业务入口（Start 在 run 内），此处安装是安全的；
-    // handler 闭包按值复制运行时状态的 shared_ptr，不借用宿主/CoApp 成员、
-    // 不捕获 this（见 internal/AppRuntimeState.hpp 的寿命契约）。
+    /**
+     * 默认装配：真实网络宿主 + 入站线桥 + 默认出站。InstallHandler/
+     * InstallRpcHandler 只存业务入口（Start 在 run 内），此处安装是安全的；
+     * handler 闭包按值复制运行时状态的 shared_ptr，不借用宿主/CoApp 成员、
+     * 不捕获 this（见 internal/AppRuntimeState.hpp 的寿命契约）。
+     */
     m_default_host = std::make_shared<InfraHttpHost>(
         m_options.network_limits, m_options.listen, m_options.local_identity);
     m_network_host = m_default_host;
@@ -56,12 +79,17 @@ CoApp::CoApp(CoAppOptions options)
     m_state->rpc_policy = m_options.rpc_policy;
     m_state->dynamic_routes = m_options.dynamic_routes;
     for (const auto& r : m_options.static_routes) {
-        m_routes.emplace(r.service_name, r.address);   // 重复名保先见，run 校验拒绝
+        /**
+         * 重复名保先见，run 校验拒绝
+         */
+        m_routes.emplace(r.service_name, r.address);
         m_state->routes.emplace(r.service_name, r.address);
     }
 }
 
-// 测试缝构造：显式注入宿主与出站发送（private，经 MakeCoAppForTest）。
+/**
+ * 测试缝构造：显式注入宿主与出站发送（private，经 MakeCoAppForTest）。
+ */
 CoApp::CoApp(CoAppOptions options, CoAppSeam seam)
     : m_options(std::move(options)),
       m_network_host(std::move(seam.host)),
@@ -79,7 +107,9 @@ CoApp::~CoApp() = default;
 
 std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
                                         CoAppSeam seam) {
-    // 测试缝构造是 private：唯一构造口在本处（CoApp 的友元）。
+    /**
+     * 测试缝构造是 private：唯一构造口在本处（CoApp 的友元）。
+     */
     return std::unique_ptr<CoApp>(
         new CoApp(std::move(options), std::move(seam)));
 }
@@ -88,20 +118,28 @@ int CoApp::run() {
     {
         std::lock_guard<std::mutex> lk(g_active_app_mtx);
         if (g_active_app != nullptr)
-            return HostLifecycle::kExitRejected;   // 已有活跃宿主
+            /**
+             * 已有活跃宿主
+             */
+            return HostLifecycle::kExitRejected;
         g_active_app = this;
     }
     ActiveAppGuard release_active;
 
     if (m_ran_once.exchange(true, std::memory_order_acq_rel))
-        return HostLifecycle::kExitRejected;       // run() 一次性
+        /**
+         * run() 一次性
+         */
+        return HostLifecycle::kExitRejected;
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_registration_open = false;
     }
 
-    // run 前校验：任何失败都在启动任何组件之前返回。
+    /**
+     * run 前校验：任何失败都在启动任何组件之前返回。
+     */
     if (auto r = _ValidateConfig(); !r) {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_early_failures.push_back(r.error().message);
@@ -111,40 +149,53 @@ int CoApp::run() {
     HostLifecycle lifecycle(m_network_host,
                             m_options.shutdown_step_budget,
                             &m_shutdown_req);
-    // guard 在发布前构造、在 lifecycle 前析构；正常退出或异常回卷都撤销发布。
-    // 同一把锁保证在途读者完成访问后才清空，后续读者不再访问局部对象。
+    /**
+     * guard 在发布前构造、在 lifecycle 前析构；正常退出或异常回卷都撤销发布。
+     * 同一把锁保证在途读者完成访问后才清空，后续读者不再访问局部对象。
+     */
     auto revoke_publish = boost::scope::make_scope_exit([this]() noexcept {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         m_lifecycle = nullptr;
     });
     {
-        // 发布局部对象地址（全函数唯一写入点）：读取者在 m_lifecycle_mtx 内
-        // 取指针并完成成员访问，清空由上面的 guard 在同一把锁内完成。
+        /**
+         * 发布局部对象地址（全函数唯一写入点）：读取者在 m_lifecycle_mtx 内
+         * 取指针并完成成员访问，清空由上面的 guard 在同一把锁内完成。
+         */
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         m_lifecycle = &lifecycle;
     }
 
     HostLifecycle::Hooks hooks;
-    // 启动：runtime 初始化之后、网络 Create 之前先创建/启动资源，再
-    // 绑定 Service——满足资源「Create 要求 runtime 已初始化」与「资源就绪
-    // 后再接纳」的装配顺序。
+    /**
+     * 启动：runtime 初始化之后、网络 Create 之前先创建/启动资源，再
+     * 绑定 Service——满足资源「Create 要求 runtime 已初始化」与「资源就绪
+     * 后再接纳」的装配顺序。
+     */
     hooks.on_scheduler_started = [this] {
         if (auto r = _StartResources(); !r)
             return r;
         return _BindServices();
     };
-    // 关闭：handler 排空后、网络 Close 前同步收束资源（资源可能在途
-    // handler 仍被引用；网络对象尚未关闭，资源可安全收尾）。
+    /**
+     * 关闭：handler 排空后、网络 Close 前同步收束资源（资源可能在途
+     * handler 仍被引用；网络对象尚未关闭，资源可安全收尾）。
+     */
     hooks.on_handlers_drained = [this] { _CloseResources(); };
-    hooks.on_release           = [this] {
-        _CloseResources();   // 回退路径兜底（spec.closed 幂等）
+    hooks.on_release = [this] {
+        /**
+         * 回退路径兜底（spec.closed 幂等）
+         */
+        _CloseResources();
         _ReleaseServices();
     };
 
     const int rc = lifecycle.Run(hooks);
 
-    // 生命周期对象随 run 结束销毁前，把失败清单与最终状态留档，
-    // 供 lifecycle_failures()/shutdown_state() 在 run 后仍可读。
+    /**
+     * 生命周期对象随 run 结束销毁前，把失败清单与最终状态留档，
+     * 供 lifecycle_failures()/shutdown_state() 在 run 后仍可读。
+     */
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto f = lifecycle.Failures();
@@ -153,8 +204,10 @@ int CoApp::run() {
                                 std::make_move_iterator(f.end()));
     }
     m_parked_state.store(lifecycle.State(), std::memory_order_release);
-    // 撤销发布统一由 revoke_publish 在退出时完成（正常 return 与异常回卷同一
-    // 规则；析构次序保证 guard 先于局部 lifecycle 运行），此处不再单独清空。
+    /**
+     * 撤销发布统一由 revoke_publish 在退出时完成（正常 return 与异常回卷同一
+     * 规则；析构次序保证 guard 先于局部 lifecycle 运行），此处不再单独清空。
+     */
     return rc;
 }
 
@@ -164,7 +217,9 @@ void CoApp::request_shutdown() noexcept {
     if (m_lifecycle != nullptr)
         m_lifecycle->RequestShutdown();
     else {
-        // run 尚未开始：对外表达「已进入关闭意图」；已结束则保持 Closed。
+        /**
+         * run 尚未开始：对外表达「已进入关闭意图」；已结束则保持 Closed。
+         */
         auto expected = ShutdownState::Running;
         m_parked_state.compare_exchange_strong(
             expected, ShutdownState::Closing, std::memory_order_release);
@@ -186,7 +241,9 @@ std::vector<std::string> CoApp::pending_cleanup() const {
 }
 
 std::vector<std::string> CoApp::lifecycle_failures() const {
-    // 嵌套次序固定为 m_lifecycle_mtx → m_mtx（无反向获取），不构成死锁环。
+    /**
+     * 嵌套次序固定为 m_lifecycle_mtx → m_mtx（无反向获取），不构成死锁环。
+     */
     std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
     if (m_lifecycle != nullptr)
         return m_lifecycle->Failures();
@@ -220,14 +277,10 @@ result<void> CoApp::grant_ordered_stream(OrderedGrant grant) {
                 "' does not enable ordered_ingress"));
 
     if (!service.ordered_ingress) {
-        auto created = OrderedIngress::Create(OrderedIngressConfig{
-            grant.service,
-            service.options.max_ordered_streams,
-            service.options.max_cached_results,
-            service.options.max_cached_result_bytes});
+        auto created = EnsureOrderedIngress(
+            service.options, grant.service, &service.ordered_ingress);
         if (!created)
             return result<void>::err(std::move(created.error()));
-        service.ordered_ingress = std::move(created.value());
     }
     return service.ordered_ingress->GrantStream(grant);
 }
@@ -287,19 +340,23 @@ result<void> CoApp::_ValidateConfig() const {
             return FailInvalid("CoApp: static route '" + r.service_name +
                                "' has empty endpoint");
     }
-    // 重复 service_name 的静态路由 → 拒绝（map 已保先见，此处显式计数）。
+    /**
+     * 重复 service_name 的静态路由 → 拒绝（map 已保先见，此处显式计数）。
+     */
     if (m_routes.size() != m_options.static_routes.size())
         return FailInvalid("CoApp: duplicate static route service_name");
     return result<void>::ok();
 }
 
 result<void> CoApp::_BindServices() {
-    // runtime 初始化之后调用（runtime 已就绪）。Concurrent → 单实例
-    // 绑定；ActorSerial → 注册表工厂在激活时绑定身份，actor key 由注册表
-    // 经 _bind_actor_key 绑定。所有实例共享同一出站注入点（经路由门）
-    // 与同一应用级资源表（context().resource<R>() 的数据源）。
-    // 出站回调复制 m_state 的 shared_ptr（不捕获 this）：服务实例经
-    // m_send 发出的调用只访问状态内的 routes/policy/egress/seam_send。
+    /**
+     * runtime 初始化之后调用（runtime 已就绪）。Concurrent → 单实例
+     * 绑定；ActorSerial → 注册表工厂在激活时绑定身份，actor key 由注册表
+     * 经 _bind_actor_key 绑定。所有实例共享同一出站注入点（经路由门）
+     * 与同一应用级资源表（context().resource<R>() 的数据源）。
+     * 出站回调复制 m_state 的 shared_ptr（不捕获 this）：服务实例经
+     * m_send 发出的调用只访问状态内的 routes/policy/egress/seam_send。
+     */
     const ICoService::RpcSendFn egress = _MakeEgress();
     std::map<std::string, std::shared_ptr<ICoService>> instances;
     auto registry = std::make_shared<ActorRegistry>();
@@ -310,17 +367,15 @@ result<void> CoApp::_BindServices() {
         for (auto& [name, entry] : m_services) {
             try {
                 if (entry.options.ordered_ingress && !entry.ordered_ingress) {
-                    auto created = OrderedIngress::Create(OrderedIngressConfig{
-                        name,
-                        entry.options.max_ordered_streams,
-                        entry.options.max_cached_results,
-                        entry.options.max_cached_result_bytes});
+                    auto created = EnsureOrderedIngress(
+                        entry.options, name, &entry.ordered_ingress);
                     if (!created)
                         return result<void>::err(std::move(created.error()));
-                    entry.ordered_ingress = std::move(created.value());
                 }
-                // 方法表移入运行时状态，分发表项强持有同一 shared_ptr：
-                // 在途分发不再借用 CoApp 成员的地址。
+                /**
+                 * 方法表移入运行时状态，分发表项强持有同一 shared_ptr：
+                 * 在途分发不再借用 CoApp 成员的地址。
+                 */
                 auto table =
                     std::make_shared<RpcMethodTable>(std::move(entry.table));
                 if (entry.options.execution == ExecutionPolicy::Concurrent) {
@@ -370,18 +425,23 @@ result<void> CoApp::_BindServices() {
 }
 
 result<void> CoApp::_StartResources() {
-    // runtime 初始化之后（on_scheduler_started）、绑定 Service 之前：
-    // 逐个执行工厂资源的 Create→Start→登记实例视图。m_resource_specs 是
-    // unordered_map（ResourceKeyHash），本处无跨资源依赖约定，顺序不敏感；
-    // 如需登记序请改存有序容器，不在注释中宣称确定性。任一失败即返回，
-    // 由 HostLifecycle 回退：已启动资源在回退路径（on_release→
-    // _CloseResources）统一收束。factory()/spec.start() 抛出的异常在此
-    // 收口为 err(InternalError)，不越过 HostLifecycle::_StartUp——保证
-    // 启动失败同样走固定回退序列，不留半启动状态。
+    /**
+     * runtime 初始化之后（on_scheduler_started）、绑定 Service 之前：
+     * 逐个执行工厂资源的 Create→Start→登记实例视图。m_resource_specs 是
+     * unordered_map（ResourceKeyHash），本处无跨资源依赖约定，顺序不敏感；
+     * 如需登记序请改存有序容器，不在注释中宣称确定性。任一失败即返回，
+     * 由 HostLifecycle 回退：已启动资源在回退路径（on_release→
+     * _CloseResources）统一收束。factory()/spec.start() 抛出的异常在此
+     * 收口为 err(InternalError)，不越过 HostLifecycle::_StartUp——保证
+     * 启动失败同样走固定回退序列，不留半启动状态。
+     */
     std::lock_guard<std::mutex> lk(m_mtx);
     for (auto& [key, spec] : m_resource_specs) {
         if (!spec.factory)
-            continue;   // 预创建实例登记期已可见
+            /**
+             * 预创建实例登记期已可见
+             */
+            continue;
         std::shared_ptr<void> instance;
         try {
             auto created = spec.factory();
@@ -403,8 +463,10 @@ result<void> CoApp::_StartResources() {
         if (spec.start) {
             try {
                 if (auto r = spec.start(instance); !r) {
-                    // 半装配资源：留在 spec.instance 供回退收束，但不进
-                    // m_resources 实例视图（service 不可见半成品）。
+                    /**
+                     * 半装配资源：留在 spec.instance 供回退收束，但不进
+                     * m_resources 实例视图（service 不可见半成品）。
+                     */
                     spec.instance = std::move(instance);
                     return result<void>::err(std::move(r.error()));
                 }
@@ -427,7 +489,9 @@ result<void> CoApp::_StartResources() {
 }
 
 void CoApp::_CloseResources() noexcept {
-    // 收集需收束的资源（持锁拷贝句柄，避免在锁内执行 Close）。
+    /**
+     * 收集需收束的资源（持锁拷贝句柄，避免在锁内执行 Close）。
+     */
     std::vector<std::shared_ptr<bbt::infra::ICoCloseable>> closeables;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -437,26 +501,35 @@ void CoApp::_CloseResources() noexcept {
                 continue;
             if (auto c = spec.as_closeable(spec.instance)) {
                 closeables.push_back(std::move(c));
-                spec.closed = true;   // 幂等：回退路径不重复收束
+                /**
+                 * 幂等：回退路径不重复收束
+                 */
+                spec.closed = true;
             }
         }
     }
-    // infra 关闭是同步契约：Close() 返回即物理释放、幂等、noexcept，
-    // 无控制线程等待预算/迟到收尾（资源不再有独立等待步）。
+    /**
+     * infra 关闭是同步契约：Close() 返回即物理释放、幂等、noexcept，
+     * 无控制线程等待预算/迟到收尾（资源不再有独立等待步）。
+     */
     for (auto& closeable : closeables)
         internal::CloseResource(closeable);
 }
 
 void CoApp::_ReleaseServices() noexcept {
-    // 收回运行时状态持有的全部业务对象引用：新分发立即拒绝，在途分发靠
-    // 本地强引用与自持表项收尾，本对象随后可完全回收。
+    /**
+     * 收回运行时状态持有的全部业务对象引用：新分发立即拒绝，在途分发靠
+     * 本地强引用与自持表项收尾，本对象随后可完全回收。
+     */
     std::lock_guard<std::mutex> lk(m_mtx);
     m_state->Release();
 }
 
 ICoService::RpcSendFn CoApp::_MakeEgress() {
-    // 出站回调复制运行时状态的 shared_ptr——不捕获 this、不借用 CoApp
-    // 成员；路由门/策略/发送实现全部在状态内（见 AppRuntimeState::Send）。
+    /**
+     * 出站回调复制运行时状态的 shared_ptr——不捕获 this、不借用 CoApp
+     * 成员；路由门/策略/发送实现全部在状态内（见 AppRuntimeState::Send）。
+     */
     auto state = m_state;
     return [state = std::move(state)](const bbt::infra::rpc::Request& env,
                                       const bbt::infra::CallOptions& options)
@@ -473,9 +546,11 @@ result<bbt::infra::rpc::Response> CoApp::dispatch_inbound(
 result<bbt::infra::rpc::Response> DispatchInboundForTest(
     CoApp& app,
     const bbt::infra::rpc::Request& request) {
-    // 转发私有 dispatch_inbound：测试侧拿到真实 Dispatcher/RequestContext
-    // 链路（envelope 校验 → 上下文落地 → 执行策略分发 → 回复封包），
-    // 不绕过 InboundDispatcher 直接触 handler。
+    /**
+     * 转发私有 dispatch_inbound：测试侧拿到真实 Dispatcher/RequestContext
+     * 链路（envelope 校验 → 上下文落地 → 执行策略分发 → 回复封包），
+     * 不绕过 InboundDispatcher 直接触 handler。
+     */
     return app.dispatch_inbound(request);
 }
 

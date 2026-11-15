@@ -1,45 +1,47 @@
 #pragma once
-// framework Redis lane：新 net Redis 资源在框架资源缝中的装配适配。
-//
-// 背景：infra 的新入口 bbt::infra::redis::CoRedisCli 消费宿主自有
-// net::Engine + 数值 net::Address + 显式 Connect（bbt_co_await 协程域），
-// 不继承旧 ICoCloseable——其 Close() 只逻辑封口并请求关闭已发布连接，
-// 物理回收由「RequestClose Engine → join Run → Phase==Stopped」的宿主收尾
-// 承担（见 bbtools-infra docs/redis-net.md §关闭与宿主收尾）。框架关闭序列
-// 只认 ICoCloseable 同步收口，因此经本适配器装配：
-//
-//   RedisNetResource
-//     ├── 继承 ICoCloseable：框架关闭序列照常收 spec.as_closeable → Close()
-//     │   （停止接纳/关闭 client——内层 redis::CoRedisCli::Close + Engine
-//     │   RequestClose + join Run + Phase==Stopped 核验，全部在本 Close()
-//     │   内同步完成，不新增框架等待步）。
-//     └── 命令面原样转发（bbt_co_await）：Connect/Set/Get/Ping/Exists/Delete。
-//
-// 工程边界（ceiling，明示不伪造）：
-//  - Engine 归本对象独占（每资源一个 client-only Engine + 自有 Run 线程），
-//    不与框架宿主/其他资源共享——新入口要求 Engine 无 RawHandler，共享会
-//    让关闭次序相互踩界；确需共享 Engine 时另由上层宿主拥有并自证收尾。
-//  - 命令只转发本任务需要的入口；新入口其余命令（SetOptions/Expire/Ttl/
-//    INCR 族/Hash）后续按需在 adapter 与调用方同步扩展。
-//  - Create 在 native 控制线程调用且要求 coroutine Scheduler 已启动
-//    （Engine::Run 校验宿主控制域+runtime 已初始化；add_resource factory
-//    的 on_scheduler_started 相位天然满足）。Create 内同步拉起 Engine Run
-//    线程并有界等 Phase==Running——Engine 未起来即装配失败，不留半启动
-//    线程。地址只接受数值 IPv4/IPv6（net::Address::Ip 不解析主机名）。
-//  - IsClosed 只表示逻辑封口；物理证据是 Close() 内记录的
-//    engine_stopped（Run 已 join 且 Phase==Stopped 且无 Run 错误）。
-//    物理收口失败时 Close() 如实记录（不抛——ICoCloseable 是 noexcept），
-//    IsClosed 仍 true，观测口 engine_stopped() 暴露该失败。
-//  - 本类不参与框架公共头的 add_resource<R> 语义推断：R=RedisNetResource
-//    继承 ICoCloseable，故 spec.as_closeable 照常由模板推导。
-//
-// 用法：
-//    app.add_resource<fw::RedisNetResource>("cache",
-//        [addr] { return fw::RedisNetResource::Create(addr); });
-//    // handler 内：auto r = bbt_co_await cli->Get(key, opts);
-//
-// 资源类型名即框架资源键的类型段；service 经
-// context().resource<fw::RedisNetResource>(name) 取用。
+/**
+ * framework Redis lane：新 net Redis 资源在框架资源缝中的装配适配。
+ *
+ * 背景：infra 的新入口 bbt::infra::redis::CoRedisCli 消费宿主自有
+ * net::Engine + 数值 net::Address + 显式 Connect（bbt_co_await 协程域），
+ * 不继承旧 ICoCloseable——其 Close() 只逻辑封口并请求关闭已发布连接，
+ * 物理回收由「RequestClose Engine → join Run → Phase==Stopped」的宿主收尾
+ * 承担（见 bbtools-infra docs/redis-net.md §关闭与宿主收尾）。框架关闭序列
+ * 只认 ICoCloseable 同步收口，因此经本适配器装配：
+ *
+ * RedisNetResource
+ * ├── 继承 ICoCloseable：框架关闭序列照常收 spec.as_closeable → Close()
+ * │   （停止接纳/关闭 client——内层 redis::CoRedisCli::Close + Engine
+ * │   RequestClose + join Run + Phase==Stopped 核验，全部在本 Close()
+ * │   内同步完成，不新增框架等待步）。
+ * └── 命令面原样转发（bbt_co_await）：Connect/Set/Get/Ping/Exists/Delete。
+ *
+ * 工程边界（ceiling，明示不伪造）：
+ * - Engine 归本对象独占（每资源一个 client-only Engine + 自有 Run 线程），
+ * 不与框架宿主/其他资源共享——新入口要求 Engine 无 RawHandler，共享会
+ * 让关闭次序相互踩界；确需共享 Engine 时另由上层宿主拥有并自证收尾。
+ * - 命令只转发本任务需要的入口；新入口其余命令（SetOptions/Expire/Ttl/
+ * INCR 族/Hash）后续按需在 adapter 与调用方同步扩展。
+ * - Create 在 native 控制线程调用且要求 coroutine Scheduler 已启动
+ * （Engine::Run 校验宿主控制域+runtime 已初始化；add_resource factory
+ * 的 on_scheduler_started 相位天然满足）。Create 内同步拉起 Engine Run
+ * 线程并有界等 Phase==Running——Engine 未起来即装配失败，不留半启动
+ * 线程。地址只接受数值 IPv4/IPv6（net::Address::Ip 不解析主机名）。
+ * - IsClosed 只表示逻辑封口；物理证据是 Close() 内记录的
+ * engine_stopped（Run 已 join 且 Phase==Stopped 且无 Run 错误）。
+ * 物理收口失败时 Close() 如实记录（不抛——ICoCloseable 是 noexcept），
+ * IsClosed 仍 true，观测口 engine_stopped() 暴露该失败。
+ * - 本类不参与框架公共头的 add_resource<R> 语义推断：R=RedisNetResource
+ * 继承 ICoCloseable，故 spec.as_closeable 照常由模板推导。
+ *
+ * 用法：
+ * app.add_resource<fw::RedisNetResource>("cache",
+ * [addr] { return fw::RedisNetResource::Create(addr); });
+ * // handler 内：auto r = bbt_co_await cli->Get(key, opts);
+ *
+ * 资源类型名即框架资源键的类型段；service 经
+ * context().resource<fw::RedisNetResource>(name) 取用。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -68,14 +70,18 @@ namespace bbt::framework {
 
 class RedisNetResource final : public bbt::infra::ICoCloseable {
 public:
-    // Engine 发布 Running 的启动窗口（不是建连预算——建连预算由调用方
-    // CallOptions 决定）。Run 线程已拉起但窗口内未 Running 即装配失败。
+    /**
+     * Engine 发布 Running 的启动窗口（不是建连预算——建连预算由调用方
+     * CallOptions 决定）。Run 线程已拉起但窗口内未 Running 即装配失败。
+     */
     static constexpr std::chrono::milliseconds kEngineRunWait{5000};
 
-    // 装配：创建 client-only Engine + 拉起 Run 线程 + 等 Running +
-    // redis::CoRedisCli::Create（只装配不拨号）。任一步失败收口已建对象
-    // （RequestClose+join）后如实返回错误，不留半装配句柄。
-    // 要求 native 线程 + coroutine Scheduler 已启动。
+    /**
+     * 装配：创建 client-only Engine + 拉起 Run 线程 + 等 Running +
+     * redis::CoRedisCli::Create（只装配不拨号）。任一步失败收口已建对象
+     * （RequestClose+join）后如实返回错误，不留半装配句柄。
+     * 要求 native 线程 + coroutine Scheduler 已启动。
+     */
     static bbt::infra::result<std::shared_ptr<RedisNetResource>> Create(
         bbt::infra::net::Address address) {
         auto engine = bbt::infra::net::Engine::Create(nullptr);
@@ -94,7 +100,9 @@ public:
                 }
                 done.set_value(ec);
             });
-        // 有界等 Phase==Running；Run 提前返回（含前置校验失败）即刻可见。
+        /**
+         * 有界等 Phase==Running；Run 提前返回（含前置校验失败）即刻可见。
+         */
         const auto until = std::chrono::steady_clock::now() + kEngineRunWait;
         while (engine->Phase() != bbt::infra::net::EnginePhase::Running) {
             if (run_result.wait_for(std::chrono::milliseconds{0}) ==
@@ -132,8 +140,10 @@ public:
     RedisNetResource(const RedisNetResource&) = delete;
     RedisNetResource& operator=(const RedisNetResource&) = delete;
 
-    // 命令面：全部要求在受管协程内经 bbt_co_await 调用；语义与底层
-    // redis::CoRedisCli 一致（未连接/已封口/竞争等在底层如实返回）。
+    /**
+     * 命令面：全部要求在受管协程内经 bbt_co_await 调用；语义与底层
+     * redis::CoRedisCli 一致（未连接/已封口/竞争等在底层如实返回）。
+     */
     bbt_co_async(bbt::infra::result<void>) Connect(
         const bbt::infra::CallOptions& options) {
         return bbt_co_await m_client->Connect(options);
@@ -163,20 +173,26 @@ public:
         return bbt_co_await m_client->Delete(std::move(keys), options);
     }
 
-    // ICoCloseable 同步收口：先 client Close（逻辑封口 + 已发布连接
-    // RequestClose），再 Engine RequestClose + join Run + Phase==Stopped
-    // 核验。幂等；任意线程可调。在途命令按底层语义以 Closed/OutcomeUnknown
-    // 落定——本收口只保证「不再接纳 + Engine Run 已返回」，不承诺在途
-    // 命令的后端结果。
+    /**
+     * ICoCloseable 同步收口：先 client Close（逻辑封口 + 已发布连接
+     * RequestClose），再 Engine RequestClose + join Run + Phase==Stopped
+     * 核验。幂等；任意线程可调。在途命令按底层语义以 Closed/OutcomeUnknown
+     * 落定——本收口只保证「不再接纳 + Engine Run 已返回」，不承诺在途
+     * 命令的后端结果。
+     */
     void Close() noexcept override {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_closed) return;
             m_closed = true;
         }
-        // client 层先停：不再接纳新命令，已发布连接 RequestClose。
+        /**
+         * client 层先停：不再接纳新命令，已发布连接 RequestClose。
+         */
         m_client->Close();
-        // Engine 物理收口：RequestClose → join Run → 结果 + Phase 核验。
+        /**
+         * Engine 物理收口：RequestClose → join Run → 结果 + Phase 核验。
+         */
         m_engine->RequestClose();
         if (m_engine_thread.joinable()) m_engine_thread.join();
         std::error_code ec{};
@@ -192,8 +208,10 @@ public:
         return m_closed;
     }
 
-    // 观测口（测试断言用）：Close() 内 Engine 物理收口是否核验成功
-    // （Run 已 join、Phase==Stopped 且无 Run 错误）。未 Close 恒 false。
+    /**
+     * 观测口（测试断言用）：Close() 内 Engine 物理收口是否核验成功
+     * （Run 已 join、Phase==Stopped 且无 Run 错误）。未 Close 恒 false。
+     */
     bool engine_stopped() const noexcept {
         std::lock_guard<std::mutex> lk(m_mtx);
         return m_engine_stopped;

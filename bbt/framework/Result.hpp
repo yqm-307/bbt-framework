@@ -1,6 +1,8 @@
 #pragma once
-// result<T> 是 bbt::infra::result<T> 的 using 引用，
-// 不另造错误体系；Error/ErrorCode/MakeError 一并按别名透出供业务使用。
+/**
+ * result<T> 是 bbt::infra::result<T> 的 using 引用，
+ * 不另造错误体系；Error/ErrorCode/MakeError 一并按别名透出供业务使用。
+ */
 
 #include <bbt/infra/Result.hpp>
 

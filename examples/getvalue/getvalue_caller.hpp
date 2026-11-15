@@ -1,15 +1,17 @@
 #pragma once
-// bbt-framework Service→Service 出站 caller 业务（应用层）。
-//
-// 只用公开面：CoApp 装配的显式静态路由 + CoService + ICoService::call<Req,Resp>
-// （typed 出站 seam，schema 由生成物 descriptor 推导）。业务不接触 envelope/
-// codec/发送注入点/http::Client。
-//
-// 四个方法承载不同真实出站场景（供跨进程 driver 断言）：
-//   Forward          —— 正常 typed call（预算继承父请求，不放大）
-//   ForwardExpired   —— 显式已过期 deadline；应在发起任何 I/O 前 TimedOut
-//   ForwardNoRoute   —— 目标无静态路由；find_route 门拒绝，不发起 I/O
-//   ForwardBlackhole —— 目标是「完整读下请求后断开（丢 reply）」的真实端点
+/**
+ * bbt-framework Service→Service 出站 caller 业务（应用层）。
+ *
+ * 只用公开面：CoApp 装配的显式静态路由 + CoService + ICoService::call<Req,Resp>
+ * （typed 出站 seam，schema 由生成物 descriptor 推导）。业务不接触 envelope/
+ * codec/发送注入点/http::Client。
+ *
+ * 四个方法承载不同真实出站场景（供跨进程 driver 断言）：
+ * Forward          —— 正常 typed call（预算继承父请求，不放大）
+ * ForwardExpired   —— 显式已过期 deadline；应在发起任何 I/O 前 TimedOut
+ * ForwardNoRoute   —— 目标无静态路由；find_route 门拒绝，不发起 I/O
+ * ForwardBlackhole —— 目标是「完整读下请求后断开（丢 reply）」的真实端点
+ */
 
 #include <chrono>
 #include <string_view>
@@ -22,8 +24,10 @@
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
 
-// ProtoCodec<GetValueRequest/Response> 特化（schema 真源 = .proto descriptor）
-// 与 callee 服务同源定义；caller 复用同一 codec，不另造一套。
+/**
+ * ProtoCodec<GetValueRequest/Response> 特化（schema 真源 = .proto descriptor）
+ * 与 callee 服务同源定义；caller 复用同一 codec，不另造一套。
+ */
 #include "getvalue_service.hpp"
 
 namespace getvalue {
@@ -33,13 +37,19 @@ class GetValueCallerService final
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.GetValueCallerService";
-    // caller 默认转发目标（callee 进程宿主）。schema 真源 = .proto descriptor。
+    /**
+     * caller 默认转发目标（callee 进程宿主）。schema 真源 = .proto descriptor。
+     */
     static constexpr std::string_view kCalleeService =
         "bbt.example.v1.GetValueService";
-    // 故意不配置静态路由的目标：find_route 门拒绝。
+    /**
+     * 故意不配置静态路由的目标：find_route 门拒绝。
+     */
     static constexpr std::string_view kNoRouteService =
         "bbt.example.v1.UnroutedService";
-    // 配置到「完整读下请求后断开（丢 reply）」端点的目标：真实传输错误。
+    /**
+     * 配置到「完整读下请求后断开（丢 reply）」端点的目标：真实传输错误。
+     */
     static constexpr std::string_view kBlackholeService =
         "bbt.example.v1.BlackholeService";
 
@@ -81,8 +91,10 @@ public:
             "ForwardBlackhole"));
 
 private:
-    // 真实 typed 出站：解析入站业务 payload → call<Req,Resp>（descriptor 推导
-    // schema、预算继承父请求、路由门、发送由框架完成）→ 回填 callee 响应。
+    /**
+     * 真实 typed 出站：解析入站业务 payload → call<Req,Resp>（descriptor 推导
+     * schema、预算继承父请求、路由门、发送由框架完成）→ 回填 callee 响应。
+     */
     bbt::framework::CoRpcResp _ForwardTo(
         bbt::framework::CoRpcReq req, std::string_view target,
         const bbt::framework::CallOptions& opt) {

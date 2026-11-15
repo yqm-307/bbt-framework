@@ -1,35 +1,37 @@
-// bbt-framework Service→Service fixture（两个互异 identity 的真实 CoApp）。
-//
-// V2 会话拒绝 self-connection：同一 identity 的出站不得拨回自身。框架又约束
-// 进程内同一时刻至多一个活跃 CoApp。因此本 fixture 由驱动器启动两个进程：
-//
-//   caller 进程（local_identity=two-service-caller）
-//     CoApp 宿主 getvalue::GetValueCallerService；其 handler 经公开
-//     ICoService::call<Req,Resp> 按显式静态路由向 callee 进程发起真实 V2 Call
-//     callee 进程（local_identity=two-service-callee）
-//     CoApp 宿主 getvalue::GetValueService；入站经同一 V2 会话分发
-//
-// 两个进程身份互异且都与驱动器客户端互异，不存在自环；调用只走「静态路由
-// 门 + 真实 TCP 会话」这一条公开路径。
-//
-// 业务 schema/服务实现/typed codec 全部复用 getvalue 切片
-// （getvalue_service.hpp / getvalue_caller.hpp + getvalue.proto），不另造
-// schema、协议、错误信封或第二套 codec。
-//
-// 不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
-// DispatchInboundForTest、INetworkHost 桩或任何发送注入；不创建额外 io_thread
-// （只调用公开 CoApp::run / request_shutdown）。
-//
-// argv:
-//   two_service callee <port_file> <meta_file> <journal_file>
-//   two_service caller <port_file> <callee_ep> <meta_file> <journal_file>
-// 就绪：绑定成功后写 port_file（动态 loopback 端口）与 meta_file；
-// 关闭：stdin EOF → request_shutdown() → run() 返回后写 shutdown 记录并退出。
-//
-// 两个进程共同 append 同一 journal（O_APPEND 整行写入），驱动器据此核对
-// handler 计数与「handler 排空后资源同步 Close」的真实先后。
-//
-// 所有结构化结果标注 auth_state=unauthenticated_loopback。
+/**
+ * bbt-framework Service→Service fixture（两个互异 identity 的真实 CoApp）。
+ *
+ * V2 会话拒绝 self-connection：同一 identity 的出站不得拨回自身。框架又约束
+ * 进程内同一时刻至多一个活跃 CoApp。因此本 fixture 由驱动器启动两个进程：
+ *
+ * caller 进程（local_identity=two-service-caller）
+ * CoApp 宿主 getvalue::GetValueCallerService；其 handler 经公开
+ * ICoService::call<Req,Resp> 按显式静态路由向 callee 进程发起真实 V2 Call
+ * callee 进程（local_identity=two-service-callee）
+ * CoApp 宿主 getvalue::GetValueService；入站经同一 V2 会话分发
+ *
+ * 两个进程身份互异且都与驱动器客户端互异，不存在自环；调用只走「静态路由
+ * 门 + 真实 TCP 会话」这一条公开路径。
+ *
+ * 业务 schema/服务实现/typed codec 全部复用 getvalue 切片
+ * （getvalue_service.hpp / getvalue_caller.hpp + getvalue.proto），不另造
+ * schema、协议、错误信封或第二套 codec。
+ *
+ * 不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
+ * DispatchInboundForTest、INetworkHost 桩或任何发送注入；不创建额外 io_thread
+ * （只调用公开 CoApp::run / request_shutdown）。
+ *
+ * argv:
+ * two_service callee <port_file> <meta_file> <journal_file>
+ * two_service caller <port_file> <callee_ep> <meta_file> <journal_file>
+ * 就绪：绑定成功后写 port_file（动态 loopback 端口）与 meta_file；
+ * 关闭：stdin EOF → request_shutdown() → run() 返回后写 shutdown 记录并退出。
+ *
+ * 两个进程共同 append 同一 journal（O_APPEND 整行写入），驱动器据此核对
+ * handler 计数与「handler 排空后资源同步 Close」的真实先后。
+ *
+ * 所有结构化结果标注 auth_state=unauthenticated_loopback。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -49,8 +51,14 @@
 
 #include <bbt/framework/CoApp.hpp>
 
-#include "getvalue_caller.hpp"  // caller 服务（公开面）
-#include "getvalue_service.hpp" // callee 服务 + ProtoCodec<GetValueRequest/Response>
+/**
+ * caller 服务（公开面）
+ */
+#include "getvalue_caller.hpp"
+/**
+ * callee 服务 + ProtoCodec<GetValueRequest/Response>
+ */
+#include "getvalue_service.hpp"
 
 namespace fw = bbt::framework;
 namespace inf = bbt::infra;
@@ -64,8 +72,10 @@ constexpr const char* kCallerIdentity = "two-service-caller";
 std::mutex g_journal_mtx;
 std::ofstream g_journal;
 
-// 整行一次写入 + flush：两个进程都以 O_APPEND 打开同一文件，行不会互相穿插，
-// 驱动器读到的顺序即真实发生顺序。
+/**
+ * 整行一次写入 + flush：两个进程都以 O_APPEND 打开同一文件，行不会互相穿插，
+ * 驱动器读到的顺序即真实发生顺序。
+ */
 void Journal(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_journal_mtx);
     const std::string buf = line + '\n';
@@ -73,9 +83,11 @@ void Journal(const std::string& line) {
     g_journal.flush();
 }
 
-// callee handler 被真正调用时回调（公开观测钩子）。request_id 是**出站**调用
-// 生成的 id（框架不把上游 request_id 透传给下游），故它只用于计数与交叉对照，
-// 不能与驱动器 request_id 直接比对。
+/**
+ * callee handler 被真正调用时回调（公开观测钩子）。request_id 是**出站**调用
+ * 生成的 id（框架不把上游 request_id 透传给下游），故它只用于计数与交叉对照，
+ * 不能与驱动器 request_id 直接比对。
+ */
 void AppendCalleeHandlerEntered(const std::string& request_id,
                                 const std::string& peer_principal) {
     Journal(std::string("event=callee_handler_entered req=") + request_id +
@@ -83,8 +95,10 @@ void AppendCalleeHandlerEntered(const std::string& request_id,
             " auth_state=" + kAuthState);
 }
 
-// 生命周期观测资源（公开 `add_resource<ICoCloseable>` 面）：只用于断言关闭
-// 序列在 handler 排空后**同步** Close 一次。不伪造任何后端。
+/**
+ * 生命周期观测资源（公开 `add_resource<ICoCloseable>` 面）：只用于断言关闭
+ * 序列在 handler 排空后**同步** Close 一次。不伪造任何后端。
+ */
 class CloseJournal final : public inf::ICoCloseable {
 public:
     void Close() noexcept override {
@@ -123,10 +137,14 @@ fw::CoAppOptions BaseOptions(std::string identity) {
         /*max_connections*/ 64, /*max_inflight*/ 64,
         /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
         /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    // 内核分配动态 loopback 端口；就绪后由 bound_endpoint 回读。
+    /**
+     * 内核分配动态 loopback 端口；就绪后由 bound_endpoint 回读。
+     */
     options.listen = inf::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    // V2 会话身份必填；caller/callee/驱动器三方互异。
+    /**
+     * V2 会话身份必填；caller/callee/驱动器三方互异。
+     */
     options.local_identity = std::move(identity);
     return options;
 }
@@ -168,7 +186,9 @@ std::string SchemaMeta(const std::string& local_identity) {
            "\nauth_state=" + kAuthState + "\n";
 }
 
-// 等待 stdin EOF 后优雅关闭。
+/**
+ * 等待 stdin EOF 后优雅关闭。
+ */
 void ServeUntilEof(fw::CoApp& app) {
     char buf[8];
     while (::read(STDIN_FILENO, buf, sizeof(buf)) > 0) {
@@ -217,8 +237,10 @@ int RunCallee(const std::string& port_file, const std::string& meta_file) {
 int RunCaller(const std::string& port_file, const std::string& callee_ep,
               const std::string& meta_file) {
     fw::CoAppOptions options = BaseOptions(kCallerIdentity);
-    // 唯一静态路由：callee 服务名 → callee 进程的显式 endpoint。未配置的目标
-    // 一律 NotFound，不存在自动发现或进程内直连捷径。
+    /**
+     * 唯一静态路由：callee 服务名 → callee 进程的显式 endpoint。未配置的目标
+     * 一律 NotFound，不存在自动发现或进程内直连捷径。
+     */
     options.static_routes = {fw::StaticRoute{
         std::string(getvalue::GetValueCallerService::kCalleeService), callee_ep}};
 
@@ -276,7 +298,10 @@ int RunCaller(const std::string& port_file, const std::string& callee_ep,
 
 int main(int argc, char* argv[]) {
     if (argc < 5)
-        return 90; // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 90;
     const std::string mode = argv[1];
     const std::string port_file = argv[2];
     const std::string journal_path = argv[argc - 1];
@@ -288,10 +313,12 @@ int main(int argc, char* argv[]) {
         return 6;
     }
 
-    // handler 内做 protobuf 编解码 + 入站分发 + 真实出站/入站并发。默认
-    // 12KB 协程栈不足以承载 protobuf 业务 codec（见 getvalue 切片 README
-    // 实测记录）；经 coroutine 公开配置宏（须在调度器 Start 前设置；
-    // process-global）放大到 512KB 并给足静态线程。
+    /**
+     * handler 内做 protobuf 编解码 + 入站分发 + 真实出站/入站并发。默认
+     * 12KB 协程栈不足以承载 protobuf 业务 codec（见 getvalue 切片 README
+     * 实测记录）；经 coroutine 公开配置宏（须在调度器 Start 前设置；
+     * process-global）放大到 512KB 并给足静态线程。
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 

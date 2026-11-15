@@ -38,7 +38,9 @@ CoRpcResp OrderService::Quote(CoRpcReq req) {
 
     v1::PriceRequest price_req;
     price_req.set_sku(sku);
-    // 只给逻辑服务名：目标地址由宿主 find_route（动态表）决定，业务不注入。
+    /**
+     * 只给逻辑服务名：目标地址由宿主 find_route（动态表）决定，业务不注入。
+     */
     auto price = this->call<v1::PriceRequest, v1::PriceResponse>(
         std::string(kCatalogService), "Price", price_req);
     if (!price) return fail(price.error());
@@ -108,7 +110,9 @@ CoRpcResp OrderService::CreateOrder(CoRpcReq req) {
         v1::BillRequest bill_req;
         *bill_req.mutable_order() = order;
         bill_req.set_total_cents(saved.value().total_cents());
-        // 一次显式业务调用只发送一次写 RPC；失败保留 pending，不盲重试。
+        /**
+         * 一次显式业务调用只发送一次写 RPC；失败保留 pending，不盲重试。
+         */
         auto bill = this->call<v1::BillRequest, v1::Record>(
             std::string(kSettlementService), "Settle", bill_req);
         if (!bill)

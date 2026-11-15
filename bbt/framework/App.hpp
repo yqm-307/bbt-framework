@@ -1,14 +1,16 @@
 #pragma once
-// Co-only 应用装配根：管理对象、绑定和生命周期，不启动或停止 runtime。
-// 所有 Co 入口在副作用前检查当前协程；只读快照和 RequestShutdown 可跨域调用。
-//
-// CoApp 唯一创建路径是静态工厂 Create（内部经 coroutine MakeCoObject 真实
-// creator/统计接管）；构造为 private，业务不能栈构造或直接 new。
-// 关闭语义（简单 Close）：CoStop/CoUninstall* 直接收口——拒绝新操作，
-// 在有限 deadline 内收口后在途责任（borrow/hook）至真实终态并销毁对象；
-// deadline 耗尽保留 owner、返回诚实的不完整状态（StopIncomplete/
-// UninstallIncomplete），允许再次以新的期限调用推进；框架不新增
-// drain/receipt/多阶段协议，等待顺序与业务任务编排由用户控制。
+/**
+ * Co-only 应用装配根：管理对象、绑定和生命周期，不启动或停止 runtime。
+ * 所有 Co 入口在副作用前检查当前协程；只读快照和 RequestShutdown 可跨域调用。
+ *
+ * CoApp 唯一创建路径是静态工厂 Create（内部经 coroutine MakeCoObject 真实
+ * creator/统计接管）；构造为 private，业务不能栈构造或直接 new。
+ * 关闭语义（简单 Close）：CoStop/CoUninstall* 直接收口——拒绝新操作，
+ * 在有限 deadline 内收口后在途责任（borrow/hook）至真实终态并销毁对象；
+ * deadline 耗尽保留 owner、返回诚实的不完整状态（StopIncomplete/
+ * UninstallIncomplete），允许再次以新的期限调用推进；框架不新增
+ * drain/receipt/多阶段协议，等待顺序与业务任务编排由用户控制。
+ */
 
 #include <atomic>
 #include <functional>
@@ -33,7 +35,9 @@
 
 namespace bbt::framework::v2 {
 
-// Registry 拥有业务对象；App self entry 与观察索引均不反向保活 App。
+/**
+ * Registry 拥有业务对象；App self entry 与观察索引均不反向保活 App。
+ */
 class CoApp : public bbt::coroutine::CoObject,
               public bbt::coroutine::CoRuntimeOnly {
 public:
@@ -46,20 +50,19 @@ public:
      * @return shared_ptr<CoApp>（业务 owner 强引用边界）。
      */
     static std::shared_ptr<CoApp> Create(AppOptions options,
-                                         std::string name = "app") {
-        return bbt::coroutine::MakeCoObject<CoApp>(
-            "framework.CoApp", std::move(name),
-            [opts = std::move(options)]() mutable {
-                return std::shared_ptr<CoApp>(new CoApp(std::move(opts)));
-            });
-    }
+                                         std::string name = "app");
 
-    ~CoApp(); // 只释放自身资源，不隐式执行生命周期 hook。
+    /**
+     * 只释放自身资源，不隐式执行生命周期 hook。
+     */
+    ~CoApp();
 
     CoApp(const CoApp&) = delete;
     CoApp& operator=(const CoApp&) = delete;
 
-    // ---- Install/Uninstall ----
+    /**
+     * ---- Install/Uninstall ----
+     */
     /**
      * @brief 安装受管组件（App/Service/Actor scope）。
      * @tparam C 组件类型，必须继承 CoComponent、构造只接受 ConstructKey、
@@ -96,7 +99,7 @@ public:
         const LifecycleOptions& life = {});
     /**
      * @brief 安装服务。
-     * @tparam S 服务类型，必须继承 CoService<...>（CoServiceBase）、构造只接受
+     * @tparam S 服务类型，必须继承 CoService\<...\>（CoServiceBase）、构造只接受
      *         ConstructKey、析构 protected/private；须声明非空 kServiceName。
      * @param options ServiceOptions（Validate 要求 max_inflight 有限正值）；
      *        其中声明的 BindComponent 条目在安装时逐个展开绑定。
@@ -134,7 +137,9 @@ public:
     template <class A>
     bbt_co_async(result<void>) CoUninstallActor(const LifecycleOptions& life = {});
 
-    // ---- Find ----
+    /**
+     * ---- Find ----
+     */
     /**
      * @brief 按服务名查非拥有句柄。
      * @param service 服务名（kServiceName）。
@@ -158,7 +163,9 @@ public:
     result<ObjectHandle> FindComponent(
         std::string_view name, const ComponentOptions& placement = {}) const;
 
-    // ---- Bind/Unbind ----
+    /**
+     * ---- Bind/Unbind ----
+     */
     /**
      * @brief 把组件绑定给 subject 并发放类型化句柄。
      * @tparam C 组件类型；subject 为 Service 时 C 必须在其声明集合内。
@@ -218,13 +225,17 @@ public:
                                   const ObjectHandle& target,
                                   ObjectObserver callback);
 
-    /// @brief 本 App 在 Registry 中的非拥有句柄。
+    /**
+     * @brief 本 App 在 Registry 中的非拥有句柄。
+     */
     ObjectHandle Handle() const;
 
     bbt_co_async(result<void>) CoWaitShutdownRequest(
         const bbt::coroutine::WaitOptions& wait = {});
 
-    // ---- 生命周期 ----
+    /**
+     * ---- 生命周期 ----
+     */
     /**
      * @brief 启动：组件按依赖拓扑 OnStart，再 Service 按安装顺序 OnStart。
      * @param life 生命周期选项；本步所有 hook 共享同一有限 deadline。
@@ -261,57 +272,103 @@ public:
      *      InvalidContext（自等待）。
      */
     bbt_co_async(result<void>) CoStart(const LifecycleOptions& life = {});
-    /// @brief 受管协程暂停入口（语义同 Pause；上下文约束同 CoStart）。
+    /**
+     * @brief 受管协程暂停入口（语义同 Pause；上下文约束同 CoStart）。
+     */
     bbt_co_async(result<void>) CoPause(const LifecycleOptions& life = {});
-    /// @brief 受管协程恢复入口（语义同 Resume；上下文约束同 CoStart）。
+    /**
+     * @brief 受管协程恢复入口（语义同 Resume；上下文约束同 CoStart）。
+     */
     bbt_co_async(result<void>) CoResume(const LifecycleOptions& life = {});
-    /// @brief 受管协程停止入口（语义同 Stop；上下文约束同 CoStart）。
+    /**
+     * @brief 受管协程停止入口（语义同 Stop；上下文约束同 CoStart）。
+     */
     bbt_co_async(result<void>) CoStop(const LifecycleOptions& life = {});
-    /// @brief 外部线程请求关闭（幂等、noexcept；唤醒 shutdown 等待，不执行 Stop）。
+    /**
+     * @brief 外部线程请求关闭（幂等、noexcept；唤醒 shutdown 等待，不执行 Stop）。
+     */
     void RequestShutdown() noexcept;
-    /// @brief App 当前状态。
+    /**
+     * @brief App 当前状态。
+     */
     AppState State() const noexcept { return m_state.load(); }
 
-    /// @brief 收口未完成项快照（bounded ring）。
+    /**
+     * @brief 收口未完成项快照（bounded ring）。
+     */
     std::vector<CleanupInfo> PendingCleanup() const;
-    /// @brief 生命周期失败记录快照（bounded ring）。
+    /**
+     * @brief 生命周期失败记录快照（bounded ring）。
+     */
     std::vector<LifecycleFailure> LifecycleFailures() const;
 
-    /// @brief 测试观察口（非稳定 API）：供本仓单测断言内部簿记。
+    /**
+     * @brief 测试观察口（非稳定 API）：供本仓单测断言内部簿记。
+     */
     std::shared_ptr<detail::Registry> RegistryForTest() const {
         return m_registry;
     }
 
 private:
-    /// @brief 受控构造：仅 Create 工厂可调用（private + friend 自身静态成员）。
+    /**
+     * @brief 受控构造：仅 Create 工厂可调用（private + friend 自身静态成员）。
+     */
     explicit CoApp(AppOptions options);
-    /// @brief shared_ptr 本体的删除同样只经 Create 返回的 owner（不开放 new/delete）。
+    /**
+     * @brief shared_ptr 本体的删除同样只经 Create 返回的 owner（不开放 new/delete）。
+     */
     friend struct std::default_delete<CoApp>;
 
-    // 生命周期 hook 在既有协程调度器执行，调用方用 CoWaiter 挂起等待。
-    result<void> _RunServiceHookCo(
-        const ObjectId& id, result<void> (CoServiceBase::*hook)(),
+    /**
+     * Service/Component 共用执行体，仅在 App.cc 实例化；hook 成员指针保留类型。
+     * 调度器执行的 hook 由任务持有 owner，调用方用 CoWaiter 挂起等待。
+     */
+    template <class T>
+    result<void> _RunHookCo(
+        const ObjectId& id, result<void> (T::*hook)(),
         const char* phase, bbt::coroutine::Deadline deadline);
-    result<void> _RunComponentHookCo(
-        const ObjectId& id, result<void> (CoComponent::*hook)(),
-        const char* phase, bbt::coroutine::Deadline deadline);
-    // 安装/卸载 hook 在已通过门禁的调用协程内、Registry 锁外执行。
-    result<void> _RunServiceHook(
-        const ObjectId& id, result<void> (CoServiceBase::*hook)(),
+    /**
+     * 安装/卸载 hook 在已通过门禁的调用协程内、Registry 锁外执行。
+     */
+    template <class T>
+    result<void> _RunHook(
+        const ObjectId& id, result<void> (T::*hook)(),
         const char* phase);
-    result<void> _RunComponentHook(
-        const ObjectId& id, result<void> (CoComponent::*hook)(),
-        const char* phase);
-    void _RunServiceVoidHook(
-        const ObjectId& id, void (CoServiceBase::*hook)(),
-        const char* phase) noexcept;
-    void _RunComponentVoidHook(
-        const ObjectId& id, void (CoComponent::*hook)(),
+    template <class T>
+    void _RunVoidHook(
+        const ObjectId& id, void (T::*hook)(),
         const char* phase) noexcept;
     result<void> _RunActorCreate(const ObjectId& id);
     void         _RunActorDestroy(const ObjectId& id) noexcept;
+    /**
+     * OnStop 执行 + 前序 hook 在途检查。成功 ok；失败/前序未达真实终态时
+     * 经 `abort` 记录并完成收口失败收尾（abort 已带 EndOp 与状态转换）。
+     * `abort` 由调用方给出，用于区分「返回错误」与「void 收口路径仅记录」
+     * 两种退出形态。
+     */
+    template <class T, class Abort>
+    result<void> _EnsureHookSettled(
+        const ObjectId& id, result<void> (T::*hook)(),
+        const char* op_name, bbt::coroutine::Deadline deadline,
+        Abort&& abort);
+    /**
+     * 对象收口尾部：撤销其签发的 observer token、FinishDestroy 移除登记、
+     * 排空 inactive observer lease、锁外派发事件并归还 owner。
+     * `on_entry`（可空）在持锁且条目存在时执行服务侧清理。
+     */
+    void _FinishObject(
+        const ObjectId& id,
+        const std::function<void(detail::RegistryEntry&)>& on_entry = {});
+    /**
+     * OnBindingChanged 锁外派发：subject 经 owner lease 保活（并发卸载不能
+     * 先于本调用销毁对象），异常只记 LifecycleFailure——绑定/解绑不回滚。
+     */
+    void _NotifyBindingChanged(ObjectKind kind, void* subj,
+                               const BindingEvent& be, const char* op);
 
-    // Install/Uninstall 的类型擦除执行体。
+    /**
+     * Install/Uninstall 的类型擦除执行体。
+     */
     result<void> _InstallComponentImpl(
         const std::type_info& ctype, std::string name,
         const ComponentOptions& placement, const LifecycleOptions& life,
@@ -350,47 +407,60 @@ private:
         const std::type_info& ctype, std::string_view name,
         const ComponentOptions& placement) const;
 
-    // Service 声明绑定：按 decls 逐个 CoBindComponent(subject=service)；
-    // 任一失败把本服务已完成的绑定解绑（契约：必需依赖缺失 → NotFound/
-    // 原错误，不虚报事务回滚——已解绑动作本身完成并记录）。
+    /**
+     * Service 声明绑定：按 decls 逐个 CoBindComponent(subject=service)；
+     * 任一失败把本服务已完成的绑定解绑（契约：必需依赖缺失 → NotFound/
+     * 原错误，不虚报事务回滚——已解绑动作本身完成并记录）。
+     */
     result<void> _ApplyServiceBindings(
         const ObjectHandle& service_handle,
         const std::vector<detail::ComponentBindingDecl>& decls,
         const LifecycleOptions& life);
 
-    // 生命周期转换体：仅由已通过门禁的 Co 入口调用。
+    /**
+     * 生命周期转换体：仅由已通过门禁的 Co 入口调用。
+     */
     result<void> _StartImpl(const LifecycleOptions& life);
     result<void> _PauseImpl(const LifecycleOptions& life);
     result<void> _ResumeImpl(const LifecycleOptions& life);
     result<void> _StopImpl(const LifecycleOptions& life);
 
-    // 上下文校验：Co 入口在非协程上下文 /
-    // 生命周期 hook 执行中同协程再调生命周期入口 → InvalidContext。
+    /**
+     * 上下文校验：Co 入口在非协程上下文 /
+     * 生命周期 hook 执行中同协程再调生命周期入口 → InvalidContext。
+     */
     result<void> _CheckCoContext() const;
 
-
-    // Stop 逆序收口：Service → Actor 实例 → scoped Component → App
-    // Component（后两者按依赖逆拓扑）。各分支独立推进，失败记
-    // LifecycleFailure 并继续。
+    /**
+     * Stop 逆序收口：Service → Actor 实例 → scoped Component → App
+     * Component（后两者按依赖逆拓扑）。各分支独立推进，失败记
+     * LifecycleFailure 并继续。
+     */
     void _StopAll(bbt::coroutine::Deadline deadline);
     void _DestroyService(const ObjectId& id,
                          bbt::coroutine::Deadline deadline);
     void _DestroyComponent(const ObjectId& id,
                            bbt::coroutine::Deadline deadline);
     void _DestroyActor(const ObjectId& id);
-    // 收口步失败统一出口：记 LifecycleFailure、标 incomplete 态、EndOp。
+    /**
+     * 收口步失败统一出口：记 LifecycleFailure、标 incomplete 态、EndOp。
+     */
     void _AbortDestroy(const ObjectId& id, const char* operation,
                        const char* phase, const Error& err,
                        ObjectState incomplete_state) noexcept;
 
     result<void> _RegisterAppObject();
-    // owner 校验：句柄必须属于本 Registry；Service scope 的 owner 必须是
-    // Service；Actor scope 的 owner 必须是已创建 actor 实例；App scope
-    // 不允许显式 owner。
+    /**
+     * owner 校验：句柄必须属于本 Registry；Service scope 的 owner 必须是
+     * Service；Actor scope 的 owner 必须是已创建 actor 实例；App scope
+     * 不允许显式 owner。
+     */
     result<void> _ValidateOwner(const ComponentOptions& placement,
                                 ObjectId* out_owner_id);
-    // 组件→组件依赖环检查（锁内）：subject 是 CoComponent 时，加入
-    // (subject → target) 边不得成环。返回 true 表示成环。
+    /**
+     * 组件→组件依赖环检查（锁内）：subject 是 CoComponent 时，加入
+     * (subject → target) 边不得成环。返回 true 表示成环。
+     */
     bool _WouldFormCycleLocked(const ObjectId& subject_id,
                                const ObjectId& target_id) const;
 
@@ -402,17 +472,23 @@ private:
     ObjectHandle                      m_self;
     bool                              m_app_entry_registered = false;
 
-    // 请求只置持久 flag 并通知单一 Co waiter，不执行 Stop。
+    /**
+     * 请求只置持久 flag 并通知单一 Co waiter，不执行 Stop。
+     */
     std::mutex                        m_run_mtx;
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> m_shutdown_waiter;
 
-    // 生命周期 hook 当前执行协程 id（0=无）：hook 内同协程再调生命周期
-    // 入口据此判自等待 → InvalidContext。非协程上下文恒 0。
+    /**
+     * 生命周期 hook 当前执行协程 id（0=无）：hook 内同协程再调生命周期
+     * 入口据此判自等待 → InvalidContext。非协程上下文恒 0。
+     */
     std::shared_ptr<std::atomic<std::uint64_t>> m_hook_co =
         std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 
-// ---- 模板实现区：上段类定义只声明，以下类外定义保持对使用点可见 ----
+/**
+ * ---- 模板实现区：上段类定义只声明，以下类外定义保持对使用点可见 ----
+ */
 
 template <class C>
 bbt_co_async(result<void>) CoApp::CoInstallComponent(

@@ -1,5 +1,7 @@
 #pragma once
-// V2 接线：运行时状态只处理业务 Request/Response，wire 与会话由 infra 持有。
+/**
+ * V2 接线：运行时状态只处理业务 Request/Response，wire 与会话由 infra 持有。
+ */
 
 #include <memory>
 #include <string_view>

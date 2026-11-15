@@ -40,7 +40,9 @@ bbt::infra::CallOptions StorageBudget(const ServiceContext& ctx) {
     return bbt::infra::CallOptions{ctx.request().value()->deadline};
 }
 namespace {
-// protobuf 记录以十六进制字符串存在真实 Mongo，避免引入第二套业务 schema。
+/**
+ * protobuf 记录以十六进制字符串存在真实 Mongo，避免引入第二套业务 schema。
+ */
 std::string Encode(const v1::Record& r) {
     const auto digit = [](int n) { return static_cast<char>(n < 10 ? '0' + n : 'a' + n - 10); };
     std::string out;
@@ -101,7 +103,9 @@ result<v1::Record> InsertRecord(MongoDbResource& db, const v1::Record& r,
     auto inserted = bbt_co_await db.InsertOne(doc.value(), options);
     if (inserted)
         return result<v1::Record>::ok(r);
-    // 只在确认重复键时读回，未知结果和其他错误原样返回。
+    /**
+     * 只在确认重复键时读回，未知结果和其他错误原样返回。
+     */
     if (inserted.error().backend_code != 11000)
         return result<v1::Record>::err(inserted.error());
     return ReadRecord(db, r.order_id(), options);

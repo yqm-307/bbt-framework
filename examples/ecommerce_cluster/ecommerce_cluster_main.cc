@@ -1,16 +1,18 @@
-// 电商集群示例入口：按 argv 装配 gateway/order/catalog/settlement 角色。
-//
-// 四个角色是独立的真实进程（各自 CoApp、各自监听动态 loopback 端口）：
-//   gateway  对外入口：只装配 GatewayService；动态发现 OrderService；
-//   order    装配 OrderService；动态发现 CatalogService；把自己注册为 OrderService；
-//   catalog  装配 CatalogService；把自己注册为 CatalogService。
-//   settlement 装配独立结算服务；仅存储模式启用并拥有账单资源。
-//
-// 业务只给逻辑服务名，目标地址由 CoApp::find_route 从 DynamicRouteTable 解析；
-// 进程里没有任何实例地址注入（没有 static_routes）。
-//
-// 生命周期：监听绑定后先自注册（若该角色需要），再输出 `event=ready`；stdin EOF
-// 触发「注销 → 优雅关闭」。注册中心地址只经 --consul 传入，业务代码不感知后端。
+/**
+ * 电商集群示例入口：按 argv 装配 gateway/order/catalog/settlement 角色。
+ *
+ * 四个角色是独立的真实进程（各自 CoApp、各自监听动态 loopback 端口）：
+ * gateway  对外入口：只装配 GatewayService；动态发现 OrderService；
+ * order    装配 OrderService；动态发现 CatalogService；把自己注册为 OrderService；
+ * catalog  装配 CatalogService；把自己注册为 CatalogService。
+ * settlement 装配独立结算服务；仅存储模式启用并拥有账单资源。
+ *
+ * 业务只给逻辑服务名，目标地址由 CoApp::find_route 从 DynamicRouteTable 解析；
+ * 进程里没有任何实例地址注入（没有 static_routes）。
+ *
+ * 生命周期：监听绑定后先自注册（若该角色需要），再输出 `event=ready`；stdin EOF
+ * 触发「注销 → 优雅关闭」。注册中心地址只经 --consul 传入，业务代码不感知后端。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -98,8 +100,10 @@ void Journal(const std::string& line) {
     std::fflush(stdout);
 }
 
-// 在受管协程里执行一次 await 型调用（注册/注销），宿主线程限时等待。
-// 协程环境检查失败会抛 std::logic_error，这里如实转成失败而不是吞掉。
+/**
+ * 在受管协程里执行一次 await 型调用（注册/注销），宿主线程限时等待。
+ * 协程环境检查失败会抛 std::logic_error，这里如实转成失败而不是吞掉。
+ */
 bool RunInCoroutine(const std::function<bbt::infra::result<void>()>& fn,
                     std::chrono::milliseconds budget, std::string* message) {
     struct Slot {
@@ -158,7 +162,10 @@ int main(int argc, char* argv[]) {
     Args args;
     if (!ParseArgs(argc, argv, &args)) {
         std::fputs(kUsage, stderr);
-        return 90;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 90;
     }
 
     if (args.storage) {
@@ -187,8 +194,10 @@ int main(int argc, char* argv[]) {
             : args.instance_id;
     ecommerce::MutableNodeInfo().process_id = pid;
 
-    // gateway 发现 order；order 发现 catalog；存储模式两者还发现 settlement。
-    // catalog 和 settlement 为链路末端，仅登记自己。
+    /**
+     * gateway 发现 order；order 发现 catalog；存储模式两者还发现 settlement。
+     * catalog 和 settlement 为链路末端，仅登记自己。
+     */
     std::vector<std::string> watches;
     std::string register_as;
     if (args.mode == "gateway") {
@@ -205,8 +214,10 @@ int main(int argc, char* argv[]) {
                                                 : std::string(ecommerce::kCatalogService);
     }
 
-    // handler 内做 protobuf 编解码 + 出站调用，默认 12KB 栈不够；这是运行期
-    // 资源配置，必须在 Scheduler Start 前设置（process-global，非 per-service）。
+    /**
+     * handler 内做 protobuf 编解码 + 出站调用，默认 12KB 栈不够；这是运行期
+     * 资源配置，必须在 Scheduler Start 前设置（process-global，非 per-service）。
+     */
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 
     auto table = std::make_shared<DynamicRouteTable>();
@@ -216,12 +227,16 @@ int main(int argc, char* argv[]) {
         64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{8000};
-    // V2 会话身份必填；每个进程角色使用自己的身份。
+    /**
+     * V2 会话身份必填；每个进程角色使用自己的身份。
+     */
     options.local_identity = std::string("ecommerce-") + args.mode;
     options.dynamic_routes       = table;
 
     CoApp app(options);
-    // 每个进程只装配本角色的服务：gateway 不监听业务下游，catalog 不装配上游。
+    /**
+     * 每个进程只装配本角色的服务：gateway 不监听业务下游，catalog 不装配上游。
+     */
     bbt::infra::result<void> added =
         args.mode == "gateway"
             ? app.add_service<ecommerce::GatewayService>(ConcurrentOptions())
@@ -237,8 +252,10 @@ int main(int argc, char* argv[]) {
         return 4;
     }
 
-    // 发现组件经资源工厂装配：Create 发生在 Scheduler 已启动、网络 Create 之前，
-    // 其 Engine 线程才有可用的协程运行时；框架负责最终 Close。
+    /**
+     * 发现组件经资源工厂装配：Create 发生在 Scheduler 已启动、网络 Create 之前，
+     * 其 Engine 线程才有可用的协程运行时；框架负责最终 Close。
+     */
     std::atomic<ConsulDiscoveryComponent*> discovery{nullptr};
     ConsulDiscoveryComponent::Options discovery_options;
     discovery_options.agent_url      = args.consul;
@@ -382,7 +399,9 @@ int main(int argc, char* argv[]) {
             " pid=" + pid +
             " registered=" + (register_as.empty() ? "0" : "1"));
 
-    // stdin EOF = 驱动器要求优雅退出：先注销，再收束宿主。
+    /**
+     * stdin EOF = 驱动器要求优雅退出：先注销，再收束宿主。
+     */
     char buffer[64];
     while (::read(STDIN_FILENO, buffer, sizeof(buffer)) > 0) {
     }

@@ -9,13 +9,17 @@ namespace ecommerce {
 
 namespace {
 
-// 多个协程并发写同一个 stdout：整行加锁，避免两条日志的字段交错。
+/**
+ * 多个协程并发写同一个 stdout：整行加锁，避免两条日志的字段交错。
+ */
 std::mutex& LogMutex() {
     static std::mutex mtx;
     return mtx;
 }
 
-// 空字段写成 '-'，让每行都能按空格分词且不出现空值。
+/**
+ * 空字段写成 '-'，让每行都能按空格分词且不出现空值。
+ */
 std::string Token(std::string_view key, std::string_view value) {
     return " " + std::string(key) + "=" +
            (value.empty() ? std::string("-") : std::string(value));

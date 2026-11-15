@@ -1,5 +1,7 @@
-// OrderedSession 发送侧测试。
-// 用例真实断言；并发用屏障构造同时进入，不用 sleep 凑时序。
+/**
+ * OrderedSession 发送侧测试。
+ * 用例真实断言；并发用屏障构造同时进入，不用 sleep 凑时序。
+ */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -45,7 +47,9 @@ fw::OrderedTicket::BoundContent MakeContent(const std::string& tag) {
     return c;
 }
 
-// 手工屏障：N 个线程全部到达后同时放行。
+/**
+ * 手工屏障：N 个线程全部到达后同时放行。
+ */
 class Barrier {
 public:
     explicit Barrier(std::size_t total) : total_(total) {}
@@ -76,7 +80,9 @@ const std::string* DetailValue(const fw::Error& e, const std::string& key) {
 
 BOOST_AUTO_TEST_SUITE(framework_f2b1)
 
-// 用例 1：序号从 1 单调递增、无重复、无跳号。
+/**
+ * 用例 1：序号从 1 单调递增、无重复、无跳号。
+ */
 BOOST_AUTO_TEST_CASE(sequence_starts_at_one_and_monotonic) {
     auto s = fw::OrderedSession::Open(MakeGrant("t1"));
     BOOST_REQUIRE(s);
@@ -87,14 +93,18 @@ BOOST_AUTO_TEST_CASE(sequence_starts_at_one_and_monotonic) {
         BOOST_CHECK_EQUAL(r.value().sequence(), i);
         BOOST_CHECK(!r.value().request_id().empty());
         ids.insert(r.value().request_id());
-        // 已准备未发送可被表达
+        /**
+         * 已准备未发送可被表达
+         */
         BOOST_CHECK(!s.value()->IsTicketSent(r.value()));
     }
     BOOST_CHECK_EQUAL(ids.size(), 64u);
 }
 
-// 用例 2：prepare 并发——屏障放行后同时分配，序号两两不同、
-// request_id 两两不同、序号集合恰为 1..N。
+/**
+ * 用例 2：prepare 并发——屏障放行后同时分配，序号两两不同、
+ * request_id 两两不同、序号集合恰为 1..N。
+ */
 BOOST_AUTO_TEST_CASE(prepare_concurrent_unique_and_dense) {
     constexpr int kThreads = 8;
     constexpr int kPerThread = 32;
@@ -132,21 +142,32 @@ BOOST_AUTO_TEST_CASE(prepare_concurrent_unique_and_dense) {
     BOOST_CHECK_EQUAL(ids.size(), kTotal);
     std::sort(seqs.begin(), seqs.end());
     for (std::uint64_t i = 0; i < kTotal; ++i) {
-        BOOST_CHECK_EQUAL(seqs[i], i + 1);  // 恰为 1..N，无重无跳
+        /**
+         * 恰为 1..N，无重无跳
+         */
+        BOOST_CHECK_EQUAL(seqs[i], i + 1);
     }
 }
 
-// 用例 3：同一票据重发同一请求 → 允许；复用票据发不同内容 →
-// SequenceConflict（RemoteError + domain="framework.actor"）。
+/**
+ * 用例 3：同一票据重发同一请求 → 允许；复用票据发不同内容 →
+ * SequenceConflict（RemoteError + domain="framework.actor"）。
+ */
 BOOST_AUTO_TEST_CASE(ticket_resend_same_request_conflict_rejected) {
     auto s = fw::OrderedSession::Open(MakeGrant("t3")).value();
     auto stamp = s->prepare().value();
     const auto content = MakeContent("a");
 
     BOOST_CHECK(!s->IsTicketSent(stamp));
-    BOOST_CHECK(s->BindForSend(stamp, content));   // 首次发送绑定
+    /**
+     * 首次发送绑定
+     */
+    BOOST_CHECK(s->BindForSend(stamp, content));
     BOOST_CHECK(s->IsTicketSent(stamp));
-    BOOST_CHECK(s->BindForSend(stamp, content));   // 重发同一请求
+    /**
+     * 重发同一请求
+     */
+    BOOST_CHECK(s->BindForSend(stamp, content));
 
     auto other = content;
     other.request_bytes = "different-bytes";
@@ -156,7 +177,9 @@ BOOST_AUTO_TEST_CASE(ticket_resend_same_request_conflict_rejected) {
     BOOST_CHECK_EQUAL(bad.error().domain, "framework.actor");
     BOOST_CHECK_EQUAL(bad.error().domain_code, "SequenceConflict");
 
-    // 任一边界字段不同均属不同请求
+    /**
+     * 任一边界字段不同均属不同请求
+     */
     auto m = content; m.method = "m2";
     BOOST_CHECK(!s->BindForSend(stamp, m));
     auto a = content; a.actor_key = "actor2";
@@ -167,8 +190,10 @@ BOOST_AUTO_TEST_CASE(ticket_resend_same_request_conflict_rejected) {
     BOOST_CHECK(!s->BindForSend(stamp, sv));
 }
 
-// 用例 4：序号不回绕——计数器置于 UINT64_MAX 附近，耗尽后 prepare
-// 明确失败而非回绕到小序号。
+/**
+ * 用例 4：序号不回绕——计数器置于 UINT64_MAX 附近，耗尽后 prepare
+ * 明确失败而非回绕到小序号。
+ */
 BOOST_AUTO_TEST_CASE(sequence_never_wraps) {
     const std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
     auto s = fw::OrderedSession::OpenForTest(MakeGrant("t4"), kMax - 1);
@@ -180,25 +205,38 @@ BOOST_AUTO_TEST_CASE(sequence_never_wraps) {
     BOOST_REQUIRE(p2);
     BOOST_CHECK_EQUAL(p2.value().sequence(), kMax);
     auto p3 = s.value()->prepare();
-    BOOST_CHECK(!p3);                       // 明确失败
+    /**
+     * 明确失败
+     */
+    BOOST_CHECK(!p3);
     BOOST_CHECK(p3.error().code == fw::ErrorCode::InternalError);
     auto p4 = s.value()->prepare();
-    BOOST_CHECK(!p4);                       // 持续失败，不回绕
+    /**
+     * 持续失败，不回绕
+     */
+    BOOST_CHECK(!p4);
 
-    // 起始序号 0 属非法注入
+    /**
+     * 起始序号 0 属非法注入
+     */
     BOOST_CHECK(!fw::OrderedSession::OpenForTest(MakeGrant("t4b"), 0));
 }
 
-// 用例 5：同一授权流进程内至多一个发送实例——同一完整 grant 重复
-// Open 返回同一共享会话；流标识相同但 grant 冲突 → StreamRejected；
-// 会话销毁后 grant 释放，可重开且序号重起。
+/**
+ * 用例 5：同一授权流进程内至多一个发送实例——同一完整 grant 重复
+ * Open 返回同一共享会话；流标识相同但 grant 冲突 → StreamRejected；
+ * 会话销毁后 grant 释放，可重开且序号重起。
+ */
 BOOST_AUTO_TEST_CASE(one_sender_per_grant) {
     const auto g = MakeGrant("t5");
     auto r1 = fw::OrderedSession::Open(g);
     BOOST_REQUIRE(r1);
     auto r2 = fw::OrderedSession::Open(g);
     BOOST_REQUIRE(r2);
-    BOOST_CHECK(r1.value().get() == r2.value().get());  // 同一实例
+    /**
+     * 同一实例
+     */
+    BOOST_CHECK(r1.value().get() == r2.value().get());
 
     auto conflict = g;
     conflict.peer_principal = "other-peer";
@@ -208,17 +246,24 @@ BOOST_AUTO_TEST_CASE(one_sender_per_grant) {
     BOOST_CHECK_EQUAL(rc.error().domain, "framework.actor");
     BOOST_CHECK_EQUAL(rc.error().domain_code, "StreamRejected");
 
-    // 不同流标识 → 独立会话、独立序号空间
+    /**
+     * 不同流标识 → 独立会话、独立序号空间
+     */
     auto ro = fw::OrderedSession::Open(MakeGrant("t5b"));
     BOOST_REQUIRE(ro);
     BOOST_CHECK(ro.value().get() != r1.value().get());
     BOOST_CHECK_EQUAL(ro.value()->prepare().value().sequence(), 1u);
 
-    // 释放全部引用后 grant 解除占用，重开得到新实例
+    /**
+     * 释放全部引用后 grant 解除占用，重开得到新实例
+     */
     fw::OrderedSession::SPtr keep = r1.value();
     auto r3 = fw::OrderedSession::Open(g);
     BOOST_REQUIRE(r3);
-    BOOST_CHECK(r3.value().get() == keep.get());  // 仍有存活实例 → 共享
+    /**
+     * 仍有存活实例 → 共享
+     */
+    BOOST_CHECK(r3.value().get() == keep.get());
     keep.reset();
     r1.value().reset();
     r2.value().reset();
@@ -228,9 +273,11 @@ BOOST_AUTO_TEST_CASE(one_sender_per_grant) {
     BOOST_CHECK_EQUAL(r4.value()->prepare().value().sequence(), 1u);
 }
 
-// 用例 6：首次发送不得跳过未发送票据——越序首发
-// 本地拒绝 SequenceGap 并给出 expected_sequence；按序补齐后可发；
-// 已发送票据的重发不受水位影响。
+/**
+ * 用例 6：首次发送不得跳过未发送票据——越序首发
+ * 本地拒绝 SequenceGap 并给出 expected_sequence；按序补齐后可发；
+ * 已发送票据的重发不受水位影响。
+ */
 BOOST_AUTO_TEST_CASE(first_send_cannot_skip_unsent_ticket) {
     auto s = fw::OrderedSession::Open(MakeGrant("t6")).value();
     auto t1 = s->prepare().value();
@@ -238,16 +285,25 @@ BOOST_AUTO_TEST_CASE(first_send_cannot_skip_unsent_ticket) {
     auto t3 = s->prepare().value();
     const auto content = MakeContent("x");
 
-    auto g1 = s->BindForSend(t3, content);  // 跳过 1、2 → SequenceGap
+    /**
+     * 跳过 1、2 → SequenceGap
+     */
+    auto g1 = s->BindForSend(t3, content);
     BOOST_REQUIRE(!g1);
     BOOST_CHECK_EQUAL(g1.error().domain_code, "SequenceGap");
     const auto* e1 = DetailValue(g1.error(), "expected_sequence");
     BOOST_REQUIRE(e1 != nullptr);
     BOOST_CHECK_EQUAL(*e1, "1");
-    BOOST_CHECK(!s->IsTicketSent(t3));       // 未发出
+    /**
+     * 未发出
+     */
+    BOOST_CHECK(!s->IsTicketSent(t3));
 
     BOOST_CHECK(s->BindForSend(t1, content));
-    auto g2 = s->BindForSend(t3, content);   // t2 仍未发 → 仍拒绝
+    /**
+     * t2 仍未发 → 仍拒绝
+     */
+    auto g2 = s->BindForSend(t3, content);
     BOOST_REQUIRE(!g2);
     BOOST_CHECK_EQUAL(g2.error().domain_code, "SequenceGap");
     const auto* e2 = DetailValue(g2.error(), "expected_sequence");
@@ -256,10 +312,15 @@ BOOST_AUTO_TEST_CASE(first_send_cannot_skip_unsent_ticket) {
 
     BOOST_CHECK(s->BindForSend(t2, content));
     BOOST_CHECK(s->BindForSend(t3, content));
-    BOOST_CHECK(s->BindForSend(t1, content));  // 重发旧票不受水位限制
+    /**
+     * 重发旧票不受水位限制
+     */
+    BOOST_CHECK(s->BindForSend(t1, content));
 }
 
-// 用例 7：六个 domain_code 与契约的 domain_code 表逐字一致。
+/**
+ * 用例 7：六个 domain_code 与契约的 domain_code 表逐字一致。
+ */
 BOOST_AUTO_TEST_CASE(domain_code_constants_match_contract) {
     BOOST_CHECK_EQUAL(std::string(fw::ordered_domain_code::kSequenceGap),
                       "SequenceGap");
@@ -277,16 +338,20 @@ BOOST_AUTO_TEST_CASE(domain_code_constants_match_contract) {
     BOOST_CHECK_EQUAL(std::string(fw::kOrderedErrorDomain), "framework.actor");
 }
 
-// 用例 8：actor 域专属语义校验在 framework 边界的归属回归。
-// infra::ValidateErrorDetails 只做通用结构校验，不再拒绝非法 actor 键；
-// framework 边界（ValidateErrorAtBoundary）必须维持旧版拒绝集：
-//   合法 actor 错误通过、非 actor 合法扩展通过、跨域写保留键拒绝、
-//   保留键非法值拒绝、非法编码/重复键/越界长度仍拒绝。
+/**
+ * 用例 8：actor 域专属语义校验在 framework 边界的归属回归。
+ * infra::ValidateErrorDetails 只做通用结构校验，不再拒绝非法 actor 键；
+ * framework 边界（ValidateErrorAtBoundary）必须维持旧版拒绝集：
+ * 合法 actor 错误通过、非 actor 合法扩展通过、跨域写保留键拒绝、
+ * 保留键非法值拒绝、非法编码/重复键/越界长度仍拒绝。
+ */
 BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
     using fw::ValidateErrorAtBoundary;
     using fw::ValidateErrorDomainRules;
 
-    // 正常 actor 错误：域归属正确 + 无符号十进制 → 通过
+    /**
+     * 正常 actor 错误：域归属正确 + 无符号十进制 → 通过
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap");
         e.domain = std::string(fw::kErrorDomainFrameworkActor);
@@ -296,7 +361,9 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
         BOOST_CHECK(r);
     }
 
-    // 合法非 actor 扩展：自定义域 + 自定义键 → 通过（不被 actor 规则误伤）
+    /**
+     * 合法非 actor 扩展：自定义域 + 自定义键 → 通过（不被 actor 规则误伤）
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "app");
         e.domain = "app.billing";
@@ -304,7 +371,9 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
         BOOST_CHECK(ValidateErrorAtBoundary(e));
     }
 
-    // 非法值：actor 域的 expected_sequence 非无符号十进制 → 拒绝
+    /**
+     * 非法值：actor 域的 expected_sequence 非无符号十进制 → 拒绝
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap");
         e.domain = std::string(fw::kErrorDomainFrameworkActor);
@@ -314,7 +383,9 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
         BOOST_CHECK(r.error().code == fw::ErrorCode::ProtocolError);
     }
 
-    // 跨域写保留键：infra 域/其他域携带 expected_sequence → 拒绝
+    /**
+     * 跨域写保留键：infra 域/其他域携带 expected_sequence → 拒绝
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::ProtocolError, "x");
         e.domain = std::string(bbt::infra::kErrorDomainInfra);
@@ -324,7 +395,9 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
         BOOST_CHECK(r.error().code == fw::ErrorCode::ProtocolError);
     }
 
-    // 结构违规仍由 infra 通用层拒绝：重复键 / 非法 UTF-8 / 越界长度
+    /**
+     * 结构违规仍由 infra 通用层拒绝：重复键 / 非法 UTF-8 / 越界长度
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "s");
         e.domain = std::string(fw::kErrorDomainFrameworkActor);
@@ -342,8 +415,10 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
         BOOST_REQUIRE(!r);
     }
 
-    // 分层确认：同一非法 actor 错误，infra 通用层不再拒绝、
-    // framework 边界仍拒绝——旧版拒绝集没有因迁移被静默放宽。
+    /**
+     * 分层确认：同一非法 actor 错误，infra 通用层不再拒绝、
+     * framework 边界仍拒绝——旧版拒绝集没有因迁移被静默放宽。
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap");
         e.domain = std::string(fw::kErrorDomainFrameworkActor);
@@ -354,19 +429,23 @@ BOOST_AUTO_TEST_CASE(error_domain_rules_at_framework_boundary) {
     }
 }
 
-// 用例 9：V2 回复边界的错误降级回归。
-//
-// V2 没有 HTTP 头通道：错误随 RESPONSE 帧的 error 分支（RpcError）传输，
-// 边界处唯一的降级判定是 ValidateErrorAtBoundary——framework 的入站回复
-// 边界（RpcBridge/InfraHttpHost）在发布终态前调用同一函数。因此这里直接
-// 断言该边界的产出，不再伪造 header 映射：
-//   a) actor 域非法 expected_sequence → 降级为 ProtocolError，且降级后的
-//      错误体不携带原始非法值/保留键/原 domain_code；
-//   b) 跨域携带保留键 → 同样降级；
-//   c) 合法 actor 错误 → code/domain/domain_code/message/details 原样通过
-//      （V2 error 分支承载 details，与 V1 header 通道不同）。
+/**
+ * 用例 9：V2 回复边界的错误降级回归。
+ *
+ * V2 没有 HTTP 头通道：错误随 RESPONSE 帧的 error 分支（RpcError）传输，
+ * 边界处唯一的降级判定是 ValidateErrorAtBoundary——framework 的入站回复
+ * 边界（RpcBridge/InfraHttpHost）在发布终态前调用同一函数。因此这里直接
+ * 断言该边界的产出，不再伪造 header 映射：
+ * a) actor 域非法 expected_sequence → 降级为 ProtocolError，且降级后的
+ * 错误体不携带原始非法值/保留键/原 domain_code；
+ * b) 跨域携带保留键 → 同样降级；
+ * c) 合法 actor 错误 → code/domain/domain_code/message/details 原样通过
+ * （V2 error 分支承载 details，与 V1 header 通道不同）。
+ */
 BOOST_AUTO_TEST_CASE(reply_boundary_downgrades_invalid_error) {
-    // a) actor 域非法 expected_sequence：边界必须降级且不泄露原值
+    /**
+     * a) actor 域非法 expected_sequence：边界必须降级且不泄露原值
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError,
                                     "actor gap detail");
@@ -378,7 +457,9 @@ BOOST_AUTO_TEST_CASE(reply_boundary_downgrades_invalid_error) {
         BOOST_REQUIRE(!valid);
         const auto& downgraded = valid.error();
         BOOST_CHECK(downgraded.code == fw::ErrorCode::ProtocolError);
-        // 降级后是通用 ProtocolError：不保留原 domain/domain_code/details
+        /**
+         * 降级后是通用 ProtocolError：不保留原 domain/domain_code/details
+         */
         BOOST_CHECK(downgraded.details.empty());
         BOOST_CHECK(downgraded.domain_code.empty());
         BOOST_CHECK(downgraded.message.find("x7") == std::string::npos);
@@ -386,12 +467,16 @@ BOOST_AUTO_TEST_CASE(reply_boundary_downgrades_invalid_error) {
                     std::string::npos);
         BOOST_CHECK(downgraded.message.find("actor gap detail") ==
                     std::string::npos);
-        // 原始错误对象不被就地改写（降级是返回值语义）。
+        /**
+         * 原始错误对象不被就地改写（降级是返回值语义）。
+         */
         BOOST_CHECK_EQUAL(e.domain_code, fw::ordered_domain_code::kSequenceGap);
         BOOST_CHECK_EQUAL(e.details.size(), 1u);
     }
 
-    // b) 跨域携带保留键：infra 域错误带 expected_sequence → 边界降级
+    /**
+     * b) 跨域携带保留键：infra 域错误带 expected_sequence → 边界降级
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::ProtocolError, "x");
         e.domain = std::string(bbt::infra::kErrorDomainInfra);
@@ -403,7 +488,9 @@ BOOST_AUTO_TEST_CASE(reply_boundary_downgrades_invalid_error) {
         BOOST_CHECK(valid.error().details.empty());
     }
 
-    // c) 合法 actor 错误：边界不回归——字段与 details 原样通过
+    /**
+     * c) 合法 actor 错误：边界不回归——字段与 details 原样通过
+     */
     {
         fw::Error e = fw::MakeError(fw::ErrorCode::RemoteError, "gap msg");
         e.domain = std::string(fw::kErrorDomainFrameworkActor);
