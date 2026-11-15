@@ -1,14 +1,16 @@
 #pragma once
-// bbt-framework GetValue 示例业务。
-//
-// 这是应用层最小 typed codec + 服务实现：
-//   - ProtoCodec<GetValueRequest/Response> 特化：只经公开 protobuf
-//     Serialize/Parse 做 payload 编解码，业务用公开 CoRpcReq::ParseProto /
-//     CoRpcResp::FromProto；
-//   - GetValueService：in-memory 只读存储，无外部后端、无写副作用；
-//   - 方法表经 fw::ProtoMethod 声明，schema 由生成物 descriptor full_name 推导。
-//
-// 生成头 get_value.pb.h 只落构建目录（见 CMakeLists），仓库内不提交。
+/**
+ * bbt-framework GetValue 示例业务。
+ *
+ * 这是应用层最小 typed codec + 服务实现：
+ * - ProtoCodec<GetValueRequest/Response> 特化：只经公开 protobuf
+ * Serialize/Parse 做 payload 编解码，业务用公开 CoRpcReq::ParseProto /
+ * CoRpcResp::FromProto；
+ * - GetValueService：in-memory 只读存储，无外部后端、无写副作用；
+ * - 方法表经 fw::ProtoMethod 声明，schema 由生成物 descriptor full_name 推导。
+ *
+ * 生成头 get_value.pb.h 只落构建目录（见 CMakeLists），仓库内不提交。
+ */
 
 #include <functional>
 #include <limits>
@@ -28,7 +30,9 @@
 
 namespace bbt::framework::rpc_detail {
 
-// GetValueRequest payload codec：wire 字节即 protobuf message 序列化。
+/**
+ * GetValueRequest payload codec：wire 字节即 protobuf message 序列化。
+ */
 template <>
 struct ProtoCodec<bbt::example::v1::GetValueRequest> {
     static constexpr bool kDefined = true;
@@ -93,9 +97,11 @@ struct ProtoCodec<bbt::example::v1::GetValueResponse> {
 
 namespace getvalue {
 
-// 可选观测钩子：handler 被真正调用时回调（request_id, peer_principal）。示例
-// server 用它写 journal，证明「预算过期/协议错误的请求未进 handler」；未设置时
-// 为 no-op，业务语义不依赖它。
+/**
+ * 可选观测钩子：handler 被真正调用时回调（request_id, peer_principal）。示例
+ * server 用它写 journal，证明「预算过期/协议错误的请求未进 handler」；未设置时
+ * 为 no-op，业务语义不依赖它。
+ */
 using ServedHook =
     std::function<void(const std::string&, const std::string&)>;
 
@@ -107,7 +113,9 @@ inline void SetServedHook(ServedHook hook) {
     ServedHookRef() = std::move(hook);
 }
 
-// in-memory 只读存储：构造期固定，运行期无写副作用。
+/**
+ * in-memory 只读存储：构造期固定，运行期无写副作用。
+ */
 class InMemoryStore {
 public:
     InMemoryStore() {
@@ -126,9 +134,11 @@ private:
     std::map<std::string, std::string, std::less<>> entries_;
 };
 
-// 业务服务：GetValue(key) -> {found, value}。空 key 返回 InvalidArgument；
-// 负载非法/类型错误由 ProtoCodec::Decode 返回 ProtocolError，原样经错误信封
-// 回传；miss 返回 found=false。
+/**
+ * 业务服务：GetValue(key) -> {found, value}。空 key 返回 InvalidArgument；
+ * 负载非法/类型错误由 ProtoCodec::Decode 返回 ProtocolError，原样经错误信封
+ * 回传；miss 返回 found=false。
+ */
 class GetValueService final : public bbt::framework::CoService<GetValueService> {
 public:
     static constexpr std::string_view kServiceName =
@@ -139,10 +149,12 @@ public:
         using bbt::framework::ErrorCode;
         using bbt::framework::MakeError;
 
-        // 观测钩子：handler 被真正调用（=请求已进业务处理，预算未过期、路由/
-        // schema 已匹配）时回调。request_id/peer_principal 取自框架受管上下文，
-        // 不读 metadata。示例 server 用它写 journal，证明预算过期/协议被拒的
-        // 请求未进 handler；业务语义不依赖它。
+        /**
+         * 观测钩子：handler 被真正调用（=请求已进业务处理，预算未过期、路由/
+         * schema 已匹配）时回调。request_id/peer_principal 取自框架受管上下文，
+         * 不读 metadata。示例 server 用它写 journal，证明预算过期/协议被拒的
+         * 请求未进 handler；业务语义不依赖它。
+         */
         if (ServedHookRef()) {
             std::string request_id;
             std::string peer_principal;

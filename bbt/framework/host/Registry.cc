@@ -1,4 +1,6 @@
-// framework v2 受管对象注册表实现（见 internal/Registry.hpp 头部纪律）。
+/**
+ * framework v2 受管对象注册表实现（见 internal/Registry.hpp 头部纪律）。
+ */
 
 #include <algorithm>
 #include <mutex>
@@ -13,7 +15,9 @@
 namespace bbt::framework {
 namespace detail {
 
-// ---- BindingLease ----
+/**
+ * ---- BindingLease ----
+ */
 
 BindingLease::~BindingLease() {
     auto reg = reg_w.lock();
@@ -21,7 +25,9 @@ BindingLease::~BindingLease() {
     reg->ReleaseBorrow(component_id, subject_id, binding_generation);
 }
 
-// ---- 工具 ----
+/**
+ * ---- 工具 ----
+ */
 
 const char* Registry::KindPrefix(ObjectKind kind) noexcept {
     switch (kind) {
@@ -38,7 +44,9 @@ ObjectId Registry::NextIdLocked(ObjectKind kind) {
         std::to_string(m_next_id_seq++);
 }
 
-// ---- 条目生命周期 ----
+/**
+ * ---- 条目生命周期 ----
+ */
 
 result<RegistryEntry*> Registry::CreateEntryLocked(
     ObjectKind kind, std::string type_name, std::string name,
@@ -65,7 +73,10 @@ result<RegistryEntry*> Registry::CreateEntryLocked(
     try {
         m_index.emplace(m_entries[idx].id, idx);
     } catch (...) {
-        m_entries.pop_back(); // caller retains object owner until this lock is released.
+        /**
+         * caller retains object owner until this lock is released.
+         */
+        m_entries.pop_back();
         throw;
     }
     return result<RegistryEntry*>::ok(&m_entries[idx]);
@@ -125,7 +136,9 @@ ObjectHandle Registry::MakeHandleLocked(const RegistryEntry& e) {
     return ObjectHandle(weak_from_this(), e.id, e.generation, e.kind);
 }
 
-// ---- 稳定 id 快照 ----
+/**
+ * ---- 稳定 id 快照 ----
+ */
 
 std::vector<ObjectId> Registry::ListIdsLocked() const {
     std::vector<ObjectId> out;
@@ -149,12 +162,14 @@ std::vector<ObjectId> Registry::ListIdsByKindLocked(ObjectKind kind) const {
     return out;
 }
 
-// ---- 状态推进与事件 ----
-//
-// SetStateLocked 只标记 active token 的待派发意图；DispatchEvents 在锁外
-// 逐个获取 callback lease（在途回调计数）后执行回调——已撤销的 token 其
-// 已复制意图被丢弃，不执行业务代码；仍 active 的回调执行期间 Revoke 只
-// 等待 lease 归零，不撤销在途调用。
+/**
+ * ---- 状态推进与事件 ----
+ *
+ * SetStateLocked 只标记 active token 的待派发意图；DispatchEvents 在锁外
+ * 逐个获取 callback lease（在途回调计数）后执行回调——已撤销的 token 其
+ * 已复制意图被丢弃，不执行业务代码；仍 active 的回调执行期间 Revoke 只
+ * 等待 lease 归零，不撤销在途调用。
+ */
 
 std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
 Registry::SetStateLocked(RegistryEntry& e, ObjectState s,
@@ -195,16 +210,22 @@ std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
 Registry::SetStateAndGetEvents(const ObjectId& id, ObjectState s,
                                std::optional<ObjectError> err) {
     auto* e = FindEntryLocked(id);
-    if (!e) return {};   // vector 空
+    /**
+     * vector 空
+     */
+    if (!e)
+        return {};
     return SetStateLocked(*e, s, std::move(err));
 }
 
 void Registry::DispatchEvents(
     std::vector<std::pair<ObserverRecord, ObjectStateEvent>> events) {
-    // 每条意图锁外逐个取 lease 后调用：回调执行期记录不可抹除；
-    // 已撤销的意图跳过（Revoke 排空语义），回调抛异常计数不传播。
-    // 事件向量本身携带 callback 副本（rec 拷贝）——回调结束即释放该
-    // 副本，不让已撤销/已派发闭包多活一轮。
+    /**
+     * 每条意图锁外逐个取 lease 后调用：回调执行期记录不可抹除；
+     * 已撤销的意图跳过（Revoke 排空语义），回调抛异常计数不传播。
+     * 事件向量本身携带 callback 副本（rec 拷贝）——回调结束即释放该
+     * 副本，不让已撤销/已派发闭包多活一轮。
+     */
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> waiters;
     for (auto& item : events) {
         auto& ev = item.second;
@@ -227,7 +248,10 @@ void Registry::DispatchEvents(
                 std::chrono::system_clock::now(),
                 "observer callback threw"});
         }
-        callback = nullptr;   // 立即归还闭包副本
+        /**
+         * 立即归还闭包副本
+         */
+        callback = nullptr;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             auto it = m_observers.find(item.first.id);
@@ -252,7 +276,9 @@ void Registry::SetStateAndDispatch(const ObjectId& id, ObjectState s,
     DispatchEvents(std::move(events));
 }
 
-// ---- 控制面互斥 ----
+/**
+ * ---- 控制面互斥 ----
+ */
 
 bool Registry::BeginOpLocked(RegistryEntry& e) {
     if (e.op_in_progress) return false;
@@ -264,12 +290,14 @@ void Registry::EndOpLocked(RegistryEntry& e) {
     e.op_in_progress = false;
 }
 
-// ---- 观察 ----
-//
-// ObserverRecord 的 callback lease：DispatchEvents 在锁外取 lease（++
-// in_flight）再执行业务回调；Revoke 先标 active=false 阻塞新派发，
-// 并等已派发 lease 归零后抹除记录与闭包——callback 捕获对象不会在
-// 回调仍在途时被销毁。
+/**
+ * ---- 观察 ----
+ *
+ * ObserverRecord 的 callback lease：DispatchEvents 在锁外取 lease（++
+ * in_flight）再执行业务回调；Revoke 先标 active=false 阻塞新派发，
+ * 并等已派发 lease 归零后抹除记录与闭包——callback 捕获对象不会在
+ * 回调仍在途时被销毁。
+ */
 
 result<ObserverToken> Registry::Observe(const ObjectHandle& observer,
                                         const ObjectHandle& target,
@@ -283,7 +311,9 @@ result<ObserverToken> Registry::Observe(const ObjectHandle& observer,
             "Observe: handle belongs to another registry"));
 
     std::lock_guard<std::mutex> lk(m_mtx);
-    // 额度只计活跃订阅：撤销后记录已抹除，不留占位。
+    /**
+     * 额度只计活跃订阅：撤销后记录已抹除，不留占位。
+     */
     std::size_t active_count = 0;
     for (const auto& [tid, rec] : m_observers)
         if (rec.active) ++active_count;
@@ -313,8 +343,10 @@ result<ObserverToken> Registry::Observe(const ObjectHandle& observer,
 }
 
 void Registry::RevokeObserver(std::uint64_t token_id) noexcept {
-    // 锁内撤销 + 等在途 lease 归零 + 抹除记录（闭包随之销毁）。
-    // 双域等待：协程内不阻塞 worker（挂起在 m_observer_waiters）。
+    /**
+     * 锁内撤销 + 等在途 lease 归零 + 抹除记录（闭包随之销毁）。
+     * 双域等待：协程内不阻塞 worker（挂起在 m_observer_waiters）。
+     */
     {
         std::unique_lock<std::mutex> lk(m_mtx);
         auto it = m_observers.find(token_id);
@@ -332,16 +364,21 @@ void Registry::RevokeObserver(std::uint64_t token_id) noexcept {
 void Registry::_WaitObserversDone(
     const std::function<bool()>& done) noexcept {
     if (bbt::coroutine::IsInCoroutineContext()) {
-        // 协程域：CoWaiter 挂起不阻塞 worker；谓词在锁内复查，等待异常
-        // （AlreadyWaiting/Cancelled 等非 Completed 状态）时降级为
-        // 让出后轮询——撤销语义必须到达，不能把错误透成 noexcept 失败。
+        /**
+         * 协程域：CoWaiter 挂起不阻塞 worker；谓词在锁内复查，等待异常
+         * （AlreadyWaiting/Cancelled 等非 Completed 状态）时降级为
+         * 让出后轮询——撤销语义必须到达，不能把错误透成 noexcept 失败。
+         */
         auto waiter = bbt::coroutine::sync::CoWaiter::Create();
         for (;;) {
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 if (done()) return;
             }
-            bbt::coroutine::WaitOptions wait;   // 无期限：lease 归零是唯一终态
+            /**
+             * 无期限：lease 归零是唯一终态
+             */
+            bbt::coroutine::WaitOptions wait;
             const auto status = waiter->WaitWithCallback(wait, [&] {
                 bool ready;
                 {
@@ -360,11 +397,15 @@ void Registry::_WaitObserversDone(
                     m_observer_waiters.end());
             }
             if (status == bbt::coroutine::WaitStatus::Completed) continue;
-            // 异常等待通道：让出当前协程并复查，不静默退出。
+            /**
+             * 异常等待通道：让出当前协程并复查，不静默退出。
+             */
             bbtco_sleep(1);
         }
     } else {
-        // native 域：m_cv 谓词等待（DispatchEvents 归还 lease 后唤醒）。
+        /**
+         * native 域：m_cv 谓词等待（DispatchEvents 归还 lease 后唤醒）。
+         */
         std::unique_lock<std::mutex> lk(m_mtx);
         m_cv.wait(lk, done);
     }
@@ -390,8 +431,10 @@ void Registry::RevokeObserversOfLocked(std::string_view observer_id) {
 }
 
 void Registry::DrainInactiveObservers() noexcept {
-    // 等全部 inactive 记录的在途 lease 归零后抹除注册记录。待派发事件快照
-    // 会在 DispatchEvents 中被跳过，但其中的闭包副本可存活到事件批次释放。
+    /**
+     * 等全部 inactive 记录的在途 lease 归零后抹除注册记录。待派发事件快照
+     * 会在 DispatchEvents 中被跳过，但其中的闭包副本可存活到事件批次释放。
+     */
     {
         std::unique_lock<std::mutex> lk(m_mtx);
         for (auto it = m_observers.begin(); it != m_observers.end();) {
@@ -402,11 +445,14 @@ void Registry::DrainInactiveObservers() noexcept {
         }
     }
     _WaitObserversDone([this] {
-        // 在途 callback 归零后 DispatchEvents 只唤醒不抹除（记录所有权归
-        // 排空方）——谓词必须按「inactive 且 in_flight>0 的记录不存在」
-        // 判定，否则一旦首次扫描留下在途记录将永久等待。
+        /**
+         * 在途 callback 归零后 DispatchEvents 只唤醒不抹除（记录所有权归
+         * 排空方）——谓词必须按「inactive 且 in_flight>0 的记录不存在」
+         * 判定，否则一旦首次扫描留下在途记录将永久等待。
+         */
         for (const auto& [tid, rec] : m_observers)
-            if (!rec.active && rec.in_flight > 0) return false;
+            if (!rec.active && rec.in_flight > 0)
+                return false;
         return true;
     });
     std::unique_lock<std::mutex> lk(m_mtx);
@@ -418,7 +464,9 @@ void Registry::DrainInactiveObservers() noexcept {
     }
 }
 
-// ---- handle 观察面 ----
+/**
+ * ---- handle 观察面 ----
+ */
 
 bool Registry::OwnsHandle(const ObjectHandle& h) const noexcept {
     return h.m_reg.lock().get() == this;
@@ -476,7 +524,9 @@ result<MailBox> Registry::MailBoxOf(const ObjectHandle& h) const {
     return result<MailBox>::ok(MailBox(addr.value()));
 }
 
-// ---- binding / borrow ----
+/**
+ * ---- binding / borrow ----
+ */
 
 result<void> Registry::BindLocked(RegistryEntry& component_entry,
                                   const RegistryEntry& subject_entry,
@@ -488,9 +538,11 @@ result<void> Registry::BindLocked(RegistryEntry& component_entry,
     if (component_entry.gate_closed)
         return result<void>::err(MakeError(ErrorCode::Closed,
             "BindComponent: component gate closed"));
-    // subject 同临界区 gate：销毁/收口路径先封 subject（gate_closed /
-    // op_in_progress / 关闭语义状态）再擦除其 retiring 边——此后新增的
-    // active 边不会被收口看到，必须以 Closed 拒绝。
+    /**
+     * subject 同临界区 gate：销毁/收口路径先封 subject（gate_closed /
+     * op_in_progress / 关闭语义状态）再擦除其 retiring 边——此后新增的
+     * active 边不会被收口看到，必须以 Closed 拒绝。
+     */
     if (subject_entry.gate_closed || subject_entry.op_in_progress ||
         subject_entry.state == ObjectState::Stopping ||
         subject_entry.state == ObjectState::Stopped ||
@@ -504,7 +556,9 @@ result<void> Registry::BindLocked(RegistryEntry& component_entry,
     if (CountBindingsLocked() >= m_limits.max_bindings)
         return result<void>::err(MakeError(ErrorCode::Overloaded,
             "BindComponent: binding limit reached"));
-    // 同 (subject, component) 已有 active binding → InvalidArgument。
+    /**
+     * 同 (subject, component) 已有 active binding → InvalidArgument。
+     */
     for (const auto& b : component_entry.bindings)
         if (b.subject_id == subject_id && !b.retiring)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
@@ -527,11 +581,15 @@ result<void> Registry::BeginUnbindLocked(RegistryEntry& component_entry,
         if (it->subject_id != subject_id || it->retiring) continue;
         it->active = false;
         it->retiring = true;
-        // generation 不推进：retiring 自身即让旧 handle 失效（Borrow 先看
-        // !active||retiring → Closed）；保持原代让在途 BindingLease 的
-        // ReleaseBorrow 仍能按 (subject, gen) 归还计数。
+        /**
+         * generation 不推进：retiring 自身即让旧 handle 失效（Borrow 先看
+         * !active||retiring → Closed）；保持原代让在途 BindingLease 的
+         * ReleaseBorrow 仍能按 (subject, gen) 归还计数。
+         */
         if (out_generation) *out_generation = it->generation;
-        // 边保留至 Unbind 等待方确认排空后 EraseBindingLocked 收口。
+        /**
+         * 边保留至 Unbind 等待方确认排空后 EraseBindingLocked 收口。
+         */
         return result<void>::ok();
     }
     return result<void>::err(MakeError(ErrorCode::NotFound,
@@ -547,9 +605,11 @@ void Registry::ReleaseBorrow(const ObjectId& component_id,
     if (!e) return;
     if (e->component_borrows > 0) --e->component_borrows;
 
-    // 本 binding 计数归还。retiring 边在归零后不自动抹除——「已排空的
-    // retiring 记录」由 Unbind 等待方在收口确认后显式 EraseBindingLocked
-    // 关闭；提前抹除会让重试的 Unbind 失去可续等的对象。
+    /**
+     * 本 binding 计数归还。retiring 边在归零后不自动抹除——「已排空的
+     * retiring 记录」由 Unbind 等待方在收口确认后显式 EraseBindingLocked
+     * 关闭；提前抹除会让重试的 Unbind 失去可续等的对象。
+     */
     for (auto& b : e->bindings) {
         if (b.subject_id == subject_id &&
             b.generation == binding_generation) {
@@ -570,9 +630,11 @@ result<std::shared_ptr<BindingLease>> Registry::AcquireBorrowLocked(
         return result<std::shared_ptr<BindingLease>>::err(MakeError(
             ErrorCode::Closed, "Borrow: component gate closed"));
 
-    // 装配窗口：subject（绑定发起方）正处于 Installing（OnInstall 执行中）
-    // 时允许借 Installed 依赖做纯内存装配——窗口由 subject 状态推导，
-    // 不靠调用方传 flag 保证（显式 allow_installing_borrow 等价放行）。
+    /**
+     * 装配窗口：subject（绑定发起方）正处于 Installing（OnInstall 执行中）
+     * 时允许借 Installed 依赖做纯内存装配——窗口由 subject 状态推导，
+     * 不靠调用方传 flag 保证（显式 allow_installing_borrow 等价放行）。
+     */
     bool installing_borrow = allow_installing_borrow;
     if (!installing_borrow) {
         const RegistryEntry* subj = FindEntryLocked(subject_id);
@@ -580,7 +642,9 @@ result<std::shared_ptr<BindingLease>> Registry::AcquireBorrowLocked(
             (subj != nullptr && subj->state == ObjectState::Installing);
     }
 
-    // 对象状态门：Running 可借；OnInstall 装配窗口内 Installed 可借。
+    /**
+     * 对象状态门：Running 可借；OnInstall 装配窗口内 Installed 可借。
+     */
     const ObjectState s = component_entry.state;
     const bool state_ok =
         (s == ObjectState::Running) ||
@@ -595,13 +659,18 @@ result<std::shared_ptr<BindingLease>> Registry::AcquireBorrowLocked(
         else if (s == ObjectState::InstallFailed || s == ObjectState::Failed)
             code = ErrorCode::Closed;
         else if (s == ObjectState::Created || s == ObjectState::Installed)
-            code = ErrorCode::Overloaded;   // 未 Running 且非装配窗口
+            /**
+             * 未 Running 且非装配窗口
+             */
+            code = ErrorCode::Overloaded;
         return result<std::shared_ptr<BindingLease>>::err(MakeError(code,
             "Borrow: component not borrowable in current state"));
     }
 
-    // binding 边：按 (subject, generation) 唯一匹配。retiring/inactive 或
-    // 代失配的旧 handle → Closed；同 subject 的新边不影响。
+    /**
+     * binding 边：按 (subject, generation) 唯一匹配。retiring/inactive 或
+     * 代失配的旧 handle → Closed；同 subject 的新边不影响。
+     */
     Binding* edge = nullptr;
     for (auto& b : component_entry.bindings) {
         if (b.subject_id == subject_id &&
@@ -727,18 +796,24 @@ void Registry::NoteHookSettled(const ObjectId& id) noexcept {
         if (e && e->hooks_in_flight > 0) --e->hooks_in_flight;
         if (e && e->hooks_in_flight == 0) w = e->hook_settled_waiter;
     }
-    // Notify 在锁外：Notify 链路会触发协程唤醒/驱动回调，不阻塞 Registry
-    // 临界区；m_cv 唤醒宿主等待者同样不持锁（m_cv 谓词在锁内复查）。
+    /**
+     * Notify 在锁外：Notify 链路会触发协程唤醒/驱动回调，不阻塞 Registry
+     * 临界区；m_cv 唤醒宿主等待者同样不持锁（m_cv 谓词在锁内复查）。
+     */
     m_cv.notify_all();
     if (w) w->Notify();
 }
 
-// ---- 组件依赖拓扑 ----
+/**
+ * ---- 组件依赖拓扑 ----
+ */
 
 std::vector<ObjectId> Registry::ComponentStartOrderLocked(
     bool* had_cycle) const {
-    // 依赖图：X 的依赖 = 所有「subject==X」的 binding 指向的目标组件。
-    // DFS 后序：依赖先于使用者。按登记顺序遍历保持稳定。
+    /**
+     * 依赖图：X 的依赖 = 所有「subject==X」的 binding 指向的目标组件。
+     * DFS 后序：依赖先于使用者。按登记顺序遍历保持稳定。
+     */
     std::unordered_map<ObjectId, std::vector<ObjectId>> deps;
     for (const auto& e : m_entries) {
         if (e.kind != ObjectKind::Component) continue;
@@ -752,7 +827,10 @@ std::vector<ObjectId> Registry::ComponentStartOrderLocked(
     }
 
     std::vector<ObjectId> order;
-    std::unordered_map<ObjectId, int> mark;   // 0=未访，1=栈中，2=完成
+    /**
+     * 0=未访，1=栈中，2=完成
+     */
+    std::unordered_map<ObjectId, int> mark;
     bool cycle = false;
     std::function<void(const ObjectId&)> dfs = [&](const ObjectId& id) {
         mark[id] = 1;
@@ -760,7 +838,11 @@ std::vector<ObjectId> Registry::ComponentStartOrderLocked(
             const auto it = mark.find(d);
             if (it != mark.end() && it->second == 2) continue;
             if (it != mark.end() && it->second == 1) { cycle = true; continue; }
-            if (deps.count(d) == 0) continue;   // 目标非组件（防御）
+            /**
+             * 目标非组件（防御）
+             */
+            if (deps.count(d) == 0)
+                continue;
             dfs(d);
         }
         mark[id] = 2;
@@ -774,7 +856,9 @@ std::vector<ObjectId> Registry::ComponentStartOrderLocked(
     return order;
 }
 
-// ---- Uninstall ----
+/**
+ * ---- Uninstall ----
+ */
 
 result<RegistryEntry*> Registry::BeginDestroyLocked(std::string_view id) {
     RegistryEntry* e = FindEntryLocked(id);
@@ -782,8 +866,10 @@ result<RegistryEntry*> Registry::BeginDestroyLocked(std::string_view id) {
         return result<RegistryEntry*>::err(MakeError(ErrorCode::NotFound,
             "BeginDestroy: object not found"));
 
-    // 组件：仍有 binding 边 → Busy（不自动解绑使用者）。retiring 且
-    // borrow 归零的边由 ReleaseBorrow 即时抹除，剩下的边都有未定责任。
+    /**
+     * 组件：仍有 binding 边 → Busy（不自动解绑使用者）。retiring 且
+     * borrow 归零的边由 ReleaseBorrow 即时抹除，剩下的边都有未定责任。
+     */
     if (e->kind == ObjectKind::Component && !e->bindings.empty())
         return result<RegistryEntry*>::err(MakeError(ErrorCode::Overloaded,
             "UninstallComponent: active bindings remain"));
@@ -810,14 +896,18 @@ Registry::FinishDestroyLocked(RegistryEntry& e) {
         obj = std::move(it->object);
         m_entries.erase(it);
     }
-    // deque 下标变化，整体重建索引。
+    /**
+     * deque 下标变化，整体重建索引。
+     */
     m_index.clear();
     for (std::size_t i = 0; i < m_entries.size(); ++i)
         m_index.emplace(m_entries[i].id, i);
     return {std::move(obj), std::move(events)};
 }
 
-// ---- 诊断 ----
+/**
+ * ---- 诊断 ----
+ */
 
 std::vector<CleanupInfo> Registry::PendingCleanup() const {
     std::lock_guard<std::mutex> lk(m_mtx);
@@ -842,7 +932,9 @@ std::vector<CleanupInfo> Registry::PendingCleanup() const {
 }
 
 void Registry::RecordFailure(LifecycleFailure f) {
-    // bounded ring：上限取 max_objects（超出丢弃并计 dropped）。
+    /**
+     * bounded ring：上限取 max_objects（超出丢弃并计 dropped）。
+     */
     const std::size_t cap = m_limits.max_objects;
     if (m_failures.size() >= cap) {
         m_failures.pop_front();
@@ -856,10 +948,12 @@ std::vector<LifecycleFailure> Registry::Failures() const {
     return std::vector<LifecycleFailure>(m_failures.begin(), m_failures.end());
 }
 
-// ---- BorrowImpl（ComponentHandle<C>::Borrow 的类型擦除半身）----
-//
-// 返回 v2::CoComponent*（不擦为 void*）：派生类型 C 经
-// CoComponent*→C* static_cast 完成指针调整，多继承布局下不产生错误地址。
+/**
+ * ---- BorrowImpl（ComponentHandle<C>::Borrow 的类型擦除半身）----
+ *
+ * 返回 v2::CoComponent*（不擦为 void*）：派生类型 C 经
+ * CoComponent*→C* static_cast 完成指针调整，多继承布局下不产生错误地址。
+ */
 
 result<std::pair<std::shared_ptr<void>, v2::CoComponent*>> BorrowImpl(
     const ObjectHandle& object, std::uint64_t binding_generation,
@@ -876,10 +970,12 @@ result<std::pair<std::shared_ptr<void>, v2::CoComponent*>> BorrowImpl(
     if (e->generation != object.m_generation)
         return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::err(
             MakeError(ErrorCode::Closed, "Borrow: generation stale"));
-    // subject_id 由调用方（service handle）给出——ComponentHandle 经
-    // BindComponent 发放时 subject 已记录在该 binding 内；这里用
-    // 「binding_generation 匹配」反查 subject，保证 handle 不可伪造
-    // 其他 subject 的借用。
+    /**
+     * subject_id 由调用方（service handle）给出——ComponentHandle 经
+     * BindComponent 发放时 subject 已记录在该 binding 内；这里用
+     * 「binding_generation 匹配」反查 subject，保证 handle 不可伪造
+     * 其他 subject 的借用。
+     */
     ObjectId subject;
     bool found = false;
     for (const auto& b : e->bindings) {

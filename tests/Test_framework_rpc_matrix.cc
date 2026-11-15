@@ -1,33 +1,35 @@
-// V2 正式会话路径上的并发隔离 / 容量 / 迟到寿命 / 关闭矩阵。
-//
-// 装配固定为两个互异身份的 V2 会话 owner：
-//   * 服务端：公开 `fw::CoApp app(opts)`（opts.local_identity 必填），真实
-//     InfraHttpHost 监听 127.0.0.1:0，业务服务经公开 ProtoMethod 注册测试
-//     专用 Hold/Fast（只读 GetValue 语义，无写副作用）；
-//   * 客户端：独立 `fw::InfraHttpHost`（互异 local_identity）的 `rpc_client()`
-//     owner，经公开 `RpcEgress::Call("tcp://<ep>", Request, CallOptions)` 走
-//     真实 TCP loopback 的 SessionFrame + Hello/HelloAck（非注入 rpc_send、
-//     非直接 dispatch、非私有身份）。
-//   未认证 principal 来自真实 transport（loopback 无认证 → 空串），测试不手造
-//   入站上下文；deadline 由 infra 按 remaining_budget_ms 与 incoming_timeout
-//   的 local-min 填入 Request::Context()。
-//
-// 用例：
-//   T1 r6_concurrent_context_not_crossed        并发挂起/逆序恢复；上下文不串。
-//   T2 r6_client_timeout_inflight_holds_capacity 客户端先超时（OutcomeUnknown+
-//                                                 committed），handler 物理在途
-//                                                 仍占容量 → 新请求精确 Overloaded。
-//   T3 r7_capacity_overloaded_then_recovers_net  Service max_inflight 有界 + 峰值
-//                                                 oracle + 释放恢复。
-//   T4 r8_normal_shutdown_after_drain            正常排空 → Close → Closed（配对）。
-//   T5 r8_shutdown_incomplete_late_completion    在途关闭 → ShutdownIncomplete →
-//                                                 迟到完成 → 资源 Close 在 handler
-//                                                 完成后。
-//
-// 诚实缺口：跨 hop 预算、独立 supervisor 硬停未覆盖；
-// NetworkLimits 的 max_inflight/字节维度未分别压测。
-//
-// 与仓内既有单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
+/**
+ * V2 正式会话路径上的并发隔离 / 容量 / 迟到寿命 / 关闭矩阵。
+ *
+ * 装配固定为两个互异身份的 V2 会话 owner：
+ * * 服务端：公开 `fw::CoApp app(opts)`（opts.local_identity 必填），真实
+ * InfraHttpHost 监听 127.0.0.1:0，业务服务经公开 ProtoMethod 注册测试
+ * 专用 Hold/Fast（只读 GetValue 语义，无写副作用）；
+ * * 客户端：独立 `fw::InfraHttpHost`（互异 local_identity）的 `rpc_client()`
+ * owner，经公开 `RpcEgress::Call("tcp://<ep>", Request, CallOptions)` 走
+ * 真实 TCP loopback 的 SessionFrame + Hello/HelloAck（非注入 rpc_send、
+ * 非直接 dispatch、非私有身份）。
+ * 未认证 principal 来自真实 transport（loopback 无认证 → 空串），测试不手造
+ * 入站上下文；deadline 由 infra 按 remaining_budget_ms 与 incoming_timeout
+ * 的 local-min 填入 Request::Context()。
+ *
+ * 用例：
+ * T1 r6_concurrent_context_not_crossed        并发挂起/逆序恢复；上下文不串。
+ * T2 r6_client_timeout_inflight_holds_capacity 客户端先超时（OutcomeUnknown+
+ * committed），handler 物理在途
+ * 仍占容量 → 新请求精确 Overloaded。
+ * T3 r7_capacity_overloaded_then_recovers_net  Service max_inflight 有界 + 峰值
+ * oracle + 释放恢复。
+ * T4 r8_normal_shutdown_after_drain            正常排空 → Close → Closed（配对）。
+ * T5 r8_shutdown_incomplete_late_completion    在途关闭 → ShutdownIncomplete →
+ * 迟到完成 → 资源 Close 在 handler
+ * 完成后。
+ *
+ * 诚实缺口：跨 hop 预算、独立 supervisor 硬停未覆盖；
+ * NetworkLimits 的 max_inflight/字节维度未分别压测。
+ *
+ * 与仓内既有单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
+ */
 
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
@@ -67,7 +69,9 @@
 #include <bbt/framework/ShutdownState.hpp>
 #include <bbt/framework/internal/HostLifecycle.hpp>
 
-// ProtoCodec<GetValueRequest/Response> 特化（schema 真源 = .proto descriptor）。
+/**
+ * ProtoCodec<GetValueRequest/Response> 特化（schema 真源 = .proto descriptor）。
+ */
 #include "getvalue_service.hpp"
 
 namespace fw  = bbt::framework;
@@ -79,10 +83,14 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 constexpr std::chrono::milliseconds kWait{15000};
-// 结构化结果标记：未认证 loopback，不表示身份已认证。
+/**
+ * 结构化结果标记：未认证 loopback，不表示身份已认证。
+ */
 constexpr const char* kAuthState = "unauthenticated_loopback";
 
-// ── 屏障原语（std CV / 协程闩；无固定 sleep 凑时序）────────────────────
+/**
+ * ── 屏障原语（std CV / 协程闩；无固定 sleep 凑时序）────────────────────
+ */
 
 class TestLatch {
 public:
@@ -104,7 +112,9 @@ private:
     int                     m_count;
 };
 
-// 单次放行协程闩：Open 前 Wait 真实挂起当前 handler 协程；Open 早到不丢唤醒。
+/**
+ * 单次放行协程闩：Open 前 Wait 真实挂起当前 handler 协程；Open 早到不丢唤醒。
+ */
 class CoGate {
 public:
     void Open() {
@@ -133,7 +143,9 @@ private:
     std::vector<co::sync::CoWaiter::SPtr> m_waiters;
 };
 
-// ── 观测态 ─────────────────────────────────────────────────────────────
+/**
+ * ── 观测态 ─────────────────────────────────────────────────────────────
+ */
 
 struct CtxSnapshot {
     bool          valid = false;
@@ -163,8 +175,14 @@ std::shared_ptr<SequenceLog> g_seq;
 struct ProbeState {
     explicit ProbeState(int arrive_n) : arrived(arrive_n) {}
 
-    TestLatch arrived;          // 到达 handler 的请求数
-    TestLatch handler_done{1};  // 单跟踪 handler 的完成（仅 T2/T5 用）
+    /**
+     * 到达 handler 的请求数
+     */
+    TestLatch arrived;
+    /**
+     * 单跟踪 handler 的完成（仅 T2/T5 用）
+     */
+    TestLatch handler_done{1};
 
     std::mutex                                        mtx;
     std::map<std::string, std::shared_ptr<CoGate>>    gates;
@@ -222,7 +240,9 @@ CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     return s;
 }
 
-// ── 资源 owner（自有 ICoCloseable；记录 Close 时序，不伪造计数）─────────
+/**
+ * ── 资源 owner（自有 ICoCloseable；记录 Close 时序，不伪造计数）─────────
+ */
 
 class OwnerRes final : public inf::ICoCloseable {
 public:
@@ -241,14 +261,18 @@ private:
     bool               m_closed = false;
 };
 
-// ── 测试服务：公开 ProtoMethod，只读 GetValue 语义 ─────────────────────
+/**
+ * ── 测试服务：公开 ProtoMethod，只读 GetValue 语义 ─────────────────────
+ */
 
 class NetMatrixSvc final : public fw::CoService<NetMatrixSvc> {
 public:
     static constexpr std::string_view kServiceName = "test.matrix.GetValueService";
 
-    // Hold：快照上下文 → 到 arrived → 在 per-rid 独立 gate 上以无界期限挂起
-    // （不依 ctx.deadline 自动返回，保持物理在途）→ 恢复后再快照当前上下文。
+    /**
+     * Hold：快照上下文 → 到 arrived → 在 per-rid 独立 gate 上以无界期限挂起
+     * （不依 ctx.deadline 自动返回，保持物理在途）→ 恢复后再快照当前上下文。
+     */
     fw::CoRpcResp Hold(fw::CoRpcReq req) {
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
         if (!parsed) return fw::CoRpcResp::Error(parsed.error());
@@ -272,7 +296,10 @@ public:
         {
             std::lock_guard<std::mutex> lk(p->mtx);
             if (completed) {
-                auto ctx2 = fw::CurrentRequestContext();   // 恢复后重新取受管上下文
+                /**
+                 * 恢复后重新取受管上下文
+                 */
+                auto ctx2 = fw::CurrentRequestContext();
                 if (ctx2) p->after[rid] = SnapCtx(*ctx2.value());
                 p->completed.push_back(rid);
                 if (g_seq) g_seq->Push("handler_done:" + rid);
@@ -308,7 +335,9 @@ public:
                         bbt::example::v1::GetValueResponse>("Fast"));
 };
 
-// ── 装配 ───────────────────────────────────────────────────────────────
+/**
+ * ── 装配 ───────────────────────────────────────────────────────────────
+ */
 
 fw::ServiceOptions ConcurrentOpts(std::size_t max_inflight) {
     return fw::ServiceOptions{
@@ -318,7 +347,9 @@ fw::ServiceOptions ConcurrentOpts(std::size_t max_inflight) {
         /*max_cached_results*/ 0, /*max_cached_result_bytes*/ 0};
 }
 
-// 正式装配：V2 会话（local_identity 必填；入站走 admission，无 bridge 选择）。
+/**
+ * 正式装配：V2 会话（local_identity 必填；入站走 admission，无 bridge 选择）。
+ */
 fw::CoAppOptions AppOpts(std::chrono::milliseconds shutdown_step_budget) {
     fw::CoAppOptions o{};
     o.network_limits = inf::NetworkLimits{
@@ -341,8 +372,10 @@ struct RunJoinOnExit {
     fw::CoApp*                  app = nullptr;
     std::unique_ptr<RunHandle>* h   = nullptr;
     void JoinNow() { if (h && *h && (*h)->th.joinable()) (*h)->th.join(); }
-    // 失败/异常退出也必须安全收尾：先 request_shutdown 再释放全部挂起 gate，
-    // 避免存在在途 handler 时 join 无界阻塞（不依赖 ctest 超时兜底）。
+    /**
+     * 失败/异常退出也必须安全收尾：先 request_shutdown 再释放全部挂起 gate，
+     * 避免存在在途 handler 时 join 无界阻塞（不依赖 ctest 超时兜底）。
+     */
     ~RunJoinOnExit() {
         if (app) app->request_shutdown();
         if (g_probe) g_probe->CompleteAll();
@@ -351,14 +384,20 @@ struct RunJoinOnExit {
 };
 
 std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
-    // 配置非线程安全：仅在调度器尚未初始化（无工作线程）时写入进程全局配置。
-    // HostLifecycle 只在未初始化时 Start，运行时为进程寿命单例（无 Stop），
-    // 故 T2+ 调用时调度器已初始化，跳过写入以规避运行期数据竞争。
+    /**
+     * 配置非线程安全：仅在调度器尚未初始化（无工作线程）时写入进程全局配置。
+     * HostLifecycle 只在未初始化时 Start，运行时为进程寿命单例（无 Stop），
+     * 故 T2+ 调用时调度器已初始化，跳过写入以规避运行期数据竞争。
+     */
     if (!g_scheduler->IsInitialized()) {
-        // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+        /**
+         * Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+         */
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
-        // handler 在协程内做 proto wire 编解码 + 分发栈，默认 12KB 栈触底；
-        // 按示例口径放大到 512KB（仅覆盖本测试负载规模）。
+        /**
+         * handler 在协程内做 proto wire 编解码 + 分发栈，默认 12KB 栈触底；
+         * 按示例口径放大到 512KB（仅覆盖本测试负载规模）。
+         */
         g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
     }
     auto h = std::make_unique<RunHandle>();
@@ -370,7 +409,9 @@ std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
     return h;
 }
 
-// 有界 yield 轮询观测（非固定 sleep 凑时序）。
+/**
+ * 有界 yield 轮询观测（非固定 sleep 凑时序）。
+ */
 std::string WaitEndpoint(fw::CoApp& app) {
     const auto end = Clock::now() + kWait;
     while (Clock::now() < end) {
@@ -391,7 +432,9 @@ bool WaitShutdownState(fw::CoApp& app, fw::ShutdownState want,
     return app.shutdown_state() == want;
 }
 
-// ── 客户端：独立 V2 会话 owner（互异 identity，真实 TCP loopback）──────
+/**
+ * ── 客户端：独立 V2 会话 owner（互异 identity，真实 TCP loopback）──────
+ */
 
 struct ClientEnv {
     std::shared_ptr<fw::InfraHttpHost> rt;
@@ -427,9 +470,11 @@ struct ClientCallOut {
     TestLatch                                     done{1};
 };
 
-// 一次真实 V2 Call：预算由 CallOptions.deadline 承载（session 换算成 wire
-// remaining_budget_ms），服务端 Context().deadline 取它与 incoming_timeout
-// 的 local-min——因此各请求的 handler 期限相互独立。
+/**
+ * 一次真实 V2 Call：预算由 CallOptions.deadline 承载（session 换算成 wire
+ * remaining_budget_ms），服务端 Context().deadline 取它与 incoming_timeout
+ * 的 local-min——因此各请求的 handler 期限相互独立。
+ */
 std::shared_ptr<ClientCallOut> CallAsync(
     const std::shared_ptr<fw::RpcEgress>& egress,
     const std::string& endpoint,
@@ -448,8 +493,10 @@ std::shared_ptr<ClientCallOut> CallAsync(
             bbt::example::v1::GetValueResponse::descriptor()->full_name())
         .SetReply(inf::rpc::ReplyMode::Required)
         .SetTraffic(inf::rpc::TrafficClass::Service);
-    // 合法元数据（framework 入站接受的 route.* 前缀）：证明 metadata 不升级
-    // peer_principal。
+    /**
+     * 合法元数据（framework 入站接受的 route.* 前缀）：证明 metadata 不升级
+     * peer_principal。
+     */
     env.SetMetadata({{"route.rid", rid}});
     bbt::example::v1::GetValueRequest q;
     q.set_key(key);
@@ -475,12 +522,17 @@ bool WaitCall(const std::shared_ptr<ClientCallOut>& out,
     return out && out->done.WaitFor(ms);
 }
 
-// 成功回复：ok + 五关联字段回显由 infra 会话校验，这里只取业务 payload。
+/**
+ * 成功回复：ok + 五关联字段回显由 infra 会话校验，这里只取业务 payload。
+ */
 bool GetReply(const std::shared_ptr<ClientCallOut>& out,
               inf::rpc::Response& reply) {
     if (!out || !out->r.has_value()) return false;
     if (!out->r.value())
-        return false; // 业务/协议错误分支
+        /**
+         * 业务/协议错误分支
+         */
+        return false;
     reply = out->r.value().value();
     return true;
 }
@@ -491,8 +543,10 @@ int CodeOf(fw::ErrorCode c) { return static_cast<int>(c); }
 
 BOOST_AUTO_TEST_SUITE(framework_matrix_network)
 
-// T1（A）：3 条真实 network 请求在各 per-rid gate 挂起，逐个逆序放行；上下文
-//         随逻辑请求绑定、不串；合法 metadata 不升级未认证 principal。
+/**
+ * T1（A）：3 条真实 network 请求在各 per-rid gate 挂起，逐个逆序放行；上下文
+ * 随逻辑请求绑定、不串；合法 metadata 不升级未认证 principal。
+ */
 BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
     g_probe = std::make_shared<ProbeState>(3);
     fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
@@ -507,8 +561,10 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
     ClientStopOnExit cl_guard{&cl};
 
     const std::vector<std::string> rids{"t1-a", "t1-b", "t1-c"};
-    // 三个不同预算（15/20/25s，均 < 传输硬看门 incoming_timeout=30s）：生效期限
-    // 由各自 remaining_budget_ms 主导、间隔 5s，故严格递增且与调度到达顺序无关。
+    /**
+     * 三个不同预算（15/20/25s，均 < 传输硬看门 incoming_timeout=30s）：生效期限
+     * 由各自 remaining_budget_ms 主导、间隔 5s，故严格递增且与调度到达顺序无关。
+     */
     std::vector<std::shared_ptr<ClientCallOut>> outs;
     for (int i = 0; i < 3; ++i) {
         outs.push_back(CallAsync(
@@ -536,12 +592,16 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
         BOOST_REQUIRE(g_probe->arrived.WaitFor(std::chrono::milliseconds{1000}));
     }
 
-    // 逐个逆序放行 + 等待对应 client done：完成顺序确定（非连续 Open）。
+    /**
+     * 逐个逆序放行 + 等待对应 client done：完成顺序确定（非连续 Open）。
+     */
     for (int i = 2; i >= 0; --i) {
         g_probe->GateFor(rids[i])->Open();
         BOOST_REQUIRE(WaitCall(outs[i]));
-        // 成功响应须解出正式业务 wire 信封（非仅 transport 层 200）：
-        // success 与 request_id 精确匹配，且 payload 为 held:<rid> 业务值。
+        /**
+         * 成功响应须解出正式业务 wire 信封（非仅 transport 层 200）：
+         * success 与 request_id 精确匹配，且 payload 为 held:<rid> 业务值。
+         */
         inf::rpc::Response reply;
         BOOST_REQUIRE(GetReply(outs[i], reply));
         BOOST_TEST(reply.RequestId() == rids[i]);
@@ -566,14 +626,26 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
         BOOST_CHECK(b.request_id == rids[i]);
         BOOST_CHECK(a.request_id == rids[i]);
         BOOST_CHECK(b.co_id != 0);
-        BOOST_CHECK(a.co_id == b.co_id);       // 上下文随协程绑定
-        BOOST_CHECK(b.peer_principal.empty()); // 合法 metadata 不升级 principal
+        /**
+         * 上下文随协程绑定
+         */
+        BOOST_CHECK(a.co_id == b.co_id);
+        /**
+         * 合法 metadata 不升级 principal
+         */
+        BOOST_CHECK(b.peer_principal.empty());
         BOOST_CHECK(a.peer_principal.empty());
-        BOOST_CHECK(a.deadline == b.deadline); // 跨挂起不漂
+        /**
+         * 跨挂起不漂
+         */
+        BOOST_CHECK(a.deadline == b.deadline);
         d[i] = b.deadline;
     }
     BOOST_CHECK(d[0] < d[1]);
-    BOOST_CHECK(d[1] < d[2]);                  // 各请求预算独立、未串
+    /**
+     * 各请求预算独立、未串
+     */
+    BOOST_CHECK(d[1] < d[2]);
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 
     app.request_shutdown();
@@ -581,10 +653,12 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
     BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
 }
 
-// T2（B）：客户端有限 deadline 先落 OutcomeUnknown+RequestCommitted，handler 经
-//         独立 gate 物理在途仍占容量（max_inflight=1）→ 新请求精确 Overloaded；
-//         释放后容量恢复（探测请求非原调用 retry）；owner 在迟到完成前未被 Close
-//         （IsClosed 仅观测 Close() 是否被调用，不表示所有权/寿命）。
+/**
+ * T2（B）：客户端有限 deadline 先落 OutcomeUnknown+RequestCommitted，handler 经
+ * 独立 gate 物理在途仍占容量（max_inflight=1）→ 新请求精确 Overloaded；
+ * 释放后容量恢复（探测请求非原调用 retry）；owner 在迟到完成前未被 Close
+ * （IsClosed 仅观测 Close() 是否被调用，不表示所有权/寿命）。
+ */
 BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     g_probe = std::make_shared<ProbeState>(1);
     g_seq   = std::make_shared<SequenceLog>();
@@ -601,50 +675,71 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     BOOST_REQUIRE(cl.Start());
     ClientStopOnExit cl_guard{&cl};
 
-    // 取服务强引用后立即释放；释放不影响框架持有的实例（CoApp 生命周期期间
-    // 持有）。此块不证明「因在途而强持有 service」。
+    /**
+     * 取服务强引用后立即释放；释放不影响框架持有的实例（CoApp 生命周期期间
+     * 持有）。此块不证明「因在途而强持有 service」。
+     */
     {
         auto svc = app.find_service(NetMatrixSvc::kServiceName);
         BOOST_REQUIRE(svc);
     }
     BOOST_CHECK(owner->IsClosed() == false);
 
-    // A：client deadline 1.5s、预算 30s → handler 在 gate 上物理在途（不依 ctx.deadline）。
+    /**
+     * A：client deadline 1.5s、预算 30s → handler 在 gate 上物理在途（不依 ctx.deadline）。
+     */
     auto a = CallAsync(cl.egress, ep, "Hold", "t2-a", "ka",
                        std::chrono::milliseconds{1500});
     BOOST_REQUIRE(a != nullptr);
-    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // handler 已挂起
+    /**
+     * handler 已挂起
+     */
+    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));
     BOOST_REQUIRE(WaitCall(a));
     BOOST_REQUIRE(a->r.has_value());
-    BOOST_REQUIRE(!a->r.value());                     // transport 层失败
+    /**
+     * transport 层失败
+     */
+    BOOST_REQUIRE(!a->r.value());
     const inf::Error& ae = a->r.value().error();
     BOOST_TEST(static_cast<int>(ae.code) == CodeOf(fw::ErrorCode::OutcomeUnknown));
     BOOST_REQUIRE(ae.request_phase.has_value());
     BOOST_TEST(static_cast<int>(*ae.request_phase) ==
                static_cast<int>(inf::RequestPhase::RequestCommitted));
 
-    // 此刻：handler completion marker 仍无、owner 尚未被 Close
-    // （IsClosed 只观测 Close() 调用，不代表所有权/寿命）。
+    /**
+     * 此刻：handler completion marker 仍无、owner 尚未被 Close
+     * （IsClosed 只观测 Close() 调用，不代表所有权/寿命）。
+     */
     BOOST_CHECK(g_probe->Active("t2-a"));
     BOOST_CHECK(owner->IsClosed() == false);
 
-    // 容量仍被占：新请求 Fast → 精确 Overloaded（只尝试一次）。
+    /**
+     * 容量仍被占：新请求 Fast → 精确 Overloaded（只尝试一次）。
+     */
     auto b = CallAsync(cl.egress, ep, "Fast", "t2-b", "kb",
                        std::chrono::seconds{30});
     BOOST_REQUIRE(b != nullptr);
     BOOST_REQUIRE(WaitCall(b));
     BOOST_REQUIRE(b->r.has_value());
-    BOOST_REQUIRE(!b->r.value()); // 服务级容量拒绝走错误分支
+    /**
+     * 服务级容量拒绝走错误分支
+     */
+    BOOST_REQUIRE(!b->r.value());
     BOOST_TEST(static_cast<int>(b->r.value().error().code) ==
                CodeOf(fw::ErrorCode::Overloaded));
 
-    // release 原 handler → 迟到完成。
+    /**
+     * release 原 handler → 迟到完成。
+     */
     g_probe->GateFor("t2-a")->Open();
     BOOST_REQUIRE(g_probe->handler_done.WaitFor(kWait));
     BOOST_CHECK(!g_probe->Active("t2-a"));
 
-    // 容量恢复：新探测请求（非原调用 retry）成功。迟到回复已过写窗口，
-    // infra 只发布本条终态、不写入共享 link，因此会话仍可复用。
+    /**
+     * 容量恢复：新探测请求（非原调用 retry）成功。迟到回复已过写窗口，
+     * infra 只发布本条终态、不写入共享 link，因此会话仍可复用。
+     */
     auto c = CallAsync(cl.egress, ep, "Fast", "t2-c", "kc",
                        std::chrono::seconds{30});
     BOOST_REQUIRE(c != nullptr);
@@ -656,11 +751,16 @@ BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     app.request_shutdown();
     join_guard.JoinNow();
     BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(owner->IsClosed());   // 关闭序列最终 Close owner
+    /**
+     * 关闭序列最终 Close owner
+     */
+    BOOST_CHECK(owner->IsClosed());
 }
 
-// T3（D）：Service max_inflight=2 有界 → 第三个明确 Overloaded（不排队）；峰值恰为
-//         声明 limit；释放后恢复接纳。NetworkLimits 维度未分别压测。
+/**
+ * T3（D）：Service max_inflight=2 有界 → 第三个明确 Overloaded（不排队）；峰值恰为
+ * 声明 limit；释放后恢复接纳。NetworkLimits 维度未分别压测。
+ */
 BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     g_probe = std::make_shared<ProbeState>(2);
     fw::CoApp app(AppOpts(std::chrono::milliseconds{2000}));
@@ -681,8 +781,14 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
             "kh" + std::to_string(i), std::chrono::seconds{60}));
         BOOST_REQUIRE(held.back() != nullptr);
     }
-    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // 两条都挂起 → 容量满
-    BOOST_CHECK(g_probe->Peak() == 2);                // 真实峰值 = 声明 limit
+    /**
+     * 两条都挂起 → 容量满
+     */
+    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));
+    /**
+     * 真实峰值 = 声明 limit
+     */
+    BOOST_CHECK(g_probe->Peak() == 2);
 
     auto over = CallAsync(cl.egress, ep, "Fast", "t3-over", "ko",
                           std::chrono::seconds{30});
@@ -692,13 +798,18 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     BOOST_REQUIRE(!over->r.value());
     BOOST_TEST(static_cast<int>(over->r.value().error().code) ==
                CodeOf(fw::ErrorCode::Overloaded));
-    BOOST_CHECK(g_probe->Peak() == 2);                // 拒绝路径不进 handler，峰值不越界
+    /**
+     * 拒绝路径不进 handler，峰值不越界
+     */
+    BOOST_CHECK(g_probe->Peak() == 2);
 
     g_probe->CompleteAll();
     for (std::size_t i = 0; i < held.size(); ++i) {
         auto& o = held[i];
         BOOST_REQUIRE(WaitCall(o));
-        // held 回复须为正式业务成功信封（success + request_id 对应）。
+        /**
+         * held 回复须为正式业务成功信封（success + request_id 对应）。
+         */
         inf::rpc::Response rh;
         BOOST_REQUIRE(GetReply(o, rh));
         BOOST_TEST(rh.RequestId() == std::string("t3-h") + std::to_string(i));
@@ -717,8 +828,10 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
     BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Closed);
 }
 
-// T4（C-配对正常）：一次正常请求后 request_shutdown → 排空 → 同步 Close → Closed；
-//                     无未完成清理项；资源 owner 被 Close。
+/**
+ * T4（C-配对正常）：一次正常请求后 request_shutdown → 排空 → 同步 Close → Closed；
+ * 无未完成清理项；资源 owner 被 Close。
+ */
 BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
     g_probe = std::make_shared<ProbeState>(0);
     g_seq   = std::make_shared<SequenceLog>();
@@ -752,14 +865,18 @@ BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 }
 
-// T5（C-超预算配对）：一条真实在途 handler 被 gate 扣住时 request_shutdown →
-//      ShutdownIncomplete、run 未返回；释放 → 迟到完成 → run 收束；资源 Close
-//      调用序列发生在 handler completion 之后（handler_done:t5-a <
-//      resource_close）。不宣称析构/所有权观测。
+/**
+ * T5（C-超预算配对）：一条真实在途 handler 被 gate 扣住时 request_shutdown →
+ * ShutdownIncomplete、run 未返回；释放 → 迟到完成 → run 收束；资源 Close
+ * 调用序列发生在 handler completion 之后（handler_done:t5-a <
+ * resource_close）。不宣称析构/所有权观测。
+ */
 BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
     g_probe = std::make_shared<ProbeState>(1);
     g_seq   = std::make_shared<SequenceLog>();
-    // 小步预算：在途 handler 让排空步超预算 → ShutdownIncomplete。
+    /**
+     * 小步预算：在途 handler 让排空步超预算 → ShutdownIncomplete。
+     */
     fw::CoApp app(AppOpts(std::chrono::milliseconds{300}));
     BOOST_REQUIRE(app.add_service<NetMatrixSvc>(ConcurrentOpts(4)));
     auto owner = std::make_shared<OwnerRes>();
@@ -776,17 +893,34 @@ BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
     auto a = CallAsync(cl.egress, ep, "Hold", "t5-a", "ka",
                        std::chrono::seconds{60});
     BOOST_REQUIRE(a != nullptr);
-    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));   // handler 在途
+    /**
+     * handler 在途
+     */
+    BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));
     BOOST_CHECK(app.shutdown_state() == fw::ShutdownState::Running);
 
     app.request_shutdown();
     BOOST_REQUIRE(WaitShutdownState(app, fw::ShutdownState::ShutdownIncomplete));
-    BOOST_CHECK(!rh->done.load());                    // run 未返回
-    BOOST_CHECK(!owner->IsClosed());                  // owner 未被 Close 调用（时序，非所有权）
-    BOOST_CHECK(g_probe->Active("t5-a"));             // handler 仍物理在途
-    BOOST_CHECK(!app.pending_cleanup().empty());      // 有未完成清理项
+    /**
+     * run 未返回
+     */
+    BOOST_CHECK(!rh->done.load());
+    /**
+     * owner 未被 Close 调用（时序，非所有权）
+     */
+    BOOST_CHECK(!owner->IsClosed());
+    /**
+     * handler 仍物理在途
+     */
+    BOOST_CHECK(g_probe->Active("t5-a"));
+    /**
+     * 有未完成清理项
+     */
+    BOOST_CHECK(!app.pending_cleanup().empty());
 
-    // release 原 handler → 迟到完成。
+    /**
+     * release 原 handler → 迟到完成。
+     */
     g_probe->GateFor("t5-a")->Open();
     BOOST_REQUIRE(g_probe->handler_done.WaitFor(kWait));
 
@@ -800,7 +934,10 @@ BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
     const int ci = g_seq->IndexOf("resource_close");
     BOOST_REQUIRE(hi >= 0);
     BOOST_REQUIRE(ci >= 0);
-    BOOST_CHECK(hi < ci);                             // Close 在 handler 完成之后
+    /**
+     * Close 在 handler 完成之后
+     */
+    BOOST_CHECK(hi < ci);
     BOOST_TEST_MESSAGE("auth_state=" << kAuthState);
 }
 

@@ -1,10 +1,12 @@
-// ICoService::call 的机器面半身。
-//
-// 公共头的 call<Reply> 模板只做编译期 codec 选择与请求编码；本文件
-// 承接类型擦除后的发送路径：受管校验、隐式请求上下文、envelope 组装、
-// 有序票据系统元数据（fw.* 只由本可信路径写入，不从业务 custom 读）、
-// deadline 经 CallOptionsAdapter 适配、宿主注入点发送与回复
-// 封包校验。成功返回回复 payload 字节，解码回公共头完成。
+/**
+ * ICoService::call 的机器面半身。
+ *
+ * 公共头的 call<Reply> 模板只做编译期 codec 选择与请求编码；本文件
+ * 承接类型擦除后的发送路径：受管校验、隐式请求上下文、envelope 组装、
+ * 有序票据系统元数据（fw.* 只由本可信路径写入，不从业务 custom 读）、
+ * deadline 经 CallOptionsAdapter 适配、宿主注入点发送与回复
+ * 封包校验。成功返回回复 payload 字节，解码回公共头完成。
+ */
 
 #include <bbt/framework/ICoService.hpp>
 
@@ -30,13 +32,17 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
     if (m_object_info.id == 0)
         return Err::err(MakeError(ErrorCode::RuntimeUnavailable,
             "call: service is not hosted by CoApp"));
-    // 隐式上下文：从当前受管请求取得；非受管协程 → InvalidContext。
+    /**
+     * 隐式上下文：从当前受管请求取得；非受管协程 → InvalidContext。
+     */
     auto ctx = CurrentRequestContext();
     if (!ctx)
         return Err::err(ctx.error());
 
-    // 组 envelope：request_id 写顶层字段；custom 只进 route.*，
-    // 不冒写系统字段（统一加 route. 前缀，接收端据此前提归类）。
+    /**
+     * 组 envelope：request_id 写顶层字段；custom 只进 route.*，
+     * 不冒写系统字段（统一加 route. 前缀，接收端据此前提归类）。
+     */
     bbt::infra::rpc::Request env{std::string(service_name), std::string(method_name)};
     env.SetRequestSchema(std::string(request_schema))
         .SetResponseSchema(std::string(response_schema))
@@ -53,9 +59,11 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
         metadata.emplace_back("route." + k, v);
     }
 
-    // 有序票据：签发会话回指在 stamp 内部状态里（业务不可见）；受限
-    // 系统字段只由可信路径写入 fw.*——grant 四元组取签发会话本体，
-    // 不从业务 custom 读。
+    /**
+     * 有序票据：签发会话回指在 stamp 内部状态里（业务不可见）；受限
+     * 系统字段只由可信路径写入 fw.*——grant 四元组取签发会话本体，
+     * 不从业务 custom 读。
+     */
     std::shared_ptr<OrderedSession> ordered_session;
     if (options.ordered.has_value()) {
         if (options.ordered->state_)
@@ -73,8 +81,10 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
 
     env.SetMetadata(std::move(metadata));
 
-    // deadline 经适配器换算（min 规则、过期 TimedOut，infra 只收期限）；
-    // 发送动作经宿主注入点完成，回复回填 slot。
+    /**
+     * deadline 经适配器换算（min 规则、过期 TimedOut，infra 只收期限）；
+     * 发送动作经宿主注入点完成，回复回填 slot。
+     */
     std::optional<bbt::infra::rpc::Response> reply_env;
     CallEgressHooks hooks;
     if (m_send) {
@@ -114,8 +124,10 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
         return Err::err(MakeError(ErrorCode::InternalError,
             "call: egress produced no reply envelope"));
 
-    // 回复封包校验：回显 request_id、response_schema 与声明一致；
-    // 不符属对端/链路协议错误，不当作业务结果。
+    /**
+     * 回复封包校验：回显 request_id、response_schema 与声明一致；
+     * 不符属对端/链路协议错误，不当作业务结果。
+     */
     if (reply_env->Service() != env.Service() ||
         reply_env->Method() != env.Method() ||
         reply_env->RequestSchema() != env.RequestSchema() ||

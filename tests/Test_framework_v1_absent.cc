@@ -1,15 +1,17 @@
-// framework 侧 V1 面缺席的负向检查（framework.v1_absent）。
-//
-// 判据分两层，均不依赖「跑起来能连上」：
-//  1) 编译层正向对照：本 TU 只 include V2 公开面并实际使用 Request/Response/
-//     RpcEgress/InstallRpcAdmission 类型——证明 V2 面在场且可编译；
-//  2) 文本层缺席：扫描 bbt/framework/ 的产品源码与 CMake，断言旧 RPC 面
-//     （LegacyHeaders/x-bbt 信封头族/RpcEnvelope/RpcAddress/RpcInboundBridge/
-//     RpcEgressProfile/HttpEgress/双桥安装入口/旧能力宏）零命中。
-//
-// 扫描范围刻意排除本文件自身与 tests/ 目录：本测试的判据字符串本身必须
-// 出现，否则无法表达「什么不该存在」。裸 RpcHandler 不是残留证据
-// （CoRpcServer::RpcHandler 是保留的 V2 路由别名，见 ADR 0022 §5）。
+/**
+ * framework 侧 V1 面缺席的负向检查（framework.v1_absent）。
+ *
+ * 判据分两层，均不依赖「跑起来能连上」：
+ * 1) 编译层正向对照：本 TU 只 include V2 公开面并实际使用 Request/Response/
+ * RpcEgress/InstallRpcAdmission 类型——证明 V2 面在场且可编译；
+ * 2) 文本层缺席：扫描 bbt/framework/ 的产品源码与 CMake，断言旧 RPC 面
+ * （LegacyHeaders/x-bbt 信封头族/RpcEnvelope/RpcAddress/RpcInboundBridge/
+ * RpcEgressProfile/HttpEgress/双桥安装入口/旧能力宏）零命中。
+ *
+ * 扫描范围刻意排除本文件自身与 tests/ 目录：本测试的判据字符串本身必须
+ * 出现，否则无法表达「什么不该存在」。裸 RpcHandler 不是残留证据
+ * （CoRpcServer::RpcHandler 是保留的 V2 路由别名，见 ADR 0022 §5）。
+ */
 
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
@@ -33,7 +35,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// 产品源码根：由 tests/CMakeLists.txt 以编译定义注入（绝对路径）。
+/**
+ * 产品源码根：由 tests/CMakeLists.txt 以编译定义注入（绝对路径）。
+ */
 constexpr const char* kSourceRoot = BBT_FRAMEWORK_SOURCE_DIR;
 
 struct Forbidden {
@@ -41,9 +45,11 @@ struct Forbidden {
     const char* needle;
 };
 
-// 旧 RPC 面的文本指纹。只列「出现即证明旧面仍在」的精确 token：
-//  - x-bbt 信封头族（x-bbt-err-* 是 HTTP 错误映射，保留，故不列）；
-//  - 旧值类型/旧桥/旧 profile 枚举/旧能力宏。
+/**
+ * 旧 RPC 面的文本指纹。只列「出现即证明旧面仍在」的精确 token：
+ * - x-bbt 信封头族（x-bbt-err-* 是 HTTP 错误映射，保留，故不列）；
+ * - 旧值类型/旧桥/旧 profile 枚举/旧能力宏。
+ */
 constexpr Forbidden kForbidden[] = {
     {"x-bbt-service", "x-bbt-service"},
     {"x-bbt-method", "x-bbt-method"},
@@ -99,7 +105,9 @@ std::string ReadAll(const fs::path& p) {
 
 BOOST_AUTO_TEST_SUITE(framework_v1_absent)
 
-// 正向对照：V2 公开面可编译、可用（本 TU 已 include 并实例化）。
+/**
+ * 正向对照：V2 公开面可编译、可用（本 TU 已 include 并实例化）。
+ */
 BOOST_AUTO_TEST_CASE(v2_surface_compiles_and_is_usable) {
     inf::rpc::Request request("svc.echo", "Echo");
     request.SetRequestId("rid-1")
@@ -113,26 +121,34 @@ BOOST_AUTO_TEST_CASE(v2_surface_compiles_and_is_usable) {
     BOOST_CHECK_EQUAL(response.Service(), "svc.echo");
     BOOST_CHECK(response.Payload().empty());
 
-    // 安装入口与出站入口都是 V2 名字（类型可用即证明头已就位）。
+    /**
+     * 安装入口与出站入口都是 V2 名字（类型可用即证明头已就位）。
+     */
     using AdmissionFn = void (*)(fw::InfraHttpHost&, fw::CoApp&);
     AdmissionFn admission = static_cast<AdmissionFn>(&fw::InstallRpcAdmission);
     BOOST_CHECK(admission != nullptr);
     BOOST_CHECK(sizeof(fw::RpcEgress) > 0);
 }
 
-// 旧桥文件必须已删除（存在即失败）。
+/**
+ * 旧桥文件必须已删除（存在即失败）。
+ */
 BOOST_AUTO_TEST_CASE(legacy_bridge_headers_are_gone) {
     const fs::path root(kSourceRoot);
     BOOST_CHECK(!fs::exists(root / "bbt/framework/internal/RpcHttpBridge.hpp"));
     BOOST_CHECK(!fs::exists(root / "bbt/framework/internal/RpcWireBridge.hpp"));
     BOOST_CHECK(!fs::exists(root / "bbt/framework/host/RpcHttpBridge.cc"));
     BOOST_CHECK(!fs::exists(root / "bbt/framework/host/RpcWireBridge.cc"));
-    // 新接线在场。
+    /**
+     * 新接线在场。
+     */
     BOOST_CHECK(fs::exists(root / "bbt/framework/internal/RpcBridge.hpp"));
     BOOST_CHECK(fs::exists(root / "bbt/framework/host/RpcBridge.cc"));
 }
 
-// 产品源码/CMake 里不得再出现旧 RPC 面 token。
+/**
+ * 产品源码/CMake 里不得再出现旧 RPC 面 token。
+ */
 BOOST_AUTO_TEST_CASE(legacy_tokens_absent_from_product_sources) {
     const auto files = CollectFiles();
     BOOST_REQUIRE_MESSAGE(!files.empty(),

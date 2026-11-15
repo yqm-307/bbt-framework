@@ -1,10 +1,12 @@
 #pragma once
-// framework v2 CoService<Components...> 模板（契约 §5）。
-//
-// 本头只承载模板化的 CoService<Components...>：组件能力集合的编译期声明与类型化
-// GetComponent。受管基类分别位于独立头：Component.hpp、Actor.hpp，以及
-// internal/ServiceBase.hpp（类型擦除基）与 internal/ObjectBase.hpp（身份基）。
-// 本头聚合包含这些头，保持既有 include 兼容。
+/**
+ * framework v2 CoService<Components...> 模板（契约 §5）。
+ *
+ * 本头只承载模板化的 CoService<Components...>：组件能力集合的编译期声明与类型化
+ * GetComponent。受管基类分别位于独立头：Component.hpp、Actor.hpp，以及
+ * internal/ServiceBase.hpp（类型擦除基）与 internal/ObjectBase.hpp（身份基）。
+ * 本头聚合包含这些头，保持既有 include 兼容。
+ */
 
 #include <string>
 #include <string_view>
@@ -21,7 +23,10 @@
 
 namespace bbt::framework {
 
-class MonitorWriter;   // 监控写端（后续切片；仅前置声明）
+/**
+ * 监控写端（后续切片；仅前置声明）
+ */
+class MonitorWriter;
 
 namespace v2 {
 
@@ -43,13 +48,17 @@ namespace v2 {
 template <class... Components>
 class CoService : public CoServiceBase {
 public:
-    /// @brief 编译期判定 C 是否在本服务的组件声明集合内。
+    /**
+     * @brief 编译期判定 C 是否在本服务的组件声明集合内。
+     */
     template <class C>
     static constexpr bool kAllowsComponent =
         (std::is_same_v<C, Components> || ...);
 
 protected:
-    /// @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+    /**
+     * @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+     */
     explicit CoService(detail::ConstructKey key) : CoServiceBase(key) {}
     ~CoService() noexcept override = default;
 
@@ -68,15 +77,20 @@ protected:
     result<ComponentHandle<C>> GetComponent(std::string_view name) const;
 
 private:
-    bool _AllowsComponent(const std::type_info& t) const noexcept override {
-        return ((t == typeid(Components)) || ...);
-    }
+    bool _AllowsComponent(const std::type_info& t) const noexcept override;
 
     friend class detail::Registry;
     friend class ::bbt::framework::v2::CoApp;
 };
 
-// ---- CoService<Components...> 模板定义 ----
+/**
+ * ---- CoService<Components...> 模板定义 ----
+ */
+
+template <class... Components>
+bool CoService<Components...>::_AllowsComponent(const std::type_info& t) const noexcept {
+    return ((t == typeid(Components)) || ...);
+}
 
 template <class... Components>
 template <class C>
@@ -85,7 +99,9 @@ result<ComponentHandle<C>> CoService<Components...>::GetComponent(
     if (!bbt::coroutine::IsInCoroutineContext())
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
-    // ComponentHandle 的 binding generation 校验由 Registry 在 Borrow() 临界区内完成。
+    /**
+     * ComponentHandle 的 binding generation 校验由 Registry 在 Borrow() 临界区内完成。
+     */
     if (!_AllowsComponent(typeid(C)))
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::InvalidArgument,
@@ -110,7 +126,9 @@ struct CoServiceStaticName {
     static std::string Get() { return {}; }
 };
 
-/// @brief CoServiceStaticName 的偏特化：S 声明了 kServiceName 时取其值。
+/**
+ * @brief CoServiceStaticName 的偏特化：S 声明了 kServiceName 时取其值。
+ */
 template <class S>
 struct CoServiceStaticName<S, std::void_t<decltype(S::kServiceName)>> {
     static std::string Get() { return std::string(S::kServiceName); }

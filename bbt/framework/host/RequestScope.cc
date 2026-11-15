@@ -11,14 +11,21 @@ namespace bbt::framework {
 namespace {
 
 struct ScopeEntry {
-    const void*                           owner;  // RequestScope 身份
+    /**
+     * RequestScope 身份
+     */
+    const void* owner;
     std::shared_ptr<const RequestContext> ctx;
 };
 
 std::mutex g_scope_mtx;
-// 协程内受管上下文：键 = 协程 id（协程跨 worker 迁移时 id 不变）。
+/**
+ * 协程内受管上下文：键 = 协程 id（协程跨 worker 迁移时 id 不变）。
+ */
 std::unordered_map<std::uint64_t, std::vector<ScopeEntry>>   g_co_scopes;
-// 非协程执行（宿主启动代码）：键 = 线程 id。
+/**
+ * 非协程执行（宿主启动代码）：键 = 线程 id。
+ */
 std::unordered_map<std::thread::id, std::vector<ScopeEntry>> g_thread_scopes;
 
 template <class Map, class Key>

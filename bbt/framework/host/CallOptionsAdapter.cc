@@ -12,8 +12,10 @@ result<bbt::infra::CallOptions> AdaptCallOptions(
 {
     using bbt::coroutine::Deadline;
 
-    // 1. 有效期限：缺省继承父剩余预算；显式期限与父预算取最小值，
-    //    不得延长父预算；顶层入口必须自带有限期限。
+    /**
+     * 1. 有效期限：缺省继承父剩余预算；显式期限与父预算取最小值，
+     * 不得延长父预算；顶层入口必须自带有限期限。
+     */
     Deadline effective;
     if (parent == nullptr) {
         if (!options.deadline.has_value() ||
@@ -32,18 +34,24 @@ result<bbt::infra::CallOptions> AdaptCallOptions(
                 "no finite call budget inherited from parent request"));
     }
 
-    // 2. 已过期 → 发起任何 I/O 之前返回 TimedOut。
+    /**
+     * 2. 已过期 → 发起任何 I/O 之前返回 TimedOut。
+     */
     if (effective <= std::chrono::steady_clock::now())
         return result<bbt::infra::CallOptions>::err(MakeError(
             ErrorCode::TimedOut,
             "call budget already expired before egress io"));
 
-    // 3. infra::CallOptions 只携带单调时钟绝对期限；业务级取消不由 infra
-    //    令牌表达，业务取消由流程按 CoXxx 返回值自行决定，见头文件规则。
+    /**
+     * 3. infra::CallOptions 只携带单调时钟绝对期限；业务级取消不由 infra
+     * 令牌表达，业务取消由流程按 CoXxx 返回值自行决定，见头文件规则。
+     */
     bbt::infra::CallOptions out;
     out.deadline = effective;
 
-    // 4. 发起 I/O 的能力检查先于任何副作用：无出站注入点 → 不消耗序号。
+    /**
+     * 4. 发起 I/O 的能力检查先于任何副作用：无出站注入点 → 不消耗序号。
+     */
     if (!hooks.initiate_io)
         return result<bbt::infra::CallOptions>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
@@ -53,7 +61,9 @@ result<bbt::infra::CallOptions> AdaptCallOptions(
             ErrorCode::InvalidArgument,
             "ordered call requires a sequence consumer hook"));
 
-    // 5. 消耗接收端序号（有序票据首次发送绑定），随后发起 I/O。
+    /**
+     * 5. 消耗接收端序号（有序票据首次发送绑定），随后发起 I/O。
+     */
     if (options.ordered.has_value()) {
         auto seq = hooks.consume_sequence(*options.ordered);
         if (!seq)

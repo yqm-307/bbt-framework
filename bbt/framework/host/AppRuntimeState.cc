@@ -31,9 +31,11 @@ result<bbt::infra::rpc::Response> AppRuntimeState::Send(
 
     const std::string target = "tcp://" + endpoint.value();
 
-    // 公开出站策略在路由授权之后、发送之前调用一次。策略只见只读事实
-    // （已解析目标 + 不可改写 envelope + 已适配绝对期限），只能 Allow/Reject
-    // 或收紧期限；无策略（nullptr）时逐字保持既有行为。
+    /**
+     * 公开出站策略在路由授权之后、发送之前调用一次。策略只见只读事实
+     * （已解析目标 + 不可改写 envelope + 已适配绝对期限），只能 Allow/Reject
+     * 或收紧期限；无策略（nullptr）时逐字保持既有行为。
+     */
     bbt::infra::CallOptions opt = options;
     if (rpc_policy) {
         RpcPolicyDecision decision;
@@ -46,13 +48,17 @@ result<bbt::infra::rpc::Response> AppRuntimeState::Send(
         if (decision.kind == RpcPolicyDecision::Kind::Reject)
             return result<bbt::infra::rpc::Response>::err(decision.reject_error);
 
-        // 只收紧：框架取 min(原期限, 收紧值)，绝不放大策略结果。
+        /**
+         * 只收紧：框架取 min(原期限, 收紧值)，绝不放大策略结果。
+         */
         if (decision.tightened_deadline.has_value() &&
             *decision.tightened_deadline < opt.deadline)
             opt.deadline = *decision.tightened_deadline;
 
-        // 收紧到已过期（或不晚于 now）→ 发起任何 I/O 之前按 TimedOut 拒绝，
-        // 与 AdaptCallOptions 的过期门同语义。
+        /**
+         * 收紧到已过期（或不晚于 now）→ 发起任何 I/O 之前按 TimedOut 拒绝，
+         * 与 AdaptCallOptions 的过期门同语义。
+         */
         if (opt.deadline <= std::chrono::steady_clock::now())
             return result<bbt::infra::rpc::Response>::err(
                 MakeError(ErrorCode::TimedOut,
@@ -77,11 +83,16 @@ void AppRuntimeState::Publish(
     tables   = std::move(t);
     instances = std::move(inst);
     registry = std::move(reg);
-    dispatcher = std::move(d);   // 最后开放接纳
+    /**
+     * 最后开放接纳
+     */
+    dispatcher = std::move(d);
 }
 
 void AppRuntimeState::Release() noexcept {
-    // 放弃指向业务对象的全部边：闭包/表项仍自持的副本不受本调用影响。
+    /**
+     * 放弃指向业务对象的全部边：闭包/表项仍自持的副本不受本调用影响。
+     */
     std::lock_guard<std::mutex> lock(mtx);
     dispatcher.reset();
     tables.clear();

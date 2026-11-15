@@ -21,7 +21,9 @@ using namespace bbt::framework;
 
 namespace {
 
-// 目录价（分）：示例数据。未知 sku 返回 0，由 handler 转 NotFound。
+/**
+ * 目录价（分）：示例数据。未知 sku 返回 0，由 handler 转 NotFound。
+ */
 std::int64_t UnitPriceCents(std::string_view sku) {
     if (sku == "sku-book") return 1299;
     if (sku == "sku-mug") return 899;

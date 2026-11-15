@@ -1,9 +1,11 @@
 #pragma once
-// framework v2 Service 类型擦除基（internal）。
-//
-// v2::CoServiceBase 只承载与模板无关的面：Handle/Info、业务 hook 默认实现、组件
-// 能力集合的运行时判定与绑定表。类型化的 v2::CoService<Components...> 与
-// GetComponent 在 Service.hpp 中；这里不引入第二套服务抽象。
+/**
+ * framework v2 Service 类型擦除基（internal）。
+ *
+ * v2::CoServiceBase 只承载与模板无关的面：Handle/Info、业务 hook 默认实现、组件
+ * 能力集合的运行时判定与绑定表。类型化的 v2::CoService<Components...> 与
+ * GetComponent 在 Service.hpp 中；这里不引入第二套服务抽象。
+ */
 
 #include <cstdint>
 #include <string>
@@ -17,7 +19,10 @@
 
 namespace bbt::framework {
 
-class MonitorWriter;   // 监控写端（后续切片；仅前置声明）
+/**
+ * 监控写端（后续切片；仅前置声明）
+ */
+class MonitorWriter;
 
 namespace v2 {
 
@@ -37,19 +42,30 @@ namespace v2 {
  */
 class CoServiceBase : public detail::ObjectBase {
 public:
-    /// @brief 返回本服务的非拥有对象句柄。
+    /**
+     * @brief 返回本服务的非拥有对象句柄。
+     */
     ObjectHandle Handle() const { return _ObjectHandle(); }
-    /// @brief 返回本服务当前身份与状态的值快照。
+    /**
+     * @brief 返回本服务当前身份与状态的值快照。
+     */
     ObjectInfo   Info() const;
 
 protected:
-    /// @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+    /**
+     * @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+     */
     explicit CoServiceBase(detail::ConstructKey) {}
-    ~CoServiceBase() noexcept override = default;   // 仅经 Registry 类型化 deleter
+    /**
+     * 仅经 Registry 类型化 deleter
+     */
+    ~CoServiceBase() noexcept override = default;
 
-    // 业务 hook 约定：OnInstall/OnUninstall 在调用协程内宿主域执行；
-    // OnStart/OnPause/OnResume/OnStop 在受管协程执行（hook 任务持有对象
-    // owner 作为 callback lease，超时只结束等待不悬空）。
+    /**
+     * 业务 hook 约定：OnInstall/OnUninstall 在调用协程内宿主域执行；
+     * OnStart/OnPause/OnResume/OnStop 在受管协程执行（hook 任务持有对象
+     * owner 作为 callback lease，超时只结束等待不悬空）。
+     */
 
     /**
      * @brief 安装钩子，在服务登记之后、Installed 之前执行。
@@ -147,8 +163,10 @@ protected:
     virtual bool _AllowsComponent(const std::type_info& t) const noexcept = 0;
 
 private:
-    // subject 绑定表与 _FindBoundCopy/_BindComponentEntry 等簿记由
-    // detail::ObjectBase 承载（CoComponent/CoActor/CoService 共用同一份实现）。
+    /**
+     * subject 绑定表与 _FindBoundCopy/_BindComponentEntry 等簿记由
+     * detail::ObjectBase 承载（CoComponent/CoActor/CoService 共用同一份实现）。
+     */
 
     friend class detail::Registry;
     friend class ::bbt::framework::v2::CoApp;

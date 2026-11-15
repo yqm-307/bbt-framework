@@ -1,5 +1,7 @@
-// framework v2 公共值层实现：Options 校验、ObjectHandle/ObserverToken 的
-// Registry 委托、AppObjectAddress 校验、ComponentBorrow 释放。
+/**
+ * framework v2 公共值层实现：Options 校验、ObjectHandle/ObserverToken 的
+ * Registry 委托、AppObjectAddress 校验、ComponentBorrow 释放。
+ */
 
 #include <bbt/framework/Address.hpp>
 #include <bbt/framework/Object.hpp>
@@ -8,7 +10,9 @@
 
 namespace bbt::framework {
 
-// ---- Options::Validate ----
+/**
+ * ---- Options::Validate ----
+ */
 
 result<void> ServiceOptions::Validate() const {
     if (m_max_inflight == 0)
@@ -44,7 +48,9 @@ result<void> AppOptions::Validate() const {
     return result<void>::ok();
 }
 
-// ---- ObjectHandle ----
+/**
+ * ---- ObjectHandle ----
+ */
 
 bool ObjectHandle::IsValid() const noexcept {
     auto reg = m_reg.lock();
@@ -68,7 +74,9 @@ result<MailBox> ObjectHandle::GetMailBox() const {
     return reg->MailBoxOf(*this);
 }
 
-// ---- ObserverToken ----
+/**
+ * ---- ObserverToken ----
+ */
 
 void ObserverToken::Revoke() noexcept {
     if (m_id == 0) return;
@@ -85,16 +93,24 @@ bool ObserverToken::IsActive() const noexcept {
     return reg->ObserverActive(m_id);
 }
 
-// ---- ComponentBorrow ----
+/**
+ * ---- ComponentBorrow ----
+ */
 
-// _Release 为内联（见 Object.hpp）。
+/**
+ * _Release 为内联（见 Object.hpp）。
+ */
 
-// ---- ComponentHandle ----
-// IsValid/Borrow 需要 Registry 内部簿记；实现放在 Registry.cc
-// （模板成员函数的显式实例化也在那里做——业务只经 GetComponent/BindComponent
-// 获得实例化类型）。
+/**
+ * ---- ComponentHandle ----
+ * IsValid/Borrow 需要 Registry 内部簿记；实现放在 Registry.cc
+ * （模板成员函数的显式实例化也在那里做——业务只经 GetComponent/BindComponent
+ * 获得实例化类型）。
+ */
 
-// ---- AppObjectAddress ----
+/**
+ * ---- AppObjectAddress ----
+ */
 
 result<void> AppObjectAddress::Validate() const {
     switch (m_kind) {

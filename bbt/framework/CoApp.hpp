@@ -48,7 +48,9 @@ struct AppRuntimeState;
 struct CoAppOptions;
 struct CoAppSeam;
 
-// 内部入口友元（internal/** 声明）：测试缝构造与默认入站线桥安装。
+/**
+ * 内部入口友元（internal/ 下声明）：测试缝构造与默认入站线桥安装。
+ */
 std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
                                         CoAppSeam seam);
 void InstallRpcAdmission(InfraHttpHost& host, CoApp& app);
@@ -69,12 +71,18 @@ struct CoAppOptions {
     bbt::infra::ListenAddress listen;
     std::vector<StaticRoute>  static_routes;
     std::chrono::milliseconds shutdown_step_budget;
-    // 会话身份必填；trusted-network identity 不是认证凭据。
+    /**
+     * 会话身份必填；trusted-network identity 不是认证凭据。
+     */
     std::string local_identity;
-    // 策略在构造时提供；nullptr 使用默认策略。m_options 持有策略至 CoApp 析构。
+    /**
+     * 策略在构造时提供；nullptr 使用默认策略。m_options 持有策略至 CoApp 析构。
+     */
     std::shared_ptr<RpcPolicy> rpc_policy{};
-    // 可选动态路由表：发现提供方（应用侧组件）发布快照，出站按逻辑服务名解析。
-    // 非空时其已配置的服务名优先于 static_routes，且不回退静态 endpoint。
+    /**
+     * 可选动态路由表：发现提供方（应用侧组件）发布快照，出站按逻辑服务名解析。
+     * 非空时其已配置的服务名优先于 static_routes，且不回退静态 endpoint。
+     */
     std::shared_ptr<DynamicRouteTable> dynamic_routes{};
 };
 
@@ -90,13 +98,17 @@ struct CoAppOptions {
  * 同一 CoApp 的 run() 只执行一次；若因已有活跃宿主被拒绝，该次调用不消耗实例的 run 次数。
  */
 class CoApp {
-    // 测试缝构造仅经 internal MakeCoAppForTest 到达；默认入站线桥
-    // 经 InstallRpcAdmission 安装，两者均在 internal/** 声明。
+    /**
+     * 测试缝构造仅经 internal MakeCoAppForTest 到达；默认入站线桥
+     * 经 InstallRpcAdmission 安装，两者均在 internal/ 下声明。
+     */
     friend std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions,
                                                    CoAppSeam);
     friend void InstallRpcAdmission(InfraHttpHost&, CoApp&);
-    // 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
-    // dispatch_inbound，不新增业务可见面。
+    /**
+     * 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
+     * dispatch_inbound，不新增业务可见面。
+     */
     friend result<bbt::infra::rpc::Response> DispatchInboundForTest(
         CoApp&, const bbt::infra::rpc::Request&);
 
@@ -147,7 +159,10 @@ public:
         if (auto r = ValidateActorKeying(table, options.execution); !r)
             return r;
 
-        T proto;    // 原型仅取服务名；构造期不得发起 I/O
+        /**
+         * 原型仅取服务名；构造期不得发起 I/O
+         */
+        T proto;
         const std::string name{proto.co_service_name()};
         if (name.empty())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
@@ -254,7 +269,9 @@ public:
     result<std::shared_ptr<ICoService>> find_service(
         std::string_view service_name) const;
 
-    /// @brief ActorSerial 实例注册表（分发/测试观察用）；未启动 → nullptr。
+    /**
+     * @brief ActorSerial 实例注册表（分发/测试观察用）；未启动 → nullptr。
+     */
     ActorRegistry* actor_registry() const noexcept;
 
     /**
@@ -283,9 +300,13 @@ public:
      */
     ShutdownState shutdown_state() const noexcept;
 
-    /// @brief 收尾未完成项观测（转发自生命周期状态机）。
+    /**
+     * @brief 收尾未完成项观测（转发自生命周期状态机）。
+     */
     std::vector<std::string> pending_cleanup() const;
-    /// @brief 启动/关闭阶段失败项观测（转发自生命周期状态机）。
+    /**
+     * @brief 启动/关闭阶段失败项观测（转发自生命周期状态机）。
+     */
     std::vector<std::string> lifecycle_failures() const;
 
     /**
@@ -303,24 +324,33 @@ private:
         std::shared_ptr<OrderedIngress> ordered_ingress;
     };
 
-    // 资源装配记录：登记期建立，运行期只读（关闭序列消费 closeable）。
-    // factory 为空表示 shared_ptr 预创建入口；instance 始终持有已装配实例
-    // （预创建即登记时填入，工厂入口在启动成功后填入），供关闭序列与
-    // ShutdownIncomplete 期间强持有。
+    /**
+     * 资源装配记录：登记期建立，运行期只读（关闭序列消费 closeable）。
+     * factory 为空表示 shared_ptr 预创建入口；instance 始终持有已装配实例
+     * （预创建即登记时填入，工厂入口在启动成功后填入），供关闭序列与
+     * ShutdownIncomplete 期间强持有。
+     */
     struct ResourceSpec {
         std::function<result<std::shared_ptr<void>>()> factory;
-        // 类型擦除的 Start 调用（仅当 R 提供 result<void> Start()）；
-        // 与类型擦除的 ICoCloseable 视图（仅当 R 继承 ICoCloseable）。
+        /**
+         * 类型擦除的 Start 调用（仅当 R 提供 result<void> Start()）；
+         * 与类型擦除的 ICoCloseable 视图（仅当 R 继承 ICoCloseable）。
+         */
         std::function<result<void>(const std::shared_ptr<void>&)> start;
         std::function<std::shared_ptr<bbt::infra::ICoCloseable>(
             const std::shared_ptr<void>&)>                      as_closeable;
         std::shared_ptr<void>                                 instance;
-        bool closed{false};   // 关闭序列幂等标记
+        /**
+         * 关闭序列幂等标记
+         */
+        bool closed{false};
     };
     using ResourceSpecMap = std::unordered_map<ResourceKey, ResourceSpec,
                                                ResourceKeyHash>;
 
-    // 检测 R 是否提供 result<void> R::Start()（资源可选启动口）。
+    /**
+     * 检测 R 是否提供 result<void> R::Start()（资源可选启动口）。
+     */
     template <class R, class = void>
     struct HasResourceStart : std::false_type {};
     template <class R>
@@ -364,15 +394,19 @@ private:
         if (!m_resource_specs.emplace(key, std::move(spec)).second)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
                 "add_resource: duplicate resource key"));
-        // 预创建实例立即可见：m_resources 是 service 的实例视图。
+        /**
+         * 预创建实例立即可见：m_resources 是 service 的实例视图。
+         */
         m_resources->emplace(std::move(key), std::move(inst));
         return result<void>::ok();
     }
 
     template <class R, class F>
     result<void> _AddResourceFactory(std::string_view name, F&& factory) {
-        // 归一成 std::function 再判空：lambda 等 callable 无 operator!，
-        // std::function 的显式 bool 转换才表达「空工厂」。
+        /**
+         * 归一成 std::function 再判空：lambda 等 callable 无 operator!，
+         * std::function 的显式 bool 转换才表达「空工厂」。
+         */
         std::function<result<std::shared_ptr<R>>()> fn =
             std::forward<F>(factory);
         if (!fn)
@@ -400,32 +434,48 @@ private:
         return result<void>::ok();
     }
 
-    // 测试缝构造：显式注入宿主与出站发送；仅 MakeCoAppForTest 可达。
+    /**
+     * 测试缝构造：显式注入宿主与出站发送；仅 MakeCoAppForTest 可达。
+     */
     CoApp(CoAppOptions options, CoAppSeam seam);
 
-    // 入站分发入口（机器面）：由入站线桥（InstallRpcAdmission）在
-    // 受管协程内调用；未启动/已收束 → err(RuntimeUnavailable)。
-    // 业务不直接调用本入口。
+    /**
+     * 入站分发入口（机器面）：由入站线桥（InstallRpcAdmission）在
+     * 受管协程内调用；未启动/已收束 → err(RuntimeUnavailable)。
+     * 业务不直接调用本入口。
+     */
     result<bbt::infra::rpc::Response> dispatch_inbound(
         const bbt::infra::rpc::Request& request);
 
-    result<void> _ValidateConfig() const;   // run 前校验，不启动任何组件
-    result<void> _BindServices();           // Scheduler::Start 后建立对象身份
-    // on_scheduler_started 相位内先 _StartResources
-    // （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
-    // handler 排空后（on_handlers_drained）与回退路径（on_release）统一
-    // 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。
+    /**
+     * run 前校验，不启动任何组件
+     */
+    result<void> _ValidateConfig() const;
+    /**
+     * Scheduler::Start 后建立对象身份
+     */
+    result<void> _BindServices();
+    /**
+     * on_scheduler_started 相位内先 _StartResources
+     * （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
+     * handler 排空后（on_handlers_drained）与回退路径（on_release）统一
+     * 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。
+     */
     result<void> _StartResources();
     void         _CloseResources() noexcept;
     void         _ReleaseServices() noexcept;
-    // find_route 路由门 + 出站实现（ICoService::RpcSendFn 是
-    // ICoService 的私有别名；CoApp 经友元命名）。
+    /**
+     * find_route 路由门 + 出站实现（ICoService::RpcSendFn 是
+     * ICoService 的私有别名；CoApp 经友元命名）。
+     */
     ICoService::RpcSendFn _MakeEgress();
 
     const CoAppOptions              m_options;
     std::shared_ptr<INetworkHost>   m_network_host;
-    // 默认装配路径的具体宿主（弱持有观察；生命周期归 m_network_host）。
-    // 测试缝注入路径为空。
+    /**
+     * 默认装配路径的具体宿主（弱持有观察；生命周期归 m_network_host）。
+     * 测试缝注入路径为空。
+     */
     std::shared_ptr<InfraHttpHost>  m_default_host;
 
     mutable std::mutex              m_mtx;
@@ -433,28 +483,37 @@ private:
     std::map<std::string, std::string> m_routes;
     std::shared_ptr<ResourceMap>    m_resources{
         std::make_shared<ResourceMap>()};
-    // 资源装配记录表（登记期写入，启动期消费 factory、关闭期消费
-    // closeable/instance/closed）；与 m_resources 同受 m_mtx 保护。
+    /**
+     * 资源装配记录表（登记期写入，启动期消费 factory、关闭期消费
+     * closeable/instance/closed）；与 m_resources 同受 m_mtx 保护。
+     */
     ResourceSpecMap                 m_resource_specs;
     bool                            m_registration_open{true};
 
-    // 运行期持有的受管对象放进 m_state（AppRuntimeState）：入站 handler
-    // 闭包与出站回调复制该 shared_ptr，不借用本对象成员、不捕获 this。
-    // ShutdownIncomplete 期间仍由 m_state 强持有。
+    /**
+     * 运行期持有的受管对象放进 m_state（AppRuntimeState）：入站 handler
+     * 闭包与出站回调复制该 shared_ptr，不借用本对象成员、不捕获 this。
+     * ShutdownIncomplete 期间仍由 m_state 强持有。
+     */
     std::shared_ptr<AppRuntimeState> m_state;
 
     std::atomic_bool                m_ran_once{false};
     std::atomic_bool                m_shutdown_req{false};
-    // run 内局部生命周期对象的地址发布点。发布/读取/清空共用 m_lifecycle_mtx：
-    // 读取者在锁内完成「取指针 + 成员访问」，run 线程在同一把锁内清空指针，
-    // 故清空（以及随后的局部对象析构）必然排在任何读取者退出访问之后——
-    // 裸原子指针只保证指针值可见，不能 pin 住 run 栈上局部对象的寿命，读取者
-    // 可能进入已析构对象（CondVar destroy vs broadcast）。锁不跨阻塞的
-    // lifecycle.Run() 持有，也不与 m_mtx 形成反向嵌套。
+    /**
+     * run 内局部生命周期对象的地址发布点。发布/读取/清空共用 m_lifecycle_mtx：
+     * 读取者在锁内完成「取指针 + 成员访问」，run 线程在同一把锁内清空指针，
+     * 故清空（以及随后的局部对象析构）必然排在任何读取者退出访问之后——
+     * 裸原子指针只保证指针值可见，不能 pin 住 run 栈上局部对象的寿命，读取者
+     * 可能进入已析构对象（CondVar destroy vs broadcast）。锁不跨阻塞的
+     * lifecycle.Run() 持有，也不与 m_mtx 形成反向嵌套。
+     */
     mutable std::mutex m_lifecycle_mtx;
     HostLifecycle* m_lifecycle{nullptr};
     std::atomic<ShutdownState> m_parked_state{ShutdownState::Running};
-    std::vector<std::string> m_early_failures; // run 前校验失败原因
+    /**
+     * run 前校验失败原因
+     */
+    std::vector<std::string> m_early_failures;
 };
 
 } // namespace bbt::framework

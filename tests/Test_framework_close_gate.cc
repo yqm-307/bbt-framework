@@ -1,48 +1,50 @@
-// 关闭门判别回归：StopAccepting 闭门的最小根因修复。
-//
-// 背景：旧实现只在 Close() 置关拒绝门（InfraHttpHost::HandlerState::
-// open）。关闭顺序是 StopAccepting → WaitHandlersDone → Close，故
-// [StopAccepting, Close) 窗口内 open 仍为 true：一个 infra 在 StopAccepting 之前
-// 已接纳、但协程尚未进入本类入站包装（_InvokeRpc/_InvokeHttp）的请求，若在
-// WaitHandlersDone 返回之后、Close 置关之前进入，会过门并触达业务。
-// 根因修：StopAccepting 内先于 infra StopAccepting，在同一 state mutex 下闭门。
-//
-// 本文件的判别性（V2 面）：
-//  - T1 用真实 V2 会话：首个请求已过门并挂起；StopAccepting 之后在同一
-//    已建立会话上再发一个请求——该请求 infra 仍会接纳并交给框架同步派发门，
-//    修法后必被拒（Closed「host sealed」），不触达 handler。旧实现该迟到
-//    进入者会过门（calls 变 2、late 为 ok），故本用例对根因修复有真实
-//    判别力，而非恒真回归。
-//  - 已过门者不被抢占，WaitHandlersDone 不漏记。
-//
-// 与旧版「infra 已接纳、协程尚未进入包装」的确定性构造的差别：旧版经
-// InfraHttpHost 的 internal 同步派发测试缝在受控时刻重放该进入；该缝随
-// V1 一起删除且没有 V2 等价物。本版改用公共 V2 面可证实的终态
-// （同一会话上的迟到 CALL 被同步派发门拒绝），不再声称命中了包装前的
-// 精确时刻——判别对象从「时刻」改为「StopAccepting 之后不得触达业务」。
-//
-// 第二组判别性（异常路径：handler 抛异常时框架在途计数不能漏减）：
-//  - 事实：infra 侧 `_RunRpc` 有 try/catch 边界（异常转 InternalError、并
-//    无条件回收 infra 自己的记账），但框架 `_InvokeHttp`/`_RunRpc` 的在途
-//    记账是自己的（HandlerState::inflight）。旧实现把 `--inflight` 写在
-//    `st->http(...)`/`st->rpc(...)` 之后：handler（或其间任何分配/业务）抛出即
-//    越过减一 → inflight 永久 +1 → WaitHandlersDone 耗尽预算后永久 TimedOut，
-//    HostLifecycle 以 Deadline::max() 无界续等 → 宿主保活不释放。
-//  - 修后：减一由构造于 ++ 之后的 noexcept 作用域守卫承担，正常返回与异常栈展开
-//    都走同一条「锁内 --inflight + notify_all」。
-//  - T4 走真实 V2 loopback：handler 抛 std::runtime_error，infra 边界按契约
-//    转 InternalError（客户端收到错误终态回复、进程不抛异常），WaitHandlersDone
-//    必须 ok（修前 TimedOut）。
-//  - T5 走真实 infra loopback（HTTP）：同一契约的 HTTP 侧对照。
-//
-// 失败路径安全（本文件同时是关闭门回归的**安全**夹具）：
-//  - 跨线程/跨帧共享的状态（计数、门、闩、结果槽）一律放 shared_ptr 自我持有，并按
-//    值捕获进 handler 闭包与协程闭包：测试帧提前退出（BOOST_REQUIRE 失败、超时）也
-//    不会给仍在途的 handler/协程留悬垂栈引用。
-//  - 收尾放 RAII 夹具析构（先放行被测门 → 有界等待 → 幂等关闭）：失败路径同样执行，
-//    既不会析构 joinable 的 std::thread（否则 std::terminate），也不会无界等待掩盖错误。
-//
-// 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
+/**
+ * 关闭门判别回归：StopAccepting 闭门的最小根因修复。
+ *
+ * 背景：旧实现只在 Close() 置关拒绝门（InfraHttpHost::HandlerState::
+ * open）。关闭顺序是 StopAccepting → WaitHandlersDone → Close，故
+ * [StopAccepting, Close) 窗口内 open 仍为 true：一个 infra 在 StopAccepting 之前
+ * 已接纳、但协程尚未进入本类入站包装（_InvokeRpc/_InvokeHttp）的请求，若在
+ * WaitHandlersDone 返回之后、Close 置关之前进入，会过门并触达业务。
+ * 根因修：StopAccepting 内先于 infra StopAccepting，在同一 state mutex 下闭门。
+ *
+ * 本文件的判别性（V2 面）：
+ * - T1 用真实 V2 会话：首个请求已过门并挂起；StopAccepting 之后在同一
+ * 已建立会话上再发一个请求——该请求 infra 仍会接纳并交给框架同步派发门，
+ * 修法后必被拒（Closed「host sealed」），不触达 handler。旧实现该迟到
+ * 进入者会过门（calls 变 2、late 为 ok），故本用例对根因修复有真实
+ * 判别力，而非恒真回归。
+ * - 已过门者不被抢占，WaitHandlersDone 不漏记。
+ *
+ * 与旧版「infra 已接纳、协程尚未进入包装」的确定性构造的差别：旧版经
+ * InfraHttpHost 的 internal 同步派发测试缝在受控时刻重放该进入；该缝随
+ * V1 一起删除且没有 V2 等价物。本版改用公共 V2 面可证实的终态
+ * （同一会话上的迟到 CALL 被同步派发门拒绝），不再声称命中了包装前的
+ * 精确时刻——判别对象从「时刻」改为「StopAccepting 之后不得触达业务」。
+ *
+ * 第二组判别性（异常路径：handler 抛异常时框架在途计数不能漏减）：
+ * - 事实：infra 侧 `_RunRpc` 有 try/catch 边界（异常转 InternalError、并
+ * 无条件回收 infra 自己的记账），但框架 `_InvokeHttp`/`_RunRpc` 的在途
+ * 记账是自己的（HandlerState::inflight）。旧实现把 `--inflight` 写在
+ * `st->http(...)`/`st->rpc(...)` 之后：handler（或其间任何分配/业务）抛出即
+ * 越过减一 → inflight 永久 +1 → WaitHandlersDone 耗尽预算后永久 TimedOut，
+ * HostLifecycle 以 Deadline::max() 无界续等 → 宿主保活不释放。
+ * - 修后：减一由构造于 ++ 之后的 noexcept 作用域守卫承担，正常返回与异常栈展开
+ * 都走同一条「锁内 --inflight + notify_all」。
+ * - T4 走真实 V2 loopback：handler 抛 std::runtime_error，infra 边界按契约
+ * 转 InternalError（客户端收到错误终态回复、进程不抛异常），WaitHandlersDone
+ * 必须 ok（修前 TimedOut）。
+ * - T5 走真实 infra loopback（HTTP）：同一契约的 HTTP 侧对照。
+ *
+ * 失败路径安全（本文件同时是关闭门回归的**安全**夹具）：
+ * - 跨线程/跨帧共享的状态（计数、门、闩、结果槽）一律放 shared_ptr 自我持有，并按
+ * 值捕获进 handler 闭包与协程闭包：测试帧提前退出（BOOST_REQUIRE 失败、超时）也
+ * 不会给仍在途的 handler/协程留悬垂栈引用。
+ * - 收尾放 RAII 夹具析构（先放行被测门 → 有界等待 → 幂等关闭）：失败路径同样执行，
+ * 既不会析构 joinable 的 std::thread（否则 std::terminate），也不会无界等待掩盖错误。
+ *
+ * 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
+ */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -83,7 +85,9 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
-// 一次性放行门（std cv 语义，非 sleep 凑时序）。
+/**
+ * 一次性放行门（std cv 语义，非 sleep 凑时序）。
+ */
 struct Gate {
     std::mutex m;
     std::condition_variable cv;
@@ -101,7 +105,9 @@ struct Gate {
     }
 };
 
-// 协程侧一次性放行门：handler 在受管协程内挂起，不阻塞调度 worker。
+/**
+ * 协程侧一次性放行门：handler 在受管协程内挂起，不阻塞调度 worker。
+ */
 struct CoGate {
     void Open() {
         std::vector<co::sync::CoWaiter::SPtr> notify;
@@ -139,7 +145,9 @@ private:
     std::vector<co::sync::CoWaiter::SPtr> waiters;
 };
 
-// 倒计数闩（有界等待）。
+/**
+ * 倒计数闩（有界等待）。
+ */
 struct Latch {
     std::mutex m;
     std::condition_variable cv;
@@ -174,7 +182,9 @@ int Code(const fw::Error& e)
     return static_cast<int>(e.code);
 }
 
-// 一条 V2 Call 请求：五关联字段 + Required/Service。
+/**
+ * 一条 V2 Call 请求：五关联字段 + Required/Service。
+ */
 inf::rpc::Request MakeRequest(std::string rid,
                               std::string service = "probe",
                               std::string method = "hold") {
@@ -189,7 +199,9 @@ inf::rpc::Request MakeRequest(std::string rid,
     return request;
 }
 
-// 测试侧第二个会话 owner（identity 与目标服务互异，避免 self-connection 被拒）。
+/**
+ * 测试侧第二个会话 owner（identity 与目标服务互异，避免 self-connection 被拒）。
+ */
 struct CallerRuntime {
     std::shared_ptr<fw::InfraHttpHost> rt;
     std::shared_ptr<fw::RpcEgress> egress;
@@ -209,7 +221,9 @@ struct CallerRuntime {
     }
 };
 
-// 控制线程发起一次真实 V2 Call 并限时等待结果。
+/**
+ * 控制线程发起一次真实 V2 Call 并限时等待结果。
+ */
 fw::result<inf::rpc::Response> Call(const std::shared_ptr<fw::RpcEgress>& egress,
                                     const std::string& endpoint,
                                     const inf::rpc::Request& request,
@@ -242,24 +256,41 @@ fw::result<inf::rpc::Response> Call(const std::shared_ptr<fw::RpcEgress>& egress
     return std::move(*st->out);
 }
 
-// T1 的跨线程状态：计数、门、闩、结果槽都由 shared_ptr 自我持有，测试线程与
-// handler 闭包均按值捕获——任一方先退出都不产生悬垂访问。
+/**
+ * T1 的跨线程状态：计数、门、闩、结果槽都由 shared_ptr 自我持有，测试线程与
+ * handler 闭包均按值捕获——任一方先退出都不产生悬垂访问。
+ */
 struct T1State {
     std::atomic<int> calls{0};
-    Latch arrived{1};    // handler 已进入包装
-    CoGate first_gate;   // 首个（已过门）handler 挂此门
-    Latch first_done{1}; // 调用线程已离开包装
-    // 由调用线程写、测试线程在读前经 first_done（或 join）同步后读。
+    /**
+     * handler 已进入包装
+     */
+    Latch arrived{1};
+    /**
+     * 首个（已过门）handler 挂此门
+     */
+    CoGate first_gate;
+    /**
+     * 调用线程已离开包装
+     */
+    Latch first_done{1};
+    /**
+     * 由调用线程写、测试线程在读前经 first_done（或 join）同步后读。
+     */
     std::optional<fw::result<inf::rpc::Response>> entered;
 };
 
-// T3 的最小探针：只验证 handler 未被触达。
+/**
+ * T3 的最小探针：只验证 handler 未被触达。
+ */
 struct CloseProbe {
     std::atomic<int> calls{0};
 };
 
-// Close 打断排空用的宿主桩：第一次/第二次 WaitHandlersDone 的分支由
-// fail_first_with_timeout 选定；owner_closed 置位后 CloseReason 可观察。
+/**
+ * Close 打断排空用的宿主桩：第一次/第二次 WaitHandlersDone 的分支由
+ * fail_first_with_timeout 选定；owner_closed 置位后 CloseReason 可观察。
+ */
 struct InterruptStubHost final : fw::INetworkHost {
     std::atomic<int> wait_calls{0};
     std::atomic<int> close_calls{0};
@@ -289,7 +320,9 @@ struct InterruptStubHost final : fw::INetworkHost {
     }
 };
 
-// 真实 loopback 暂停 handler 的共享状态：handler 进入即报闩，放行后报完成。
+/**
+ * 真实 loopback 暂停 handler 的共享状态：handler 进入即报闩，放行后报完成。
+ */
 struct PauseState {
     Latch entered{1};
     Latch done{1};
@@ -302,9 +335,11 @@ struct PauseState {
 
 BOOST_AUTO_TEST_SUITE(framework_rpc_close_gate)
 
-// T1（R1）：StopAccepting 在同一 state mutex 内先于 infra StopAccepting 闭门——
-// StopAccepting 之后在同一已建立会话上到达的迟到请求被拒、不触达业务；已过门者
-// 不抢占、WaitHandlersDone 不漏记；Close 幂等。
+/**
+ * T1（R1）：StopAccepting 在同一 state mutex 内先于 infra StopAccepting 闭门——
+ * StopAccepting 之后在同一已建立会话上到达的迟到请求被拒、不触达业务；已过门者
+ * 不抢占、WaitHandlersDone 不漏记；Close 幂等。
+ */
 BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -319,13 +354,17 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
     host->InstallRpcHandler(
         [st](const inf::rpc::Request& request, const std::function<void()>& dispatched)
             -> fw::result<inf::rpc::Response> {
-            // 契约：所有可挂起动作之前释放同步派发门。
+            /**
+             * 契约：所有可挂起动作之前释放同步派发门。
+             */
             dispatched();
             const int n = st->calls.fetch_add(1);
             st->arrived.Down();
             if (n == 0) {
-                // 只有「已过门」的首个请求挂起；迟到进入者若过门则立即返回——
-                // 使负例（修法前）得到干净失败而非死等，判别力可观测。
+                /**
+                 * 只有「已过门」的首个请求挂起；迟到进入者若过门则立即返回——
+                 * 使负例（修法前）得到干净失败而非死等，判别力可观测。
+                 */
                 st->first_gate.Wait(Clock::now() + 30s);
             }
             return fw::result<inf::rpc::Response>::ok(
@@ -352,29 +391,42 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
         first_registered);
     BOOST_REQUIRE(first_registered);
 
-    // 等首个进入包装并挂起（inflight==1）。失败早退由收尾段放行门兜底。
+    /**
+     * 等首个进入包装并挂起（inflight==1）。失败早退由收尾段放行门兜底。
+     */
     BOOST_REQUIRE_MESSAGE(st->arrived.WaitFor(5s),
                           "entered handler never reached wrapper");
 
-    // StopAccepting：修复后必在此闭门（先于 infra StopAccepting）。
+    /**
+     * StopAccepting：修复后必在此闭门（先于 infra StopAccepting）。
+     */
     host->StopAccepting();
 
-    // 迟到进入者：同一已建立会话上再发一条 CALL——infra 仍会接纳并交给框架
-    // 同步派发门；修法后必被拒（host sealed），且不触达业务。
+    /**
+     * 迟到进入者：同一已建立会话上再发一条 CALL——infra 仍会接纳并交给框架
+     * 同步派发门；修法后必被拒（host sealed），且不触达业务。
+     */
     auto late = Call(caller.egress, endpoint, MakeRequest("rid-2"));
     BOOST_CHECK_MESSAGE(!late, "late entrant must be refused after StopAccepting");
     if (!late)
         BOOST_CHECK_EQUAL(Code(late.error()),
                           Code(fw::MakeError(fw::ErrorCode::Closed, "x")));
-    BOOST_CHECK_EQUAL(st->calls.load(), 1); // 拒绝发生在 handler 之前
+    /**
+     * 拒绝发生在 handler 之前
+     */
+    BOOST_CHECK_EQUAL(st->calls.load(), 1);
 
-    // WaitHandlersDone 不漏：已过门者仍在途 → 预算内不返回 ok。
+    /**
+     * WaitHandlersDone 不漏：已过门者仍在途 → 预算内不返回 ok。
+     */
     auto r1 = host->WaitHandlersDone(Clock::now() + 150ms);
     BOOST_CHECK_MESSAGE(!r1, "drain must not report success with inflight>0");
     if (!r1)
         BOOST_CHECK(r1.error().code == fw::ErrorCode::TimedOut);
 
-    // 放行已过门者：不被抢占（等到它自己完成）。
+    /**
+     * 放行已过门者：不被抢占（等到它自己完成）。
+     */
     st->first_gate.Open();
     BOOST_REQUIRE(st->first_done.WaitFor(5s));
     BOOST_CHECK(st->entered.has_value());
@@ -385,11 +437,15 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
     }
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
 
-    // 排空后 WaitHandlersDone 返回 ok。
+    /**
+     * 排空后 WaitHandlersDone 返回 ok。
+     */
     BOOST_CHECK(host->WaitHandlersDone(Clock::now() + 2s));
 
-    // Close 幂等：此处 StopAccepting 已闭门，故下面只证明「Close 之后仍拒绝」
-    // 与幂等，不构成「不经 StopAccepting 的直接 Close」证据（由 T3 覆盖）。
+    /**
+     * Close 幂等：此处 StopAccepting 已闭门，故下面只证明「Close 之后仍拒绝」
+     * 与幂等，不构成「不经 StopAccepting 的直接 Close」证据（由 T3 覆盖）。
+     */
     host->Close();
     host->Close();
     auto late2 = Call(caller.egress, endpoint, MakeRequest("rid-3"));
@@ -399,10 +455,12 @@ BOOST_AUTO_TEST_CASE(stop_accepting_closes_gate_rejects_late_entrant) {
     caller.Stop();
 }
 
-// T3：独立宿主的「直接 Close」终态——不经 StopAccepting/WaitHandlersDone，
-// Close 必须发布关闭原因、释放 server/client owner，且幂等。旧版用
-// internal 同步派发测试缝重放「Close 后进入者」；该缝随 V1 删除且无 V2 等价物，
-// 本版改为断言公共面可证实的终态：排空等待把同一原因交回（不是硬编码文案）。
+/**
+ * T3：独立宿主的「直接 Close」终态——不经 StopAccepting/WaitHandlersDone，
+ * Close 必须发布关闭原因、释放 server/client owner，且幂等。旧版用
+ * internal 同步派发测试缝重放「Close 后进入者」；该缝随 V1 删除且无 V2 等价物，
+ * 本版改为断言公共面可证实的终态：排空等待把同一原因交回（不是硬编码文案）。
+ */
 BOOST_AUTO_TEST_CASE(direct_close_publishes_terminal_state) {
     auto probe = std::make_shared<CloseProbe>();
     fw::InfraHttpHost host(Limits(), inf::ListenAddress{"127.0.0.1", 0},
@@ -418,31 +476,46 @@ BOOST_AUTO_TEST_CASE(direct_close_publishes_terminal_state) {
         });
 
     host.Close(bbt::infra::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
-    host.Close(); // 幂等
+    /**
+     * 幂等
+     */
+    host.Close();
 
     auto reason = host.CloseReason();
     BOOST_REQUIRE(reason.has_value());
     BOOST_CHECK(reason->code == fw::ErrorCode::Unavailable);
     BOOST_CHECK_EQUAL(reason->message, "owner abort");
 
-    // 关闭后进入排空路径：立即把同一关闭原因交给等待者，不进入收口。
+    /**
+     * 关闭后进入排空路径：立即把同一关闭原因交给等待者，不进入收口。
+     */
     auto drained = host.WaitHandlersDone(Clock::now() + 1s);
     BOOST_CHECK_MESSAGE(!drained, "closed host must not report a clean drain");
     if (!drained) {
         BOOST_CHECK(drained.error().code == fw::ErrorCode::Unavailable);
         BOOST_CHECK_EQUAL(drained.error().message, "owner abort");
     }
-    BOOST_CHECK(host.rpc_server() == nullptr); // owner 已释放
+    /**
+     * owner 已释放
+     */
+    BOOST_CHECK(host.rpc_server() == nullptr);
     BOOST_CHECK(host.rpc_client() == nullptr);
-    BOOST_CHECK_EQUAL(probe->calls.load(), 0); // handler 从未被触达
+    /**
+     * handler 从未被触达
+     */
+    BOOST_CHECK_EQUAL(probe->calls.load(), 0);
 }
 
-// T2（R2）：真实 infra loopback（HTTP）——已过门 handler 不被 StopAccepting 抢占，
-// 关闭序列等到它完成后 WaitHandlersDone 返回 ok，回复路径不被 StopAccepting 关断。
+/**
+ * T2（R2）：真实 infra loopback（HTTP）——已过门 handler 不被 StopAccepting 抢占，
+ * 关闭序列等到它完成后 WaitHandlersDone 返回 ok，回复路径不被 StopAccepting 关断。
+ */
 BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
 {
     if (!g_scheduler->IsInitialized()) {
-        // Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+        /**
+         * Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
+         */
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         g_scheduler->Start();
@@ -456,7 +529,10 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
             -> fw::result<inf::http::Response> {
             st->calls.fetch_add(1);
             st->entered.Down();
-            st->gate.Wait(Clock::now() + 30s); // 已过门：挂起，等测试放行
+            /**
+             * 已过门：挂起，等测试放行
+             */
+            st->gate.Wait(Clock::now() + 30s);
             st->returned.store(true);
             return fw::result<inf::http::Response>::ok(
                 inf::http::Response{200, {}, "ok"});
@@ -499,7 +575,10 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
     BOOST_CHECK_MESSAGE(!r, "entered handler must keep drain pending");
     if (!r)
         BOOST_CHECK(r.error().code == fw::ErrorCode::TimedOut);
-    BOOST_CHECK(!st->returned.load()); // StopAccepting 未取消在途 handler
+    /**
+     * StopAccepting 未取消在途 handler
+     */
+    BOOST_CHECK(!st->returned.load());
 
     st->gate.Open();
     BOOST_REQUIRE(http_state->done.WaitFor(5s));
@@ -514,9 +593,11 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
     host->Close();
 }
 
-// T4：handler 抛异常的框架侧判别（真实 V2 loopback）。infra 的 _RunRpc 边界
-// 把异常转 InternalError 回复；判别点是「异常栈展开也必须减在途计数」——
-// 修前 inflight 永久 +1，下面的排空断言会真实失败（TimedOut），而非恒真。
+/**
+ * T4：handler 抛异常的框架侧判别（真实 V2 loopback）。infra 的 _RunRpc 边界
+ * 把异常转 InternalError 回复；判别点是「异常栈展开也必须减在途计数」——
+ * 修前 inflight 永久 +1，下面的排空断言会真实失败（TimedOut），而非恒真。
+ */
 BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -545,10 +626,15 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
     auto r = Call(caller.egress, endpoint, MakeRequest("rid-exc"));
     BOOST_REQUIRE_MESSAGE(!r, "handler exception must surface as an error reply");
     BOOST_CHECK(r.error().code == fw::ErrorCode::InternalError);
-    BOOST_CHECK_EQUAL(probe->calls.load(), 1); // 异常发生在 handler 内
+    /**
+     * 异常发生在 handler 内
+     */
+    BOOST_CHECK_EQUAL(probe->calls.load(), 1);
 
-    // 记账未被破坏：换一个正常 handler 再进一次仍能记账（双重减一会把
-    // size_t 减成极大值，后续排空断言随即失败）。
+    /**
+     * 记账未被破坏：换一个正常 handler 再进一次仍能记账（双重减一会把
+     * size_t 减成极大值，后续排空断言随即失败）。
+     */
     host->InstallRpcHandler(
         [](const inf::rpc::Request& request, const std::function<void()>& dispatched)
             -> fw::result<inf::rpc::Response> {
@@ -560,7 +646,9 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
     BOOST_REQUIRE(ok_call);
     BOOST_CHECK_EQUAL(ok_call.value().RequestId(), "rid-ok");
 
-    // 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
+    /**
+     * 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
+     */
     auto drained = host->WaitHandlersDone(Clock::now() + 2s);
     BOOST_CHECK_MESSAGE(
         drained,
@@ -572,10 +660,12 @@ BOOST_AUTO_TEST_CASE(rpc_handler_exception_releases_inflight) {
     host->Close();
 }
 
-// T5：handler 抛异常的框架侧判别（真实 infra loopback，HTTP）。
-// infra 契约（`http/Server.hpp`：异常由边界捕获转 InternalError）把 handler
-// 异常在协程边界内吞掉 → 客户端收到 500 终态回复、进程不抛异常。但框架自己的
-// 在途记账仍必须归零——修前 inflight 永久 +1，下面的排空断言会真实失败（TimedOut）。
+/**
+ * T5：handler 抛异常的框架侧判别（真实 infra loopback，HTTP）。
+ * infra 契约（`http/Server.hpp`：异常由边界捕获转 InternalError）把 handler
+ * 异常在协程边界内吞掉 → 客户端收到 500 终态回复、进程不抛异常。但框架自己的
+ * 在途记账仍必须归零——修前 inflight 永久 +1，下面的排空断言会真实失败（TimedOut）。
+ */
 BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
@@ -591,7 +681,10 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
             -> fw::result<inf::http::Response> {
             st->calls.fetch_add(1);
             st->entered.Down();
-            throw std::runtime_error("http handler boom"); // 越过 _InvokeHttp 调用点
+            /**
+             * 越过 _InvokeHttp 调用点
+             */
+            throw std::runtime_error("http handler boom");
         });
     BOOST_REQUIRE(host->Create());
     BOOST_REQUIRE(host->Start());
@@ -622,9 +715,14 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
         succ);
     BOOST_REQUIRE(succ);
 
-    BOOST_REQUIRE(st->entered.WaitFor(5s)); // handler 已进入（抛异常前）
+    /**
+     * handler 已进入（抛异常前）
+     */
+    BOOST_REQUIRE(st->entered.WaitFor(5s));
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
-    // 客户端拿到终态回复：infra 边界把异常转 InternalError → 500。
+    /**
+     * 客户端拿到终态回复：infra 边界把异常转 InternalError → 500。
+     */
     BOOST_REQUIRE(http_state->done.WaitFor(5s));
     BOOST_REQUIRE(http_state->out.has_value());
     BOOST_REQUIRE_MESSAGE(
@@ -633,7 +731,9 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
     BOOST_CHECK_EQUAL(
         static_cast<int>(http_state->out.value().value().status_code), 500);
 
-    // 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
+    /**
+     * 判别点：异常栈展开已减一 → 排空成立。修前 inflight 停在 1 → TimedOut。
+     */
     auto drained = host->WaitHandlersDone(Clock::now() + 2s);
     BOOST_CHECK_MESSAGE(
         drained,
@@ -644,16 +744,18 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
     host->Close();
 }
 
-// T6（关闭收口责任移交回归）：迟到 handler/callback 排空收口责任由
-// WaitHandlersDone 承担（业务 inflight 归零 → CoRpcServer::Shutdown 同步封口），
-// 不再由 Close 的 5s 兜底掩盖。真实判别链（全部经同一真实 V2 loopback，无 mock）：
-//   1) 已 Start 宿主上发起真实 CALL，handler 挂起（inflight>0）；
-//   2) StopAccepting → WaitHandlersDone(有界期限) 必须返回 TimedOut——此时
-//      尚未封口，CoRpcServer 不得已 IsClosed；
-//   3) 放行 handler → WaitHandlersDone(Deadline::max) 续等必须成功完成
-//      （inflight 归零 → CoRpcServer::Shutdown 同步封口）；
-//   4) IsClosed() 为 true 证明封口已执行；随后宿主 Close() 释放
-//      owner（rpc_server() 置空）且 close_error() 为空。
+/**
+ * T6（关闭收口责任移交回归）：迟到 handler/callback 排空收口责任由
+ * WaitHandlersDone 承担（业务 inflight 归零 → CoRpcServer::Shutdown 同步封口），
+ * 不再由 Close 的 5s 兜底掩盖。真实判别链（全部经同一真实 V2 loopback，无 mock）：
+ * 1) 已 Start 宿主上发起真实 CALL，handler 挂起（inflight>0）；
+ * 2) StopAccepting → WaitHandlersDone(有界期限) 必须返回 TimedOut——此时
+ * 尚未封口，CoRpcServer 不得已 IsClosed；
+ * 3) 放行 handler → WaitHandlersDone(Deadline::max) 续等必须成功完成
+ * （inflight 归零 → CoRpcServer::Shutdown 同步封口）；
+ * 4) IsClosed() 为 true 证明封口已执行；随后宿主 Close() 释放
+ * owner（rpc_server() 置空）且 close_error() 为空。
+ */
 BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
 {
     if (!g_scheduler->IsInitialized()) {
@@ -706,43 +808,61 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
         succ);
     BOOST_REQUIRE(succ);
 
-    // handler 已过门并挂起（framework inflight==1 + infra inflight==1）。
+    /**
+     * handler 已过门并挂起（framework inflight==1 + infra inflight==1）。
+     */
     BOOST_REQUIRE(st->entered.WaitFor(5s));
     BOOST_CHECK_EQUAL(st->calls.load(), 1);
 
     host->StopAccepting();
 
-    // 有界期限：inflight>0 → TimedOut；此时 server 不得已被 Close/Stopped。
+    /**
+     * 有界期限：inflight>0 → TimedOut；此时 server 不得已被 Close/Stopped。
+     */
     auto r1 = host->WaitHandlersDone(Clock::now() + 150ms);
     BOOST_CHECK_MESSAGE(!r1, "drain must fail while handler in-flight");
     if (!r1)
         BOOST_CHECK(r1.error().code == fw::ErrorCode::TimedOut);
     BOOST_REQUIRE(host->rpc_server() != nullptr);
-    BOOST_CHECK(!host->rpc_server()->IsClosed()); // 未提前逻辑封口
+    /**
+     * 未提前逻辑封口
+     */
+    BOOST_CHECK(!host->rpc_server()->IsClosed());
 
-    // 放行 → Deadline::max 续等：inflight 归零 → Shutdown 封口。
+    /**
+     * 放行 → Deadline::max 续等：inflight 归零 → Shutdown 封口。
+     */
     st->handler_gate.Open();
     BOOST_REQUIRE(st->done.WaitFor(5s));
     auto r2 = host->WaitHandlersDone(co::Deadline::max());
     BOOST_CHECK_MESSAGE(
         r2, "Deadline::max retry must complete full server drain+stop chain");
 
-    // 收口凭据：CoRpcServer 已逻辑关闭（IsClosed）。
+    /**
+     * 收口凭据：CoRpcServer 已逻辑关闭（IsClosed）。
+     */
     BOOST_REQUIRE(host->rpc_server() != nullptr);
     BOOST_CHECK(host->rpc_server()->IsClosed());
 
-    // Close：取得收口凭据后停 Engine（Run 返回 + Phase==Stopped 实际检查）
-    // 并释放 owner——无 close_error 证明 Engine 未走「未达 Stopped 保留」路径。
+    /**
+     * Close：取得收口凭据后停 Engine（Run 返回 + Phase==Stopped 实际检查）
+     * 并释放 owner——无 close_error 证明 Engine 未走「未达 Stopped 保留」路径。
+     */
     host->Close();
     BOOST_CHECK(!host->close_error().has_value());
-    BOOST_CHECK(host->rpc_server() == nullptr); // owner 已释放
+    /**
+     * owner 已释放
+     */
+    BOOST_CHECK(host->rpc_server() == nullptr);
 
     caller.Stop();
 }
 
-// T7（直接 Close 兜底路径）：不经 StopAccepting/WaitHandlersDone 的裸
-// Close 也必须安全收口——同步 Shutdown 后正常释放（原同步关闭契约），
-// 不是把「未走 WaitHandlersDone」当永久失败保留 owner。
+/**
+ * T7（直接 Close 兜底路径）：不经 StopAccepting/WaitHandlersDone 的裸
+ * Close 也必须安全收口——同步 Shutdown 后正常释放（原同步关闭契约），
+ * 不是把「未走 WaitHandlersDone」当永久失败保留 owner。
+ */
 BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
 {
     if (!g_scheduler->IsInitialized()) {
@@ -768,17 +888,23 @@ BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
     BOOST_REQUIRE(host->Start());
     BOOST_REQUIRE(host->bound_address().has_value());
 
-    // 直接 Close：同步 Shutdown 必成功（无在途 handler/callback），
-    // owner 正常释放，close_error 为空。
+    /**
+     * 直接 Close：同步 Shutdown 必成功（无在途 handler/callback），
+     * owner 正常释放，close_error 为空。
+     */
     host->Close();
     BOOST_CHECK(!host->close_error().has_value());
     BOOST_CHECK(host->rpc_server() == nullptr);
-    // 幂等重入安全（不重复 join/get）。
+    /**
+     * 幂等重入安全（不重复 join/get）。
+     */
     host->Close();
 }
 
-// T8：Close 立即返回（不等暂停的 handler），析构不因 joinable 线程 terminate；
-// 关闭原因经公共读口发布，handler 放行后安全返回（HandlerState 自持）。
+/**
+ * T8：Close 立即返回（不等暂停的 handler），析构不因 joinable 线程 terminate；
+ * 关闭原因经公共读口发布，handler 放行后安全返回（HandlerState 自持）。
+ */
 BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
 {
     if (!g_scheduler->IsInitialized()) {
@@ -829,7 +955,9 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
     const auto begin = Clock::now();
     host->Close(fw::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
     const auto close_cost = Clock::now() - begin;
-    // handler 仍暂停：Close 的返回不得依赖它完成。
+    /**
+     * handler 仍暂停：Close 的返回不得依赖它完成。
+     */
     BOOST_CHECK(!st->returned.load());
     BOOST_CHECK_MESSAGE(close_cost < 2s,
                         "Close must not wait for paused handler");
@@ -838,7 +966,9 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
     BOOST_CHECK(reason->code == fw::ErrorCode::Unavailable);
     BOOST_CHECK_EQUAL(reason->message, "owner abort");
 
-    // 迟到进入者路径已被 Close 封口：排空等待立即拿到同一原因（不是硬编码文案）。
+    /**
+     * 迟到进入者路径已被 Close 封口：排空等待立即拿到同一原因（不是硬编码文案）。
+     */
     auto late = host->WaitHandlersDone(Clock::now() + 1s);
     BOOST_CHECK(!late);
     if (!late) {
@@ -846,8 +976,10 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
         BOOST_CHECK_EQUAL(late.error().message, "owner abort");
     }
 
-    // 析构安全：业务未完成时释放宿主，析构必须 join 而不是 terminate/detach；
-    // handler 由 HandlerState 保活，放行后安全返回（不访问已析构宿主）。
+    /**
+     * 析构安全：业务未完成时释放宿主，析构必须 join 而不是 terminate/detach；
+     * handler 由 HandlerState 保活，放行后安全返回（不访问已析构宿主）。
+     */
     std::atomic<bool> destroy_started{false};
     std::thread destroy([&host, &destroy_started] {
         destroy_started.store(true);
@@ -864,9 +996,11 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
     caller.Stop();
 }
 
-// T9：HostLifecycle 用明确状态（CloseReason）识别「排空被 Close 打断」，
-// 不再 park：跳过 on_handlers_drained（handler 可能仍借业务对象），走
-// on_release，返回 kExitShutdownFailed。
+/**
+ * T9：HostLifecycle 用明确状态（CloseReason）识别「排空被 Close 打断」，
+ * 不再 park：跳过 on_handlers_drained（handler 可能仍借业务对象），走
+ * on_release，返回 kExitShutdownFailed。
+ */
 BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
 {
     auto host = std::make_shared<InterruptStubHost>();
@@ -895,8 +1029,10 @@ BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
                         "failure list must record the close interrupt");
 }
 
-// T10：第一次排空超时、无界续等期间被 Close 打断——迟到收尾按 kExitShutdownLate
-// 报告，而不是因失败项改报 Failed，也不是 park。
+/**
+ * T10：第一次排空超时、无界续等期间被 Close 打断——迟到收尾按 kExitShutdownLate
+ * 报告，而不是因失败项改报 Failed，也不是 park。
+ */
 BOOST_AUTO_TEST_CASE(lifecycle_close_during_unbounded_retry_reports_late)
 {
     auto host = std::make_shared<InterruptStubHost>();

@@ -1,9 +1,11 @@
 #pragma once
-// framework v2 Actor 基类（契约 §5）。
-//
-// CoActor 与 CoComponent/CoService 共用 internal/ObjectBase.hpp 的身份基。本头只
-// 声明 ActorId/MailBox 身份面、生命周期与绑定 hook，以及 kActorType 声明 trait。
-// 消息分发、邮箱串行执行和动态 CreateActor 不在本切片。
+/**
+ * framework v2 Actor 基类（契约 §5）。
+ *
+ * CoActor 与 CoComponent/CoService 共用 internal/ObjectBase.hpp 的身份基。本头只
+ * 声明 ActorId/MailBox 身份面、生命周期与绑定 hook，以及 kActorType 声明 trait。
+ * 消息分发、邮箱串行执行和动态 CreateActor 不在本切片。
+ */
 
 #include <string>
 #include <string_view>
@@ -16,11 +18,17 @@
 
 namespace bbt::framework {
 
-class MonitorWriter;   // 监控写端（后续切片；仅前置声明）
+/**
+ * 监控写端（后续切片；仅前置声明）
+ */
+class MonitorWriter;
 
 namespace v2 {
 
-class CoComponent;     // GetComponent 静态断言的基类；实例化点须含 Component.hpp
+/**
+ * GetComponent 静态断言的基类；实例化点须含 Component.hpp
+ */
+class CoComponent;
 
 /**
  * @brief 受管 Actor 基类，提供 ActorId 与 MailBox 身份面。
@@ -38,17 +46,27 @@ class CoComponent;     // GetComponent 静态断言的基类；实例化点须�
  */
 class CoActor : public detail::ObjectBase {
 public:
-    /// @brief 返回 Actor 的稳定逻辑标识 (type, key)。
+    /**
+     * @brief 返回 Actor 的稳定逻辑标识 (type, key)。
+     */
     const ActorId& GetId() const noexcept { return m_actor_id; }
-    /// @brief 返回 Actor 的邮箱地址值；它是地址，不是对象引用。
+    /**
+     * @brief 返回 Actor 的邮箱地址值；它是地址，不是对象引用。
+     */
     const MailBox& GetMailBox() const noexcept { return m_mailbox; }
-    /// @brief 返回本 Actor 的非拥有对象句柄。
+    /**
+     * @brief 返回本 Actor 的非拥有对象句柄。
+     */
     ObjectHandle   Handle() const { return _ObjectHandle(); }
-    /// @brief 返回 Actor 的身份与状态快照，包含 actor_id 与 mailbox。
+    /**
+     * @brief 返回 Actor 的身份与状态快照，包含 actor_id 与 mailbox。
+     */
     ActorInfo      Info() const;
 
 protected:
-    /// @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+    /**
+     * @brief 受控构造，只接受 Registry 发放的 ConstructKey。
+     */
     explicit CoActor(detail::ConstructKey) {}
     ~CoActor() noexcept override = default;
 
@@ -121,13 +139,17 @@ struct CoActorStaticName {
     static std::string Get() { return {}; }
 };
 
-/// @brief CoActorStaticName 的偏特化：A 声明了 kActorType 时取其值。
+/**
+ * @brief CoActorStaticName 的偏特化：A 声明了 kActorType 时取其值。
+ */
 template <class A>
 struct CoActorStaticName<A, std::void_t<decltype(A::kActorType)>> {
     static std::string Get() { return std::string(A::kActorType); }
 };
 
-// ---- CoActor 模板定义 ----
+/**
+ * ---- CoActor 模板定义 ----
+ */
 
 template <class C>
 result<ComponentHandle<C>> CoActor::GetComponent(std::string_view name) const {

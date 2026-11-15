@@ -1,5 +1,7 @@
 #pragma once
-// 存储模式配置与 Mongo 订单记录转换，不承载服务编排。
+/**
+ * 存储模式配置与 Mongo 订单记录转换，不承载服务编排。
+ */
 #include <string>
 #include <bbt/example/ecommerce/v1/ecommerce.pb.h>
 #include <bbt/framework/ServiceContext.hpp>

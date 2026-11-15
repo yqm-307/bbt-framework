@@ -1,36 +1,38 @@
-// examples/dual_service/storage_main.cc — svc_a：存储服务进程。
-//
-// 业务形态：单进程托管一个 Concurrent 服务 "storage"，真实后端经
-// CoApp::add_resource 工厂装配为命名资源——Redis（"cache"，新 net 入口
-// bbt::infra::redis::CoRedisCli，经框架 RedisNetResource 适配进
-// ICoCloseable 关闭序列）与 MongoDB（"docs"，新 owner/句柄入口
-// bbt::infra::mongo::CoMongoDb + CoMongoColl，经框架 MongoDbResource
-// 适配进同一关闭序列；owner Close 返回即 ops 清空 + worker 全退），
-// handler 内 context().resource 取用。不再使用进程内 KvStore 替身：
-// put/get/del 落到真实后端往返，两端地址由命令行显式传入（无可达
-// 后端 → 工厂 Create 失败 → run 拒绝）。Redis 侧只接受数值
-// IPv4/IPv6（net::Address::Ip 不解析主机名，非法地址在装配期如实失败）。
-// 跨进程对端（gateway 经 static_routes 指向本进程）与 driver 都按 V2 会话
-// （SessionFrame + u32be + Hello/HelloAck）真实接入。
-//
-// 方法表：
-//   put(key, value)   写 Redis SET + Mongo upsert；空 key → InvalidArgument。
-//   get(key)          先查 Redis，miss 回退 Mongo；都未命中 → 业务错误
-//                     NotFound（非传输错误）。
-//   del(key)          Redis DEL + Mongo DeleteOne；命中回 int32 1。
-//   sleep_ms(ms)      挂起至多 ms 毫秒（等待一个永不完成的信号，deadline
-//                     取自入站上下文——调用方预算到期时如实 TimedOut）。
-//
-// 资源预算：put/get/del 的 Redis/Mongo 出站 deadline 取本请求入站上下文
-// deadline（V2 入站已按 min(传输硬看门, now+budget) 收敛），不使用无限
-// deadline——调用方预算耗尽时后端调用随之受限，不悬挂在无界等待上。
-//
-// 优雅关闭：SIGINT/SIGTERM → watcher 线程调用 request_shutdown →
-// CoApp::run 返回生命周期返回码（0 = kExitOk 按期收束）；关闭序列经
-// _CloseResources 把两个后端资源收束到 IsClosed 终态（RedisNetResource
-// 的 Close 内完成 client 逻辑封口 + Engine RequestClose/join/Stopped 核验；
-// MongoDbResource 的 Close 内完成集合句柄门禁 + owner 同步物理收口——
-// 与新入口关闭契约一致）。
+/**
+ * examples/dual_service/storage_main.cc — svc_a：存储服务进程。
+ *
+ * 业务形态：单进程托管一个 Concurrent 服务 "storage"，真实后端经
+ * CoApp::add_resource 工厂装配为命名资源——Redis（"cache"，新 net 入口
+ * bbt::infra::redis::CoRedisCli，经框架 RedisNetResource 适配进
+ * ICoCloseable 关闭序列）与 MongoDB（"docs"，新 owner/句柄入口
+ * bbt::infra::mongo::CoMongoDb + CoMongoColl，经框架 MongoDbResource
+ * 适配进同一关闭序列；owner Close 返回即 ops 清空 + worker 全退），
+ * handler 内 context().resource 取用。不再使用进程内 KvStore 替身：
+ * put/get/del 落到真实后端往返，两端地址由命令行显式传入（无可达
+ * 后端 → 工厂 Create 失败 → run 拒绝）。Redis 侧只接受数值
+ * IPv4/IPv6（net::Address::Ip 不解析主机名，非法地址在装配期如实失败）。
+ * 跨进程对端（gateway 经 static_routes 指向本进程）与 driver 都按 V2 会话
+ * （SessionFrame + u32be + Hello/HelloAck）真实接入。
+ *
+ * 方法表：
+ * put(key, value)   写 Redis SET + Mongo upsert；空 key → InvalidArgument。
+ * get(key)          先查 Redis，miss 回退 Mongo；都未命中 → 业务错误
+ * NotFound（非传输错误）。
+ * del(key)          Redis DEL + Mongo DeleteOne；命中回 int32 1。
+ * sleep_ms(ms)      挂起至多 ms 毫秒（等待一个永不完成的信号，deadline
+ * 取自入站上下文——调用方预算到期时如实 TimedOut）。
+ *
+ * 资源预算：put/get/del 的 Redis/Mongo 出站 deadline 取本请求入站上下文
+ * deadline（V2 入站已按 min(传输硬看门, now+budget) 收敛），不使用无限
+ * deadline——调用方预算耗尽时后端调用随之受限，不悬挂在无界等待上。
+ *
+ * 优雅关闭：SIGINT/SIGTERM → watcher 线程调用 request_shutdown →
+ * CoApp::run 返回生命周期返回码（0 = kExitOk 按期收束）；关闭序列经
+ * _CloseResources 把两个后端资源收束到 IsClosed 终态（RedisNetResource
+ * 的 Close 内完成 client 逻辑封口 + Engine RequestClose/join/Stopped 核验；
+ * MongoDbResource 的 Close 内完成集合句柄门禁 + owner 同步物理收口——
+ * 与新入口关闭契约一致）。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -67,16 +69,20 @@ fw::CoRpcResp ArgErr(const char* what) {
         fw::MakeError(fw::ErrorCode::InvalidArgument, what));
 }
 
-// 缺资源统一错误：资源缝在 run 期已装配成功才分发，缺失即框架 invariant
-// 被破坏，如实 RuntimeUnavailable。
+/**
+ * 缺资源统一错误：资源缝在 run 期已装配成功才分发，缺失即框架 invariant
+ * 被破坏，如实 RuntimeUnavailable。
+ */
 fw::CoRpcResp ResErr(const char* name) {
     return fw::CoRpcResp::Error(fw::MakeError(
         fw::ErrorCode::RuntimeUnavailable,
         std::string("storage: resource '") + name + "' missing"));
 }
 
-// Mongo 值文档：把 string value 编进 {_id:key, v:value} 的最小 BSON。
-// MongoDocument 是 owning bytes；只编码本服务用的 string 元素。
+/**
+ * Mongo 值文档：把 string value 编进 {_id:key, v:value} 的最小 BSON。
+ * MongoDocument 是 owning bytes；只编码本服务用的 string 元素。
+ */
 void BsonPutI32(std::vector<std::uint8_t>& b, std::int32_t v) {
     b.push_back(static_cast<std::uint8_t>(v & 0xFF));
     b.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFF));
@@ -89,7 +95,10 @@ void BsonPutCStr(std::vector<std::uint8_t>& b, std::string_view s) {
 }
 void BsonElemString(std::vector<std::uint8_t>& b,
                     std::string_view key, std::string_view val) {
-    b.push_back(0x02);                        // type: string
+    /**
+     * type: string
+     */
+    b.push_back(0x02);
     BsonPutCStr(b, key);
     BsonPutI32(b, static_cast<std::int32_t>(val.size() + 1));
     BsonPutCStr(b, val);
@@ -106,12 +115,16 @@ inf::mongo::MongoDocument DocKey(std::string_view key) {
     doc.bytes.push_back(0x00);
     return doc;
 }
-// update 文档：{$set:{v:value}}，upsert 语义由 UpdateOne 承担。
+/**
+ * update 文档：{$set:{v:value}}，upsert 语义由 UpdateOne 承担。
+ */
 inf::mongo::MongoDocument DocSet(std::string_view val) {
     std::vector<std::uint8_t> inner;
     BsonElemString(inner, "v", val);
     std::vector<std::uint8_t> body;
-    // $set 是嵌入文档元素（type 0x03）。
+    /**
+     * $set 是嵌入文档元素（type 0x03）。
+     */
     body.push_back(0x03);
     BsonPutCStr(body, "$set");
     BsonPutI32(body, static_cast<std::int32_t>(inner.size() + 5));
@@ -127,9 +140,11 @@ inf::mongo::MongoDocument DocSet(std::string_view val) {
     return doc;
 }
 
-// 资源调用统一取入站预算：Redis/Mongo 出站不得用无限 deadline——本请求从
-// wire 继承来的 deadline（上游已按 min(传输硬看门, now+budget) 收敛）就是
-// 后端调用的上限；无受管请求上下文即如实失败，不退化为无限等待。
+/**
+ * 资源调用统一取入站预算：Redis/Mongo 出站不得用无限 deadline——本请求从
+ * wire 继承来的 deadline（上游已按 min(传输硬看门, now+budget) 收敛）就是
+ * 后端调用的上限；无受管请求上下文即如实失败，不退化为无限等待。
+ */
 class StorageSvc final : public fw::CoService<StorageSvc> {
 public:
     static constexpr std::string_view kServiceName = "storage";
@@ -157,7 +172,9 @@ public:
         auto budget = ResourceBudget();
         if (!budget) return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
-        // 真实双写：Redis SET 与 Mongo upsert 都成功才回写好的值。
+        /**
+         * 真实双写：Redis SET 与 Mongo upsert 都成功才回写好的值。
+         */
         if (auto r = bbt_co_await cache->Set(key, value, o); !r)
             return fw::CoRpcResp::Error(r.error());
         if (auto r = bbt_co_await docs->UpdateOne(DocKey(key), DocSet(value), o); !r)
@@ -177,7 +194,9 @@ public:
         auto budget = ResourceBudget();
         if (!budget) return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
-        // 真实读路径：Redis GET 命中即回；miss 回退 Mongo FindOne。
+        /**
+         * 真实读路径：Redis GET 命中即回；miss 回退 Mongo FindOne。
+         */
         auto hit = bbt_co_await cache->Get(args.value(), o);
         if (!hit) return fw::CoRpcResp::Error(hit.error());
         if (hit.value().has_value())
@@ -185,11 +204,15 @@ public:
         auto doc = bbt_co_await docs->FindOne(DocKey(args.value()), o);
         if (!doc) return fw::CoRpcResp::Error(doc.error());
         if (doc.value().has_value()) {
-            // 命中 Mongo 即算命中（值本体在文档字节里，示例只证真实往返）。
+            /**
+             * 命中 Mongo 即算命中（值本体在文档字节里，示例只证真实往返）。
+             */
             return fw::CoRpcResp::From(
                 std::string{"mongo-hit:"} + args.value());
         }
-        // 两端都未命中：业务错误 NotFound，不是传输失败。
+        /**
+         * 两端都未命中：业务错误 NotFound，不是传输失败。
+         */
         return fw::CoRpcResp::Error(fw::MakeError(
             fw::ErrorCode::NotFound,
             "storage.get: key '" + args.value() + "' not found"));
@@ -219,9 +242,11 @@ public:
         if (args.value() < 0) return ArgErr("storage.sleep_ms: negative ms");
         auto ctx = context().request();
         if (!ctx) return fw::CoRpcResp::Error(ctx.error());
-        // 在永不通知的 CoWaiter 上带预算等待：等价于协作式 sleep，入站
-        // deadline 到期以 TimedOut 如实返回，协程级 RequestCancel 到达则
-        // 返回 Cancelled（deadline 取入站预算，本示例不另叠 ms 上限）。
+        /**
+         * 在永不通知的 CoWaiter 上带预算等待：等价于协作式 sleep，入站
+         * deadline 到期以 TimedOut 如实返回，协程级 RequestCancel 到达则
+         * 返回 Cancelled（deadline 取入站预算，本示例不另叠 ms 上限）。
+         */
         auto gate = co::sync::CoWaiter::Create();
         co::WaitOptions wo;
         wo.deadline = ctx.value()->deadline;
@@ -241,9 +266,11 @@ public:
         fw::Method<&StorageSvc::SleepMs>("sleep_ms"));
 };
 
-// signal → flag：handler 只做 async-signal-safe 的 atomic store；
-// watcher 线程轮询后调用 request_shutdown（避免在信号上下文里
-// 触碰 condition_variable）。
+/**
+ * signal → flag：handler 只做 async-signal-safe 的 atomic store；
+ * watcher 线程轮询后调用 request_shutdown（避免在信号上下文里
+ * 触碰 condition_variable）。
+ */
 std::atomic_bool g_stop{false};
 
 void InstallSignals() {
@@ -251,8 +278,10 @@ void InstallSignals() {
     std::signal(SIGTERM, [](int) { g_stop.store(true); });
 }
 
-// 十进制端口解析：只接受 1..65535 的数字串。刻意不走 std::stoi——异常未捕获
-// 会让进程 terminate，而非法端口是普通用法错误，应给诊断后正常退出。
+/**
+ * 十进制端口解析：只接受 1..65535 的数字串。刻意不走 std::stoi——异常未捕获
+ * 会让进程 terminate，而非法端口是普通用法错误，应给诊断后正常退出。
+ */
 bool ParsePort(const char* text, std::uint16_t* out) {
     if (text == nullptr || *text == '\0') return false;
     unsigned long value = 0;
@@ -266,9 +295,11 @@ bool ParsePort(const char* text, std::uint16_t* out) {
     return true;
 }
 
-// "host:port" → (host, port)；port 段缺失/非法 → port=0（调用方据此给诊断退出，
-// infra 的 net::Address::Ip 仍是同一个 0/非法值的后端兜底）。不静默猜测、
-// 不抛异常。
+/**
+ * "host:port" → (host, port)；port 段缺失/非法 → port=0（调用方据此给诊断退出，
+ * infra 的 net::Address::Ip 仍是同一个 0/非法值的后端兜底）。不静默猜测、
+ * 不抛异常。
+ */
 std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     const auto pos = addr.rfind(':');
     if (pos == std::string::npos) return {addr, 0};
@@ -278,48 +309,63 @@ std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     return {addr.substr(0, pos), port};
 }
 
-// Redis 建连预算与工厂等待窗口：预算给 Connect 本身，窗口 = 预算 + 1s 宽限。
-// 两者等宽时「拨号在预算内刚成功」与「等待窗口到期」会同刻判定，把成功建连
-// 误判成超时（协程落定 promise 还要再被调度线程推进一格）。失败/超时路径的
-// 收尾由 RedisNetResource::Close 承担：client 逻辑封口 + Engine
-// RequestClose/join/Phase==Stopped 核验一次完成（幂等、任意线程可调）；被
-// 投递的协程按值持有 shared_ptr，故 Close 后迟到的 Connect 回调不会踩到
-// 已释放对象。
+/**
+ * Redis 建连预算与工厂等待窗口：预算给 Connect 本身，窗口 = 预算 + 1s 宽限。
+ * 两者等宽时「拨号在预算内刚成功」与「等待窗口到期」会同刻判定，把成功建连
+ * 误判成超时（协程落定 promise 还要再被调度线程推进一格）。失败/超时路径的
+ * 收尾由 RedisNetResource::Close 承担：client 逻辑封口 + Engine
+ * RequestClose/join/Phase==Stopped 核验一次完成（幂等、任意线程可调）；被
+ * 投递的协程按值持有 shared_ptr，故 Close 后迟到的 Connect 回调不会踩到
+ * 已释放对象。
+ */
 constexpr auto kRedisConnectBudget = std::chrono::milliseconds{5000};
 constexpr auto kRedisConnectWait   = std::chrono::milliseconds{6000};
 
 } // namespace
 
 int main(int argc, char** argv) {
-    // 用法: svc_a <listen_port> <redis_addr host:port> <mongo_uri>
+    /**
+     * 用法: svc_a <listen_port> <redis_addr host:port> <mongo_uri>
+     */
     if (argc != 4) {
         std::fprintf(stderr,
             "usage: svc_a <listen_port> <redis_addr host:port> <mongo_uri>\n");
-        return 64;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 64;
     }
     std::uint16_t port = 0;
     if (!ParsePort(argv[1], &port)) {
         std::fprintf(stderr,
             "[svc_a] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
             argv[1]);
-        return 64;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 64;
     }
     const auto [rhost, rport] = SplitAddr(argv[2]);
     if (rhost.empty() || rport == 0) {
         std::fprintf(stderr,
             "[svc_a] FATAL: 非法 redis_addr \"%s\"（需要 host:port，端口 1..65535）\n",
             argv[2]);
-        return 64;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 64;
     }
     const std::string mongo_uri = argv[3];
 
-    // 嵌套出站链的协程栈需求见实测记录：默认 12KB 触底，
-    // 本进程 handler 经资源缝发起真实 Redis/Mongo 出站，与对端保持同一配置。
-    // static worker 槽位 = 3（最小充分值）：每个 net::Engine 绑定
-    // slot_count = max(1, num_event_loop) + (server ? 1 : 0)，槽位在 Run 时
-    // 从 static worker 绑定。本进程：RedisNetResource 的 client-only Engine
-    // 1 槽 + RPC server Engine 2 槽（1 sub + 1 main）= 3；2 worker 时 bind 报
-    // no_buffer_space，InfraHttpHost::Start 失败。
+    /**
+     * 嵌套出站链的协程栈需求见实测记录：默认 12KB 触底，
+     * 本进程 handler 经资源缝发起真实 Redis/Mongo 出站，与对端保持同一配置。
+     * static worker 槽位 = 3（最小充分值）：每个 net::Engine 绑定
+     * slot_count = max(1, num_event_loop) + (server ? 1 : 0)，槽位在 Run 时
+     * 从 static worker 绑定。本进程：RedisNetResource 的 client-only Engine
+     * 1 槽 + RPC server Engine 2 槽（1 sub + 1 main）= 3；2 worker 时 bind 报
+     * no_buffer_space，InfraHttpHost::Start 失败。
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 
@@ -331,10 +377,15 @@ int main(int argc, char** argv) {
         /*max_body_bytes*/  65536,
         /*incoming_timeout*/std::chrono::milliseconds{30000}};
     opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
-    // V2 会话：入站预算经 wire 的 remaining_budget_ms 与本地 incoming_timeout
-    // 取 local-min 后才对 handler 可见，资源调用据此获得有限预算。
+    /**
+     * V2 会话：入站预算经 wire 的 remaining_budget_ms 与本地 incoming_timeout
+     * 取 local-min 后才对 handler 可见，资源调用据此获得有限预算。
+     */
     opts.local_identity = "dual-storage";
-    opts.static_routes = {};                    // 纯被调方：无出站 RPC 路由
+    /**
+     * 纯被调方：无出站 RPC 路由
+     */
+    opts.static_routes = {};
     opts.shutdown_step_budget = std::chrono::milliseconds{2000};
 
     fw::CoApp app{opts};
@@ -347,13 +398,15 @@ int main(int argc, char** argv) {
         return 65;
     }
 
-    // 真实后端：工厂形态装配。RedisNetResource::Create 在控制线程完成
-    // Engine Run 线程拉起 + 等 Running + client 装配（新入口：
-    // net::Engine + 数值 net::Address）；显式 Connect 只允许协程上下文。
-    // Mongo 的 Create 走旧 ICoCloseable 工厂形态不变——两个后端在
-    // on_scheduler_started 相位各自装配，关闭序列统一收束到 IsClosed。
-    // Redis 地址只接受数值 IPv4/IPv6：host:port 注入若含主机名/非法段在
-    // 装配前如实退出（EX_USAGE），不静默猜测。
+    /**
+     * 真实后端：工厂形态装配。RedisNetResource::Create 在控制线程完成
+     * Engine Run 线程拉起 + 等 Running + client 装配（新入口：
+     * net::Engine + 数值 net::Address）；显式 Connect 只允许协程上下文。
+     * Mongo 的 Create 走旧 ICoCloseable 工厂形态不变——两个后端在
+     * on_scheduler_started 相位各自装配，关闭序列统一收束到 IsClosed。
+     * Redis 地址只接受数值 IPv4/IPv6：host:port 注入若含主机名/非法段在
+     * 装配前如实退出（EX_USAGE），不静默猜测。
+     */
     std::error_code raddr_ec;
     auto redis_address = inf::net::Address::Ip(rhost, rport, raddr_ec);
     if (raddr_ec || !redis_address.Valid()) {
@@ -361,14 +414,19 @@ int main(int argc, char** argv) {
             "[svc_a] FATAL: 非法 redis_addr \"%s\"（新入口只接受数值 "
             "IPv4/IPv6: %s）\n",
             argv[2], raddr_ec.message().c_str());
-        return 64;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 64;
     }
-    // Redis 工厂：Create 只建对象（含 Engine Run 线程）；命令要求先 Connect，
-    // 而 Connect 只允许在协程上下文调用。故工厂投递一个显式 Connect 到
-    // Scheduler，并在控制线程等它结束（与 tests live 验收同口径）——只有
-    // Connected 实例才交框架绑定 Service，使 ready 先于入站接纳；交付前任何
-    // 失败路径都同步 Close，不留半装配句柄。（否则 handler 首次命令会得到
-    // RuntimeUnavailable "redis: not connected"。）
+    /**
+     * Redis 工厂：Create 只建对象（含 Engine Run 线程）；命令要求先 Connect，
+     * 而 Connect 只允许在协程上下文调用。故工厂投递一个显式 Connect 到
+     * Scheduler，并在控制线程等它结束（与 tests live 验收同口径）——只有
+     * Connected 实例才交框架绑定 Service，使 ready 先于入站接纳；交付前任何
+     * 失败路径都同步 Close，不留半装配句柄。（否则 handler 首次命令会得到
+     * RuntimeUnavailable "redis: not connected"。）
+     */
     if (auto r = app.add_resource<fw::RedisNetResource>("cache",
             [redis_address]() -> inf::result<std::shared_ptr<fw::RedisNetResource>> {
             auto created = fw::RedisNetResource::Create(redis_address);
@@ -416,11 +474,13 @@ int main(int argc, char** argv) {
         return 65;
     }
 
-    // Mongo：新 owner/句柄入口——MongoRuntimeConfig 只携带连接预算，
-    // database/collection 目标值由 MongoDbResource 绑定为集合句柄
-    // （target 不再走旧 MongoClientConfig 的 database/collection 字段）。
-    // MongoDbResource::Create 在控制线程完成 Validate + owner Create/Start +
-    // Collection 绑定；owner Close 是同步物理收口（ops 清空 + worker 全退）。
+    /**
+     * Mongo：新 owner/句柄入口——MongoRuntimeConfig 只携带连接预算，
+     * database/collection 目标值由 MongoDbResource 绑定为集合句柄
+     * （target 不再走旧 MongoClientConfig 的 database/collection 字段）。
+     * MongoDbResource::Create 在控制线程完成 Validate + owner Create/Start +
+     * Collection 绑定；owner Close 是同步物理收口（ops 清空 + worker 全退）。
+     */
     inf::mongo::MongoRuntimeConfig mcfg;
     mcfg.uri                      = mongo_uri;
     mcfg.worker_threads           = 2;
@@ -451,7 +511,10 @@ int main(int argc, char** argv) {
                 "(redis=%s mongo=%s)\n",
                 port, argv[2], mongo_uri.c_str());
     std::fflush(stdout);
-    const int rc = app.run();   // 0 = kExitOk
+    /**
+     * 0 = kExitOk
+     */
+    const int rc = app.run();
     g_stop.store(true, std::memory_order_release);
     watcher.join();
     std::printf("[svc_a] run() returned %d, shutdown_state=%d\n",

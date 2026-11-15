@@ -1,5 +1,7 @@
 #pragma once
-// 独立结算服务，拥有账单集合；不接入真实支付。
+/**
+ * 独立结算服务，拥有账单集合；不接入真实支付。
+ */
 #include <string_view>
 #include <bbt/example/ecommerce/v1/ecommerce.pb.h>
 #include <bbt/framework/CoService.hpp>

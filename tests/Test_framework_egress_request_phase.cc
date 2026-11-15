@@ -1,22 +1,24 @@
-// 下游 request-phase/OutcomeUnknown 消费验收（V2 SessionFrame wire）：
-// committed→OutcomeUnknown；另覆盖发送前过期、未提交失败、remaining budget；
-// 不覆盖并发/容量/关闭矩阵。
-// 消费已合入 infra 的公开 request-phase / OutcomeUnknown 契约
-// （bbt::infra::RequestPhase、IsRequestCommitted、Error::request_phase），
-// 在真实 framework RpcEgress（V2 会话 owner）上机器断言：
-//   T1 发送前已过期     → TimedOut，request_phase=nullopt，服务端零连接（无 I/O）；
-//   T2 连接被拒         → 未提交的确定失败（TransportError 保留），phase 未提交；
-//   T3 完整写出后丢 reply → 升级为 OutcomeUnknown 且 phase=RequestCommitted，
-//                        服务端只被连接一次（一次终态、无 retry）；
-//   T4 remaining budget → 发送端从本地 deadline 换算出 remaining_budget_ms；
-//                        deadline 明显超过 wire 上限时 clamp 到 kRpcV2MaxRemainingBudgetMs。
-//
-// 对端是测试自有的裸 TCP loopback 端点：完成 Hello/HelloAck 后读满一整帧
-// SessionFrame（u32be 前缀 + body）即视为请求已提交，随后不回复直接断开。
-// 不使用固定 sleep、不放宽断言、不解析错误消息猜阶段；断言只读公开
-// Error / request_phase 与 wire 字段本身，不接触 Beast/Asio/socket 类型。
-//
-// 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
+/**
+ * 下游 request-phase/OutcomeUnknown 消费验收（V2 SessionFrame wire）：
+ * committed→OutcomeUnknown；另覆盖发送前过期、未提交失败、remaining budget；
+ * 不覆盖并发/容量/关闭矩阵。
+ * 消费已合入 infra 的公开 request-phase / OutcomeUnknown 契约
+ * （bbt::infra::RequestPhase、IsRequestCommitted、Error::request_phase），
+ * 在真实 framework RpcEgress（V2 会话 owner）上机器断言：
+ * T1 发送前已过期     → TimedOut，request_phase=nullopt，服务端零连接（无 I/O）；
+ * T2 连接被拒         → 未提交的确定失败（TransportError 保留），phase 未提交；
+ * T3 完整写出后丢 reply → 升级为 OutcomeUnknown 且 phase=RequestCommitted，
+ * 服务端只被连接一次（一次终态、无 retry）；
+ * T4 remaining budget → 发送端从本地 deadline 换算出 remaining_budget_ms；
+ * deadline 明显超过 wire 上限时 clamp 到 kRpcV2MaxRemainingBudgetMs。
+ *
+ * 对端是测试自有的裸 TCP loopback 端点：完成 Hello/HelloAck 后读满一整帧
+ * SessionFrame（u32be 前缀 + body）即视为请求已提交，随后不回复直接断开。
+ * 不使用固定 sleep、不放宽断言、不解析错误消息猜阶段；断言只读公开
+ * Error / request_phase 与 wire 字段本身，不接触 Beast/Asio/socket 类型。
+ *
+ * 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
+ */
 
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
@@ -59,16 +61,22 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-// 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测；
-// V2 egress 使用宿主共享会话 owner 与独立 client-only Engine
-// 驱动槽）。runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
+/**
+ * 协程用例需要真实调度器；2 个静态 worker 足够（用例内不并发压测；
+ * V2 egress 使用宿主共享会话 owner 与独立 client-only Engine
+ * 驱动槽）。runtime 是进程寿命单例：只 Start 一次、无 Stop；已初始化则复用。
+ */
 struct SchedulerFixture {
     SchedulerFixture() {
-        // Registered driver capacity: app server 2 + app egress 1 + raw peer driver 1 + runnable worker 1.
+        /**
+         * Registered driver capacity: app server 2 + app egress 1 + raw peer driver 1 + runnable worker 1.
+         */
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
-        // 用例在协程内做 proto wire 编解码与嵌套调用；默认 12KB 栈在
-        // 同仓 inbound_http 用例的同一条出站链上已实测触底（guard 页
-        // SIGSEGV）。按同口径在 Start() 前放大到 64 KiB。
+        /**
+         * 用例在协程内做 proto wire 编解码与嵌套调用；默认 12KB 栈在
+         * 同仓 inbound_http 用例的同一条出站链上已实测触底（guard 页
+         * SIGSEGV）。按同口径在 Start() 前放大到 64 KiB。
+         */
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
         if (!g_scheduler->IsInitialized())
             g_scheduler->Start();
@@ -97,9 +105,11 @@ private:
 
 constexpr std::chrono::milliseconds kWait{15000};
 
-// ── 最小 SessionFrame 读取（只取本测试需要的两个字段）────────────────
-// 帧格式：u32be payload_length | SessionFrame body（profile 2）。
-// 只做「读满一帧」与 varint/LEN 字段定位，不复制 infra 的完整 codec。
+/**
+ * ── 最小 SessionFrame 读取（只取本测试需要的两个字段）────────────────
+ * 帧格式：u32be payload_length | SessionFrame body（profile 2）。
+ * 只做「读满一帧」与 varint/LEN 字段定位，不复制 infra 的完整 codec。
+ */
 
 bool ReadExact(int fd, void* out, std::size_t want) {
     auto* p = static_cast<char*>(out);
@@ -130,7 +140,9 @@ bool ReadVarint(const std::string& b, std::size_t& pos, std::uint64_t& v) {
     return false;
 }
 
-// 顺序扫一遍 body，取指定 field 的值（varint 或 LEN bytes）。
+/**
+ * 顺序扫一遍 body，取指定 field 的值（varint 或 LEN bytes）。
+ */
 bool FrameField(const std::string& body, int want_field, std::uint64_t* varint_out,
                 std::string* bytes_out) {
     std::size_t pos = 0;
@@ -166,7 +178,9 @@ bool FrameField(const std::string& body, int want_field, std::uint64_t* varint_o
     return true;
 }
 
-// 写一整帧：u32be 前缀 + body。
+/**
+ * 写一整帧：u32be 前缀 + body。
+ */
 bool WriteFrame(int fd, const std::string& body) {
     const std::uint32_t n = static_cast<std::uint32_t>(body.size());
     std::string out;
@@ -185,7 +199,9 @@ bool WriteFrame(int fd, const std::string& body) {
     return true;
 }
 
-// 握手帧（Hello/HelloAck）的最小 body 编码：只写本测试用到的字段。
+/**
+ * 握手帧（Hello/HelloAck）的最小 body 编码：只写本测试用到的字段。
+ */
 std::string HandshakeBody(int kind, const std::string& identity,
                           std::uint64_t epoch, std::uint64_t nonce) {
     std::string b;
@@ -206,21 +222,46 @@ std::string HandshakeBody(int kind, const std::string& identity,
     auto len = [&](int field, const std::string& s) {
         return tag(field, 2) + varint(s.size()) + s;
     };
-    b += tag(1, 0) + varint(2);      // profile_version
-    b += tag(2, 0) + varint(kind);   // frame_kind
-    b += tag(3, 0) + varint(0);      // traffic_class = SYSTEM
-    b += len(4, identity);           // peer_identity
-    b += tag(5, 0) + varint(epoch);  // session_epoch
-    b += tag(20, 0) + varint(nonce); // connection_nonce
+    /**
+     * profile_version
+     */
+    b += tag(1, 0) + varint(2);
+    /**
+     * frame_kind
+     */
+    b += tag(2, 0) + varint(kind);
+    /**
+     * traffic_class = SYSTEM
+     */
+    b += tag(3, 0) + varint(0);
+    /**
+     * peer_identity
+     */
+    b += len(4, identity);
+    /**
+     * session_epoch
+     */
+    b += tag(5, 0) + varint(epoch);
+    /**
+     * connection_nonce
+     */
+    b += tag(20, 0) + varint(nonce);
     return b;
 }
 
-// 读一整帧 SessionFrame（u32be 前缀 + body）。收回整帧即表示请求字节已完整
-// 到达对端；返回 false 表示读失败/连接被中断。
+/**
+ * 读一整帧 SessionFrame（u32be 前缀 + body）。收回整帧即表示请求字节已完整
+ * 到达对端；返回 false 表示读失败/连接被中断。
+ */
 bool ReadFrameBody(int fd, std::string& body_out) {
-    // 有界收口：对已接受连接设接收超时，避免「连接后不发完整帧」时
-    // ::recv 永久阻塞，导致 Stop() 的 join 只能靠 ctest 超时兜底。
-    timeval rcvto{1, 0};   // 1s
+    /**
+     * 有界收口：对已接受连接设接收超时，避免「连接后不发完整帧」时
+     * ::recv 永久阻塞，导致 Stop() 的 join 只能靠 ctest 超时兜底。
+     */
+    /**
+     * 1s
+     */
+    timeval rcvto{1, 0};
     if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto)) != 0)
         return false;
     unsigned char prefix[4] = {0, 0, 0, 0};
@@ -231,13 +272,18 @@ bool ReadFrameBody(int fd, std::string& body_out) {
                               (static_cast<std::uint32_t>(prefix[2]) << 8) |
                               static_cast<std::uint32_t>(prefix[3]);
     if (len == 0 || len > (1u << 20))
-        return false; // 防御：不无界增长
+        /**
+         * 防御：不无界增长
+         */
+        return false;
     body_out.assign(len, '\0');
     return ReadExact(fd, body_out.data(), len);
 }
 
-// 对端（epoch owner，identity 字典序更小）完成 Hello/HelloAck 后读首个 CALL。
-// 成功即代表：客户端已完成握手并把整帧请求写到本端。
+/**
+ * 对端（epoch owner，identity 字典序更小）完成 Hello/HelloAck 后读首个 CALL。
+ * 成功即代表：客户端已完成握手并把整帧请求写到本端。
+ */
 bool HandshakeAndReadCall(int fd, std::string& call_body,
                           std::atomic<bool>* ack_verified) {
     constexpr std::uint64_t kPeerEpoch = 1001;
@@ -287,9 +333,11 @@ bool HandshakeAndReadCall(int fd, std::string& call_body,
     return FrameField(call_body, 2, &call_kind, nullptr) && call_kind == 3;
 }
 
-// 测试自有裸 TCP loopback 端点：接受连接 → 握手 → 读完一整帧 CALL → 不回复
-// 直接断开。这是唯一形态（没有可切换的丢弃开关）：只有完整收下请求才置
-// commit 标记，读失败/超时则不计。记录被连接次数，用于断言一次终态/无 retry。
+/**
+ * 测试自有裸 TCP loopback 端点：接受连接 → 握手 → 读完一整帧 CALL → 不回复
+ * 直接断开。这是唯一形态（没有可切换的丢弃开关）：只有完整收下请求才置
+ * commit 标记，读失败/超时则不计。记录被连接次数，用于断言一次终态/无 retry。
+ */
 struct LoopbackPeer {
     int                listen_fd = -1;
     std::uint16_t      port      = 0;
@@ -332,7 +380,10 @@ struct LoopbackPeer {
             fd_set rf;
             FD_ZERO(&rf);
             FD_SET(listen_fd, &rf);
-            timeval tv{0, 100000};   // 100ms 轮询，仅为可停止；不用于推断时序
+            /**
+             * 100ms 轮询，仅为可停止；不用于推断时序
+             */
+            timeval tv{0, 100000};
             const int r = ::select(listen_fd + 1, &rf, nullptr, nullptr, &tv);
             if (r <= 0) continue;
             const int c = ::accept(listen_fd, nullptr, nullptr);
@@ -348,7 +399,10 @@ struct LoopbackPeer {
                 body_ready.store(true, std::memory_order_release);
                 got_commit.store(true, std::memory_order_release);
             }
-            ::close(c);   // 不回复，直接断开（丢 reply）
+            /**
+             * 不回复，直接断开（丢 reply）
+             */
+            ::close(c);
         }
     }
 
@@ -366,7 +420,9 @@ struct LoopbackPeer {
     }
 };
 
-// 绑定后立即关闭、不 listen：该端口对 connect 回 ECONNREFUSED（未建立连接）。
+/**
+ * 绑定后立即关闭、不 listen：该端口对 connect 回 ECONNREFUSED（未建立连接）。
+ */
 std::uint16_t ReservedRefusedPort() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return 0;
@@ -397,7 +453,10 @@ inf::rpc::Request MakeEnvelope(const char* rid) {
         .SetResponseSchema("probe.v1.ProbeResponse")
         .SetReply(inf::rpc::ReplyMode::Required)
         .SetTraffic(inf::rpc::TrafficClass::Service)
-        .SetPayload({0x08, 0x01}); // 任意载荷字节；wire 只做搬运
+        /**
+         * 任意载荷字节；wire 只做搬运
+         */
+        .SetPayload({0x08, 0x01});
     return env;
 }
 
@@ -422,14 +481,19 @@ struct EgressHost {
     void Stop() { if (host) host->Close(); }
 };
 
-// 在真实协程内调用框架出站（RpcEgress::Call 是协程阻塞调用）。
-//
-// 超时安全：协程侧经 shared_ptr 按值捕获一块独立堆状态，不引用调用者栈上
-// 对象。若 WaitFor 超时，BOOST_REQUIRE 返回后迟到的协程仍写该堆状态，不会
-// 形成栈悬垂（与 infra F-2 同类的迟到回调访问问题）。成功路径的时序与断言
-// 与修前一致。
+/**
+ * 在真实协程内调用框架出站（RpcEgress::Call 是协程阻塞调用）。
+ *
+ * 超时安全：协程侧经 shared_ptr 按值捕获一块独立堆状态，不引用调用者栈上
+ * 对象。若 WaitFor 超时，BOOST_REQUIRE 返回后迟到的协程仍写该堆状态，不会
+ * 形成栈悬垂（与 infra F-2 同类的迟到回调访问问题）。成功路径的时序与断言
+ * 与修前一致。
+ */
 struct EgressCallState {
-    std::shared_ptr<fw::InfraHttpHost> host;     // 迟到返回前 runtime 不释放
+    /**
+     * 迟到返回前 runtime 不释放
+     */
+    std::shared_ptr<fw::InfraHttpHost> host;
     std::shared_ptr<fw::RpcEgress> egress;
     std::string target;
     inf::rpc::Request env;
@@ -465,7 +529,9 @@ BOOST_TEST_GLOBAL_FIXTURE(SchedulerFixture);
 
 BOOST_AUTO_TEST_SUITE(framework_egress_phase)
 
-// T1：发送前已过期 → TimedOut，request_phase 无值；对端零连接（不做任何 I/O）。
+/**
+ * T1：发送前已过期 → TimedOut，request_phase 无值；对端零连接（不做任何 I/O）。
+ */
 BOOST_AUTO_TEST_CASE(expired_budget_no_io_not_unknown) {
     EgressHost eh;
     BOOST_REQUIRE(eh.Start());
@@ -491,7 +557,9 @@ BOOST_AUTO_TEST_CASE(expired_budget_no_io_not_unknown) {
     eh.Stop();
 }
 
-// T2：连接被拒 → 未提交的确定失败；保留 TransportError，阶段未提交（非未知）。
+/**
+ * T2：连接被拒 → 未提交的确定失败；保留 TransportError，阶段未提交（非未知）。
+ */
 BOOST_AUTO_TEST_CASE(connection_refused_is_transport_not_unknown) {
     EgressHost eh;
     BOOST_REQUIRE(eh.Start());
@@ -506,9 +574,11 @@ BOOST_AUTO_TEST_CASE(connection_refused_is_transport_not_unknown) {
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(!static_cast<bool>(*res));
         const inf::Error& e = res->error();
-        // 共享 V2 会话 owner（runtime 限额 owner）出站：连接被拒是「未提交」的
-        // 确定失败——判别点是「非 OutcomeUnknown、非已提交」。request_phase
-        // 在新栈契约下允许为空（NetToError 无阶段事实）；有值时必为未提交。
+        /**
+         * 共享 V2 会话 owner（runtime 限额 owner）出站：连接被拒是「未提交」的
+         * 确定失败——判别点是「非 OutcomeUnknown、非已提交」。request_phase
+         * 在新栈契约下允许为空（NetToError 无阶段事实）；有值时必为未提交。
+         */
         BOOST_TEST(static_cast<int>(e.code) ==
                    static_cast<int>(fw::ErrorCode::TransportError));
         BOOST_TEST(static_cast<int>(e.code) !=
@@ -520,7 +590,9 @@ BOOST_AUTO_TEST_CASE(connection_refused_is_transport_not_unknown) {
     eh.Stop();
 }
 
-// T3：完整写出后丢 reply → OutcomeUnknown，phase=RequestCommitted；对端只连接一次。
+/**
+ * T3：完整写出后丢 reply → OutcomeUnknown，phase=RequestCommitted；对端只连接一次。
+ */
 BOOST_AUTO_TEST_CASE(committed_reply_loss_is_outcome_unknown) {
     EgressHost eh;
     BOOST_REQUIRE(eh.Start());
@@ -535,7 +607,9 @@ BOOST_AUTO_TEST_CASE(committed_reply_loss_is_outcome_unknown) {
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(!static_cast<bool>(*res));
         const inf::Error& e = res->error();
-        // 真实 loopback：对端已收全请求（commit 标记）后不回复。
+        /**
+         * 真实 loopback：对端已收全请求（commit 标记）后不回复。
+         */
         BOOST_REQUIRE_MESSAGE(peer.got_commit.load(),
                               "server did not receive a complete request");
         BOOST_TEST(static_cast<int>(e.code) ==
@@ -546,14 +620,18 @@ BOOST_AUTO_TEST_CASE(committed_reply_loss_is_outcome_unknown) {
         BOOST_TEST(inf::IsRequestCommitted(*e.request_phase));
     }
 
-    // 一次终态、无 retry：对端只被连接一次。
+    /**
+     * 一次终态、无 retry：对端只被连接一次。
+     */
     BOOST_TEST(peer.accepts.load() == 1);
     peer.Stop();
     eh.Stop();
 }
 
-// T4：发送端 remaining budget 由本地 deadline 换算；deadline 明显超过 wire 上限时被
-// clamp 到 kRpcV2MaxRemainingBudgetMs（可判别常量哨兵实现）。
+/**
+ * T4：发送端 remaining budget 由本地 deadline 换算；deadline 明显超过 wire 上限时被
+ * clamp 到 kRpcV2MaxRemainingBudgetMs（可判别常量哨兵实现）。
+ */
 BOOST_AUTO_TEST_CASE(remaining_budget_propagated_within_bounds) {
     EgressHost eh;
     BOOST_REQUIRE(eh.Start());
@@ -562,15 +640,20 @@ BOOST_AUTO_TEST_CASE(remaining_budget_propagated_within_bounds) {
 
     {
         inf::CallOptions opt;
-        // 声明预算明显超过 wire 上限（kRpcV2MaxRemainingBudgetMs + 1min），
-        // 使 clamp 结果唯一确定为 kRpcV2MaxRemainingBudgetMs。
+        /**
+         * 声明预算明显超过 wire 上限（kRpcV2MaxRemainingBudgetMs + 1min），
+         * 使 clamp 结果唯一确定为 kRpcV2MaxRemainingBudgetMs。
+         */
         opt.deadline = Clock::now() +
                        std::chrono::milliseconds{inf::rpc::kRpcV2MaxRemainingBudgetMs} +
                        std::chrono::minutes{1};
         auto res = CallEgress(eh.host, peer.Endpoint(),
                               MakeEnvelope("t4-budget"), opt);
         BOOST_REQUIRE(res.has_value());
-        BOOST_REQUIRE(!static_cast<bool>(*res));   // 对端丢 reply
+        /**
+         * 对端丢 reply
+         */
+        BOOST_REQUIRE(!static_cast<bool>(*res));
     }
 
     BOOST_REQUIRE(peer.body_ready.load());
@@ -579,16 +662,23 @@ BOOST_AUTO_TEST_CASE(remaining_budget_propagated_within_bounds) {
         std::lock_guard<std::mutex> lk(peer.mtx);
         body = peer.received_body;
     }
-    // 对端已收下的就是一整帧 CALL body：直接读 wire 字段。
-    BOOST_TEST(peer.ack_verified.load()); // 握手 echo 已被对端校验
+    /**
+     * 对端已收下的就是一整帧 CALL body：直接读 wire 字段。
+     */
+    /**
+     * 握手 echo 已被对端校验
+     */
+    BOOST_TEST(peer.ack_verified.load());
     std::string request_id;
     BOOST_REQUIRE_MESSAGE(FrameField(body, 7, nullptr, &request_id),
                           "framework egress request is not a valid SessionFrame");
     BOOST_TEST(request_id == std::string("t4-budget"));
     std::uint64_t budget = 0;
     BOOST_REQUIRE(FrameField(body, 13, &budget, nullptr));
-    // 声明 deadline 明显超过 wire 上限：剩余预算必被 clamp 到上限。
-    // 该等式可证伪「写常量哨兵」的实现（例如固定 1），常量实现无法满足。
+    /**
+     * 声明 deadline 明显超过 wire 上限：剩余预算必被 clamp 到上限。
+     * 该等式可证伪「写常量哨兵」的实现（例如固定 1），常量实现无法满足。
+     */
     BOOST_TEST(budget >= 1u);
     BOOST_TEST(budget <= inf::rpc::kRpcV2MaxRemainingBudgetMs);
     BOOST_TEST(budget == inf::rpc::kRpcV2MaxRemainingBudgetMs);

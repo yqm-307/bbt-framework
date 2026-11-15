@@ -56,7 +56,9 @@ result<void> InfraHttpHost::Create() {
     namespace rpc = bbt::infra::rpc;
     if (auto valid = bbt::infra::ValidateNetworkLimits(m_limits); !valid)
         return valid;
-    // 一个端口只能安装一种接纳协议；HTTP 能力不承载 RPC 信封。
+    /**
+     * 一个端口只能安装一种接纳协议；HTTP 能力不承载 RPC 信封。
+     */
     if (m_state->http && m_state->rpc)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
                                            "host: HTTP and RPC cannot share a listener"));
@@ -135,7 +137,9 @@ result<bbt::infra::http::Response> InfraHttpHost::_InvokeHttp(
 }
 result<void> InfraHttpHost::_AdmitRpc(const std::shared_ptr<HandlerState>& state,
                                       bbt::infra::rpc::AdmissionItem&& item) {
-    // 同步回调只转移拥有权，不运行业务，也不等待回复写终态。
+    /**
+     * 同步回调只转移拥有权，不运行业务，也不等待回复写终态。
+     */
     std::lock_guard<std::mutex> lock(state->mtx);
     if (!state->open)
         return result<void>::err(state->close_reason.value_or(
@@ -146,7 +150,9 @@ result<void> InfraHttpHost::_AdmitRpc(const std::shared_ptr<HandlerState>& state
     bool registered = false;
     g_scheduler->RegistCoroutineTask(256 * 1024, [state] { _RunRpc(state); }, registered);
     if (!registered) {
-        // 回滚转移；infra 仍负责拒绝终态和 lease，不留下孤儿项。
+        /**
+         * 回滚转移；infra 仍负责拒绝终态和 lease，不留下孤儿项。
+         */
         item = std::move(state->queue.back());
         state->queue.pop_back();
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
@@ -158,8 +164,10 @@ result<void> InfraHttpHost::_AdmitRpc(const std::shared_ptr<HandlerState>& state
 
 void InfraHttpHost::_RunRpc(const std::shared_ptr<HandlerState>& state) {
     namespace rpc = bbt::infra::rpc;
-    // 取队列与同步派发共用门，避免多 worker 把同一有序流的后项先入邮箱。
-    // on_dispatched 在任何业务等待之前解锁，不持系统锁跨协程挂起。
+    /**
+     * 取队列与同步派发共用门，避免多 worker 把同一有序流的后项先入邮箱。
+     * on_dispatched 在任何业务等待之前解锁，不持系统锁跨协程挂起。
+     */
     std::unique_lock<std::mutex> dispatch_lock(state->dispatch_mtx);
     const auto dispatched = [&] {
         if (dispatch_lock.owns_lock())
@@ -174,7 +182,9 @@ void InfraHttpHost::_RunRpc(const std::shared_ptr<HandlerState>& state) {
         closed = state->close_reason;
     }
     const bool call = item.request.Reply() == rpc::ReplyMode::Required;
-    // 业务和回复实际返回后才减计数；Close 不提前宣布排空。
+    /**
+     * 业务和回复实际返回后才减计数；Close 不提前宣布排空。
+     */
     auto done = boost::scope::make_scope_exit([state, lease = item.lease, call] {
         if (call && lease)
             (void)lease->Release();
@@ -201,7 +211,9 @@ void InfraHttpHost::_RunRpc(const std::shared_ptr<HandlerState>& state) {
                                                      "inbound rpc: non-standard handler exception"));
     }
     dispatched();
-    // SendAccepted/Send lease 属 infra；业务完成不是第二次接纳终态。
+    /**
+     * SendAccepted/Send lease 属 infra；业务完成不是第二次接纳终态。
+     */
     if (!call || !item.reply)
         return;
     if (!reply) {
@@ -209,7 +221,10 @@ void InfraHttpHost::_RunRpc(const std::shared_ptr<HandlerState>& state) {
         if (auto valid = ValidateErrorAtBoundary(error); !valid)
             error = std::move(valid.error());
         auto written = bbt_co_await item.reply->Fail(std::move(error));
-        (void)written; // 断链/超时已由 infra 记录；无论写结果如何均须归还 lease。
+        /**
+         * 断链/超时已由 infra 记录；无论写结果如何均须归还 lease。
+         */
+        (void)written;
     } else {
         auto written = bbt_co_await item.reply->Complete(std::move(reply).value());
         (void)written;
@@ -254,18 +269,22 @@ void InfraHttpHost::StopAccepting() noexcept {
         std::lock_guard<std::mutex> lock(m_state->mtx);
         m_state->open = false;
     }
-    // RPC 会话层的新契约没有独立的 StopAccepting 阶段：业务门关闭后
-    // 新入站由 _AdmitRpc 同步拒绝；会话/监听封口只在 WaitHandlersDone 的
-    // Shutdown 或 Close 发生（提前封 Engine 接纳会让会话提前退役，迟到
-    // 请求拿不到业务门的 Closed 终态）。HTTP 栈仍是旧生命周期，保留其
-    // 停止接纳步骤。
+    /**
+     * RPC 会话层的新契约没有独立的 StopAccepting 阶段：业务门关闭后
+     * 新入站由 _AdmitRpc 同步拒绝；会话/监听封口只在 WaitHandlersDone 的
+     * Shutdown 或 Close 发生（提前封 Engine 接纳会让会话提前退役，迟到
+     * 请求拿不到业务门的 Closed 终态）。HTTP 栈仍是旧生命周期，保留其
+     * 停止接纳步骤。
+     */
     if (auto server = http_server())
         server->StopAccepting();
 }
 result<void> InfraHttpHost::WaitHandlersDone(bbt::coroutine::Deadline deadline) {
     {
         std::unique_lock<std::mutex> lock(m_state->mtx);
-        // Close 先到：立即把关闭原因交给等待者，不进入排空/收口。
+        /**
+         * Close 先到：立即把关闭原因交给等待者，不进入排空/收口。
+         */
         if (m_state->close_reason) { return result<void>::err(*m_state->close_reason); }
         const auto done = m_state->cv.wait_until(lock, deadline, [this] {
             return m_state->inflight == 0 || m_state->close_reason.has_value();
@@ -276,12 +295,16 @@ result<void> InfraHttpHost::WaitHandlersDone(bbt::coroutine::Deadline deadline) 
             return result<void>::err(
                 MakeError(ErrorCode::TimedOut, "inbound handlers still running"));
         }
-        // 排空已证实：同一把业务门内拒绝后续接纳，避免「检查归零 → 封口」
-        // 之间又进入一个 handler。
+        /**
+         * 排空已证实：同一把业务门内拒绝后续接纳，避免「检查归零 → 封口」
+         * 之间又进入一个 handler。
+         */
         m_state->open = false;
     }
-    // 排空被证实：HTTP 仍按旧契约做拒新 + 已授权 reply 写终态 + 物理收口；
-    // Close 打断时 Shutdown 直接返回其关闭原因，后续物理收口不再进行。
+    /**
+     * 排空被证实：HTTP 仍按旧契约做拒新 + 已授权 reply 写终态 + 物理收口；
+     * Close 打断时 Shutdown 直接返回其关闭原因，后续物理收口不再进行。
+     */
     auto shutdown_or_drain = [](auto& server, bbt::coroutine::Deadline deadline)
         -> result<void> {
         if (auto r = server->Shutdown(deadline); !r) {
@@ -296,10 +319,12 @@ result<void> InfraHttpHost::WaitHandlersDone(bbt::coroutine::Deadline deadline) 
         server->Close();
         if (auto r = server->WaitStopped(deadline); !r) { return r; }
     }
-    // RPC 新契约只有统一 Close/Shutdown 入口；本入口在 native 控制线程，
-    // 不在协程域。业务 handler 与 reply 写终态已由 inflight 归零证明，
-    // 剩余只是会话/连接责任，用同步 Shutdown 封口；物理回收由 Close 的
-    // Engine 收口证明。
+    /**
+     * RPC 新契约只有统一 Close/Shutdown 入口；本入口在 native 控制线程，
+     * 不在协程域。业务 handler 与 reply 写终态已由 inflight 归零证明，
+     * 剩余只是会话/连接责任，用同步 Shutdown 封口；物理回收由 Close 的
+     * Engine 收口证明。
+     */
     if (auto server = rpc_server()) {
         server->Shutdown();
     }
@@ -312,9 +337,11 @@ bool InfraHttpHost::_JoinEngine(const std::shared_ptr<bbt::infra::net::Engine>& 
     engine->RequestClose();
     if (!runner.joinable())
         return true;
-    // 短同步 join：驱动线程自身退出是毫秒级；但 Engine 的 owner 收口可能排在
-    // 仍在业务 handler 里的协程之后，不能在这里等业务完成。未就绪就把 join
-    // 责任留给析构（绝不 detach、不提前 reset owner）。
+    /**
+     * 短同步 join：驱动线程自身退出是毫秒级；但 Engine 的 owner 收口可能排在
+     * 仍在业务 handler 里的协程之后，不能在这里等业务完成。未就绪就把 join
+     * 责任留给析构（绝不 detach、不提前 reset owner）。
+     */
     if (finished.valid() &&
         finished.wait_for(std::chrono::milliseconds{200}) != std::future_status::ready)
         return false;
@@ -335,9 +362,11 @@ void InfraHttpHost::Close() noexcept {
 }
 
 void InfraHttpHost::Close(bbt::infra::Error reason) noexcept {
-    // call_once：并发/重复关闭阻塞到首次完成，析构再调为空操作——不会留下
-    // 仍 joinable 的 std::thread 让析构 terminate。Close 本身不等待业务
-    // handler：只封口、发原因、RequestClose 并 join 自有驱动线程。
+    /**
+     * call_once：并发/重复关闭阻塞到首次完成，析构再调为空操作——不会留下
+     * 仍 joinable 的 std::thread 让析构 terminate。Close 本身不等待业务
+     * handler：只封口、发原因、RequestClose 并 join 自有驱动线程。
+     */
     std::call_once(m_close_once, [this, reason = std::move(reason)]() mutable {
         _Close(std::move(reason));
     });
@@ -350,15 +379,20 @@ void InfraHttpHost::_Close(bbt::infra::Error reason) noexcept {
             m_state->open = false;
             if (!m_state->close_reason) { m_state->close_reason = reason; }
         }
-        m_state->cv.notify_all();   // 唤醒 WaitHandlersDone 的排空等待
+        /**
+         * 唤醒 WaitHandlersDone 的排空等待
+         */
+        m_state->cv.notify_all();
         {
             std::lock_guard<std::mutex> lock(m_mtx);
             if (!m_close_reason) { m_close_reason = reason; }
         }
         StopAccepting();
         if (auto server = http_server()) { server->Close(reason); }
-        // RPC 新契约的同步强制关闭：任意域、幂等、不等 handler。业务完成后
-        // 的物理回收由下面的 Engine 收口统一证明。
+        /**
+         * RPC 新契约的同步强制关闭：任意域、幂等、不等 handler。业务完成后
+         * 的物理回收由下面的 Engine 收口统一证明。
+         */
         if (auto server = rpc_server()) {
             server->Shutdown(reason);
         }
@@ -366,12 +400,16 @@ void InfraHttpHost::_Close(bbt::infra::Error reason) noexcept {
         if (auto client = rpc_client()) {
             client->Shutdown(reason);
         }
-        // 无条件 join：旧路径失败即 return 会保留 joinable 线程，析构时
-        // std::terminate。join 只在驱动线程可即时退出时完成；仍被业务占用
-        // 时把 join 留给析构（见 _JoinEngine / ~InfraHttpHost）。
+        /**
+         * 无条件 join：旧路径失败即 return 会保留 joinable 线程，析构时
+         * std::terminate。join 只在驱动线程可即时退出时完成；仍被业务占用
+         * 时把 join 留给析构（见 _JoinEngine / ~InfraHttpHost）。
+         */
         const bool inbound_stopped = _JoinEngine(m_engine, m_engine_thread, m_engine_result);
         std::lock_guard<std::mutex> lock(m_mtx);
-        // 已 Close 的 server/client owner 与驱动线程寿命解耦，可立即释放。
+        /**
+         * 已 Close 的 server/client owner 与驱动线程寿命解耦，可立即释放。
+         */
         m_server.reset();
         m_rpc_server.reset();
         m_rpc_client.reset();
@@ -381,15 +419,19 @@ void InfraHttpHost::_Close(bbt::infra::Error reason) noexcept {
         m_bound = {};
         m_created = false;
     } catch (...) {
-        // noexcept 契约：Close 必须可安全重入/析构调用，不让分配失败逃逸。
+        /**
+         * noexcept 契约：Close 必须可安全重入/析构调用，不让分配失败逃逸。
+         */
     }
 }
 
 InfraHttpHost::~InfraHttpHost() noexcept {
     Close();
-    // Close 只在驱动线程可即时退出时 join；业务仍占用驱动 owner 时把 join
-    // 责任留到这里。必须 join 而不是 detach：析构不能留下仍访问本对象的线程，
-    // 也不能因仍 joinable 的 std::thread terminate。
+    /**
+     * Close 只在驱动线程可即时退出时 join；业务仍占用驱动 owner 时把 join
+     * 责任留到这里。必须 join 而不是 detach：析构不能留下仍访问本对象的线程，
+     * 也不能因仍 joinable 的 std::thread terminate。
+     */
     if (m_engine_thread.joinable()) { m_engine_thread.join(); }
 }
 

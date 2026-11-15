@@ -1,14 +1,16 @@
-// Consul 发现组件实现（应用侧组装）。
-//
-// 阻塞查询循环的规则（与 docs/architecture §5.2 的 revision/epoch 语义一致）：
-//   - 首轮 index=0 取一次完整快照；
-//   - 之后带上一轮的 X-Consul-Index 走阻塞查询（wait 由 adapter 附加）；
-//   - 返回 index 小于上一轮 → 视为 agent epoch 重置，下一轮退回 index=0 重取
-//     完整权威快照，不跨 epoch 比较；
-//   - 返回 index=0 → 下一轮用 1，避免 busy loop；
-//   - 相同 index 也可能带回不同视图：始终比较 endpoint 集合，只有真的变了才
-//     记 changed=1；
-//   - 每次成功查询都 Replace（刷新新鲜度），查询失败什么都不发布、也不刷新。
+/**
+ * Consul 发现组件实现（应用侧组装）。
+ *
+ * 阻塞查询循环的规则（与 docs/architecture §5.2 的 revision/epoch 语义一致）：
+ * - 首轮 index=0 取一次完整快照；
+ * - 之后带上一轮的 X-Consul-Index 走阻塞查询（wait 由 adapter 附加）；
+ * - 返回 index 小于上一轮 → 视为 agent epoch 重置，下一轮退回 index=0 重取
+ * 完整权威快照，不跨 epoch 比较；
+ * - 返回 index=0 → 下一轮用 1，避免 busy loop；
+ * - 相同 index 也可能带回不同视图：始终比较 endpoint 集合，只有真的变了才
+ * 记 changed=1；
+ * - 每次成功查询都 Replace（刷新新鲜度），查询失败什么都不发布、也不刷新。
+ */
 
 #include "discovery.hpp"
 
@@ -29,7 +31,9 @@ using bbt::infra::ErrorCode;
 using bbt::infra::MakeError;
 using bbt::infra::result;
 
-// 观测行：由 Python 驱动器与人工读同一份文本证据。
+/**
+ * 观测行：由 Python 驱动器与人工读同一份文本证据。
+ */
 void Journal(const std::string& line) {
     std::printf("%s\n", line.c_str());
     std::fflush(stdout);
@@ -66,8 +70,10 @@ result<std::shared_ptr<ConsulDiscoveryComponent>> ConsulDiscoveryComponent::Crea
                 MakeError(ErrorCode::InvalidArgument,
                           "consul discovery: empty watch service name"));
     }
-    // adapter 的阻塞查询读档要容纳 wait，wait 必须严格小于总期限，否则阻塞
-    // 返回会被总 deadline 打断。
+    /**
+     * adapter 的阻塞查询读档要容纳 wait，wait 必须严格小于总期限，否则阻塞
+     * 返回会被总 deadline 打断。
+     */
     if (options.query_wait >= options.request_timeout)
         return result<std::shared_ptr<ConsulDiscoveryComponent>>::err(MakeError(
             ErrorCode::InvalidArgument,
@@ -147,7 +153,9 @@ result<void> ConsulDiscoveryComponent::Start() {
     }
     for (std::size_t i = 0; i < m_watches.size(); ++i) {
         bool submitted = false;
-        // 查询路径含 JSON 解析：协程栈显式放大，不用默认 12KB。
+        /**
+         * 查询路径含 JSON 解析：协程栈显式放大，不用默认 12KB。
+         */
         g_scheduler->RegistCoroutineTask(
             256 * 1024, [this, i] { bbt_co_await _WatchLoop(i); }, submitted);
         if (!submitted)
@@ -156,7 +164,9 @@ result<void> ConsulDiscoveryComponent::Start() {
                 "consul discovery: watcher coroutine registration failed"));
     }
 
-    // 首个权威快照决定 App 能否启动：失败即启动失败，不留「静默无视图」。
+    /**
+     * 首个权威快照决定 App 能否启动：失败即启动失败，不留「静默无视图」。
+     */
     const auto deadline = std::chrono::steady_clock::now() +
                           m_options.request_timeout * 2 +
                           std::chrono::milliseconds{1000};
@@ -181,7 +191,9 @@ result<void> ConsulDiscoveryComponent::Start() {
 }
 
 bbt_co_async(void) ConsulDiscoveryComponent::_WatchLoop(std::size_t index) {
-    // m_watches 在 Start 之后不再增删，引用稳定。
+    /**
+     * m_watches 在 Start 之后不再增删，引用稳定。
+     */
     Watch& watch = m_watches[index];
     std::uint64_t last_index = 0;
     while (!m_stop.load(std::memory_order_acquire)) {
@@ -230,7 +242,9 @@ bbt_co_async(void) ConsulDiscoveryComponent::_WatchLoop(std::size_t index) {
             _SetLastError(std::string{});
         }
 
-        // 下一轮 index：epoch 回退退回 0 重取完整快照；0 用 1 避免 busy loop。
+        /**
+         * 下一轮 index：epoch 回退退回 0 重取完整快照；0 用 1 避免 busy loop。
+         */
         std::uint64_t next_index = snapshot.value().index;
         if (snapshot.value().index < last_index) next_index = 0;
         else if (snapshot.value().index == 0) next_index = 1;
@@ -332,7 +346,9 @@ void ConsulDiscoveryComponent::Close() noexcept {
     if (m_closed.exchange(true)) return;
     m_stop.store(true, std::memory_order_release);
 
-    // 视图不再由本进程维护：立即标记不可用，残留 gateway 不会继续打到旧地址。
+    /**
+     * 视图不再由本进程维护：立即标记不可用，残留 gateway 不会继续打到旧地址。
+     */
     for (const auto& watch : m_watches) m_table->MarkUnavailable(watch.service);
     m_cv.notify_all();
 
@@ -374,7 +390,9 @@ void ConsulDiscoveryComponent::_SetLastError(std::string message) {
 
 void ConsulDiscoveryComponent::_SleepWhileActive(
     std::chrono::milliseconds budget) {
-    // 协程域睡眠：让出 worker，且 stop 后最多再等 budget 就退出循环。
+    /**
+     * 协程域睡眠：让出 worker，且 stop 后最多再等 budget 就退出循环。
+     */
     bbtco_sleep(static_cast<int>(budget.count()));
 }
 

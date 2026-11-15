@@ -1,10 +1,12 @@
 #pragma once
-// framework v2 唯一地址/消息值层（契约 §5.1 最小落地）。
-//
-// AppObjectAddress 是可公开的目标地址值；MailBox 是它的可复制包装
-// （地址值，不是队列或 Actor 引用）。本地发送路径本切片不接业务消息
-// 分发——CoCall/CoTell 由 Service/Actor 受管入口在后续切片接入网络；
-// 本切片只保证地址语义、校验与 Service/Actor handle 失效观察。
+/**
+ * framework v2 唯一地址/消息值层（契约 §5.1 最小落地）。
+ *
+ * AppObjectAddress 是可公开的目标地址值；MailBox 是它的可复制包装
+ * （地址值，不是队列或 Actor 引用）。本地发送路径本切片不接业务消息
+ * 分发——CoCall/CoTell 由 Service/Actor 受管入口在后续切片接入网络；
+ * 本切片只保证地址语义、校验与 Service/Actor handle 失效观察。
+ */
 
 #include <cstdint>
 #include <string>
@@ -26,18 +28,28 @@ namespace bbt::framework {
 class Payload {
 public:
     Payload() = default;
-    /// @brief 以字节向量构造（移动语义）。
+    /**
+     * @brief 以字节向量构造（移动语义）。
+     */
     explicit Payload(std::vector<std::uint8_t> bytes)
         : m_bytes(std::move(bytes)) {}
-    /// @brief 以字符串内容构造（拷贝为字节）。
+    /**
+     * @brief 以字符串内容构造（拷贝为字节）。
+     */
     explicit Payload(std::string_view sv)
         : m_bytes(sv.begin(), sv.end()) {}
 
-    /// @brief 载荷字节。
+    /**
+     * @brief 载荷字节。
+     */
     const std::vector<std::uint8_t>& Bytes() const noexcept { return m_bytes; }
-    /// @brief 载荷字节数。
+    /**
+     * @brief 载荷字节数。
+     */
     std::size_t Size() const noexcept { return m_bytes.size(); }
-    /// @brief 载荷是否为空。
+    /**
+     * @brief 载荷是否为空。
+     */
     bool        Empty() const noexcept { return m_bytes.empty(); }
 
 private:
@@ -55,7 +67,9 @@ private:
  */
 class AppObjectAddress {
 public:
-    /// @brief 目标类别。
+    /**
+     * @brief 目标类别。
+     */
     enum class Kind { Service, Actor };
 
     /**
@@ -87,13 +101,21 @@ public:
         return a;
     }
 
-    /// @brief 目标类别。
+    /**
+     * @brief 目标类别。
+     */
     Kind ObjectKind() const noexcept { return m_kind; }
-    /// @brief Service：服务名；Actor：actor type。
+    /**
+     * @brief Service：服务名；Actor：actor type。
+     */
     const std::string& Type() const noexcept { return m_type; }
-    /// @brief Actor key；Service 恒为空串。
+    /**
+     * @brief Actor key；Service 恒为空串。
+     */
     const std::string& Key() const noexcept { return m_key; }
-    /// @brief 目标 app 逻辑 id；空 = 本 app。
+    /**
+     * @brief 目标 app 逻辑 id；空 = 本 app。
+     */
     const std::string& App() const noexcept { return m_app; }
 
     /**
@@ -119,39 +141,88 @@ private:
 class MailBox {
 public:
     MailBox() = default;
-    /// @brief 以地址值构造。
+    /**
+     * @brief 以地址值构造。
+     */
     explicit MailBox(AppObjectAddress address)
         : m_address(std::move(address)) {}
 
-    /// @brief 地址值。
+    /**
+     * @brief 地址值。
+     */
     const AppObjectAddress& Address() const noexcept { return m_address; }
 
 private:
     AppObjectAddress m_address;
 };
 
-/// @brief 消息流量类别。
+/**
+ * @brief 消息流量类别。
+ */
 enum class AppTrafficClass : std::uint8_t {
-    System = 0,  ///< infra 生成的控制帧。
-    Service = 1, ///< Service 请求流量。
-    Actor = 2    ///< Actor 消息流量。
+    /**
+     * infra 生成的控制帧。
+     */
+    System = 0,
+    /**
+     * Service 请求流量。
+     */
+    Service = 1,
+    /**
+     * Actor 消息流量。
+     */
+    Actor = 2
 };
-/// @brief 回复要求。
+/**
+ * @brief 回复要求。
+ */
 enum class ReplyMode : std::uint8_t {
-    None = 0,     ///< Tell（无回复）。
-    Required = 1  ///< Call（要求回复）。
+    /**
+     * Tell（无回复）。
+     */
+    None = 0,
+    /**
+     * Call（要求回复）。
+     */
+    Required = 1
 };
 
-/// @brief 应用层消息值（owning）。
+/**
+ * @brief 应用层消息值（owning）。
+ */
 struct AppMessage {
-    AppObjectAddress source;      ///< 源地址。
-    AppObjectAddress target;      ///< 目标地址。
-    std::string      method;      ///< 显式方法名。
-    std::string      request_id;  ///< 请求关联 id。
-    std::string      message_id;  ///< 消息 id。
-    ReplyMode        reply = ReplyMode::None; ///< 回复要求。
-    std::uint64_t    sequence = 0;///< 提交序号。
-    Payload          payload;     ///< 载荷。
+    /**
+     * 源地址。
+     */
+    AppObjectAddress source;
+    /**
+     * 目标地址。
+     */
+    AppObjectAddress target;
+    /**
+     * 显式方法名。
+     */
+    std::string method;
+    /**
+     * 请求关联 id。
+     */
+    std::string request_id;
+    /**
+     * 消息 id。
+     */
+    std::string message_id;
+    /**
+     * 回复要求。
+     */
+    ReplyMode reply = ReplyMode::None;
+    /**
+     * 提交序号。
+     */
+    std::uint64_t sequence = 0;
+    /**
+     * 载荷。
+     */
+    Payload payload;
 };
 
 } // namespace bbt::framework

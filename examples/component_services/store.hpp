@@ -1,14 +1,16 @@
 #pragma once
-// 电商商品/购物车示例的复用业务模块。
-//
-// 业务故事：PriceBook 组件保存价目与购物车行，CatalogService 在启动时写入
-// 目录价，CartService 在绑定变化时写入购物车行；两个服务绑定同一个 App
-// scope 的 "pricing" 实例，因此互相看得到对方写入的状态。
-//
-// 本头只演示公开 v2 面：CoComponent/CoService、声明式
-// ServiceOptions::BindComponent、ComponentHandle::Borrow、生命周期与绑定
-// hook。同一份头被主例程与独立 node 进程各自装配——进程内共享的是组件实例，
-// 跨进程只共享代码，不共享对象。
+/**
+ * 电商商品/购物车示例的复用业务模块。
+ *
+ * 业务故事：PriceBook 组件保存价目与购物车行，CatalogService 在启动时写入
+ * 目录价，CartService 在绑定变化时写入购物车行；两个服务绑定同一个 App
+ * scope 的 "pricing" 实例，因此互相看得到对方写入的状态。
+ *
+ * 本头只演示公开 v2 面：CoComponent/CoService、声明式
+ * ServiceOptions::BindComponent、ComponentHandle::Borrow、生命周期与绑定
+ * hook。同一份头被主例程与独立 node 进程各自装配——进程内共享的是组件实例，
+ * 跨进程只共享代码，不共享对象。
+ */
 
 #include <atomic>
 #include <cstdint>
@@ -25,8 +27,10 @@
 
 namespace shop {
 
-// 只在本业务命名空间内收窄框架名字：这些是 public v2 面，写全限定名会淹没
-// 业务语义。不做全局 using namespace，消费者不受影响。
+/**
+ * 只在本业务命名空间内收窄框架名字：这些是 public v2 面，写全限定名会淹没
+ * 业务语义。不做全局 using namespace，消费者不受影响。
+ */
 namespace v2 = bbt::framework::v2;
 using bbt::framework::result;
 using bbt::framework::ErrorCode;
@@ -34,10 +38,14 @@ using bbt::framework::MakeError;
 using bbt::framework::BindingEvent;
 using bbt::framework::detail::ConstructKey;
 
-/// @brief 两个服务共同绑定的组件逻辑名。
+/**
+ * @brief 两个服务共同绑定的组件逻辑名。
+ */
 inline constexpr std::string_view kPricingSlot = "pricing";
 
-/// @brief 示例 journal 行输出口；由 main 注入（写入 journal 文件并回显）。
+/**
+ * @brief 示例 journal 行输出口；由 main 注入（写入 journal 文件并回显）。
+ */
 using JournalFn = std::function<void(const std::string&)>;
 
 inline std::mutex& JournalMutex() {
@@ -50,13 +58,17 @@ inline JournalFn& JournalSink() {
     return sink;
 }
 
-/// @brief 注入 journal 输出口；只在启动阶段调用一次。
+/**
+ * @brief 注入 journal 输出口；只在启动阶段调用一次。
+ */
 inline void SetJournal(JournalFn sink) {
     std::lock_guard<std::mutex> lk(JournalMutex());
     JournalSink() = std::move(sink);
 }
 
-/// @brief 输出一行 `event=... k=v`；值不得含空格（驱动器按空格分词）。
+/**
+ * @brief 输出一行 `event=... k=v`；值不得含空格（驱动器按空格分词）。
+ */
 inline void Emit(const std::string& line) {
     JournalFn sink;
     {
@@ -66,10 +78,14 @@ inline void Emit(const std::string& line) {
     if (sink) sink(line);
 }
 
-/// @brief 共享的价格/购物车组件。只能经 CoApp::CoInstallComponent 创建。
+/**
+ * @brief 共享的价格/购物车组件。只能经 CoApp::CoInstallComponent 创建。
+ */
 class PriceBook final : public v2::CoComponent {
 public:
-    /// @brief 装配参数：版本、目录单价、停止时挂起毫秒、是否让 OnStart 失败。
+    /**
+     * @brief 装配参数：版本、目录单价、停止时挂起毫秒、是否让 OnStart 失败。
+     */
     struct Options {
         int  version          = 1;
         int  unit_price_cents = 0;
@@ -93,11 +109,15 @@ public:
     int InstanceSeq() const noexcept { return m_instance_seq; }
     int CatalogSize() const { return Locked([this] { return int(m_catalog.size()); }); }
 
-    /// @brief 写入一条目录价；由 CatalogService 在启动时调用。
+    /**
+     * @brief 写入一条目录价；由 CatalogService 在启动时调用。
+     */
     void AddCatalogItem(const std::string& sku, int price_cents) {
         LockedVoid([&] { m_catalog[sku] = price_cents; });
     }
-    /// @brief 追加购物车行（同 sku 数量累加）；由 CartService 在绑定变化时调用。
+    /**
+     * @brief 追加购物车行（同 sku 数量累加）；由 CartService 在绑定变化时调用。
+     */
     void AddCartLine(const std::string& sku, int qty, int unit_price_cents) {
         LockedVoid([&] {
             m_cart_qty[sku] += qty;
@@ -112,7 +132,9 @@ public:
     }
     int CartTotalCents() const { return Locked([this] { return m_cart_total_cents; }); }
 
-    // 跨实例的阶段计数：用于断言"只创建一次/只存活一个"，不参与业务。
+    /**
+     * 跨实例的阶段计数：用于断言"只创建一次/只存活一个"，不参与业务。
+     */
     inline static std::atomic<int> s_constructed{0};
     inline static std::atomic<int> s_live{0};
     inline static std::atomic<int> s_install{0};
@@ -123,7 +145,9 @@ public:
 protected:
     ~PriceBook() noexcept override {
         --s_live;
-        // noexcept 析构里不外传 journal 的分配失败。
+        /**
+         * noexcept 析构里不外传 journal 的分配失败。
+         */
         try {
             Emit("event=component_destroy name=" + std::string(kPricingSlot) +
                  " version=" + std::to_string(m_version) +
@@ -154,7 +178,9 @@ protected:
 
     result<void> OnStop() override {
         ++s_stop;
-        // 真实挂起：证明 hook 在受管协程中执行，有限 deadline 覆盖它。
+        /**
+         * 真实挂起：证明 hook 在受管协程中执行，有限 deadline 覆盖它。
+         */
         if (m_halt_ms > 0) bbtco_sleep(m_halt_ms);
         Emit("event=component_hook name=" + std::string(kPricingSlot) +
              " phase=stop version=" + std::to_string(m_version) +
@@ -196,7 +222,9 @@ private:
     friend class bbt::framework::detail::Registry;
 };
 
-/// @brief 目录服务：安装时声明式绑定 "pricing"，启动时写入目录价。
+/**
+ * @brief 目录服务：安装时声明式绑定 "pricing"，启动时写入目录价。
+ */
 class CatalogService final
     : public v2::CoService<PriceBook> {
 public:
@@ -215,7 +243,9 @@ protected:
 
     result<void> OnStart() override {
         Emit("event=service_hook service=catalog phase=start");
-        // 声明式绑定在安装时建立；此时组件已 Running，可借用并写共享状态。
+        /**
+         * 声明式绑定在安装时建立；此时组件已 Running，可借用并写共享状态。
+         */
         auto h = GetComponent<PriceBook>(kPricingSlot);
         if (!h) {
             Emit("event=catalog_start error=get_component code=" +
@@ -247,8 +277,10 @@ protected:
     }
 
     void OnBindingChanged(const BindingEvent& ev) override {
-        // 安装期绑定发生在服务 Installing 的装配窗口内，Registry 允许借
-        // Installed 依赖做纯内存装配；运行期重绑同样可借。这里只记录事实。
+        /**
+         * 安装期绑定发生在服务 Installing 的装配窗口内，Registry 允许借
+         * Installed 依赖做纯内存装配；运行期重绑同样可借。这里只记录事实。
+         */
         std::string line = "event=binding_hook service=catalog bound=";
         line += ev.bound ? "1" : "0";
         auto h = GetComponent<PriceBook>(kPricingSlot);
@@ -267,11 +299,15 @@ protected:
     friend class bbt::framework::detail::Registry;
 };
 
-/// @brief 购物车服务：运行期被显式绑定后，在绑定 hook 中写购物车行。
+/**
+ * @brief 购物车服务：运行期被显式绑定后，在绑定 hook 中写购物车行。
+ */
 class CartService final : public v2::CoService<PriceBook> {
 public:
     static constexpr std::string_view kServiceName = "cart";
-    /// @brief 绑定 hook 每次写入的行数。
+    /**
+     * @brief 绑定 hook 每次写入的行数。
+     */
     static constexpr int kQtyPerBinding = 2;
 
     explicit CartService(ConstructKey key)

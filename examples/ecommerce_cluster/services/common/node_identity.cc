@@ -10,7 +10,9 @@ namespace ecommerce {
 
 namespace {
 
-// incarnation：同一 pid 重启后也必须换新身份，所以掺入单调时钟而不是只靠 pid。
+/**
+ * incarnation：同一 pid 重启后也必须换新身份，所以掺入单调时钟而不是只靠 pid。
+ */
 std::string RandomHex() {
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < sizeof(value); ++i)

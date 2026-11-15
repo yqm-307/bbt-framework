@@ -1,8 +1,10 @@
-// 执行策略校验矩阵、ActorSerial 缺 key 提取器启动失败、
-// Actor 邮箱保序/非重入/容量/异常续跑/Close、跨 Actor 并发、
-// ActorRegistry 至多一次与上限。
-// 并发用例用条件变量屏障构造真实重叠窗口：handler 在 drain 协程内被
-// 屏障拦停，另一个执行体获得完整进入机会；禁止 sleep 凑时序。
+/**
+ * 执行策略校验矩阵、ActorSerial 缺 key 提取器启动失败、
+ * Actor 邮箱保序/非重入/容量/异常续跑/Close、跨 Actor 并发、
+ * ActorRegistry 至多一次与上限。
+ * 并发用例用条件变量屏障构造真实重叠窗口：handler 在 drain 协程内被
+ * 屏障拦停，另一个执行体获得完整进入机会；禁止 sleep 凑时序。
+ */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
@@ -22,7 +24,9 @@
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/CoApp.hpp>
 
-// 邮箱/注册表/方法表是机器面：显式包含 internal 头。
+/**
+ * 邮箱/注册表/方法表是机器面：显式包含 internal 头。
+ */
 #include <bbt/framework/internal/ActorMailbox.hpp>
 #include <bbt/framework/internal/ActorRegistry.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
@@ -31,10 +35,14 @@ namespace fw = bbt::framework;
 
 namespace {
 
-// ── 测试屏障原语（std CV：线程与协程内 handler 均可用；协程内等待会占住
-//    当前 worker 线程，测试固定 4 个静态 worker，屏障设计保证不死锁）──
+/**
+ * ── 测试屏障原语（std CV：线程与协程内 handler 均可用；协程内等待会占住
+ * 当前 worker 线程，测试固定 4 个静态 worker，屏障设计保证不死锁）──
+ */
 
-// one-shot 门闩：Open 后所有 Wait 通过；WaitFor 返回是否及时等到。
+/**
+ * one-shot 门闩：Open 后所有 Wait 通过；WaitFor 返回是否及时等到。
+ */
 class TestGate {
 public:
     void Open() {
@@ -58,7 +66,9 @@ private:
     bool                    m_open = false;
 };
 
-// count-down 闩：计满后 Wait 通过。
+/**
+ * count-down 闩：计满后 Wait 通过。
+ */
 class TestLatch {
 public:
     explicit TestLatch(int n) : m_count(n) {}
@@ -84,8 +94,10 @@ private:
     int                     m_count;
 };
 
-// 轮询等待谓词成立（带超时）：用于「最终收敛」类断言——被测动作与观测
-// 点之间有调度间隙，立即检查会在慢 runner 上抖动。
+/**
+ * 轮询等待谓词成立（带超时）：用于「最终收敛」类断言——被测动作与观测
+ * 点之间有调度间隙，立即检查会在慢 runner 上抖动。
+ */
 template <typename Pred>
 bool WaitUntil(Pred&& pred, std::chrono::milliseconds ms) {
     const auto deadline = std::chrono::steady_clock::now() + ms;
@@ -97,7 +109,9 @@ bool WaitUntil(Pred&& pred, std::chrono::milliseconds ms) {
     return pred();
 }
 
-// 顺序记录仪：handler 并发/串行写都安全。
+/**
+ * 顺序记录仪：handler 并发/串行写都安全。
+ */
 struct OrderRecorder {
     void Push(int i) {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -111,8 +125,10 @@ struct OrderRecorder {
     std::vector<int>   values;
 };
 
-// 全局 fixture：调度器是进程寿命单例，只 Start 一次、无 Stop；4 个静态
-// worker 保证跨 Actor 用例有真实并行度（各用例已通过 latch 确认任务跑完）。
+/**
+ * 全局 fixture：调度器是进程寿命单例，只 Start 一次、无 Stop；4 个静态
+ * worker 保证跨 Actor 用例有真实并行度（各用例已通过 latch 确认任务跑完）。
+ */
 struct SchedulerFixture {
     SchedulerFixture() {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
@@ -127,7 +143,9 @@ BOOST_TEST_GLOBAL_FIXTURE(SchedulerFixture);
 
 namespace {
 
-// 混合声明：一个无 key 的普通方法 + 一个 ActorMethodAt。
+/**
+ * 混合声明：一个无 key 的普通方法 + 一个 ActorMethodAt。
+ */
 class MixedService final : public fw::CoService<MixedService> {
 public:
     static constexpr std::string_view kServiceName = "mixed";
@@ -142,7 +160,9 @@ public:
         fw::ActorMethodAt<&MixedService::Keyed, std::int32_t>("keyed"));
 };
 
-// 全部方法都经 ActorMethodAt 声明。
+/**
+ * 全部方法都经 ActorMethodAt 声明。
+ */
 class AllKeyedService final : public fw::CoService<AllKeyedService> {
 public:
     static constexpr std::string_view kServiceName = "keyed";
@@ -157,7 +177,9 @@ public:
         fw::ActorMethodAt<&AllKeyedService::B, std::int32_t>("b"));
 };
 
-// 注册表测试服务：构造计数验证「至多一次」。无 RPC 方法声明 → 空表。
+/**
+ * 注册表测试服务：构造计数验证「至多一次」。无 RPC 方法声明 → 空表。
+ */
 class CountingService final : public fw::CoService<CountingService> {
 public:
     CountingService() { s_ctor_count.fetch_add(1); }
@@ -170,7 +192,9 @@ constexpr std::chrono::milliseconds kWait{5000};
 
 BOOST_AUTO_TEST_SUITE(framework_f2a)
 
-// ValidateServiceOptions 合法/非法矩阵。
+/**
+ * ValidateServiceOptions 合法/非法矩阵。
+ */
 BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
     const fw::ServiceOptions actor_base{
         fw::ExecutionPolicy::ActorSerial,
@@ -181,7 +205,9 @@ BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
         /*max_ordered_streams*/ 0,
         /*max_cached_results*/ 0,
         /*max_cached_result_bytes*/ 0};
-    // BOOST_CHECK 只记录表达式文本，不要求操作数可流式输出（result<T>）。
+    /**
+     * BOOST_CHECK 只记录表达式文本，不要求操作数可流式输出（result<T>）。
+     */
     BOOST_CHECK(fw::ValidateServiceOptions(actor_base));
 
     fw::ServiceOptions concurrent = actor_base;
@@ -214,7 +240,9 @@ BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
       expect_invalid(o, "mailbox_capacity"); }
     { auto o = concurrent; o.max_actors = 1;
       expect_invalid(o, "max_actors"); }
-    // ordered_ingress 用在 Concurrent 上必须被拒。
+    /**
+     * ordered_ingress 用在 Concurrent 上必须被拒。
+     */
     { auto o = concurrent; o.ordered_ingress = true;
       o.max_ordered_streams = 1; o.max_cached_results = 1;
       o.max_cached_result_bytes = 1;
@@ -233,7 +261,9 @@ BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
       expect_invalid(o, "max_cached_result_bytes"); }
 }
 
-// ActorSerial 服务存在无 key 提取器的方法 → 启动期校验失败。
+/**
+ * ActorSerial 服务存在无 key 提取器的方法 → 启动期校验失败。
+ */
 BOOST_AUTO_TEST_CASE(actor_serial_requires_key_extractor) {
     const auto mixed = fw::BuildMethodTable<MixedService>();
     auto bad = fw::ValidateActorKeying(mixed, fw::ExecutionPolicy::ActorSerial);
@@ -248,7 +278,9 @@ BOOST_AUTO_TEST_CASE(actor_serial_requires_key_extractor) {
         fw::ExecutionPolicy::ActorSerial));
 }
 
-// 保序：首项用屏障拦在 handler 内，保证后续项全部排队后仍按接纳顺序处理。
+/**
+ * 保序：首项用屏障拦在 handler 内，保证后续项全部排队后仍按接纳顺序处理。
+ */
 BOOST_AUTO_TEST_CASE(mailbox_preserves_admission_order) {
     auto mb = fw::ActorMailbox::Create(8);
     TestGate entered, release;
@@ -261,7 +293,9 @@ BOOST_AUTO_TEST_CASE(mailbox_preserves_admission_order) {
         rec.Push(0);
         done.CountDown();
     }));
-    // 首项已进入 handler（执行中），此时再接纳的项必然全部落在等待队列。
+    /**
+     * 首项已进入 handler（执行中），此时再接纳的项必然全部落在等待队列。
+     */
     BOOST_REQUIRE(entered.WaitFor(kWait));
     for (int i = 1; i <= 5; ++i)
         BOOST_REQUIRE(mb->TryEnqueue([&rec, &done, i] {
@@ -273,8 +307,10 @@ BOOST_AUTO_TEST_CASE(mailbox_preserves_admission_order) {
     BOOST_TEST(rec.Snapshot() == std::vector<int>({0, 1, 2, 3, 4, 5}));
 }
 
-// 非重入：handler1 被屏障拦在执行中时再接纳 handler2；
-// 重入实现会让 handler2 在 handler1 阻塞期间进入（leaked=true 即失败）。
+/**
+ * 非重入：handler1 被屏障拦在执行中时再接纳 handler2；
+ * 重入实现会让 handler2 在 handler1 阻塞期间进入（leaked=true 即失败）。
+ */
 BOOST_AUTO_TEST_CASE(mailbox_non_reentrant) {
     auto mb = fw::ActorMailbox::Create(4);
     std::atomic<int> in_exec{0}, max_exec{0};
@@ -291,12 +327,18 @@ BOOST_AUTO_TEST_CASE(mailbox_non_reentrant) {
     BOOST_REQUIRE(mb->TryEnqueue([&] {
         note_entry();
         entered1.Open();
-        release1.Wait();          // 执行中阻塞：给 handler2 完整重叠窗口
+        /**
+         * 执行中阻塞：给 handler2 完整重叠窗口
+         */
+        release1.Wait();
         rec.Push(1);
         in_exec.fetch_sub(1);
         done.CountDown();
     }));
-    BOOST_REQUIRE(entered1.WaitFor(kWait));   // handler1 确认在执行中
+    /**
+     * handler1 确认在执行中
+     */
+    BOOST_REQUIRE(entered1.WaitFor(kWait));
 
     BOOST_REQUIRE(mb->TryEnqueue([&] {
         note_entry();
@@ -305,8 +347,10 @@ BOOST_AUTO_TEST_CASE(mailbox_non_reentrant) {
         in_exec.fetch_sub(1);
         done.CountDown();
     }));
-    // 正确实现下 handler2 此刻只能排队，entered2 不可能提前打开；
-    // 若实现重入（每条任务一个协程），200ms 内必然进入并打开 entered2。
+    /**
+     * 正确实现下 handler2 此刻只能排队，entered2 不可能提前打开；
+     * 若实现重入（每条任务一个协程），200ms 内必然进入并打开 entered2。
+     */
     const bool leaked = entered2.WaitFor(std::chrono::milliseconds(200));
     release1.Open();
     BOOST_REQUIRE(done.WaitFor(kWait));
@@ -314,12 +358,16 @@ BOOST_AUTO_TEST_CASE(mailbox_non_reentrant) {
     BOOST_TEST(!leaked);
     BOOST_TEST(max_exec.load() == 1);
     BOOST_TEST(rec.Snapshot() == std::vector<int>({1, 2}));
-    // done 归零（handler 内 CountDown）早于 drain 协程回环清 m_draining；
-    // 立即断言 IsDraining() 会撞上窗口，改为带超时等收敛。
+    /**
+     * done 归零（handler 内 CountDown）早于 drain 协程回环清 m_draining；
+     * 立即断言 IsDraining() 会撞上窗口，改为带超时等收敛。
+     */
     BOOST_TEST(WaitUntil([&] { return !mb->IsDraining(); }, kWait));
 }
 
-// 容量：等待队列满后再接纳返回 Overloaded，被拒任务不得执行。
+/**
+ * 容量：等待队列满后再接纳返回 Overloaded，被拒任务不得执行。
+ */
 BOOST_AUTO_TEST_CASE(mailbox_full_returns_overloaded) {
     auto mb = fw::ActorMailbox::Create(2);
     TestGate entered, release;
@@ -333,7 +381,10 @@ BOOST_AUTO_TEST_CASE(mailbox_full_returns_overloaded) {
         rec.Push(0);
         done.CountDown();
     }));
-    BOOST_REQUIRE(entered.WaitFor(kWait));    // 执行中项不占容量
+    /**
+     * 执行中项不占容量
+     */
+    BOOST_REQUIRE(entered.WaitFor(kWait));
     BOOST_REQUIRE(mb->TryEnqueue([&] { rec.Push(1); done.CountDown(); }));
     BOOST_REQUIRE(mb->TryEnqueue([&] { rec.Push(2); done.CountDown(); }));
     BOOST_TEST(mb->Pending() == std::size_t{2});
@@ -350,7 +401,9 @@ BOOST_AUTO_TEST_CASE(mailbox_full_returns_overloaded) {
     BOOST_TEST(!rejected_ran.load());
 }
 
-// 异常路径：handler 抛异常后下一条仍被处理，且异常经 hook 可观测。
+/**
+ * 异常路径：handler 抛异常后下一条仍被处理，且异常经 hook 可观测。
+ */
 BOOST_AUTO_TEST_CASE(mailbox_exception_continues_queue) {
     std::atomic<int> abnormal{0};
     auto mb = fw::ActorMailbox::Create(4,
@@ -368,14 +421,18 @@ BOOST_AUTO_TEST_CASE(mailbox_exception_continues_queue) {
     BOOST_TEST(abnormal.load() == 1);
     BOOST_TEST(rec.Snapshot() == std::vector<int>({0, 1}));
 
-    // 异常后邮箱仍可继续接纳。
+    /**
+     * 异常后邮箱仍可继续接纳。
+     */
     BOOST_REQUIRE(mb->TryEnqueue([&] { rec.Push(2); done3.CountDown(); }));
     BOOST_REQUIRE(done3.WaitFor(kWait));
     BOOST_TEST(rec.Snapshot() == std::vector<int>({0, 1, 2}));
 }
 
-// 跨 Actor 并发：两个邮箱的 handler 互相等对方进入执行，
-// 两侧都等到才证明执行真实重叠，而非各自跑完。
+/**
+ * 跨 Actor 并发：两个邮箱的 handler 互相等对方进入执行，
+ * 两侧都等到才证明执行真实重叠，而非各自跑完。
+ */
 BOOST_AUTO_TEST_CASE(mailboxes_progress_concurrently) {
     auto mb_a = fw::ActorMailbox::Create(4);
     auto mb_b = fw::ActorMailbox::Create(4);
@@ -400,7 +457,9 @@ BOOST_AUTO_TEST_CASE(mailboxes_progress_concurrently) {
     BOOST_TEST(b_saw_a.load());
 }
 
-// Close 停止接纳；已接纳项仍被消费完。
+/**
+ * Close 停止接纳；已接纳项仍被消费完。
+ */
 BOOST_AUTO_TEST_CASE(mailbox_close_stops_admission) {
     auto mb = fw::ActorMailbox::Create(4);
     TestGate entered, release;
@@ -423,8 +482,10 @@ BOOST_AUTO_TEST_CASE(mailbox_close_stops_admission) {
     BOOST_REQUIRE(done.WaitFor(kWait));
 }
 
-// Registry：同 key 至多一次（返回同一实例、工厂只调一次）、key 可读回、
-// max_actors 超限拒绝、未注册服务拒绝。
+/**
+ * Registry：同 key 至多一次（返回同一实例、工厂只调一次）、key 可读回、
+ * max_actors 超限拒绝、未注册服务拒绝。
+ */
 BOOST_AUTO_TEST_CASE(registry_at_most_once_and_max_actors) {
     fw::ActorRegistry reg;
     BOOST_REQUIRE(reg.RegisterService<CountingService>("svc", 2));
@@ -434,7 +495,10 @@ BOOST_AUTO_TEST_CASE(registry_at_most_once_and_max_actors) {
     BOOST_REQUIRE(a1);
     auto a1b = reg.GetOrCreate("svc", "k1");
     BOOST_REQUIRE(a1b);
-    BOOST_TEST(a1.value().get() == a1b.value().get());   // 同一实例
+    /**
+     * 同一实例
+     */
+    BOOST_TEST(a1.value().get() == a1b.value().get());
     BOOST_TEST(CountingService::s_ctor_count.load() == before + 1);
     BOOST_REQUIRE(a1.value()->co_actor_key().has_value());
     BOOST_TEST(a1.value()->co_actor_key().value() == "k1");
@@ -454,7 +518,9 @@ BOOST_AUTO_TEST_CASE(registry_at_most_once_and_max_actors) {
     BOOST_CHECK(unreg.error().code == fw::ErrorCode::NotFound);
 }
 
-// 激活失败不留半激活对象：不占位不计数，同 key 重试可成功。
+/**
+ * 激活失败不留半激活对象：不占位不计数，同 key 重试可成功。
+ */
 BOOST_AUTO_TEST_CASE(registry_failed_activation_leaves_no_partial) {
     fw::ActorRegistry reg;
     std::atomic<int> calls{0};

@@ -1,20 +1,22 @@
-// examples/dual_service/gateway_main.cc — svc_b：网关服务进程。
-//
-// 业务形态：单进程托管一个 Concurrent 服务 "gateway"，handler 内经
-// this->call 真实跨进程调用 storage（static_routes 显式白名单，目标
-// endpoint 由命令行传入）。演示：
-//   fetch(key)          → storage.get 透传（含 miss → NotFound 透传）
-//   store(key, value)   → storage.put 透传
-//   explode()           → 业务错误（InternalError）不经网络直达客户端
-//   slowcall(ms)        → storage.sleep_ms；显式子预算到期，服务端继承后 TimedOut
-//   missing()           → 调用未路由服务名 → find_route NotFound 失败路径
-//
-// 协议：V2 会话（SessionFrame + u32be + Hello/HelloAck，与 examples/getvalue
-// 同口径）。V2 的 CallOptions.deadline 同时是客户端等待上限与 wire
-// remaining_budget_ms 的来源，出站子预算/父预算才能真正到达对端服务端
-// （见 SlowCall 注释）。
-//
-// 优雅关闭同 svc_a：SIGINT/SIGTERM → watcher 线程 request_shutdown。
+/**
+ * examples/dual_service/gateway_main.cc — svc_b：网关服务进程。
+ *
+ * 业务形态：单进程托管一个 Concurrent 服务 "gateway"，handler 内经
+ * this->call 真实跨进程调用 storage（static_routes 显式白名单，目标
+ * endpoint 由命令行传入）。演示：
+ * fetch(key)          → storage.get 透传（含 miss → NotFound 透传）
+ * store(key, value)   → storage.put 透传
+ * explode()           → 业务错误（InternalError）不经网络直达客户端
+ * slowcall(ms)        → storage.sleep_ms；显式子预算到期，服务端继承后 TimedOut
+ * missing()           → 调用未路由服务名 → find_route NotFound 失败路径
+ *
+ * 协议：V2 会话（SessionFrame + u32be + Hello/HelloAck，与 examples/getvalue
+ * 同口径）。V2 的 CallOptions.deadline 同时是客户端等待上限与 wire
+ * remaining_budget_ms 的来源，出站子预算/父预算才能真正到达对端服务端
+ * （见 SlowCall 注释）。
+ *
+ * 优雅关闭同 svc_a：SIGINT/SIGTERM → watcher 线程 request_shutdown。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -34,10 +36,12 @@ namespace fw = bbt::framework;
 
 namespace {
 
-// slowcall 对 storage 的显式子预算：经 V2 Call 的 remaining_budget_ms
-// 传到对端，storage handler 可见前收敛为 min(传输硬看门, now+budget) 并据此
-// 中断 sleep_ms。driver 用远大于它的客户端预算，故收到的 TimedOut 只能由
-// 服务端自产——这是「服务端继承预算」而非「仅客户端超时」的可判定证据。
+/**
+ * slowcall 对 storage 的显式子预算：经 V2 Call 的 remaining_budget_ms
+ * 传到对端，storage handler 可见前收敛为 min(传输硬看门, now+budget) 并据此
+ * 中断 sleep_ms。driver 用远大于它的客户端预算，故收到的 TimedOut 只能由
+ * 服务端自产——这是「服务端继承预算」而非「仅客户端超时」的可判定证据。
+ */
 constexpr std::int64_t kSlowCallSubBudgetMs = 600;
 
 class GatewaySvc final : public fw::CoService<GatewaySvc> {
@@ -45,8 +49,10 @@ public:
     static constexpr std::string_view kServiceName = "gateway";
 
     fw::CoRpcResp Fetch(fw::CoRpcReq req) {
-        // 跨进程调用：static_routes["storage"] → http://<svc_a>/rpc。
-        // 远端业务错误（NotFound）原样透传给本进程调用方。
+        /**
+         * 跨进程调用：static_routes["storage"] → http://<svc_a>/rpc。
+         * 远端业务错误（NotFound）原样透传给本进程调用方。
+         */
         auto resp = this->call("storage", "get", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
@@ -59,7 +65,9 @@ public:
     }
 
     fw::CoRpcResp Del(fw::CoRpcReq req) {
-        // 清理本轮 key 用：透传 storage.del（Redis DEL + Mongo DeleteOne）。
+        /**
+         * 清理本轮 key 用：透传 storage.del（Redis DEL + Mongo DeleteOne）。
+         */
         auto resp = this->call("storage", "del", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
@@ -73,10 +81,12 @@ public:
     }
 
     fw::CoRpcResp SlowCall(fw::CoRpcReq req) {
-        // 显式给 storage 一个 600ms 子预算（两参数重载：CallOptions 经
-        // AdaptCallOptions 与父预算取 min，不会延长父预算）。预算随
-        // V2 Call 的 remaining_budget_ms 到达 storage，服务端继承后
-        // 在其 deadline 到期时如实 TimedOut；本进程再把该错误透传给 driver。
+        /**
+         * 显式给 storage 一个 600ms 子预算（两参数重载：CallOptions 经
+         * AdaptCallOptions 与父预算取 min，不会延长父预算）。预算随
+         * V2 Call 的 remaining_budget_ms 到达 storage，服务端继承后
+         * 在其 deadline 到期时如实 TimedOut；本进程再把该错误透传给 driver。
+         */
         fw::CallOptions o;
         o.deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds{kSlowCallSubBudgetMs};
@@ -86,8 +96,10 @@ public:
     }
 
     fw::CoRpcResp Missing(fw::CoRpcReq req) {
-        // 失败路径：static_routes 未配置 "no.such.service" →
-        // find_route NotFound，不发起任何网络 I/O。
+        /**
+         * 失败路径：static_routes 未配置 "no.such.service" →
+         * find_route NotFound，不发起任何网络 I/O。
+         */
         auto resp = this->call("no.such.service", "ping", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
@@ -109,7 +121,9 @@ void InstallSignals() {
     std::signal(SIGTERM, [](int) { g_stop.store(true); });
 }
 
-// 十进制端口解析（同 svc_a）：非法值给诊断后正常退出，不走 std::stoi 抛异常。
+/**
+ * 十进制端口解析（同 svc_a）：非法值给诊断后正常退出，不走 std::stoi 抛异常。
+ */
 bool ParsePort(const char* text, std::uint16_t* out) {
     if (text == nullptr || *text == '\0') return false;
     unsigned long value = 0;
@@ -126,7 +140,9 @@ bool ParsePort(const char* text, std::uint16_t* out) {
 } // namespace
 
 int main(int argc, char** argv) {
-    // 用法: svc_b <listen_port> <storage_endpoint host:port>
+    /**
+     * 用法: svc_b <listen_port> <storage_endpoint host:port>
+     */
     if (argc != 3) {
         std::fprintf(stderr,
             "usage: svc_b <listen_port> <storage_endpoint host:port>\n");
@@ -137,12 +153,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "[svc_b] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
             argv[1]);
-        return 64;   // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 64;
     }
     const std::string storage_ep = argv[2];
 
-    // handler 内嵌套出站调用（入站 → this->call → HTTP client →
-    // 等回包），协程栈按实测放大到 64KB。
+    /**
+     * handler 内嵌套出站调用（入站 → this->call → HTTP client →
+     * 等回包），协程栈按实测放大到 64KB。
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 
@@ -154,10 +175,14 @@ int main(int argc, char** argv) {
         /*max_body_bytes*/  65536,
         /*incoming_timeout*/std::chrono::milliseconds{30000}};
     opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
-    // V2 会话身份必填；gateway 与 storage 进程使用互异身份。
+    /**
+     * V2 会话身份必填；gateway 与 storage 进程使用互异身份。
+     */
     opts.local_identity = "dual-gateway";
-    // 出站白名单：仅允许名为 "storage" 的逻辑目标，endpoint 为真实
-    // host:port——没有自动发现，也未配置的目标一律 NotFound。
+    /**
+     * 出站白名单：仅允许名为 "storage" 的逻辑目标，endpoint 为真实
+     * host:port——没有自动发现，也未配置的目标一律 NotFound。
+     */
     opts.static_routes = {
         fw::StaticRoute{"storage", storage_ep}};
     opts.shutdown_step_budget = std::chrono::milliseconds{2000};

@@ -1,11 +1,13 @@
 #pragma once
 #include <bbt/coroutine/object/CoRuntimeOnly.hpp>
-// framework v2 受管对象公共值层：id/generation/状态/info/handle/borrow/token。
-//
-// 本头只承载契约 §3 的值类型与句柄面；Registry/生命周期实现见
-// internal/Registry.hpp，CoApp 装配面见 CoApp.hpp（v2 面经 Framework.hpp
-// 透出）。所有 handle 只携带「Registry 弱引用 + id + generation + 失效位」，
-// 不持有对象所有权；对象由对应 Registry 强持有并最终归 CoApp。
+/**
+ * framework v2 受管对象公共值层：id/generation/状态/info/handle/borrow/token。
+ *
+ * 本头只承载契约 §3 的值类型与句柄面；Registry/生命周期实现见
+ * internal/Registry.hpp，CoApp 装配面见 CoApp.hpp（v2 面经 Framework.hpp
+ * 透出）。所有 handle 只携带「Registry 弱引用 + id + generation + 失效位」，
+ * 不持有对象所有权；对象由对应 Registry 强持有并最终归 CoApp。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -28,9 +30,13 @@
 namespace bbt::framework {
 namespace v2 { class CoApp; class CoComponent; }
 
-/// @brief 受管对象的稳定逻辑标识；不是指针、fd 或协程 id。
+/**
+ * @brief 受管对象的稳定逻辑标识；不是指针、fd 或协程 id。
+ */
 using ObjectId = std::string;
-/// @brief Actor 实例标识：(actor type, key)。
+/**
+ * @brief Actor 实例标识：(actor type, key)。
+ */
 using ActorId = std::pair<std::string, std::string>;
 
 /**
@@ -40,39 +46,114 @@ using ActorId = std::pair<std::string, std::string>;
  * InstallFailed/Failed 是可 Find 的终前状态，不是自动回滚。
  */
 enum class ObjectState {
-    Created,      ///< 已构造登记、未开始安装 hook。
-    Installing,   ///< 登记完成、OnInstall/绑定装配进行中。
-    Installed,    ///< OnInstall 成功；App 未 Running 时停在此态。
-    Starting,     ///< OnStart 进行中。
-    Running,      ///< 已启动，可派发/借用。
-    Paused,       ///< OnPause 成功，拒新。
-    Stopping,     ///< 收口进行中。
-    Stopped,      ///< 收口完成。
-    InstallFailed,///< OnInstall 或声明绑定失败；仍可 Find/卸载。
-    Failed,       ///< OnStart/Pause/Resume 等运行期 hook 失败。
-    StopIncomplete,   ///< Stop 超时或有 pending borrow；允许再次 Stop 推进。
-    Uninstalling,     ///< 卸载进行中。
-    UninstallIncomplete, ///< 卸载超时（borrow 未归零等）。
-    Destroyed,    ///< 已从 Registry 移除并销毁。
-    Invalidated,  ///< 观察端视角：句柄 generation 已失配。
-    Unknown       ///< 无证据状态。
+    /**
+     * 已构造登记、未开始安装 hook。
+     */
+    Created,
+    /**
+     * 登记完成、OnInstall/绑定装配进行中。
+     */
+    Installing,
+    /**
+     * OnInstall 成功；App 未 Running 时停在此态。
+     */
+    Installed,
+    /**
+     * OnStart 进行中。
+     */
+    Starting,
+    /**
+     * 已启动，可派发/借用。
+     */
+    Running,
+    /**
+     * OnPause 成功，拒新。
+     */
+    Paused,
+    /**
+     * 收口进行中。
+     */
+    Stopping,
+    /**
+     * 收口完成。
+     */
+    Stopped,
+    /**
+     * OnInstall 或声明绑定失败；仍可 Find/卸载。
+     */
+    InstallFailed,
+    /**
+     * OnStart/Pause/Resume 等运行期 hook 失败。
+     */
+    Failed,
+    /**
+     * Stop 超时或有 pending borrow；允许再次 Stop 推进。
+     */
+    StopIncomplete,
+    /**
+     * 卸载进行中。
+     */
+    Uninstalling,
+    /**
+     * 卸载超时（borrow 未归零等）。
+     */
+    UninstallIncomplete,
+    /**
+     * 已从 Registry 移除并销毁。
+     */
+    Destroyed,
+    /**
+     * 观察端视角：句柄 generation 已失配。
+     */
+    Invalidated,
+    /**
+     * 无证据状态。
+     */
+    Unknown
 };
 
-/// @brief 组件归属范围：App 共享、Service 私有或 Actor 实例私有。
+/**
+ * @brief 组件归属范围：App 共享、Service 私有或 Actor 实例私有。
+ */
 enum class ComponentScope { App, Service, Actor };
 
-/// @brief v2::CoApp 自身生命周期状态。
+/**
+ * @brief v2::CoApp 自身生命周期状态。
+ */
 enum class AppState {
-    Created,        ///< 已构造未启动。
-    Starting,       ///< Start 进行中。
-    Running,        ///< 已启动，接纳安装/绑定操作。
-    Paused,         ///< Pause 成功，拒新。
-    Stopping,       ///< Stop 收口进行中。
-    StopIncomplete, ///< 收口未竟（pending cleanup），可再次 Stop 推进。
-    Stopped         ///< 收口完成；Stop 后不能 Start。
+    /**
+     * 已构造未启动。
+     */
+    Created,
+    /**
+     * Start 进行中。
+     */
+    Starting,
+    /**
+     * 已启动，接纳安装/绑定操作。
+     */
+    Running,
+    /**
+     * Pause 成功，拒新。
+     */
+    Paused,
+    /**
+     * Stop 收口进行中。
+     */
+    Stopping,
+    /**
+     * 收口未竟（pending cleanup），可再次 Stop 推进。
+     */
+    StopIncomplete,
+    /**
+     * 收口完成；Stop 后不能 Start。
+     */
+    Stopped
 };
 
-/// @brief 受管对象类别。
+/**
+ * @brief 受管对象类别。
+ */
 enum class ObjectKind { App, Service, Actor, Component };
 
 class ObjectHandle;
@@ -145,11 +226,22 @@ ComponentHandle<C> MakeComponentHandle(ObjectHandle object,
                                        std::uint64_t binding_generation);
 } // namespace detail
 
-/// @brief 最后一次错误的稳定摘要（不含原始异常文本）。
+/**
+ * @brief 最后一次错误的稳定摘要（不含原始异常文本）。
+ */
 struct ObjectError {
-    ErrorCode   code = ErrorCode::InternalError; ///< 稳定错误码。
-    std::string phase;      ///< install/start/stop/uninstall/observe 等相位。
-    std::string message;    ///< 已脱敏说明。
+    /**
+     * 稳定错误码。
+     */
+    ErrorCode code = ErrorCode::InternalError;
+    /**
+     * install/start/stop/uninstall/observe 等相位。
+     */
+    std::string phase;
+    /**
+     * 已脱敏说明。
+     */
+    std::string message;
 };
 
 /**
@@ -158,22 +250,59 @@ struct ObjectError {
  * ObjectHandle::Info() 的唯一返回面，不携带对象指针、引用或 shared_ptr。
  */
 struct ObjectInfo {
-    ObjectId        id;             ///< 稳定逻辑 id。
-    std::uint64_t   generation = 0; ///< 对象代；句柄失配即失效。
-    ObjectKind      kind = ObjectKind::App; ///< 对象类别。
-    std::string     type_name;      ///< 静态类型名（服务名/actor type/组件 typeid 名）。
-    std::string     name;           ///< 逻辑名（service/component name；actor 为 key）。
-    ComponentScope  scope = ComponentScope::App; ///< 组件归属范围。
-    ObjectId        owner_id;       ///< Service/Actor scope 组件的宿主 id；其余为空。
-    ObjectState     state = ObjectState::Unknown; ///< 观察时刻状态。
-    std::optional<ObjectError> last_error;    ///< 最近一次错误摘要。
-    std::chrono::system_clock::time_point observed_at; ///< 快照时间。
+    /**
+     * 稳定逻辑 id。
+     */
+    ObjectId id;
+    /**
+     * 对象代；句柄失配即失效。
+     */
+    std::uint64_t generation = 0;
+    /**
+     * 对象类别。
+     */
+    ObjectKind kind = ObjectKind::App;
+    /**
+     * 静态类型名（服务名/actor type/组件 typeid 名）。
+     */
+    std::string type_name;
+    /**
+     * 逻辑名（service/component name；actor 为 key）。
+     */
+    std::string name;
+    /**
+     * 组件归属范围。
+     */
+    ComponentScope scope = ComponentScope::App;
+    /**
+     * Service/Actor scope 组件的宿主 id；其余为空。
+     */
+    ObjectId owner_id;
+    /**
+     * 观察时刻状态。
+     */
+    ObjectState state = ObjectState::Unknown;
+    /**
+     * 最近一次错误摘要。
+     */
+    std::optional<ObjectError> last_error;
+    /**
+     * 快照时间。
+     */
+    std::chrono::system_clock::time_point observed_at;
 };
 
-/// @brief Actor 扩展快照：在 ObjectInfo 上附带 actor_id 与 mailbox 值。
+/**
+ * @brief Actor 扩展快照：在 ObjectInfo 上附带 actor_id 与 mailbox 值。
+ */
 struct ActorInfo : ObjectInfo {
-    ActorId actor_id;   ///< Actor 实例标识。
-    /// MailBox 为地址值（非对象引用）；生成期填充。
+    /**
+     * Actor 实例标识。
+     */
+    ActorId actor_id;
+    /**
+     * MailBox 为地址值（非对象引用）；生成期填充。
+     */
     MailBox mailbox;
 };
 
@@ -181,16 +310,39 @@ struct ActorInfo : ObjectInfo {
  * @brief 对象状态事件（owning 值），Observe 回调的唯一载荷。
  */
 struct ObjectStateEvent {
-    ObjectId        id;             ///< 事件对象 id。
-    std::uint64_t   generation = 0; ///< 对象代。
-    ObjectState     state = ObjectState::Unknown; ///< 新状态。
-    std::uint64_t   revision = 0;   ///< 每对象单调递增事件序号。
-    std::chrono::system_clock::time_point observed_at; ///< 事件时间。
-    std::optional<ObjectError> error;   ///< 失败事件的错误摘要。
-    std::optional<ActorInfo> actor;     ///< 仅 Actor 终态附带。
+    /**
+     * 事件对象 id。
+     */
+    ObjectId id;
+    /**
+     * 对象代。
+     */
+    std::uint64_t generation = 0;
+    /**
+     * 新状态。
+     */
+    ObjectState state = ObjectState::Unknown;
+    /**
+     * 每对象单调递增事件序号。
+     */
+    std::uint64_t revision = 0;
+    /**
+     * 事件时间。
+     */
+    std::chrono::system_clock::time_point observed_at;
+    /**
+     * 失败事件的错误摘要。
+     */
+    std::optional<ObjectError> error;
+    /**
+     * 仅 Actor 终态附带。
+     */
+    std::optional<ActorInfo> actor;
 };
 
-/// @brief 状态观察者回调签名；在锁外执行，抛异常被框架计数。
+/**
+ * @brief 状态观察者回调签名；在锁外执行，抛异常被框架计数。
+ */
 using ObjectObserver = std::function<void(const ObjectStateEvent&)>;
 
 /**
@@ -209,20 +361,30 @@ class ObjectHandle {
 public:
     ObjectHandle() = default;
 
-    /// @brief 对象稳定逻辑 id。
+    /**
+     * @brief 对象稳定逻辑 id。
+     */
     const ObjectId& Id() const noexcept { return m_id; }
-    /// @brief 对象代。
+    /**
+     * @brief 对象代。
+     */
     std::uint64_t   Generation() const noexcept { return m_generation; }
     /**
      * @brief 对象是否仍登记且 generation 未变（观察值，不代表可解引用）。
      * @return 有效返回 true；Registry 已关闭或对象失效返回 false。
      */
     bool            IsValid() const noexcept;
-    /// @brief 取对象身份与状态快照；Registry 关闭返回 Closed。
+    /**
+     * @brief 取对象身份与状态快照；Registry 关闭返回 Closed。
+     */
     result<ObjectInfo> Info() const;
-    /// @brief 取 Service/Actor 地址值；Component/App 或 Registry 关闭返回错误。
+    /**
+     * @brief 取 Service/Actor 地址值；Component/App 或 Registry 关闭返回错误。
+     */
     result<MailBox> GetMailBox() const;
-    /// @brief 对象类别。
+    /**
+     * @brief 对象类别。
+     */
     ObjectKind      Kind() const noexcept { return m_kind; }
 
 private:
@@ -253,32 +415,28 @@ private:
 template <class C>
 class ComponentBorrow {
 public:
-    ComponentBorrow(ComponentBorrow&& o) noexcept
-        : m_binding(std::move(o.m_binding)), m_obj(o.m_obj) { o.m_obj = nullptr; }
-    ComponentBorrow& operator=(ComponentBorrow&& o) noexcept {
-        if (this != &o) { _Release(); m_binding = std::move(o.m_binding);
-            m_obj = o.m_obj; o.m_obj = nullptr; }
-        return *this;
-    }
+    ComponentBorrow(ComponentBorrow&& o) noexcept;
+    ComponentBorrow& operator=(ComponentBorrow&& o) noexcept;
     ~ComponentBorrow() noexcept { _Release(); }
 
     ComponentBorrow(const ComponentBorrow&) = delete;
     ComponentBorrow& operator=(const ComponentBorrow&) = delete;
 
-    /// @brief 被借用的组件引用；只在本 borrow 生存期内有效。
+    /**
+     * @brief 被借用的组件引用；只在本 borrow 生存期内有效。
+     */
     C& Get() const noexcept { return *m_obj; }
 
 private:
     ComponentBorrow(std::shared_ptr<void> binding_lease, C* obj)
         : m_binding(std::move(binding_lease)), m_obj(obj) {}
 
-    void _Release() noexcept {
-        m_binding.reset();
-        m_obj = nullptr;
-    }
+    void _Release() noexcept;
 
-    // 保持 binding lease（内部为 detail::BindingLease，析构把 borrow 计数
-    // 归还 Registry）；对象本体由 Registry 持有，这里只放非拥有指针。
+    /**
+     * 保持 binding lease（内部为 detail::BindingLease，析构把 borrow 计数
+     * 归还 Registry）；对象本体由 Registry 持有，这里只放非拥有指针。
+     */
     std::shared_ptr<void> m_binding;
     C*                    m_obj = nullptr;
 
@@ -314,33 +472,26 @@ class ComponentHandle {
 public:
     ComponentHandle() = default;
 
-    /// @brief 组件对象的非拥有句柄。
+    /**
+     * @brief 组件对象的非拥有句柄。
+     */
     ObjectHandle Object() const { return m_object; }
-    /// @brief 对象是否仍登记且 generation 未变。
+    /**
+     * @brief 对象是否仍登记且 generation 未变。
+     */
     bool         IsValid() const noexcept { return m_object.IsValid(); }
     /**
      * @brief 借取组件实际引用 lease。
      * @return 成功返回 ComponentBorrow<C>；对象销毁/绑定失效/状态门拒/封门
      *         时返回 Closed 或 Overloaded。
      */
-    result<ComponentBorrow<C>> Borrow() const {
-        if (!bbt::coroutine::IsInCoroutineContext())
-            return result<ComponentBorrow<C>>::err(MakeError(
-                ErrorCode::InvalidContext, "Borrow requires coroutine context"));
-        return _Borrow(false);
-    }
+    result<ComponentBorrow<C>> Borrow() const;
 
 private:
     ComponentHandle(ObjectHandle object, std::uint64_t binding_generation)
         : m_object(std::move(object)), m_binding_gen(binding_generation) {}
 
-    result<ComponentBorrow<C>> _Borrow(bool allow_installing_borrow) const {
-        auto r = detail::BorrowImpl(m_object, m_binding_gen,
-                                    allow_installing_borrow);
-        if (!r) return result<ComponentBorrow<C>>::err(std::move(r.error()));
-        return detail::MakeComponentBorrow<C>(
-            std::move(r.value().first), static_cast<C*>(r.value().second));
-    }
+    result<ComponentBorrow<C>> _Borrow(bool allow_installing_borrow) const;
 
     ObjectHandle   m_object;
     std::uint64_t  m_binding_gen = 0;
@@ -348,12 +499,17 @@ private:
     template <class T>
     friend ComponentHandle<T> detail::MakeComponentHandle(
         ObjectHandle, std::uint64_t);
-    friend class ::bbt::framework::v2::CoApp;   // 装配窗口借 Installed 依赖
+    /**
+     * 装配窗口借 Installed 依赖
+     */
+    friend class ::bbt::framework::v2::CoApp;
 };
 
 namespace detail {
-// ComponentHandle<C> 的唯一构造点：Registry/CoApp 在绑定成功后经本函数
-// 供给（object handle + binding generation）。
+/**
+ * ComponentHandle<C> 的唯一构造点：Registry/CoApp 在绑定成功后经本函数
+ * 供给（object handle + binding generation）。
+ */
 template <class C>
 ComponentHandle<C> MakeComponentHandle(ObjectHandle object,
                                        std::uint64_t binding_generation) {
@@ -382,9 +538,13 @@ public:
     ObserverToken(const ObserverToken&) = delete;
     ObserverToken& operator=(const ObserverToken&) = delete;
 
-    /// @brief 逻辑撤销订阅；在途回调不被强杀，Revoke 后不再新派发。
+    /**
+     * @brief 逻辑撤销订阅；在途回调不被强杀，Revoke 后不再新派发。
+     */
     void Revoke() noexcept;
-    /// @brief 订阅是否仍生效（Revoke 或 observer/target 卸载后为 false）。
+    /**
+     * @brief 订阅是否仍生效（Revoke 或 observer/target 卸载后为 false）。
+     */
     bool IsActive() const noexcept;
 
 private:
@@ -397,7 +557,9 @@ private:
     friend class detail::Registry;
 };
 
-// ---- Options（契约 §4.1 的最小落地：只有本切片用到的 setter）----
+/**
+ * ---- Options（契约 §4.1 的最小落地：只有本切片用到的 setter）----
+ */
 
 /**
  * @brief 生命周期操作的时限选项。
@@ -406,7 +568,9 @@ private:
  */
 class LifecycleOptions {
 public:
-    /// @brief 设置操作期限。
+    /**
+     * @brief 设置操作期限。
+     */
     LifecycleOptions& SetDeadline(bbt::coroutine::Deadline d) {
         m_deadline = d; return *this;
     }
@@ -419,7 +583,9 @@ public:
     bbt::coroutine::Deadline Deadline() const noexcept {
         return m_deadline.value_or(bbt::coroutine::Deadline::max());
     }
-    /// @brief 未显式设置时返回空。
+    /**
+     * @brief 未显式设置时返回空。
+     */
     std::optional<bbt::coroutine::Deadline> RawDeadline() const noexcept {
         return m_deadline;
     }
@@ -432,15 +598,23 @@ private:
  */
 class ComponentOptions {
 public:
-    /// @brief 设置归属范围（默认 App）。
+    /**
+     * @brief 设置归属范围（默认 App）。
+     */
     ComponentOptions& SetScope(ComponentScope s) { m_scope = s; return *this; }
-    /// @brief 设置宿主对象（Service/Actor scope 必须；App scope 禁止）。
+    /**
+     * @brief 设置宿主对象（Service/Actor scope 必须；App scope 禁止）。
+     */
     ComponentOptions& SetOwner(ObjectHandle owner) {
         m_owner = std::move(owner); return *this;
     }
-    /// @brief 归属范围。
+    /**
+     * @brief 归属范围。
+     */
     ComponentScope Scope() const noexcept { return m_scope; }
-    /// @brief 宿主句柄（未设为空）。
+    /**
+     * @brief 宿主句柄（未设为空）。
+     */
     const std::optional<ObjectHandle>& Owner() const noexcept { return m_owner; }
 private:
     ComponentScope            m_scope = ComponentScope::App;
@@ -455,8 +629,14 @@ private:
  */
 namespace detail {
 struct ComponentBindingDecl {
-    const std::type_info* component_type;   ///< &typeid(C)
-    std::string           name;             ///< 组件逻辑名
+    /**
+     * &typeid(C)
+     */
+    const std::type_info* component_type;
+    /**
+     * 组件逻辑名
+     */
+    std::string name;
 };
 } // namespace detail
 
@@ -467,15 +647,23 @@ struct ComponentBindingDecl {
  */
 class ServiceOptions {
 public:
-    /// @brief 本服务安装/启动等生命周期步骤的时限选项。
+    /**
+     * @brief 本服务安装/启动等生命周期步骤的时限选项。
+     */
     ServiceOptions& SetLifecycleOptions(LifecycleOptions o) {
         m_life = o; return *this;
     }
-    /// @brief 最大在途请求数（必须 >0，Install 校验）。
+    /**
+     * @brief 最大在途请求数（必须 >0，Install 校验）。
+     */
     ServiceOptions& SetMaxInflight(std::size_t n) { m_max_inflight = n; return *this; }
-    /// @brief 按 key 串行的最大 key 数。
+    /**
+     * @brief 按 key 串行的最大 key 数。
+     */
     ServiceOptions& SetMaxSerialKeys(std::size_t n) { m_max_serial_keys = n; return *this; }
-    /// @brief 串行队列容量。
+    /**
+     * @brief 串行队列容量。
+     */
     ServiceOptions& SetSerialQueueCapacity(std::size_t n) {
         m_serial_queue_capacity = n; return *this;
     }
@@ -486,31 +674,42 @@ public:
      * @param name 目标组件逻辑名（指向已安装项）。
      */
     template <class C>
-    ServiceOptions& BindComponent(std::string name) {
-        m_component_bindings.push_back(
-            detail::ComponentBindingDecl{&typeid(C), std::move(name)});
-        return *this;
-    }
+    ServiceOptions& BindComponent(std::string name);
 
-    /// @brief 生命周期选项。
+    /**
+     * @brief 生命周期选项。
+     */
     const LifecycleOptions& Life() const noexcept { return m_life; }
-    /// @brief 最大在途请求数。
+    /**
+     * @brief 最大在途请求数。
+     */
     std::size_t MaxInflight() const noexcept { return m_max_inflight; }
-    /// @brief 最大串行 key 数。
+    /**
+     * @brief 最大串行 key 数。
+     */
     std::size_t MaxSerialKeys() const noexcept { return m_max_serial_keys; }
-    /// @brief 串行队列容量。
+    /**
+     * @brief 串行队列容量。
+     */
     std::size_t SerialQueueCapacity() const noexcept {
         return m_serial_queue_capacity;
     }
-    /// @brief 已声明的组件绑定列表。
+    /**
+     * @brief 已声明的组件绑定列表。
+     */
     const std::vector<detail::ComponentBindingDecl>& ComponentBindings()
         const noexcept { return m_component_bindings; }
 
-    /// @brief 校验选项（max_inflight 必须为有限正值）。
+    /**
+     * @brief 校验选项（max_inflight 必须为有限正值）。
+     */
     result<void> Validate() const;
 private:
     LifecycleOptions m_life;
-    std::size_t      m_max_inflight = 0;          // 0 = 未设；Install 校验 >0
+    /**
+     * 0 = 未设；Install 校验 >0
+     */
+    std::size_t m_max_inflight = 0;
     std::size_t      m_max_serial_keys = 0;
     std::size_t      m_serial_queue_capacity = 0;
     std::vector<detail::ComponentBindingDecl> m_component_bindings;
@@ -523,17 +722,25 @@ private:
  */
 class ActorOptions {
 public:
-    /// @brief 生命周期选项。
+    /**
+     * @brief 生命周期选项。
+     */
     ActorOptions& SetLifecycleOptions(LifecycleOptions o) {
         m_life = o; return *this;
     }
-    /// @brief 本类型最大实例数（必须 >0）。
+    /**
+     * @brief 本类型最大实例数（必须 >0）。
+     */
     ActorOptions& SetMaxActors(std::size_t n) { m_max_actors = n; return *this; }
-    /// @brief 每实例邮箱容量（必须 >0）。
+    /**
+     * @brief 每实例邮箱容量（必须 >0）。
+     */
     ActorOptions& SetMailboxCapacity(std::size_t n) {
         m_mailbox_capacity = n; return *this;
     }
-    /// @brief 聚合队列容量（必须 >0）。
+    /**
+     * @brief 聚合队列容量（必须 >0）。
+     */
     ActorOptions& SetAggregateQueueCapacity(std::size_t n) {
         m_aggregate_queue_capacity = n; return *this;
     }
@@ -543,27 +750,35 @@ public:
      * @param name 目标组件逻辑名。
      */
     template <class C>
-    ActorOptions& BindComponent(std::string name) {
-        m_component_bindings.push_back(
-            detail::ComponentBindingDecl{&typeid(C), std::move(name)});
-        return *this;
-    }
+    ActorOptions& BindComponent(std::string name);
 
-    /// @brief 生命周期选项。
+    /**
+     * @brief 生命周期选项。
+     */
     const LifecycleOptions& Life() const noexcept { return m_life; }
-    /// @brief 最大实例数。
+    /**
+     * @brief 最大实例数。
+     */
     std::size_t MaxActors() const noexcept { return m_max_actors; }
-    /// @brief 每实例邮箱容量。
+    /**
+     * @brief 每实例邮箱容量。
+     */
     std::size_t MailboxCapacity() const noexcept { return m_mailbox_capacity; }
-    /// @brief 聚合队列容量。
+    /**
+     * @brief 聚合队列容量。
+     */
     std::size_t AggregateQueueCapacity() const noexcept {
         return m_aggregate_queue_capacity;
     }
-    /// @brief 已声明的组件绑定列表。
+    /**
+     * @brief 已声明的组件绑定列表。
+     */
     const std::vector<detail::ComponentBindingDecl>& ComponentBindings()
         const noexcept { return m_component_bindings; }
 
-    /// @brief 校验选项（三项额度必须为有限正值）。
+    /**
+     * @brief 校验选项（三项额度必须为有限正值）。
+     */
     result<void> Validate() const;
 private:
     LifecycleOptions m_life;
@@ -578,11 +793,15 @@ private:
  */
 class CreateOptions {
 public:
-    /// @brief 设置创建期限。
+    /**
+     * @brief 设置创建期限。
+     */
     CreateOptions& SetDeadline(bbt::coroutine::Deadline d) {
         m_deadline = d; return *this;
     }
-    /// @brief 已设期限；未设为空。
+    /**
+     * @brief 已设期限；未设为空。
+     */
     std::optional<bbt::coroutine::Deadline> Deadline() const noexcept {
         return m_deadline;
     }
@@ -597,7 +816,9 @@ private:
  */
 class AppOptions {
 public:
-    /// @brief 配置监听地址（本切片登记值，未接网络面）。
+    /**
+     * @brief 配置监听地址（本切片登记值，未接网络面）。
+     */
     AppOptions& Listen(std::string uri) { m_listen = std::move(uri); return *this; }
     /**
      * @brief 设置受管对象/绑定/观察者/事件队列额度（四项均须 >0）。
@@ -614,81 +835,226 @@ public:
         m_observer_queue_capacity = observer_queue_capacity;
         return *this;
     }
-    /// @brief 关闭收口总预算（须为正）。
+    /**
+     * @brief 关闭收口总预算（须为正）。
+     */
     AppOptions& SetShutdownBudget(std::chrono::milliseconds budget) {
         m_shutdown_budget = budget; return *this;
     }
-    /// @brief 各生命周期步骤默认预算（须为正；未显式 SetDeadline 时使用）。
+    /**
+     * @brief 各生命周期步骤默认预算（须为正；未显式 SetDeadline 时使用）。
+     */
     AppOptions& SetLifecycleBudget(std::chrono::milliseconds budget) {
         m_lifecycle_budget = budget; return *this;
     }
 
-    /// @brief 监听地址（未设为空）。
+    /**
+     * @brief 监听地址（未设为空）。
+     */
     const std::optional<std::string>& ListenUri() const noexcept { return m_listen; }
-    /// @brief 最大受管对象数。
+    /**
+     * @brief 最大受管对象数。
+     */
     std::size_t MaxObjects() const noexcept { return m_max_objects; }
-    /// @brief 最大绑定边数。
+    /**
+     * @brief 最大绑定边数。
+     */
     std::size_t MaxBindings() const noexcept { return m_max_bindings; }
-    /// @brief 最大观察订阅数。
+    /**
+     * @brief 最大观察订阅数。
+     */
     std::size_t MaxObservers() const noexcept { return m_max_observers; }
-    /// @brief 事件队列容量。
+    /**
+     * @brief 事件队列容量。
+     */
     std::size_t ObserverQueueCapacity() const noexcept {
         return m_observer_queue_capacity;
     }
-    /// @brief 关闭收口预算。
+    /**
+     * @brief 关闭收口预算。
+     */
     std::chrono::milliseconds ShutdownBudget() const noexcept {
         return m_shutdown_budget;
     }
-    /// @brief 生命周期默认预算。
+    /**
+     * @brief 生命周期默认预算。
+     */
     std::chrono::milliseconds LifecycleBudget() const noexcept {
         return m_lifecycle_budget;
     }
 
-    /// @brief 校验选项（额度与预算必须为有限正值）。
+    /**
+     * @brief 校验选项（额度与预算必须为有限正值）。
+     */
     result<void> Validate() const;
 private:
     std::optional<std::string> m_listen;
-    // 有限正值才放行；0 表示未设（Validate 拒绝）。
+    /**
+     * 有限正值才放行；0 表示未设（Validate 拒绝）。
+     */
     std::size_t m_max_objects = 0;
     std::size_t m_max_bindings = 0;
     std::size_t m_max_observers = 0;
     std::size_t m_observer_queue_capacity = 0;
     std::chrono::milliseconds m_shutdown_budget{0};
-    // 未设 LifecycleOptions::SetDeadline 时各 lifecycle 步使用的总预算。
+    /**
+     * 未设 LifecycleOptions::SetDeadline 时各 lifecycle 步使用的总预算。
+     */
     std::chrono::milliseconds m_lifecycle_budget{0};
 };
 
-// ---- 收尾/失败诊断（值快照，bounded ring 由 Registry 维持）----
-/// @brief 收口未完成项快照（PendingCleanup 的元素）。
+/**
+ * ---- 收尾/失败诊断（值快照，bounded ring 由 Registry 维持）----
+ * @brief 收口未完成项快照（PendingCleanup 的元素）。
+ */
 struct CleanupInfo {
-    ObjectId      object_id;            ///< 对象 id。
-    std::uint64_t generation = 0;       ///< 对象代。
-    std::string   phase;                ///< 收口相位。
-    std::size_t   pending_borrows = 0;  ///< 未归还的 borrow 数。
-    std::size_t   pending_tasks = 0;    ///< 未完成任务数（本切片恒 0）。
-    std::size_t   pending_callbacks = 0;///< 未派发回调数。
-    ErrorCode     code = ErrorCode::InternalError; ///< 稳定错误码。
+    /**
+     * 对象 id。
+     */
+    ObjectId object_id;
+    /**
+     * 对象代。
+     */
+    std::uint64_t generation = 0;
+    /**
+     * 收口相位。
+     */
+    std::string phase;
+    /**
+     * 未归还的 borrow 数。
+     */
+    std::size_t pending_borrows = 0;
+    /**
+     * 未完成任务数（本切片恒 0）。
+     */
+    std::size_t pending_tasks = 0;
+    /**
+     * 未派发回调数。
+     */
+    std::size_t pending_callbacks = 0;
+    /**
+     * 稳定错误码。
+     */
+    ErrorCode code = ErrorCode::InternalError;
 };
 
-/// @brief 生命周期失败记录（LifecycleFailures 的元素；bounded ring）。
+/**
+ * @brief 生命周期失败记录（LifecycleFailures 的元素；bounded ring）。
+ */
 struct LifecycleFailure {
-    ObjectId      object_id;            ///< 对象 id。
-    std::uint64_t generation = 0;       ///< 对象代。
-    std::string   operation;            ///< 操作名（install/start/stop 等）。
-    std::string   phase;                ///< 失败相位。
-    ErrorCode     code = ErrorCode::InternalError; ///< 稳定错误码。
-    std::chrono::system_clock::time_point at;      ///< 发生时间。
-    std::string   message;  ///< 本地脱敏说明。
+    /**
+     * 对象 id。
+     */
+    ObjectId object_id;
+    /**
+     * 对象代。
+     */
+    std::uint64_t generation = 0;
+    /**
+     * 操作名（install/start/stop 等）。
+     */
+    std::string operation;
+    /**
+     * 失败相位。
+     */
+    std::string phase;
+    /**
+     * 稳定错误码。
+     */
+    ErrorCode code = ErrorCode::InternalError;
+    /**
+     * 发生时间。
+     */
+    std::chrono::system_clock::time_point at;
+    /**
+     * 本地脱敏说明。
+     */
+    std::string message;
 };
 
-/// @brief 绑定/解绑事件值快照（OnBindingChanged 的载荷）。
+/**
+ * @brief 绑定/解绑事件值快照（OnBindingChanged 的载荷）。
+ */
 struct BindingEvent {
-    ObjectId      subject_id;           ///< 绑定发起方 id。
-    ObjectId      target_id;            ///< 目标组件 id。
-    std::uint64_t generation = 0;       ///< 目标对象代。
-    bool          bound = false;        ///< true=绑定发布，false=解绑完成。
-    std::uint64_t revision = 0;         ///< 目标对象事件序号。
-    std::chrono::system_clock::time_point observed_at; ///< 事件时间。
+    /**
+     * 绑定发起方 id。
+     */
+    ObjectId subject_id;
+    /**
+     * 目标组件 id。
+     */
+    ObjectId target_id;
+    /**
+     * 目标对象代。
+     */
+    std::uint64_t generation = 0;
+    /**
+     * true=绑定发布，false=解绑完成。
+     */
+    bool bound = false;
+    /**
+     * 目标对象事件序号。
+     */
+    std::uint64_t revision = 0;
+    /**
+     * 事件时间。
+     */
+    std::chrono::system_clock::time_point observed_at;
 };
+
+template <class C>
+ComponentBorrow<C>::ComponentBorrow(ComponentBorrow&& o) noexcept
+    : m_binding(std::move(o.m_binding)), m_obj(o.m_obj) {
+    o.m_obj = nullptr;
+}
+
+template <class C>
+ComponentBorrow<C>& ComponentBorrow<C>::operator=(ComponentBorrow&& o) noexcept {
+    if (this != &o) {
+        _Release();
+        m_binding = std::move(o.m_binding);
+        m_obj = o.m_obj;
+        o.m_obj = nullptr;
+    }
+    return *this;
+}
+
+template <class C>
+void ComponentBorrow<C>::_Release() noexcept {
+    m_binding.reset();
+    m_obj = nullptr;
+}
+
+template <class C>
+result<ComponentBorrow<C>> ComponentHandle<C>::Borrow() const {
+    if (!bbt::coroutine::IsInCoroutineContext())
+        return result<ComponentBorrow<C>>::err(MakeError(
+            ErrorCode::InvalidContext, "Borrow requires coroutine context"));
+    return _Borrow(false);
+}
+
+template <class C>
+result<ComponentBorrow<C>> ComponentHandle<C>::_Borrow(bool allow_installing_borrow) const {
+    auto r = detail::BorrowImpl(m_object, m_binding_gen,
+                                allow_installing_borrow);
+    if (!r)
+        return result<ComponentBorrow<C>>::err(std::move(r.error()));
+    return detail::MakeComponentBorrow<C>(
+        std::move(r.value().first), static_cast<C*>(r.value().second));
+}
+
+template <class C>
+ServiceOptions& ServiceOptions::BindComponent(std::string name) {
+    m_component_bindings.push_back(
+        detail::ComponentBindingDecl{&typeid(C), std::move(name)});
+    return *this;
+}
+
+template <class C>
+ActorOptions& ActorOptions::BindComponent(std::string name) {
+    m_component_bindings.push_back(
+        detail::ComponentBindingDecl{&typeid(C), std::move(name)});
+    return *this;
+}
 
 } // namespace bbt::framework

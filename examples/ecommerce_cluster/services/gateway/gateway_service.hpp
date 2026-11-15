@@ -1,8 +1,10 @@
 #pragma once
-// 网关服务：对外唯一入口，把结算请求转给 order。
-//
-// 本头只声明业务面，实现见 gateway_service.cc。出站目标是逻辑服务名
-// kOrderService，地址由宿主 find_route 按动态路由表解析。
+/**
+ * 网关服务：对外唯一入口，把结算请求转给 order。
+ *
+ * 本头只声明业务面，实现见 gateway_service.cc。出站目标是逻辑服务名
+ * kOrderService，地址由宿主 find_route 按动态路由表解析。
+ */
 
 #include <string>
 #include <string_view>
@@ -25,7 +27,9 @@ using bbt::framework::CoService;
 using bbt::framework::ProtoMethod;
 using bbt::framework::RpcMethods;
 
-/// @brief 网关服务：`Checkout` 调用 order.Quote 并回带三跳实例身份。
+/**
+ * @brief 网关服务：`Checkout` 调用 order.Quote 并回带三跳实例身份。
+ */
 class GatewayService final : public CoService<GatewayService> {
 public:
     static constexpr std::string_view kServiceName = kGatewayService;

@@ -1,45 +1,47 @@
-// bbt-framework 公开出站策略 fixture。
-//
-// V2 会话拒绝 self-connection，框架又约束进程内同一时刻至多一个活跃 CoApp，
-// 因此本 fixture 由 caller 进程派生一个互异 identity 的 callee 进程：
-//
-//   caller 进程（local_identity=rpc-policy-caller）
-//     CoApp 宿主 PolicyCallerService；其 handler 内经受保护的
-//     `this->call<Req,Resp>` 出站，出站目标解析成功后、真实 socket 发送之前
-//     调用公开策略 `CoAppOptions::rpc_policy`
-//   callee 进程（local_identity=rpc-policy-callee）
-//     CoApp 宿主 PolicyCalleeService；入站经真实 V2 会话分发
-//
-// 只用公开面：`bbt/framework/CoApp.hpp`、`bbt/framework/RpcPolicy.hpp`、
-// `RequestContext.hpp` + getvalue 的 proto/codec。**不** include internal/、
-// **不**用 CoAppSeam/MakeCoAppForTest/DispatchInboundForTest/INetworkHost 桩/
-// 发送注入——编译期即证明「不依赖 internal 测试缝」。
-//
-// callee 在自己的 handler 内读公开 `RequestContext::deadline` 并 journal 可见
-// 剩余预算，作为「期限只缩不放」的真实 oracle（不依赖 reply envelope 预算，
-// 后者只反映 caller 自己的入站预算）。
-//
-// argv: rpc_policy <mode> <port_file> <meta_file> <journal_file>
-//   mode ∈ allow | reject | tighten | widen | expired | decorator
-//   - allow     ：策略允许（只计数）
-//   - reject    ：策略拒绝（Cancelled）：`_MakeEgress` 在 Send 之前返回错误
-//   - tighten   ：策略收紧出站期限到 now+300ms（应传播到 callee 可见预算）
-//   - widen     ：策略返回「放大」期限 now+3600s（框架必须忽略）
-//   - expired   ：策略收紧到 now-1ms（框架须在 I/O 前 TimedOut）
-//   - decorator ：外层策略包内层策略，两个虚 Preflight 各调一次、顺序固定
-//   内部模式 `--callee <port_file> <meta_file> <journal_file>` 由 caller 派生，
-//   不对外使用。
-//
-// journal 事件：preflight name=<n> seq=<k> / callee_handler_entered
-//   deadline_ms=<n> / listener_probe phase=after_run_before_exit port=<n>
-//   result=refused|connected|error errno=<n> / resource_close /
-//   shutdown rc=.. state=.. owner_closed=.. / callee_shutdown rc=..
-//
-// 关闭后验收（B1）：`app.run()` 返回、runner 已 join、进程与 `CoApp` 对象均仍
-// 存活时，由本进程对自己的 bound 端口做一次**有界** nonblocking connect 并入
-// journal。只有 ECONNREFUSED 记 result=refused（唯一判绿值）；超时或其它 errno
-// 记 result=error（不算绿）。该探针只证明「存活期 listener 已关」——它不证明
-// 关闭期零额外 I/O，也不替代在途 I/O 排空的判定。
+/**
+ * bbt-framework 公开出站策略 fixture。
+ *
+ * V2 会话拒绝 self-connection，框架又约束进程内同一时刻至多一个活跃 CoApp，
+ * 因此本 fixture 由 caller 进程派生一个互异 identity 的 callee 进程：
+ *
+ * caller 进程（local_identity=rpc-policy-caller）
+ * CoApp 宿主 PolicyCallerService；其 handler 内经受保护的
+ * `this->call<Req,Resp>` 出站，出站目标解析成功后、真实 socket 发送之前
+ * 调用公开策略 `CoAppOptions::rpc_policy`
+ * callee 进程（local_identity=rpc-policy-callee）
+ * CoApp 宿主 PolicyCalleeService；入站经真实 V2 会话分发
+ *
+ * 只用公开面：`bbt/framework/CoApp.hpp`、`bbt/framework/RpcPolicy.hpp`、
+ * `RequestContext.hpp` + getvalue 的 proto/codec。**不** include internal/、
+ * **不**用 CoAppSeam/MakeCoAppForTest/DispatchInboundForTest/INetworkHost 桩/
+ * 发送注入——编译期即证明「不依赖 internal 测试缝」。
+ *
+ * callee 在自己的 handler 内读公开 `RequestContext::deadline` 并 journal 可见
+ * 剩余预算，作为「期限只缩不放」的真实 oracle（不依赖 reply envelope 预算，
+ * 后者只反映 caller 自己的入站预算）。
+ *
+ * argv: rpc_policy <mode> <port_file> <meta_file> <journal_file>
+ * mode ∈ allow | reject | tighten | widen | expired | decorator
+ * - allow     ：策略允许（只计数）
+ * - reject    ：策略拒绝（Cancelled）：`_MakeEgress` 在 Send 之前返回错误
+ * - tighten   ：策略收紧出站期限到 now+300ms（应传播到 callee 可见预算）
+ * - widen     ：策略返回「放大」期限 now+3600s（框架必须忽略）
+ * - expired   ：策略收紧到 now-1ms（框架须在 I/O 前 TimedOut）
+ * - decorator ：外层策略包内层策略，两个虚 Preflight 各调一次、顺序固定
+ * 内部模式 `--callee <port_file> <meta_file> <journal_file>` 由 caller 派生，
+ * 不对外使用。
+ *
+ * journal 事件：preflight name=<n> seq=<k> / callee_handler_entered
+ * deadline_ms=<n> / listener_probe phase=after_run_before_exit port=<n>
+ * result=refused|connected|error errno=<n> / resource_close /
+ * shutdown rc=.. state=.. owner_closed=.. / callee_shutdown rc=..
+ *
+ * 关闭后验收（B1）：`app.run()` 返回、runner 已 join、进程与 `CoApp` 对象均仍
+ * 存活时，由本进程对自己的 bound 端口做一次**有界** nonblocking connect 并入
+ * journal。只有 ECONNREFUSED 记 result=refused（唯一判绿值）；超时或其它 errno
+ * 记 result=error（不算绿）。该探针只证明「存活期 listener 已关」——它不证明
+ * 关闭期零额外 I/O，也不替代在途 I/O 排空的判定。
+ */
 
 #include <atomic>
 #include <cerrno>
@@ -74,7 +76,10 @@
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
 
-#include "getvalue_service.hpp" // ProtoCodec<GetValueRequest/Response>（公开面）
+/**
+ * ProtoCodec<GetValueRequest/Response>（公开面）
+ */
+#include "getvalue_service.hpp"
 
 namespace fw = bbt::framework;
 namespace inf = bbt::infra;
@@ -90,7 +95,9 @@ std::ofstream g_journal;
 
 void Journal(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_journal_mtx);
-    // 单次 write（含换行）+ O_APPEND：两个进程的整行不会互相穿插/覆盖。
+    /**
+     * 单次 write（含换行）+ O_APPEND：两个进程的整行不会互相穿插/覆盖。
+     */
     const std::string buf = line + '\n';
     g_journal.write(buf.data(), static_cast<std::streamsize>(buf.size()));
     g_journal.flush();
@@ -118,10 +125,12 @@ private:
     bool m_closed = false;
 };
 
-// —— 业务（公开面）：caller 出站 + callee 观测 ——
-//
-// callee：journal handler 进入与**公开可见**的 handler 期限剩余（RequestContext
-// ::deadline - now），作为「期限只缩不放」的真实 oracle。
+/**
+ * —— 业务（公开面）：caller 出站 + callee 观测 ——
+ *
+ * callee：journal handler 进入与**公开可见**的 handler 期限剩余（RequestContext
+ * ::deadline - now），作为「期限只缩不放」的真实 oracle。
+ */
 class PolicyCalleeService final : public fw::CoService<PolicyCalleeService> {
 public:
     static constexpr std::string_view kServiceName = "bbt.example.v1.PolicyCallee";
@@ -150,8 +159,10 @@ public:
                                        bbt::example::v1::GetValueResponse>("GetValue"));
 };
 
-// caller：经公开 typed 出站 `this->call<Req,Resp>` 转发到 callee（静态路由）或
-// 未配置路由目标（find_route 门拒绝，策略不被询问）。
+/**
+ * caller：经公开 typed 出站 `this->call<Req,Resp>` 转发到 callee（静态路由）或
+ * 未配置路由目标（find_route 门拒绝，策略不被询问）。
+ */
 class PolicyCallerService final : public fw::CoService<PolicyCallerService> {
 public:
     static constexpr std::string_view kServiceName = "bbt.example.v1.PolicyCaller";
@@ -185,16 +196,20 @@ private:
     }
 };
 
-// —— B1 关闭后存活期 listener 探针（本段与负例替身共用同一份源码文本；
-//    scratch 负例按 BEGIN/END 标记抽取） BEGIN ——
+/**
+ * —— B1 关闭后存活期 listener 探针（本段与负例替身共用同一份源码文本；
+ * scratch 负例按 BEGIN/END 标记抽取） BEGIN ——
+ */
 enum class ListenerProbeResult {
     kRefused,
     kConnected,
     kError
 };
 
-// 有界 nonblocking connect：只有 ECONNREFUSED 判「listener 已关」；connect
-// 超时（poll 超时）或任何其它 errno 一律 kError，绝不判绿。
+/**
+ * 有界 nonblocking connect：只有 ECONNREFUSED 判「listener 已关」；connect
+ * 超时（poll 超时）或任何其它 errno 一律 kError，绝不判绿。
+ */
 ListenerProbeResult ProbeListenerBoundPort(std::uint16_t port, int* out_errno) {
     *out_errno = 0;
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -216,12 +231,18 @@ ListenerProbeResult ProbeListenerBoundPort(std::uint16_t port, int* out_errno) {
     ListenerProbeResult result = ListenerProbeResult::kError;
     const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     if (rc == 0) {
-        result = ListenerProbeResult::kConnected; // 仍在接受连接
+        /**
+         * 仍在接受连接
+         */
+        result = ListenerProbeResult::kConnected;
     } else if (errno == EINPROGRESS || errno == EALREADY) {
         pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLOUT;
-        const int n = ::poll(&pfd, 1, 2000); // 有界：最多 2s
+        /**
+         * 有界：最多 2s
+         */
+        const int n = ::poll(&pfd, 1, 2000);
         if (n == 1) {
             int soerr = 0;
             socklen_t slen = sizeof(soerr);
@@ -236,7 +257,10 @@ ListenerProbeResult ProbeListenerBoundPort(std::uint16_t port, int* out_errno) {
             }
         } else if (n < 0) {
             *out_errno = errno;
-        } // n == 0：超时 → kError
+            /**
+         * n == 0：超时 → kError
+         */
+        }
     } else if (errno == ECONNREFUSED) {
         *out_errno = errno;
         result = ListenerProbeResult::kRefused;
@@ -258,7 +282,9 @@ const char* ProbeResultName(ListenerProbeResult r) {
     }
     return "error";
 }
-// —— B1 关闭后存活期 listener 探针 END ——
+/**
+ * —— B1 关闭后存活期 listener 探针 END ——
+ */
 
 fw::ServiceOptions ConcurrentOpts() {
     return fw::ServiceOptions{fw::ExecutionPolicy::Concurrent,
@@ -271,7 +297,9 @@ fw::ServiceOptions ConcurrentOpts() {
                               /*max_cached_result_bytes*/ 0};
 }
 
-// —— 公开策略实现（继承 RpcPolicy）；组合包装见 DecoratorPolicy ——
+/**
+ * —— 公开策略实现（继承 RpcPolicy）；组合包装见 DecoratorPolicy ——
+ */
 class CountingAllowPolicy final : public fw::RpcPolicy {
 public:
     CountingAllowPolicy(std::string name, std::optional<std::chrono::milliseconds> tighten)
@@ -308,8 +336,10 @@ private:
     std::atomic<unsigned> m_calls{0};
 };
 
-// 装饰器策略（包装）：外层记录后委托内层，验证两个虚 Preflight 各调一次、
-// 顺序固定（外层先、内层后）。
+/**
+ * 装饰器策略（包装）：外层记录后委托内层，验证两个虚 Preflight 各调一次、
+ * 顺序固定（外层先、内层后）。
+ */
 class DecoratorPolicy final : public fw::RpcPolicy {
 public:
     DecoratorPolicy(std::shared_ptr<fw::RpcPolicy> inner, std::string name)
@@ -334,11 +364,20 @@ std::shared_ptr<fw::RpcPolicy> MakePolicy(const std::string& mode) {
         return std::make_shared<CountingAllowPolicy>("allow", std::nullopt);
     if (mode == "reject")
         return std::make_shared<RejectPolicy>();
-    if (mode == "tighten") // 收紧到 now+300ms
+    /**
+     * 收紧到 now+300ms
+     */
+    if (mode == "tighten")
         return std::make_shared<CountingAllowPolicy>("tighten", ms{300});
-    if (mode == "widen") // 放大到 now+3600s（框架必须忽略）
+    /**
+     * 放大到 now+3600s（框架必须忽略）
+     */
+    if (mode == "widen")
         return std::make_shared<CountingAllowPolicy>("widen", std::chrono::duration_cast<ms>(std::chrono::hours{1}));
-    if (mode == "expired") // 收紧到 now-1ms（I/O 前 TimedOut）
+    /**
+     * 收紧到 now-1ms（I/O 前 TimedOut）
+     */
+    if (mode == "expired")
         return std::make_shared<CountingAllowPolicy>("expired", ms{-1});
     if (mode == "decorator")
         return std::make_shared<DecoratorPolicy>(std::make_shared<CountingAllowPolicy>("inner", std::nullopt), "outer");
@@ -380,7 +419,9 @@ void ServeUntilEof(fw::CoApp& app) {
     app.request_shutdown();
 }
 
-// —— callee 进程：由 caller 派生，独立 CoApp（互异 identity） ——
+/**
+ * —— callee 进程：由 caller 派生，独立 CoApp（互异 identity） ——
+ */
 int RunCallee(const std::string& port_file, const std::string& meta_file) {
     fw::CoAppOptions options;
     options.network_limits = inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
@@ -445,7 +486,9 @@ bool SpawnCallee(const std::string& dir, const std::string& journal_path,
     }
     if (pid == 0) {
         ::close(in_pipe[1]);
-        // 父进程异常消失时子进程随之终止，避免验收失败后遗留 callee。
+        /**
+         * 父进程异常消失时子进程随之终止，避免验收失败后遗留 callee。
+         */
         ::prctl(PR_SET_PDEATHSIG, SIGTERM);
         ::dup2(in_pipe[0], STDIN_FILENO);
         ::close(in_pipe[0]);
@@ -465,7 +508,9 @@ bool SpawnCallee(const std::string& dir, const std::string& journal_path,
     return true;
 }
 
-// 有界等待 callee 就绪；子进程提前退出即失败（不静默继续）。
+/**
+ * 有界等待 callee 就绪；子进程提前退出即失败（不静默继续）。
+ */
 bool WaitCalleePort(CalleeProcess& callee, std::uint16_t& port, int timeout_ms) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
@@ -484,7 +529,9 @@ bool WaitCalleePort(CalleeProcess& callee, std::uint16_t& port, int timeout_ms) 
     return false;
 }
 
-// 关 stdin 触发 callee 优雅关闭；有界等待后强杀（异常路径也要回收）。
+/**
+ * 关 stdin 触发 callee 优雅关闭；有界等待后强杀（异常路径也要回收）。
+ */
 void ReapCallee(CalleeProcess& callee) {
     if (callee.pid < 0)
         return;
@@ -532,11 +579,15 @@ int RunCaller(const std::string& mode, const std::string& port_file,
                                                 /*incoming_timeout*/ std::chrono::milliseconds{30000}};
     options.listen = inf::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    // V2 会话身份必填；caller/callee/驱动器三方互异。
+    /**
+     * V2 会话身份必填；caller/callee/驱动器三方互异。
+     */
     options.local_identity = kCallerIdentity;
     options.static_routes = {
         fw::StaticRoute{std::string(PolicyCallerService::kCalleeService), callee_endpoint}};
-    // 唯一组装点——构造期选择公开策略。
+    /**
+     * 唯一组装点——构造期选择公开策略。
+     */
     options.rpc_policy = MakePolicy(mode);
 
     fw::CoApp app{std::move(options)};
@@ -586,14 +637,18 @@ int RunCaller(const std::string& mode, const std::string& port_file,
     const int state = static_cast<int>(app.shutdown_state());
     Journal(std::string("event=shutdown rc=") + std::to_string(rc) + " state=" + std::to_string(state) + " owner_closed=" + (owner->IsClosed() ? "1" : "0") + " auth_state=" + kAuthState);
 
-    // B1：run 已返回、runner 已 join，而本进程与 app 对象仍存活——此刻对 bound
-    // 端口做有界探针才可能区分「框架关掉了 listener」与「进程回收后被内核顺带
-    // 释放」。端口取自已服务过真实 RPC 的同一个值（driver 核 port 字段一致）。
+    /**
+     * B1：run 已返回、runner 已 join，而本进程与 app 对象仍存活——此刻对 bound
+     * 端口做有界探针才可能区分「框架关掉了 listener」与「进程回收后被内核顺带
+     * 释放」。端口取自已服务过真实 RPC 的同一个值（driver 核 port 字段一致）。
+     */
     int probe_errno = 0;
     const ListenerProbeResult probe = ProbeListenerBoundPort(port, &probe_errno);
     Journal(std::string("event=listener_probe phase=after_run_before_exit port=") + std::to_string(port) + " result=" + ProbeResultName(probe) + " errno=" + std::to_string(probe_errno) + " auth_state=" + kAuthState);
 
-    // caller 已收束后再关 callee；异常路径也被有界回收。
+    /**
+     * caller 已收束后再关 callee；异常路径也被有界回收。
+     */
     ReapCallee(callee);
     std::fprintf(stderr,
                  "rpc_policy fixture rc=%d state=%d owner_closed=%d "
@@ -606,12 +661,17 @@ int RunCaller(const std::string& mode, const std::string& port_file,
 
 int main(int argc, char* argv[]) {
     if (argc < 5)
-        return 90; // EX_USAGE
+        /**
+         * EX_USAGE
+         */
+        return 90;
 
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 
-    // 内部 callee 模式：先于 caller 打开 journal（append），不截断。
+    /**
+     * 内部 callee 模式：先于 caller 打开 journal（append），不截断。
+     */
     if (std::strcmp(argv[1], "--callee") == 0) {
         const std::string port_file = argv[2];
         const std::string meta_file = argv[3];

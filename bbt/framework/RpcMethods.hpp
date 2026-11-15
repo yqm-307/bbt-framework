@@ -1,19 +1,21 @@
 #pragma once
-// RPC 方法清单的声明糖（业务面）。
-//
-// 业务在服务类型上声明一份 constexpr 方法清单：
-//   static constexpr auto kRpcMethods = fw::RpcMethods(
-//       fw::Method<&EchoSvc::Ping>("ping"),
-//       fw::ActorMethodAt<&EchoSvc::Xfer, std::string>("xfer"));
-//
-//  - Method<成员指针>：普通 RPC 方法；handler 签名 CoRpcResp(CoRpcReq)；
-//  - ActorMethodAt<成员指针, Key类型, 位置下标>：ActorSerial 方法，
-//    actor key 取自 CoRpcReq 的第 Index 个位置参数，不再写提取 lambda；
-//  - RpcMethods(...)：把若干声明条目收进一个 MethodList。
-//
-// 声明条目是纯值类型，不含逻辑；展开为类型擦除方法表、codec 选择、
-// 重复/空名校验在 internal/MethodTable.hpp（机器面）完成——本头只承载
-// 业务要写的声明面，业务不应直接 include internal 头。
+/**
+ * RPC 方法清单的声明糖（业务面）。
+ *
+ * 业务在服务类型上声明一份 constexpr 方法清单：
+ * static constexpr auto kRpcMethods = fw::RpcMethods(
+ * fw::Method\<&EchoSvc::Ping\>("ping"),
+ * fw::ActorMethodAt<&EchoSvc::Xfer, std::string>("xfer"));
+ *
+ * - Method\<成员指针\>：普通 RPC 方法；handler 签名 CoRpcResp(CoRpcReq)；
+ * - ActorMethodAt\<成员指针, Key类型, 位置下标\>：ActorSerial 方法，
+ * actor key 取自 CoRpcReq 的第 Index 个位置参数，不再写提取 lambda；
+ * - RpcMethods(...)：把若干声明条目收进一个 MethodList。
+ *
+ * 声明条目是纯值类型，不含逻辑；展开为类型擦除方法表、codec 选择、
+ * 重复/空名校验在 internal/MethodTable.hpp（机器面）完成——本头只承载
+ * 业务要写的声明面，业务不应直接 include internal 头。
+ */
 
 #include <cstddef>
 #include <tuple>
@@ -23,7 +25,9 @@ namespace bbt::framework {
 
 namespace detail {
 
-// ---- 声明条目类型：NTTP 携带成员指针，name 为运行期字符串 ----
+/**
+ * ---- 声明条目类型：NTTP 携带成员指针，name 为运行期字符串 ----
+ */
 
 template <auto Ptr>
 struct MethodDecl {
@@ -35,9 +39,11 @@ struct PositionalActorMethodDecl {
     const char* name;
 };
 
-// 带 schema 类型的方法声明。请求/回复类型是 protobuf Message 类型，
-// 方法表在构建期从二者的 descriptor full_name 推导 request_schema /
-// response_schema——.proto 是唯一真源，业务不手写 schema 字符串。
+/**
+ * 带 schema 类型的方法声明。请求/回复类型是 protobuf Message 类型，
+ * 方法表在构建期从二者的 descriptor full_name 推导 request_schema /
+ * response_schema——.proto 是唯一真源，业务不手写 schema 字符串。
+ */
 template <auto Ptr, class Req, class Resp>
 struct ProtoMethodDecl {
     const char* name;
@@ -50,9 +56,11 @@ struct MethodList {
 
 } // namespace detail
 
-// 声明构造（constexpr）：CoService<T> 经 kRpcMethods 消费。
-//   fw::Method<&Svc::Ping>("ping")
-//   fw::ActorMethodAt<&Svc::Xfer, std::string>("xfer")
+/**
+ * 声明构造（constexpr）：CoService<T> 经 kRpcMethods 消费。
+ * fw::Method\<&Svc::Ping\>("ping")
+ * fw::ActorMethodAt<&Svc::Xfer, std::string>("xfer")
+ */
 
 template <auto Ptr>
 constexpr detail::MethodDecl<Ptr> Method(const char* name) {
@@ -65,13 +73,15 @@ ActorMethodAt(const char* name) {
     return detail::PositionalActorMethodDecl<Ptr, Key, Index>{name};
 }
 
-// proto schema 方法声明。
-//   fw::ProtoMethod<&Svc::GetValue,
-//                   bbt::example::v1::GetValueRequest,
-//                   bbt::example::v1::GetValueResponse>("GetValue")
-// handler 仍为 CoRpcResp(CoRpcReq)；负载 codec 由业务经公开
-// CoRpcReq::ParseProto / CoRpcResp::FromProto + rpc_detail::ProtoCodec<T>
-// 特化提供。schema 字符串由生成物的 descriptor 推导，不在此重复。
+/**
+ * proto schema 方法声明。
+ * fw::ProtoMethod<&Svc::GetValue,
+ * bbt::example::v1::GetValueRequest,
+ * bbt::example::v1::GetValueResponse>("GetValue")
+ * handler 仍为 CoRpcResp(CoRpcReq)；负载 codec 由业务经公开
+ * CoRpcReq::ParseProto / CoRpcResp::FromProto + rpc_detail::ProtoCodec<T>
+ * 特化提供。schema 字符串由生成物的 descriptor 推导，不在此重复。
+ */
 template <auto Ptr, class Req, class Resp>
 constexpr detail::ProtoMethodDecl<Ptr, Req, Resp>
 ProtoMethod(const char* name) {
@@ -83,7 +93,9 @@ constexpr detail::MethodList<D...> RpcMethods(D... decls) {
     return detail::MethodList<D...>{std::tuple<D...>(decls...)};
 }
 
-// T::kRpcMethods 检测（未声明 → 空表，同旧空 co_bind_rpc 语义）。
+/**
+ * T::kRpcMethods 检测（未声明 → 空表，同旧空 co_bind_rpc 语义）。
+ */
 template <class T, class = void>
 struct has_rpc_methods : std::false_type {};
 template <class T>

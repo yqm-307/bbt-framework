@@ -1,18 +1,20 @@
-// bbt-framework Service→Service 正式出站 caller 进程。
-//
-// 与 getvalue_server 同装配口径：公开 CoApp（local_identity 显式、V2 入站
-// 经 InstallRpcAdmission）+ 公开 CoService，不使用测试缝。宿主
-// GetValueCallerService；其 handler 内经 ICoService::call<Req,Resp> 向另一个
-// framework CoApp（callee 进程）发起真实 V2 Call 出站。监听 loopback 动态端口，写端口/元数据文件，阻塞等待
-// stdin EOF 后按序优雅关闭。
-//
-// argv:
-//   getvalue_caller caller <port_file> <callee_ep> <blackhole_ep> <meta_file>
-//     callee_ep / blackhole_ep 形如 127.0.0.1:<port>（静态路由 endpoint 形态）。
-//   getvalue_caller badroute <kind> <result_file>
-//     以公开入口验证三类非法静态路由在 run 启动任何组件前被拒绝。
-//     kind ∈ {empty-service, empty-endpoint, duplicate}；
-//     写出机器可读观测（rc/lifecycle_failures/bound_endpoint/资源工厂计数）。
+/**
+ * bbt-framework Service→Service 正式出站 caller 进程。
+ *
+ * 与 getvalue_server 同装配口径：公开 CoApp（local_identity 显式、V2 入站
+ * 经 InstallRpcAdmission）+ 公开 CoService，不使用测试缝。宿主
+ * GetValueCallerService；其 handler 内经 ICoService::call<Req,Resp> 向另一个
+ * framework CoApp（callee 进程）发起真实 V2 Call 出站。监听 loopback 动态端口，写端口/元数据文件，阻塞等待
+ * stdin EOF 后按序优雅关闭。
+ *
+ * argv:
+ * getvalue_caller caller <port_file> <callee_ep> <blackhole_ep> <meta_file>
+ * callee_ep / blackhole_ep 形如 127.0.0.1:<port>（静态路由 endpoint 形态）。
+ * getvalue_caller badroute <kind> <result_file>
+ * 以公开入口验证三类非法静态路由在 run 启动任何组件前被拒绝。
+ * kind ∈ {empty-service, empty-endpoint, duplicate}；
+ * 写出机器可读观测（rc/lifecycle_failures/bound_endpoint/资源工厂计数）。
+ */
 
 #include <atomic>
 #include <chrono>
@@ -37,20 +39,26 @@
 
 namespace {
 
-// 「启动任何组件前拒绝」的公开面额外证据：该延迟工厂只在 run() 通过配置
-// 校验、进入资源启动相位（on_scheduler_started）时被调用一次。被拒绝的
-// 配置下计数必须保持 0——证明拒绝发生在资源/网络/服务启动之前。
+/**
+ * 「启动任何组件前拒绝」的公开面额外证据：该延迟工厂只在 run() 通过配置
+ * 校验、进入资源启动相位（on_scheduler_started）时被调用一次。被拒绝的
+ * 配置下计数必须保持 0——证明拒绝发生在资源/网络/服务启动之前。
+ */
 std::atomic<int> g_probe_factory_calls{0};
 struct ProbeResource {};
 
-// caller 与 badroute 共用的基础装配（除 static_routes 外完全一致）。
+/**
+ * caller 与 badroute 共用的基础装配（除 static_routes 外完全一致）。
+ */
 bbt::framework::CoAppOptions BaseOptions() {
     bbt::framework::CoAppOptions options;
     options.network_limits = bbt::infra::NetworkLimits{
         64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}};
     options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
     options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    // V2 会话身份必填；caller 与 callee/badroute 进程使用互异身份。
+    /**
+     * V2 会话身份必填；caller 与 callee/badroute 进程使用互异身份。
+     */
     options.local_identity = "getvalue-caller";
     return options;
 }
@@ -60,12 +68,14 @@ bool IsKnownBadRouteKind(const std::string& kind) {
            kind == "duplicate";
 }
 
-// 三类非法静态路由（其余字段保持与正常 caller 相同的合法口径），供公开
-// CoApp 装配后在 run 前被 _ValidateConfig 拒绝：
-//   empty-service  空 service_name
-//   empty-endpoint 空 endpoint（V2 只校验 endpoint 非空，地址语法归 infra）
-//   duplicate      两条相同 service_name
-// （transport 维度随 V2 endpoint 字符串收敛而消失。）
+/**
+ * 三类非法静态路由（其余字段保持与正常 caller 相同的合法口径），供公开
+ * CoApp 装配后在 run 前被 _ValidateConfig 拒绝：
+ * empty-service  空 service_name
+ * empty-endpoint 空 endpoint（V2 只校验 endpoint 非空，地址语法归 infra）
+ * duplicate      两条相同 service_name
+ * （transport 维度随 V2 endpoint 字符串收敛而消失。）
+ */
 std::vector<bbt::framework::StaticRoute> BadRoutes(const std::string& kind) {
     using bbt::framework::StaticRoute;
     if (kind == "empty-service")
@@ -94,9 +104,11 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
-// 公开入口：装配非法静态路由 → add_service/add_resource → run()。
-// 断言依据是 run() 的返回码与公开观测口（lifecycle_failures/bound_endpoint/
-// 资源工厂计数），本进程只如实写观测，不打印硬编码期望值。
+/**
+ * 公开入口：装配非法静态路由 → add_service/add_resource → run()。
+ * 断言依据是 run() 的返回码与公开观测口（lifecycle_failures/bound_endpoint/
+ * 资源工厂计数），本进程只如实写观测，不打印硬编码期望值。
+ */
 int RunBadRoute(const std::string& kind, const std::string& result_file) {
     bbt::framework::CoAppOptions options = BaseOptions();
     options.static_routes = BadRoutes(kind);
@@ -123,7 +135,9 @@ int RunBadRoute(const std::string& kind, const std::string& result_file) {
         return 4;
     }
 
-    // 坏配置 → _ValidateConfig 在任何组件启动前返回 kExitRejected(1)。
+    /**
+     * 坏配置 → _ValidateConfig 在任何组件启动前返回 kExitRejected(1)。
+     */
     const int rc = app.run();
     const std::vector<std::string> failures = app.lifecycle_failures();
     const std::string endpoint = app.bound_endpoint();
@@ -164,7 +178,9 @@ int main(int argc, char* argv[]) {
         return 90;
     const std::string mode = argv[1];
 
-    // 非法静态路由的公开入口验收模式。
+    /**
+     * 非法静态路由的公开入口验收模式。
+     */
     if (mode == "badroute") {
         if (argc < 4 || !IsKnownBadRouteKind(argv[2]))
             return 90;
@@ -178,9 +194,11 @@ int main(int argc, char* argv[]) {
     const std::string black_ep  = argv[4];
     const std::string meta_file = argv[5];
 
-    // caller handler 内做 typed 出站（protobuf 编解码 + 框架分发），显式把
-    // 协程栈调大（公开配置宏，须在调度器 Start 前设置；process-global）。
-    // Two server drivers + one client-only driver + one application worker.
+    /**
+     * caller handler 内做 typed 出站（protobuf 编解码 + 框架分发），显式把
+     * 协程栈调大（公开配置宏，须在调度器 Start 前设置；process-global）。
+     * Two server drivers + one client-only driver + one application worker.
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 

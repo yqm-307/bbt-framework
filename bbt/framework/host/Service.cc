@@ -1,4 +1,6 @@
-// framework v2 受管对象基类实现：身份观察面与 subject 绑定表。
+/**
+ * framework v2 受管对象基类实现：身份观察面与 subject 绑定表。
+ */
 
 #include <mutex>
 
@@ -10,12 +12,16 @@
 
 namespace bbt::framework {
 
-// ---- detail::ObjectBase ----
+/**
+ * ---- detail::ObjectBase ----
+ */
 
 ObjectInfo detail::ObjectBase::_ObjectInfo() const {
     auto r = m_handle.Info();
     if (r) return r.value();
-    // 对象已销毁/失效：返回带原 id/generation 的最小快照。
+    /**
+     * 对象已销毁/失效：返回带原 id/generation 的最小快照。
+     */
     ObjectInfo info;
     info.id = m_handle.Id();
     info.generation = m_handle.Generation();
@@ -70,15 +76,21 @@ bool detail::ObjectBase::_FindBoundCopy(const std::type_info& type,
     return false;
 }
 
-// ---- CoComponent::Info ----
+/**
+ * ---- CoComponent::Info ----
+ */
 
 ObjectInfo v2::CoComponent::Info() const { return _ObjectInfo(); }
 
-// ---- CoServiceBase ----
+/**
+ * ---- CoServiceBase ----
+ */
 
 ObjectInfo v2::CoServiceBase::Info() const { return _ObjectInfo(); }
 
-// ---- CoActor::Info ----
+/**
+ * ---- CoActor::Info ----
+ */
 
 ActorInfo v2::CoActor::Info() const {
     ActorInfo out;
