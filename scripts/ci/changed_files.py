@@ -96,11 +96,27 @@ def classify_status(status: str, changed_files) -> str:
 
 # ---- affected path → focused ctest 名映射（本仓内联；唯一真源即本表，
 # 配套单测 test_changed_files.py 校验每个映射名都在当前 ctest 注册集内）----
-# 前缀按本仓源码模块划分（framework/src/<area>/、examples/<name>/），
+# 前缀按本仓源码模块划分（bbt/framework/<area>/、examples/<name>/），
 # 值是该模块直接耦合的 ctest 名列表（与 tests/CMakeLists.txt 的 add_test 名一一
 # 对应）。同一变更集命中多条前缀时取并集；无命中 → 空集 → 下游不追加 focused 步。
 # 维护规则：新增源码模块/ctest 注册名时必须同步本表；docs/CI 配置文件不进表。
+# bbt/framework/ 是 framework/include + framework/src 迁移后的并集布局：
+# 根兜底段取旧 src 兜底（rpc_*）与旧 include 段（coapp_lifecycle、
+# resource_lifecycle）的并集；旧 framework/ 前缀保留，供迁移前的存量分支
+# 仍选到同一测试集。
 FOCUSED_MAP = (
+    ("bbt/framework/actor/",
+     ("framework.actor_mailbox", "framework.ordered_egress",
+      "framework.ordered_ingress", "framework.ordered_ingress_rpc")),
+    ("bbt/framework/host/",
+     ("framework.coapp_lifecycle", "framework.inbound_http",
+      "framework.request_context", "framework.close_gate",
+      "framework.resource_lifecycle", "framework.shutdown",
+      "framework.egress_request_phase")),
+    ("bbt/framework/",
+     ("framework.rpc_surface", "framework.rpc_codec",
+      "framework.coapp_lifecycle", "framework.resource_lifecycle",
+      "framework.rpc_matrix")),
     ("framework/src/actor/",
      ("framework.actor_mailbox", "framework.ordered_egress",
       "framework.ordered_ingress", "framework.ordered_ingress_rpc")),

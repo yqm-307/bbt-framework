@@ -1,6 +1,14 @@
-# 三仓共用编码与维护规范
+# bbt-framework 本仓开发细则
 
-本规范供 `bbt-framework`、`bbtools-infra`、`bbtools-coroutine` 逐字复用。仓库现有实现风格与本规范冲突时，不做无关格式化或重命名；新增代码采用以下约定，明确的架构边界与安全约束优先。`.clang-format` 是 C++ 格式细则的唯一真源，本文件不展开其参数。
+跨仓公共设计、编码、Review 与用例规则以 `third-party/bbtools-pub/README.md` 及其职责入口为真源；本文件保留 framework 的分层、依赖、API、示例、测试、CI 与 fork 边界细则。仓库现有实现风格与本规范冲突时，不做无关格式化或重命名；新增代码采用以下约定，明确的架构边界与安全约束优先。`.clang-format` 是 C++ 格式细则的唯一真源，本文件不展开其参数。本文已有的通用条款作为本仓兼容入口保留；与 pub 重叠时以 pub 的当前正文为基线，本仓特有约束以本文为准。
+
+## 共用规范入口
+
+- 设计：`third-party/bbtools-pub/docs/10-design/README.md`
+- 编码与文档：`third-party/bbtools-pub/docs/20-coding/README.md`
+- Review：`third-party/bbtools-pub/docs/30-review/README.md`
+- 用例设计：`third-party/bbtools-pub/docs/40-testcase/README.md`
+- 本仓实现与验证：本文及 `docs/guides/`、`docs/architecture/`
 
 ## 1. 命名
 
@@ -25,8 +33,8 @@ cmake/                 CMake 模块
 ```
 
 - 根目录保留各仓入口文件（如 `AGENTS.md`、`README.md`、`CMakeLists.txt`、`.clang-format`、`.editorconfig`、`.gitignore`）。新目录按上表归类，不另建工具工作流或任务状态目录。
-- 现有目录在本轮按已定迁移边界处理：coroutine 的 `unit_test/`、`example/`、`benchmark_test/` 迁至 `tests/`、`examples/`、`benchmarks/`；framework 的 `framework/` 与 infra 的 `include/`、`src/` 暂不改名。不要把目标布局解释为要求一次性移动所有旧文件。
-- 每个公开类原则上由独立 `.hpp` 声明；有非内联实现时配对 `.cc`。接口抽象放 `interface/` 子目录，纯虚基类使用 `I` 前缀；头文件用 `#pragma once`。目录层级与命名空间保持一致。
+- 现有目录在本轮按已定迁移边界处理：coroutine 的 `unit_test/`、`example/`、`benchmark_test/` 已迁至 `tests/`、`examples/`、`benchmarks/`；infra 的源码已统一位于 `bbt/infra/`；framework 的 `framework/` 按既定迁移边界迁至 `bbt/framework/`。不要把目标布局解释为要求一次性移动所有旧文件。
+- 每个公开类原则上由独立 `.hpp` 声明；有非内联实现时配对 `.cc`。非模板有状态类的成员实现放配对 `.cc`；模板、`constexpr` 与必须头内可见的 `inline` 实现放同目录 `__TXxx.hpp`，由主头末尾 include，主头只留声明、访问分区与数据成员。接口抽象放 `interface/` 子目录，纯虚基类使用 `I` 前缀；头文件用 `#pragma once`。目录层级与命名空间保持一致。
 - include 顺序遵循仓库现有约定：对应/本文件所需头文件、标准库、项目公共头（如 `bbt/xxx`）、子模块头；避免无关 include。
 
 ## 3. 语言、架构与依赖
@@ -48,7 +56,7 @@ cmake/                 CMake 模块
 ## 5. 注释
 
 - **语言分工**：注释用中文（英文术语、标识符、API 名保留原样）；断言消息、异常 `what()`、日志/控制台错误与错误码 `message` 用英文。原因是这些字符串会进终端与日志管道，中文在各平台编码下容易变成乱码，而注释只被人读。不翻译业务 payload 里的原文。
-- **Doxygen 格式**：文件职责用文件头注释；公开类、结构体、自由函数、公开成员函数用 `/** @brief ... */`，字段/参数/返回值按需用 `@param`/`@return`，字段尾注用 `///<`。私有实现里的 WHY 行注释保持普通 `//`，不要机械加空 `@brief`。局部变量不逐个注释。
+- **注释形态**：自有 C/C++ 注释统一为多行 `/**` 块——`/**` 与 `*/` 各自独占一行，正文每行以 ` * ` 开头，短注释同样；`//`、`///`、`///<`、单行 `/* ... */` 一律按此写。行尾注释移到被说明语句上方；无大括号的控制体，注释挂在控制头上方。注释组与前后代码空一行、紧贴被说明代码；访问说明符后不空行，文件首块不空行；`}` 结束命名空间不写尾注。分区横幅用 `/** @name ... @{ */` 与 `/** @} */` 成对包住，避免吸附到下一个实体；函数体内的说明块由 Doxygen `HIDE_IN_BODY_DOCS` 挡在文档外。工具/法律必需指令（`// clang-format`、`NOLINT`、许可证原文、第三方头原文）保持原样。公开类、结构体、自由函数、公开成员函数用 `@brief`，字段/参数/返回值按需用 `@param`/`@return`；不要机械加空 `@brief`，局部变量不逐个注释。尚未迁移的存量 `//` 注释按既定迁移计划批量改写，或随所在代码修改时迁移。
 - **描述当前状态**：注释只说明现在为什么这样写。不留历史堆砌、旧方案叙事、审查编号、阶段/修复代号或契约行号；需要长期保留的决策写进 `docs/`（架构契约、ADR、指南），过程关联留在 commit/PR/Issue。
 - 解释 WHY，不复述代码已经表达的 WHAT。涉及线程/协程交错、挂起/唤醒、取消、事件顺序、所有权或资源关闭时，写明必须成立的时序/生命周期约束。
 - **复杂机制配图**：状态机、多阶段关闭、责任转移这类靠文字很难读准的机制，允许并鼓励用几行 ASCII 图或一段 PlantUML 说明事件流；图只服务于这段代码，不新建文档站点、不接 CI 渲染。
@@ -58,20 +66,28 @@ cmake/                 CMake 模块
 正反例：
 
 ```cpp
-// 差：术语堆叠、没有信息、AI 味重
-// 本模块基于统一责任编排范式，实现全链路、多维度、可观测的关闭语义闭环。
+/**
+ * 差：术语堆叠、没有信息、AI 味重
+ * 本模块基于统一责任编排范式，实现全链路、多维度、可观测的关闭语义闭环。
+ */
 
-// 差：堆历史，读者无法判断当前行为
-// P2-5 修复了早期版本在 reader 上阻塞的问题，旧实现曾经直接 Fail()。
+/**
+ * 差：堆历史，读者无法判断当前行为
+ * P2-5 修复了早期版本在 reader 上阻塞的问题，旧实现曾经直接 Fail()。
+ */
 
-// 好：先说约束，再说做法
-// reader 只有一个，不能在这里等写终态——写背压会把后续 Response/System
-// 帧一起堵住。所以这里只入队错误帧，写责任仍由 WriterLoop/Kill 结算。
+/**
+ * 好：先说约束，再说做法
+ * reader 只有一个，不能在这里等写终态——写背压会把后续 Response/System
+ * 帧一起堵住。所以这里只入队错误帧，写责任仍由 WriterLoop/Kill 结算。
+ */
 
-// 好：区分关闭请求和物理回收（复杂机制允许少量字符画）
-//   rpc::CoRpcServer::Shutdown()
-//     ├─ 立即拒新并强制关闭会话，不等待业务或物理释放
-//     └─ Engine 继续驱动；物理回收由宿主最终收口确认
+/**
+ * 好：区分关闭请求和物理回收（复杂机制允许少量字符画）
+ *   rpc::CoRpcServer::Shutdown()
+ *     ├─ 立即拒新并强制关闭会话，不等待业务或物理释放
+ *     └─ Engine 继续驱动；物理回收由宿主最终收口确认
+ */
 ```
 
 - 断言/异常消息示例：`static_assert(..., "ManagerBase: automatic key requires TKey == CoObjectId")`、`throw std::invalid_argument("ManagerBase: creator returned an empty owner")`。

@@ -1,10 +1,10 @@
 # 框架引入编译产物：bbt_framework 由 INTERFACE 改为 STATIC，
-# 仍对外暴露 framework/include/。链接 bbt::infra_common 获得
-# result/Codec 与 coroutine 运行时（含 include 路径传播）；
+# 对外暴露仓根为 include root（<bbt/framework/…>）。链接 bbt::infra_common
+# 获得 result/Codec 与 coroutine 运行时（含 include 路径传播）；
 # InfraHttpHost 消费 infra 已验收的 HTTP 实现目标。
 add_library(bbt_framework STATIC
     ExecutionPolicy.cc
-    MethodTable.cc
+    internal/MethodTable.cc
     actor/ActorMailbox.cc
     actor/ActorRegistry.cc
     actor/OrderedSession.cc
@@ -26,7 +26,7 @@ add_library(bbt_framework STATIC
     host/Service.cc)
 add_library(bbt::framework ALIAS bbt_framework)
 target_include_directories(bbt_framework PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>
     $<INSTALL_INTERFACE:include>)
 if(NOT TARGET bbt::infra_http_net)
     message(FATAL_ERROR "bbt-framework requires bbt::infra_http_net (BBT_INFRA_HTTP_NET=ON)")

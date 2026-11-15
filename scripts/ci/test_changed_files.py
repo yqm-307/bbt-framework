@@ -33,7 +33,7 @@ class ClassifyPathTests(unittest.TestCase):
     def test_cmake_lists_txt_is_code(self):
         # 构建入口绝不允许被 .txt 后缀带成 docs-only。
         for path in ("CMakeLists.txt", "tests/CMakeLists.txt",
-                     "framework/src/CMakeLists.txt", "examples/getvalue/CMakeLists.txt"):
+                     "bbt/framework/CMakeLists.txt", "examples/getvalue/CMakeLists.txt"):
             with self.subTest(path=path):
                 self.assertEqual(changed_files.classify_path(path), "code")
 
@@ -60,7 +60,7 @@ class ClassifyPathTests(unittest.TestCase):
                 self.assertEqual(changed_files.classify_path(path), "doc")
 
     def test_source_and_unknown_suffix_are_code(self):
-        for path in ("framework/src/CoApp.cc", "framework/include/x.hpp",
+        for path in ("bbt/framework/ExecutionPolicy.cc", "bbt/framework/x.hpp",
                      "scripts/local_build.sh", "deps.lock", "docker/Dockerfile",
                      "tests/Test_framework_rpc_surface.cc"):
             with self.subTest(path=path):
@@ -131,19 +131,21 @@ class FocusedMapTests(unittest.TestCase):
                                   f"{prefix} 映射的 {name} 未在 CMake 注册")
 
     def test_changed_files_to_expected_regex(self):
-        # 前缀是前缀匹配，父子前缀取并集：framework/src/host/ 命中 host 段
-        # 的同时也命中兜底段 framework/src/（rpc_surface/rpc_codec/rpc_matrix）。
+        # 前缀是前缀匹配，父子前缀取并集：bbt/framework/host/ 命中 host 段
+        # 的同时也命中兜底段 bbt/framework/（include+src 合并布局的并集选集）。
         cases = {
-            ("framework/src/actor/ActorMailbox.cc",):
-                "^framework\\.actor_mailbox$|^framework\\.ordered_egress$|"
-                "^framework\\.ordered_ingress$|^framework\\.ordered_ingress_rpc$|"
+            ("bbt/framework/actor/ActorMailbox.cc",):
+                "^framework\\.actor_mailbox$|^framework\\.coapp_lifecycle$|"
+                "^framework\\.ordered_egress$|^framework\\.ordered_ingress$|"
+                "^framework\\.ordered_ingress_rpc$|^framework\\.resource_lifecycle$|"
                 "^framework\\.rpc_codec$|^framework\\.rpc_matrix$|"
                 "^framework\\.rpc_surface$",
-            ("framework/src/CoApp.cc",):
+            ("bbt/framework/ExecutionPolicy.cc",):
+                "^framework\\.coapp_lifecycle$|^framework\\.resource_lifecycle$|"
                 "^framework\\.rpc_codec$|^framework\\.rpc_matrix$|"
                 "^framework\\.rpc_surface$",
-            ("framework/src/host/CoApp.cc",
-             "framework/src/actor/ActorMailbox.cc"):
+            ("bbt/framework/host/CoApp.cc",
+             "bbt/framework/actor/ActorMailbox.cc"):
                 "^framework\\.actor_mailbox$|^framework\\.close_gate$|"
                 "^framework\\.coapp_lifecycle$|^framework\\.egress_request_phase$|"
                 "^framework\\.inbound_http$|^framework\\.ordered_egress$|"
@@ -160,6 +162,31 @@ class FocusedMapTests(unittest.TestCase):
         for paths, expected in cases.items():
             with self.subTest(paths=paths):
                 self.assertEqual(changed_files.focused_regex(list(paths)), expected)
+
+    def test_migrated_paths_cover_old_selection(self):
+        # 目录迁移前后同一直接耦合模块的 focused 选集只增不减：合并布局下
+        # 顶层/internal 前缀无法再区分头与实现，兜底段取旧 include+src 并集。
+        pairs = [
+            ("framework/src/actor/ActorMailbox.cc", "bbt/framework/actor/ActorMailbox.cc"),
+            ("framework/src/host/CoApp.cc", "bbt/framework/host/CoApp.cc"),
+            ("framework/src/ExecutionPolicy.cc", "bbt/framework/ExecutionPolicy.cc"),
+            ("framework/src/MethodTable.cc", "bbt/framework/internal/MethodTable.cc"),
+            ("framework/include/bbt/framework/App.hpp", "bbt/framework/App.hpp"),
+            ("framework/include/bbt/framework/internal/Registry.hpp",
+             "bbt/framework/internal/Registry.hpp"),
+        ]
+        for old_path, new_path in pairs:
+            old_names = changed_files.focused_names([old_path])
+            new_names = changed_files.focused_names([new_path])
+            with self.subTest(old=old_path, new=new_path):
+                self.assertTrue(old_names, f"{old_path} 旧映射不应为空")
+                self.assertLessEqual(old_names, new_names,
+                                     f"{new_path} 选集不应少于 {old_path}")
+                # 新增只允许并集并表带来的三类：不引入无关测试名。
+                self.assertLessEqual(
+                    new_names - old_names,
+                    {"framework.coapp_lifecycle", "framework.resource_lifecycle",
+                     "framework.rpc_matrix"})
 
     def test_unmatched_paths_yield_empty_string(self):
         for paths in (["docs/guides/ci.md"], ["README.md"],
@@ -221,7 +248,7 @@ class ChangedFilesRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as repo:
             self._init_repo(repo)
             first = self._commit(repo, "docs/a.md", "a", "docs")
-            second = self._commit(repo, "framework/src/x.cc", "x", "code")
+            second = self._commit(repo, "bbt/framework/x.cc", "x", "code")
             proc, values = self._run(
                 repo, {"EVENT_NAME": "push", "BEFORE": first, "SHA": second,
                        "REF_NAME": "main"})
@@ -229,7 +256,7 @@ class ChangedFilesRoutingTests(unittest.TestCase):
             self.assertEqual(values["classifier_status"], "ok")
             self.assertEqual(values["classification"], "code")
             self.assertEqual(json.loads(values["changed_files_json"]),
-                             ["framework/src/x.cc"])
+                             ["bbt/framework/x.cc"])
 
     def test_push_docs_change_classified_docs_only(self):
         with tempfile.TemporaryDirectory() as repo:
@@ -259,7 +286,7 @@ class ChangedFilesRoutingTests(unittest.TestCase):
     def test_unknown_range_is_conservative_unknown(self):
         with tempfile.TemporaryDirectory() as repo:
             self._init_repo(repo)
-            first = self._commit(repo, "framework/x.cc", "x", "one")
+            first = self._commit(repo, "bbt/framework/x.cc", "x", "one")
             proc, values = self._run(
                 repo, {"EVENT_NAME": "push", "BEFORE": "f" * 40, "SHA": first})
             self.assertEqual(proc.returncode, 0, proc.stderr)

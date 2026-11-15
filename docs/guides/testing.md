@@ -57,7 +57,7 @@ live 这类主动 SKIP 在选集阶段（`-LE live`）就排除，不靠事后�
 - **普通 PR CI**：`build_test` job 内一次 Release 构建 + `--profile smoke`
   （`--timeout 300`）；`changes` 产出的 `focused_regex` 非空时同一构建树
   追加一次 `--profile focused --regex <regex>`（`changed_files.py` 的
-  `FOCUSED_MAP` 把 `framework/src/**`、`framework/include/**`、`tests/`、
+  `FOCUSED_MAP` 把 `bbt/framework/**`、`tests/`、
   `examples/**` 的变更路径映射到直接耦合的 ctest 名；无命中 → 空串 →
   该步显式跳过）。不跑全量 unit/integration/live/perf。见
   `docs/guides/ci.md`。

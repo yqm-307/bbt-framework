@@ -10,11 +10,11 @@
 | @par 职责 | Engine 装配与 Run 线程、服务端 Start 时序、入站 handler 的在途记账与业务门、RPC 同步 Shutdown 与 Engine 收口、绑定地址回填；HTTP 关闭步骤单独按其接口处理。 |
 | @par 不负责 | 业务 Service/Actor 路由与调度（归 `InboundDispatcher`）、出站路由门与策略（归 `AppRuntimeState`/`RpcPolicy`）、连接物理回收的对外承诺。 |
 | @par 约束 | `Create` 只在 Engine Idle 时装配，不联网不建线程；`Start` 之后才监听。`Close` 幂等且 noexcept，只封口不等待业务 handler；仍被业务占用的驱动线程留给析构 join。 |
-| @par 真源 | `framework/include/bbt/framework/internal/InfraHttpHost.hpp`、`framework/src/host/InfraHttpHost.cc`；RPC 入站/出站装配在 `framework/include/bbt/framework/internal/RpcBridge.hpp` 与 `framework/src/host/RpcBridge.cc`。已删除的 `RpcWireBridge.*`/`RpcHttpBridge.*` 不再存在。 |
+| @par 真源 | `bbt/framework/internal/InfraHttpHost.hpp`、`bbt/framework/host/InfraHttpHost.cc`；RPC 入站/出站装配在 `bbt/framework/internal/RpcBridge.hpp` 与 `bbt/framework/host/RpcBridge.cc`。已删除的 `RpcWireBridge.*`/`RpcHttpBridge.*` 不再存在。 |
 
 ## 装配与消费入口
 
-`framework/src/CMakeLists.txt` 直接链接 `bbt::infra_http_net` 与公开 `bbt::infra_rpc_net`；后者缺失即 configure `FATAL_ERROR`，没有 header 桥或能力宏降级。所有构建必须传 `BBT_INFRA_HTTP_NET=ON`、`BBT_INFRA_RPC_NET=ON` 与固定 `BBT_PROTOBUF_PREFIX`。
+`bbt/framework/CMakeLists.txt` 直接链接 `bbt::infra_http_net` 与公开 `bbt::infra_rpc_net`；后者缺失即 configure `FATAL_ERROR`，没有 header 桥或能力宏降级。所有构建必须传 `BBT_INFRA_HTTP_NET=ON`、`BBT_INFRA_RPC_NET=ON` 与固定 `BBT_PROTOBUF_PREFIX`。
 
 ```cpp
 // 形状示意（未编译、未运行）：rpc::CoRpcClient::Create / rpc::CoRpcServer::Create 返回 result，

@@ -121,7 +121,7 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
   skipped/Not Run/failure/error 皆非零退出（判据与旧内联 no-SKIP 门禁同口径，
   实跑对账由 JUnit XML 校验承担）。
 - **必要 focused**：`changed_files.py` 按仓内「路径前缀 → ctest 测试名」映射
-  （`FOCUSED_MAP`，覆盖 `framework/src/**` 与 `examples/**` 全部源码模块）产出
+  （`FOCUSED_MAP`，覆盖 `bbt/framework/**` 与 `examples/**` 全部源码模块）产出
   `focused_regex`；非空时 build_test 在同一构建树追加
   `run_test_profile.sh --profile focused --regex <regex>`，空串则该步显式跳过。
   focused 是 smoke 之外的增量加强，选集/对账/失败判据与 smoke 同一脚本契约。

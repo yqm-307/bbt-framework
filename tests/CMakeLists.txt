@@ -81,9 +81,9 @@ add_test(NAME framework.ordered_ingress_rpc
 set_tests_properties(framework.ordered_ingress_rpc PROPERTIES
     TIMEOUT 60 LABELS "smoke;integration")
 
-# framework 侧 V1 面缺席的负向检查：编译层正向对照（V2 面可用）+ 文本层
-# 扫描 framework/include、framework/src 与其 CMake，断言旧桥/旧值类型/
-# x-bbt 信封头族/旧能力宏零命中。源码根以编译定义注入，不靠相对 cwd。
+# framework v2 公开面编译对照 + 文本层扫描 bbt/framework/（含 CMake），
+# 断言旧桥/旧值类型/x-bbt 信封头族/旧能力宏零命中。源码根以编译定义注入，
+# 不靠相对 cwd。
 add_executable(Test_framework_v1_absent Test_framework_v1_absent.cc)
 target_link_libraries(Test_framework_v1_absent PRIVATE bbt::framework)
 target_compile_options(Test_framework_v1_absent PRIVATE -Wall -Wextra)
@@ -191,10 +191,9 @@ endif()
 # 各自显式要求对应 infra 模块已构建（缺 target → 编译期失败而不是静默
 # 消失）；环境变量缺失时进程以 77 退出，配合 SKIP_RETURN_CODE 标为
 # CTest Skipped——缺后端必须显式 skipped 或非零失败，不得记为 Passed。
-# Redis 用例消费新 net 入口（framework/include/bbt/framework/
-# RedisNetResource.hpp），不再走旧 bbt::infra::CoRedisCli 栈；Mongo 用例
-# 消费新 owner/句柄入口（framework/include/bbt/framework/
-# MongoDbResource.hpp），不再走旧 bbt::infra::CoMongoCli 栈。
+# Redis 用例消费新 net 入口（bbt/framework/RedisNetResource.hpp），不再走旧
+# bbt::infra::CoRedisCli 栈；Mongo 用例消费新 owner/句柄入口
+# （bbt/framework/MongoDbResource.hpp），不再走旧 bbt::infra::CoMongoCli 栈。
 if(TARGET bbt::infra_redis_net)
     add_executable(Test_framework_resource_live_redis
         Test_framework_resource_live.cc)
