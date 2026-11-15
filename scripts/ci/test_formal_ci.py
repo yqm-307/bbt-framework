@@ -646,14 +646,14 @@ class ChangedFilesRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as repo:
             _init_repo(repo)
             first = _commit(repo, "docs/ci/a.md", "a", "docs")
-            second = _commit(repo, "framework/src/x.cc", "x", "code")
+            second = _commit(repo, "bbt/framework/x.cc", "x", "code")
             proc, values = _changed_files(
                 repo,
                 {"EVENT_NAME": "push", "BEFORE": first, "SHA": second, "REF_NAME": "main"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(values["classifier_status"], "ok")
-            self.assertEqual(json.loads(values["changed_files_json"]), ["framework/src/x.cc"])
+            self.assertEqual(json.loads(values["changed_files_json"]), ["bbt/framework/x.cc"])
             self.assertEqual(
                 json.loads(values["event_json"]),
                 {"name": "push", "head_ref": "main"},
@@ -682,7 +682,7 @@ class ChangedFilesRoutingTests(unittest.TestCase):
     def test_unknown_range_falls_back_conservative(self):
         with tempfile.TemporaryDirectory() as repo:
             _init_repo(repo)
-            first = _commit(repo, "framework/x.cc", "x", "one")
+            first = _commit(repo, "bbt/framework/x.cc", "x", "one")
             proc, values = _changed_files(
                 repo,
                 {"EVENT_NAME": "push", "BEFORE": "f" * 40, "SHA": first},

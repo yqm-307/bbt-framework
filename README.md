@@ -43,6 +43,8 @@ app.run();
 
 ## 构建与测试
 
+干净 clone 先执行 `git submodule update --init --recursive`（`third-party/bbtools-pub` 固定共用规范）。
+
 依赖：`bbtools-infra`（其自身再依赖 `bbtools-coroutine`）。本机/候选分支开发经显式路径覆盖接入：
 
 ```bash
@@ -155,8 +157,10 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
 
 ## 文档地图
 
+- 跨仓公共规范（设计/编码/Review/用例）：[bbtools-pub README](https://github.com/yqm-307/bbtools-pub/blob/main/README.md)（`third-party/bbtools-pub` 固定 submodule，clone 后 `git submodule update --init --recursive`）
 - 架构基调（设计真源）：[`docs/architecture/distributed-framework-baseline.md`](docs/architecture/distributed-framework-baseline.md)
 - 验收矩阵（测试设计，非实测结果）：[`docs/architecture/distributed-framework-validation-matrix.md`](docs/architecture/distributed-framework-validation-matrix.md)
+- 开发流程与本地验证：[`docs/guides/development.md`](docs/guides/development.md)
 - 示例总览（需求→例程→公开 API/边界）：[`examples/README.md`](examples/README.md)
 - 示例：[`examples/getvalue/README.md`](examples/getvalue/README.md)、
   [`examples/two_service/README.md`](examples/two_service/README.md)、

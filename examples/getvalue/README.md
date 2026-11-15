@@ -87,14 +87,14 @@ app.run();
 ```
 
 框架侧（V2 唯一消费面）：
-- `framework/include/bbt/framework/CoApp.hpp`：`CoAppOptions::local_identity`
+- `bbt/framework/CoApp.hpp`：`CoAppOptions::local_identity`
   （必填，映射 `rpc::ClientOptions::SetLocalIdentity`）；无 profile/旧桥选择；
-- `framework/include/bbt/framework/internal/RpcBridge.hpp`：
+- `bbt/framework/internal/RpcBridge.hpp`：
   `InstallRpcAdmission`（`rpc::AdmissionHandler` → 框架有界队列/worker）与
   `RpcEgress`（`rpc::CoRpcClient::Call/Send`）；
-- `framework/include/bbt/framework/RpcMethods.hpp` + `internal/MethodTable.hpp`：
+- `bbt/framework/RpcMethods.hpp` + `internal/MethodTable.hpp`：
   `ProtoMethod` 声明糖，schema 取自 descriptor；
-- `framework/src/CMakeLists.txt`：`bbt::infra_rpc_net`（V2 单一 target）是
+- `bbt/framework/CMakeLists.txt`：`bbt::infra_rpc_net`（V2 单一 target）是
   框架必需前置，缺失时 configure fail-closed。
 
 ## 4. 构建 / 运行 / 验收入口

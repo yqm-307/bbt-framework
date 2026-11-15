@@ -320,7 +320,7 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 
 **按独立概念拆文件。** `Component` 本身就是带默认 hook 的组件基类，不是缺少基类；不为命名形式再叠加职责重复的 `IComponent → ComponentBase → Component`。只有出现独立的纯接口职责时，才按 `docs/conventions.md` 的 `I` 前缀和接口目录规则设计接口。
 
-以下是目标文件归属，尚不是现有文件清单；路径相对于 `framework/include/bbt/framework/`：
+以下是目标文件归属，尚不是现有文件清单；路径相对于 `bbt/framework/`：
 
 | 文件 | 职责 |
 |---|---|
@@ -334,7 +334,7 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 
 **模板声明与实现分离。** 默认采用“头文件上半段是完整类定义、成员只作声明；下半段是类外模板成员定义”。实现较长时，改为在公共头末尾 include 对应的实现头，例如 `impl/ServiceImpl.hpp`，不同时维护两份实现。实现头是本公共头的实现细节，不作为调用者的独立入口。模板定义必须保持对使用点可见，不能直接搬到普通 `.cc` 导致消费者实例化缺失；非模板实现仍进入配对编译单元。类型 trait、常量和 `= default` 等简短声明可随类保留，不为分区增加空壳或重复转发层。
 
-**Doxygen 放在声明处。** 公开类型、函数、模板及受保护的业务扩展 hook 使用 `/** ... */` 或 `///`，不能只写无法导出的普通 `//`。类型按职责卡说明 `@brief`、`@par 职责`、`@par 不负责`、`@par 约束`；函数按实际签名补齐 `@brief`、存在的 `@tparam`/`@param` 和有意义的 `@return`。调用上下文、线程/协程限制、借用寿命、错误与关闭行为按需写 `@pre`、`@par` 或正文，不为空参数或 void 返回机械生成空标签，也不编造尚未兑现的保证。实现文件和模板实现区用 `//` 解释 WHY、算法和时序，不复制公共声明的 Doxygen 契约。
+**Doxygen 放在声明处。** 公开类型、函数、模板及受保护的业务扩展 hook 使用 `/** ... */` 块（注释形态唯一真源为 `docs/conventions.md` §5，`///` 与 `//` 只限工具/法律必需指令），不能只写无法导出的普通 `//`。类型按职责卡说明 `@brief`、`@par 职责`、`@par 不负责`、`@par 约束`；函数按实际签名补齐 `@brief`、存在的 `@tparam`/`@param` 和有意义的 `@return`。调用上下文、线程/协程限制、借用寿命、错误与关闭行为按需写 `@pre`、`@par` 或正文，不为空参数或 void 返回机械生成空标签，也不编造尚未兑现的保证。实现文件和模板实现区解释 WHY、算法和时序，不复制公共声明的 Doxygen 契约。
 
 **整理验收：**
 
@@ -394,7 +394,7 @@ public:
 
 ### 7.1 RPC V2 唯一消费面（ADR 0022 现行面）
 
-RPC 只按 V2 会话消费：`LegacyHeaders`/`ProtoWireV1`/`TcpV1` 模式选择、`x-bbt-*` 编解码、`RpcEnvelope`/`RpcAddress`/旧 `RpcHandler` 与两座旧桥（`RpcWireBridge`/`RpcHttpBridge`）已按 `bbtools-infra/docs/decisions/0022-rpc-single-protocol.md` 删除；`framework/src/host/` 现由 `RpcBridge.{hpp,cc}` 承担 V2 入站/出站装配。下表旧列只表示迁移历史，当前代码不存在这些旧面，也不保留兼容壳：
+RPC 只按 V2 会话消费：`LegacyHeaders`/`ProtoWireV1`/`TcpV1` 模式选择、`x-bbt-*` 编解码、`RpcEnvelope`/`RpcAddress`/旧 `RpcHandler` 与两座旧桥（`RpcWireBridge`/`RpcHttpBridge`）已按 `bbtools-infra/docs/decisions/0022-rpc-single-protocol.md` 删除；`bbt/framework/host/` 现由 `RpcBridge.{hpp,cc}` 承担 V2 入站/出站装配。下表旧列只表示迁移历史，当前代码不存在这些旧面，也不保留兼容壳：
 
 | 旧 | 新 | 责任方 |
 |---|---|---|
@@ -710,11 +710,11 @@ Registry 继续是受管业务对象唯一所有权责任方；这里的“唯�
 
 | 责任 | R3 最小文件范围 | 关键迁移/签名 | 直接测试映射 |
 |---|---|---|---|
-| framework public | `framework/include/bbt/framework/App.hpp`、`Object.hpp`、`Component.hpp`、`Actor.hpp`、`Service.hpp`、`internal/ObjectBase.hpp`、`internal/Registry.hpp`、`internal/ServiceBase.hpp` | 上述 `CoInstall*`/`CoUninstall*`/`CoBind*`/`CoObserve`/`CoStart`/`CoStop`/`CoJoin`；保留 `ICoObject`、`ObjectHandle`、`Deadline`；业务类型唯一面为 `v2::CoService<...>`/`v2::CoComponent`/`v2::CoActor` | `tests/Test_framework_v2_core.cc` → `framework.v2_core` 只证明当前无网络核心；`Test_framework_coapp_lifecycle.cc` → `framework.coapp_lifecycle` 含旧 `StubNetHost`，不能充当 F17 真实 loopback；新 v2 loopback 必须另注册实名目标 |
-| framework implementation | `framework/src/host/App.cc`、`Object.cc`、`Registry.cc`、`Service.cc`，必要时现有 `CoServiceCall.cc` | Registry 接同一 creator；CoWaitShutdownRequest 单槽挂起、RequestShutdown 仅通知；控制面锁外调用 hook（锁外使用点一律持对象 owner 作 callback lease），不新增 scheduler/线程 | 现有 framework.v2_core、framework.coapp_lifecycle 保有效原断言；新增用例见下一行，旧 stub 不证明网络 |
-| native owner bridge / 新 v2 集成 | `InfraHttpHost` 旧路径仅作源码依据；拟新增 `tests/Test_framework_v2_coapp_loopback.cc` 与 `tests/CMakeLists.txt`；既有 `RedisNetResource.hpp`/资源实现仅替换实际 EngineThread 消费点 | 已授权口径：普通 `main` + 既有 `bbtco` 注册；Engine 由 infra `Engine::Create`+`Engine::Run` 拥有，framework 组件只经公开 seam 消费，不接管 Begin/Advance/native control 注册。新增 target Test_framework_v2_coapp_loopback / CTest framework.v2_coapp_loopback；动态端口真实 peer 子进程 | 未注册/构建/运行；装配→启动→真实字节请求→RequestShutdown→CoStop/子对象 Join→Engine 真实收口→实际析构/统计基线；timeout 保 owner/request≠stop；旧 StubNetHost 不得替代 |
-| examples/CMake | `tests/CMakeLists.txt`、根/`framework/src/CMakeLists.txt`、受影响 examples | 示例由普通 `main` + `bbtco` 建主入口，所有装配和 stop/join 在 Co 域；`RequestShutdown` 只触发请求 waiter，主协程负责 `CoStop`；失败通知不能挂死 native 入口 | 新 v2 真实 loopback：装配→启动→请求→CoStop/Join；必须区分 request observed 与 stop settled |
-| framework↔infra seam | `framework/include/bbt/framework/RedisNetResource.hpp`、`MongoDbResource.hpp`、`internal/*Network*` 及其实现/测试（只改实际消费点） | 组件借用仍是 lease；Co 命令携带同一 `Deadline`；native callback 不直接进入业务对象 | 资源命令 gate、borrow 跨挂起、超时保 owner、底层 `Released`/Close 证据 |
+| framework public | `bbt/framework/App.hpp`、`Object.hpp`、`Component.hpp`、`Actor.hpp`、`Service.hpp`、`internal/ObjectBase.hpp`、`internal/Registry.hpp`、`internal/ServiceBase.hpp` | 上述 `CoInstall*`/`CoUninstall*`/`CoBind*`/`CoObserve`/`CoStart`/`CoStop`/`CoJoin`；保留 `ICoObject`、`ObjectHandle`、`Deadline`；业务类型唯一面为 `v2::CoService<...>`/`v2::CoComponent`/`v2::CoActor` | `tests/Test_framework_v2_core.cc` → `framework.v2_core` 只证明当前无网络核心；`Test_framework_coapp_lifecycle.cc` → `framework.coapp_lifecycle` 含旧 `StubNetHost`，不能充当 F17 真实 loopback；新 v2 loopback 必须另注册实名目标 |
+| framework implementation | `bbt/framework/host/App.cc`、`Object.cc`、`Registry.cc`、`Service.cc`，必要时现有 `CoServiceCall.cc` | Registry 接同一 creator；CoWaitShutdownRequest 单槽挂起、RequestShutdown 仅通知；控制面锁外调用 hook（锁外使用点一律持对象 owner 作 callback lease），不新增 scheduler/线程 | 现有 framework.v2_core、framework.coapp_lifecycle 保有效原断言；新增用例见下一行，旧 stub 不证明网络 |
+| native owner bridge / 新 v2 集成 | `bbt/framework/internal/InfraHttpHost.hpp` 与配对实现；拟新增 `tests/Test_framework_v2_coapp_loopback.cc` 与 `tests/CMakeLists.txt`；既有 `RedisNetResource.hpp`/资源实现仅替换实际 EngineThread 消费点 | 已授权口径：普通 `main` + 既有 `bbtco` 注册；Engine 由 infra `Engine::Create`+`Engine::Run` 拥有，framework 组件只经公开 seam 消费，不接管 Begin/Advance/native control 注册。新增 target Test_framework_v2_coapp_loopback / CTest framework.v2_coapp_loopback；动态端口真实 peer 子进程 | 未注册/构建/运行；装配→启动→真实字节请求→RequestShutdown→CoStop/子对象 Join→Engine 真实收口→实际析构/统计基线；timeout 保 owner/request≠stop；旧 StubNetHost 不得替代 |
+| examples/CMake | `tests/CMakeLists.txt`、根/`bbt/framework/CMakeLists.txt`、受影响 examples | 示例由普通 `main` + `bbtco` 建主入口，所有装配和 stop/join 在 Co 域；`RequestShutdown` 只触发请求 waiter，主协程负责 `CoStop`；失败通知不能挂死 native 入口 | 新 v2 真实 loopback：装配→启动→请求→CoStop/Join；必须区分 request observed 与 stop settled |
+| framework↔infra seam | `bbt/framework/RedisNetResource.hpp`、`MongoDbResource.hpp`、`internal/*Network*` 及其实现/测试（只改实际消费点） | 组件借用仍是 lease；Co 命令携带同一 `Deadline`；native callback 不直接进入业务对象 | 资源命令 gate、borrow 跨挂起、超时保 owner、底层 `Released`/Close 证据 |
 
 R3 不把旧 `Run` 改名后保留为隐藏兼容壳，也不在本节点扩大 Actor、Monitor、存储或消息协议迁移；只按这张表切换直接生命周期消费者。现有 v2 头和测试仍是候选事实，未迁移前不得引用其局部通过作为 F17 验收。
 

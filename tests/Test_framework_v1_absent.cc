@@ -3,7 +3,7 @@
 // 判据分两层，均不依赖「跑起来能连上」：
 //  1) 编译层正向对照：本 TU 只 include V2 公开面并实际使用 Request/Response/
 //     RpcEgress/InstallRpcAdmission 类型——证明 V2 面在场且可编译；
-//  2) 文本层缺席：扫描 framework/ 的产品源码与 CMake，断言旧 RPC 面
+//  2) 文本层缺席：扫描 bbt/framework/ 的产品源码与 CMake，断言旧 RPC 面
 //     （LegacyHeaders/x-bbt 信封头族/RpcEnvelope/RpcAddress/RpcInboundBridge/
 //     RpcEgressProfile/HttpEgress/双桥安装入口/旧能力宏）零命中。
 //
@@ -78,18 +78,13 @@ bool IsScannedFile(const fs::path& p) {
 
 std::vector<fs::path> CollectFiles() {
     std::vector<fs::path> files;
-    for (const char* rel : {"include", "src"}) {
-        const fs::path root = fs::path(kSourceRoot) / "framework" / rel;
-        if (!fs::exists(root))
-            continue;
+    const fs::path root = fs::path(kSourceRoot) / "bbt" / "framework";
+    if (fs::exists(root)) {
         for (const auto& entry : fs::recursive_directory_iterator(root)) {
             if (entry.is_regular_file() && IsScannedFile(entry.path()))
                 files.push_back(entry.path());
         }
     }
-    const fs::path top_cmake = fs::path(kSourceRoot) / "framework" / "CMakeLists.txt";
-    if (fs::exists(top_cmake))
-        files.push_back(top_cmake);
     return files;
 }
 
@@ -128,13 +123,13 @@ BOOST_AUTO_TEST_CASE(v2_surface_compiles_and_is_usable) {
 // 旧桥文件必须已删除（存在即失败）。
 BOOST_AUTO_TEST_CASE(legacy_bridge_headers_are_gone) {
     const fs::path root(kSourceRoot);
-    BOOST_CHECK(!fs::exists(root / "framework/include/bbt/framework/internal/RpcHttpBridge.hpp"));
-    BOOST_CHECK(!fs::exists(root / "framework/include/bbt/framework/internal/RpcWireBridge.hpp"));
-    BOOST_CHECK(!fs::exists(root / "framework/src/host/RpcHttpBridge.cc"));
-    BOOST_CHECK(!fs::exists(root / "framework/src/host/RpcWireBridge.cc"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/internal/RpcHttpBridge.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/internal/RpcWireBridge.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/host/RpcHttpBridge.cc"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/host/RpcWireBridge.cc"));
     // 新接线在场。
-    BOOST_CHECK(fs::exists(root / "framework/include/bbt/framework/internal/RpcBridge.hpp"));
-    BOOST_CHECK(fs::exists(root / "framework/src/host/RpcBridge.cc"));
+    BOOST_CHECK(fs::exists(root / "bbt/framework/internal/RpcBridge.hpp"));
+    BOOST_CHECK(fs::exists(root / "bbt/framework/host/RpcBridge.cc"));
 }
 
 // 产品源码/CMake 里不得再出现旧 RPC 面 token。

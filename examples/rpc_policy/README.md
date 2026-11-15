@@ -6,7 +6,7 @@ infra owner·限额·关联·Close 约束。
 
 ## 扩展入口
 
-`framework/include/bbt/framework/RpcPolicy.hpp`：
+`bbt/framework/RpcPolicy.hpp`：
 
 - `RpcCallView`：只读调用事实（已解析目标 + 不可改写 `rpc::Request` + 已适配
   绝对期限）。

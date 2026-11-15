@@ -18,7 +18,7 @@ option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE
     "构建依赖真实 Redis/Mongo 的 examples/dual_service 示例（Issue #5）" OFF)
 
 # 框架库目标：F0 为 header-only INTERFACE；F2-a 起含编译产物，
-# 目标在 framework/src/CMakeLists.txt 定义（需先接入 bbt::infra_common，
+# 目标在 bbt/framework/CMakeLists.txt 定义（需先接入 bbt::infra_common，
 # 见下方依赖块后的 add_subdirectory）。
 
 # --- bbtools-infra / bbtools-coroutine 依赖接入 -------------------------------
@@ -75,7 +75,7 @@ endif()
 add_compile_options(-Werror=return-type -Werror=unused-result)
 
 # bbt::infra_common 就绪后定义框架库目标（STATIC + bbt::framework 别名）
-add_subdirectory(framework/src)
+add_subdirectory(bbt/framework)
 
 # 每个公共头单独编译 TU，验证头文件自给
 set(BBT_FRAMEWORK_PUBLIC_HEADERS
@@ -155,6 +155,7 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/Registry.hpp
     internal/RpcBridge.hpp
     internal/CoAppSeam.hpp
+    internal/ErrorDomainRule.hpp
     internal/ResourceClose.hpp
     internal/ObjectBase.hpp
     internal/ServiceBase.hpp)
