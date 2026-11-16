@@ -29,8 +29,7 @@
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/rpc/CoRpcServer.hpp>
 #include <bbt/infra/rpc/CoRpcClient.hpp>
-#include <bbt/framework/CoApp.hpp>
-#include <bbt/framework/internal/HostLifecycle.hpp>
+#include <bbt/framework/internal/NetworkHost.hpp>
 
 namespace bbt::framework {
 class InfraHttpHost final : public INetworkHost {

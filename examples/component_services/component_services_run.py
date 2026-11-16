@@ -4,7 +4,7 @@
 由 ctest 调用：
   component_services_run.py --bin <component_services> [--results <json>]
 
-职责（全部是真实进程 + 公开 v2 API 的运行证据）：
+职责（全部是真实进程 + 公开 `bbt::framework` API 的运行证据）：
   1. 运行 shared 场景：一个 App 内两个 Service 共享同一组件实例、运行期
      热拔插、hook/observer 生存期、缺失槽位错误、hook 失败记录、有限
      deadline 收口；
@@ -73,7 +73,7 @@ REQUIRED_SHARED_CHECKS = [
 REQUIRED_FAILURE_CHECKS = [
     "install_failing_component",
     "hook_failure_surfaces_error",
-    "partial_start_reports_running",
+    "start_failure_app_running_object_failed",
     "hook_failure_state_failed",
     "hook_failure_recorded",
     "failure_app_clean_stop",

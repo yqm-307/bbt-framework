@@ -3,7 +3,7 @@
  * 网关服务：对外唯一入口，把结算请求转给 order。
  *
  * 本头只声明业务面，实现见 gateway_service.cc。出站目标是逻辑服务名
- * kOrderService，地址由宿主 find_route 按动态路由表解析。
+ * kOrderService/kSettlementService，地址由宿主路由门按动态路由表解析。
  */
 
 #include <string>
@@ -30,9 +30,12 @@ using bbt::framework::RpcMethods;
 /**
  * @brief 网关服务：`Checkout` 调用 order.Quote 并回带三跳实例身份。
  */
-class GatewayService final : public CoService<GatewayService> {
+class GatewayService final : public CoService<> {
 public:
     static constexpr std::string_view kServiceName = kGatewayService;
+
+    explicit GatewayService(bbt::framework::detail::ConstructKey key)
+        : CoService<>(key) {}
 
     CoRpcResp Checkout(CoRpcReq req);
 
@@ -46,6 +49,12 @@ public:
         ProtoMethod<&GatewayService::CreateOrder, v1::OrderRequest, v1::Record>("CreateOrder"),
         ProtoMethod<&GatewayService::GetOrder, v1::LookupRequest, v1::Record>("GetOrder"),
         ProtoMethod<&GatewayService::GetBill, v1::LookupRequest, v1::Record>("GetBill"));
+
+protected:
+    ~GatewayService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
 };
 
 } // namespace ecommerce

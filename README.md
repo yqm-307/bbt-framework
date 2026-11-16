@@ -1,174 +1,152 @@
 # bbt-framework
-通用后端框架
+
+通用后端框架：受管 `CoApp` / `CoService` / `CoComponent` 对象模型，统一生命周期与关闭语义，
+基于 `bbtools-infra` V2 会话的 RPC 入站/出站与出站路由门。
 
 ## 现状
 
-业务公共面：handler 签名统一 `CoRpcResp(CoRpcReq)`，请求/回复经位置参数 codec
-（`CoRpcReq::From` / `req.Parse<Ts...>` / `CoRpcResp::From`）；`kRpcMethods` +
-`this->call` 声明/发起 RPC，`CoService<T>` / `ICoService` 继承服务，`CoApp` 注册并运行。
-跨语言/结构化负载走 Protobuf 适配（`ProtoCodec` seam）。
+- **公共面唯一**：业务只使用 `bbt::framework`。聚合头 `bbt/framework/Framework.hpp`，宿主头
+  `bbt/framework/CoApp.hpp`。机器面头在 `bbt/framework/internal/`，业务不直接包含。
+- **已实现**：受管对象装配与卸载（`CoInstallService`、`CoInstallComponent`、`CoUninstallService`、
+  `CoUninstallComponent`）、Actor 类型登记（`CoInstallActor`）、声明式与运行期绑定
+  （`ServiceOptions::BindComponent`、`CoBindComponent`、`CoUnbindComponent`）、`GetComponent` + `Borrow`、
+  `CoObserve` 事件、`CoStart` / `CoStop`、`RequestShutdown` / `CoWaitShutdownRequest`、
+  `State` / `PendingCleanup` / `LifecycleFailures` 观察面、V2 RPC 入站（`InstallRpcAdmission`）与
+  出站（`RpcEgress`）、静态路由（`AppOptions::AddRoute`）与 `DynamicRouteTable`。
+- **未实现**：
+  - 非拥有关系边 `CoBindObject` / `CoUnbindObject` 恒返回 `UnsupportedRoute`（`host/CoApp.cc`）。
+  - Actor 实例创建与销毁（`CoCreateActor` / `CoDestroyActor`）与 Actor 消息分发未接线；
+    `CoInstallActor` 只登记类型，不创建实例。
+  - `MonitorService`、`HttpComponent`、`AppInspector`、`AppSession`、`Resolver`、`CoJoin` 在源码中不存在；
+    框架契约中出现的这些名字是目标设计，不是现有 API。
+- 目标设计与当前实现的差异见 [框架契约](docs/architecture/framework-contract.md) §1 与 §12。
+
+## 最短用法
+
+类型声明（服务名、RPC 方法表、受控构造）：
 
 ```cpp
 #include <bbt/framework/Framework.hpp>
-#include <bbt/framework/CoApp.hpp>
 
-class EchoSvc final : public fw::CoService<EchoSvc> {
+class EchoService final : public bbt::framework::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "echo";
-    fw::CoRpcResp Ping(fw::CoRpcReq req);   // req.Parse<std::string>() 取第 0 个位置参数
-    static constexpr auto kRpcMethods = fw::RpcMethods(
-        fw::Method<&EchoSvc::Ping>("ping"));
-};
 
-fw::CoApp app{opts};
-app.add_service<EchoSvc>(service_opts);
-app.run();
+    bbt::framework::CoRpcResp Ping(bbt::framework::CoRpcReq req);
+
+    static constexpr auto kRpcMethods = bbt::framework::RpcMethods(
+        bbt::framework::Method<&EchoService::Ping>("ping"));
+
+    explicit EchoService(bbt::framework::detail::ConstructKey key) : CoService(key) {}
+
+protected:
+    ~EchoService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+};
 ```
 
-`Framework.hpp` 汇总服务/RPC 声明头，不含宿主。`CoApp.hpp` 是宿主头
-（`add_service` 会展开方法表）。编解码、envelope、分发器、发送注入在框架内部；
-测试缝在 `internal/`。
+装配（须在受管协程内）：
 
-资源缝：服务在受管生命周期内经 `context().resource<R>(name)` 取客户端
-（未装配 → `nullptr`）。两种装配入口：
-- `add_resource<R>(name, shared_ptr<R>)`：预创建实例，登记即对服务可见；
-- `add_resource<R>(name, factory)`：延迟工厂——`factory` 返回
-  `result<shared_ptr<R>>`，在运行时初始化后、绑定服务与开始接纳之前执行
-  `Create`；若 `R` 暴露 `result<void> Start()` 由框架随即调用一次，若实现
-  `bbt::infra::ICoCloseable` 则由关闭序列统一 `Close()` 同步收口
-  （handler 排空之后、网络组件关闭之前）。任一资源创建/启动失败 →
-  启动失败回退，已启动资源按序收束，不留半装配状态。
+```cpp
+auto app = bbt::framework::CoApp::Create(
+    bbt::framework::AppOptions{}
+        .SetLimits(64, 64, 64, 64)
+        .SetNetworkLimits(bbt::infra::NetworkLimits{
+            /*max_connections*/ 64, /*max_inflight*/ 64,
+            /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
+            /*incoming_timeout*/ std::chrono::milliseconds{30000}})
+        .SetShutdownBudget(std::chrono::milliseconds{3000})
+        .SetLifecycleBudget(std::chrono::milliseconds{3000})
+        .Listen("127.0.0.1:0")
+        .SetLocalIdentity("echo-server"),
+    "echo-server");
 
-公共目标 `bbt::framework`（静态库）。
+bbt_co_await app->CoInstallService<EchoService>(
+    bbt::framework::ServiceOptions{}.SetMaxInflight(64));
+bbt_co_await app->CoStart();
+bbt_co_await app->CoWaitShutdownRequest();   // 外部线程 RequestShutdown() 唤醒
+bbt_co_await app->CoStop();                  // 显式收口，State() == Stopped 才是完整收口
+```
+
+- 对象只能经 `CoApp::CoInstall*` 创建。业务不能栈构造、`new` 或 `make_shared`。
+- 配置监听时必须给非零 `SetNetworkLimits`：`bbt::infra::NetworkLimits` 默认全零，
+  会被 `CoStart` 的网络配置校验以 `max_connections out of range` 拒绝。
+- `Co` 前缀方法必须在受管协程内调用，宿主/非协程上下文返回 `InvalidContext`。
+  `RequestShutdown()` 与 `State()` 例外，可在任意线程调用。
+- 服务内受管出站 `CoServiceBase::call`（`CoRpcReq` 与 typed `call<Req,Resp>` 两个
+  重载）以 `bbt_co_async(result<...>)` 声明，只能在受管协程内经 `bbt_co_await`
+  消费；非协程环境下 `bbt_co_await` 先抛 `std::logic_error`（实参与函数体不执行），
+  通过后沿当前协程同步执行、期间可挂起，没有 Future/并行调度。
+- 完整可运行的装配序列（普通 `main` + 受管协程 + 跨线程交接）见
+  [`examples/getvalue`](examples/getvalue/README.md) 与 [`examples/component_services`](examples/component_services/README.md)。
 
 ## 构建与测试
 
 干净 clone 先执行 `git submodule update --init --recursive`（`third-party/bbtools-pub` 固定共用规范）。
 
-依赖：`bbtools-infra`（其自身再依赖 `bbtools-coroutine`）。本机/候选分支开发经显式路径覆盖接入：
+依赖：`bbtools-infra`（其自身再依赖 `bbtools-coroutine`）。本机开发经显式路径覆盖接入：
 
 ```bash
 INFRA=/path/to/bbtools-infra            # 含顶层 CMakeLists.txt 与 include/
 CO=/path/to/bbtools-coroutine           # 含顶层 CMakeLists.txt 与 bbt/
+PB=/path/to/protobuf-3.21.12/prefix     # 绝对路径
 
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DNEED_TEST=ON \
+flock /tmp/bbt-build.lock cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DNEED_TEST=ON \
   -DBBT_INFRA_SOURCE_DIR=$INFRA -DBBT_COROUTINE_SOURCE_DIR=$CO \
-  -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
-  -DBBT_PROTOBUF_PREFIX=<protobuf-3.21.12 前缀>
+  -DBBT_INFRA_CONFIG=ON -DBBT_INFRA_NET=ON -DBBT_INFRA_HTTP_NET=ON \
+  -DBBT_INFRA_RPC_NET=ON -DBBT_PROTOBUF_PREFIX=$PB
 
-# 构建按目标进行，固定 `--parallel 2`；同机多 agent 时构建/测试经宿主已有
-# 共享验证队列串行执行（一次只跑一个重任务），不按逻辑核数放大并发。
-# 下列目标覆盖下面三条聚焦 ctest 选集所需的全部可执行文件/fixture
-# （tests/ 与 examples/ 各自 add_executable，ctest 不负责构建）。
-cmake --build build --parallel 2 --target \
-  bbt_framework \
-  Test_framework_v2_core Test_framework_rpc_surface Test_framework_request_context \
-  Test_framework_coapp_lifecycle Test_framework_inbound_http \
-  Test_framework_actor_mailbox Test_framework_ordered_egress \
-  Test_framework_ordered_ingress Test_framework_ordered_ingress_rpc \
-  Test_framework_v1_absent \
-  Test_framework_shutdown Test_framework_rpc_codec Test_framework_close_gate \
-  Test_framework_resource_lifecycle Test_framework_egress_request_phase \
-  Test_framework_getvalue_codec Test_framework_rpc_matrix rpc_xlang_server \
-  getvalue_server getvalue_caller two_service rpc_policy lifecycle_fixture \
-  component_services Test_framework_dynamic_routes
+# 构建按目标进行，固定 --parallel 2；ctest 不负责构建，需显式列出目标。
+flock /tmp/bbt-build.lock cmake --build build --parallel 2 --target \
+  bbt_framework Test_framework_v2_core Test_framework_coapp_lifecycle
 
-# 测试一律经统一 profile 入口（run_test_profile.sh，内部 ctest -j1）；
-# 本地 smoke/focused 快速集，全量走发布/手动入口；PR CI 为 smoke + 必要 focused。
-ctest --test-dir build -j1 -L smoke --output-on-failure
-ctest --test-dir build -j1 -R 'examples\.' --output-on-failure
+# 测试经统一入口 scripts/ci/run_test_profile.sh（内部 ctest -j1）。
+bash scripts/ci/run_test_profile.sh --build-dir build --profile smoke
 ```
 
-真实 Consul 电商集群示例为可选目标，需单独启用 infra Consul 支持；构建与运行说明见
-[集群示例入口](examples/ecommerce_cluster/README.md)。
-
-说明：
-
-- `BBT_INFRA_SOURCE_DIR` / `BBT_COROUTINE_SOURCE_DIR` 默认为空；不给
-  `BBT_INFRA_SOURCE_DIR` 时回退 `find_package(bbt_infra CONFIG QUIET)`，
-  仍无 `bbt::infra_common` 目标则 `FATAL_ERROR` 并指明两条路径选项。
-- `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名
-  `NEED_TEST`、`BUILD_TESTING` 开关在接入时被局部屏蔽。
-- 上游 infra RPC 只保留 V2 会话：`bbt::infra_rpc_net` 目标承载
-  `SessionFrame`（proto 2）+ u32be 分帧 + Hello/HelloAck；需要
-  `BBT_INFRA_RPC_NET=ON` + `BBT_PROTOBUF_PREFIX`。框架默认宿主
-  `InfraHttpHost` 仍消费 `bbt::infra_http_net`（`BBT_INFRA_HTTP_NET=ON`），
-  两个目标都是 `bbt::framework` 的必需前置，缺失时 configure fail-closed。
-  NEED_TEST=ON 的本仓验收（`framework.rpc_xlang` 等强制用例）同样要求
-  RPC target 在场；不存在 HTTP header 或旧 wire 的降级路径。
-- HTTP 宿主装配与执行槽、共享池、`Close` 与优雅排空的区别、运行时状态
-  shared_ptr 寿命模型（`AppRuntimeState`）、客户端字节限额及无 DNS/TLS 的
-  边界见 [HTTP 宿主指南](docs/guides/http-host.md)；RPC 只经 V2 会话消费，
-  映射见 [框架契约 §7.1](docs/architecture/framework-contract.md)。
+- 构建并发固定 `--parallel 2`，经 `flock /tmp/bbt-build.lock` 串行；测试 `ctest -j1`。
+- `NEED_TEST=ON` 注册 CTest 名 `framework.*`（`tests/`）与 `examples.*`（`examples/`）。
+  测试分层、label 与 profile 见 [testing](docs/guides/testing.md)，CI 门禁见 [ci](docs/guides/ci.md)。
+- `BBT_INFRA_RPC_NET=ON` 与 `BBT_PROTOBUF_PREFIX` 必需，缺失时 configure fail-closed。`BBT_INFRA_HTTP_NET=ON`
+  同样必需（框架默认宿主 `InfraHttpHost` 消费 `bbt::infra_http_net`）。
+- `BBT_INFRA_SOURCE_DIR` / `BBT_COROUTINE_SOURCE_DIR` 默认为空；为空时回退
+  `find_package(bbt_infra CONFIG QUIET)`，仍无 `bbt::infra_common` 则 `FATAL_ERROR`。
+- `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名 `NEED_TEST` 与 `BUILD_TESTING`
+  在接入时被局部屏蔽。
 - 构建产物只进已忽略的 `build/`。
 
-## 跨语言 RPC 示例：GetValue
+以下路径**需要外部后端与显式授权，默认不运行**，本仓普通 CI 也不覆盖：
 
-`examples/getvalue/` 是首个真实业务切片：业务 `.proto`（唯一 schema 真源）
-+ C++ framework 服务端（V2 会话入站）+ Python 标准库客户端。
-详见 [`examples/getvalue/README.md`](examples/getvalue/README.md)。
+- Redis/Mongo 真实资源验收：`framework.resource_live_*`（源码已迁移到当前公共 API；
+  live 目标仅在 infra 相应模块在场时构建，本仓无真实后端运行授权，未运行）与
+  [`dual_service`](examples/dual_service/README.md)
+  的 `run_acceptance.sh`（临时容器）。`dual_service` 需 `BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON`，默认关闭。
+- 真实 Consul 动态发现：[`ecommerce_cluster`](examples/ecommerce_cluster/README.md) 需
+  `BBT_INFRA_CONSUL=ON` 与 `BBT_CONSUL_BINARY`；未设置时 CTest 不注册。
 
-- 业务 schema：`examples/getvalue/proto/bbt/example/v1/get_value.proto`
-  （`bbt.example.v1.GetValueRequest/Response`；`GetValue(key) -> {found, value}`）。
-- V2 会话 wire：`SessionFrame`（`session_frame.proto`，profile 2）+ u32be
-  分帧 + Hello/HelloAck 身份协商；`CoAppOptions::local_identity` 必填且与
-  peer 互异（拒绝 self-connection）。`remaining_budget_ms` 由 CALL 帧携带，
-  接收端按 local-min 收紧；0 预算在解码期以 `SESSION_ERROR(ProtocolError)`
-  拒绝。没有 HTTP header 旁路或版本化 envelope。
-- 跨语言客户端共用 `tests/rpc_v2_wire.py`（SessionFrame 编解码 + 分帧 +
-  握手），运行/验收（ctest 名 `examples.getvalue.xlang` 与
-  `framework.getvalue_codec`）。所有结构化结果带
-  `auth_state=unauthenticated_loopback`。
+## 网络与 RPC
 
-## 双服务资源示例：dual_service（默认不构建）
+- RPC 只经 infra V2 会话（`SessionFrame` + u32be 分帧 + Hello/HelloAck），不存在 HTTP header 或旧 wire 降级路径。
+- 入站与出站装配、执行槽、关闭顺序：[网络宿主与 RPC V2 消费](docs/guides/http-host.md)；
+  RPC 映射见 [框架契约 §7.1](docs/architecture/framework-contract.md)。
+- 身份：`AppOptions::SetLocalIdentity` 必填（配置监听时），与 peer 互异。当前明文 trusted-network 下
+  `peer_principal` 恒为空，示例结果带 `auth_state=unauthenticated_loopback`，不证明授权完成。
 
-`examples/dual_service/` 是三个真实进程的跨服务示例（`svc_a` storage /
-`svc_b` gateway / `driver` 客户端，`svc_a` 用真实 Redis + Mongo 资源），
-由根 CMake 的显式开关控制：
+## 示例
 
-```cmake
-option(BBT_ENABLE_DUAL_SERVICE_EXAMPLE "…" OFF)
-```
-
-- 默认 OFF：普通 framework 构建与测试不加入该示例，不要求
-  hiredis / mongo-cxx-driver，也不要求真实 Redis/Mongo 后端。
-- 显式 ON：fail-closed。必须同时具备 `NEED_TEST=ON`、protobuf 前缀
-  （`bbt_infra_rpc_net`）、`BBT_INFRA_REDIS_NET=ON` + hiredis 前缀
-  （`bbt::infra_redis_net`）、
-  `BBT_MONGOC_PREFIX`+`BBT_MONGOCXX_PREFIX`（`bbt::infra_mongo`）；
-  任一缺失都在 configure 阶段 `FATAL_ERROR`，不静默跳过。
-- 协议：三个进程统一 V2 会话（`SessionFrame` + u32be + Hello/HelloAck，
-  `local_identity` 互异）；CALL 帧携带 `remaining_budget_ms`，服务端按
-  local-min 继承调用方预算（示例含可判定证据）。
-- 覆盖边界：默认 CI 不传该开关，所以它的绿灯**不**覆盖本示例；真实资源
-  验收入口是 `examples/dual_service/run_acceptance.sh`（临时 Redis/Mongo
-  容器 + 全场景 + 残留复核），当前仅本地/受控环境运行。资源验收 CI job
-  尚未接线——本轮不新增 `ubuntu-latest`/新 runner 架构，推荐方向是派生一个
-  预装 hiredis/mongoc/mongocxx 固定前缀的 runner 镜像 + infra 固定 recipe，
-  待其落地并冻结 SHA 后经 `run_acceptance.sh` 复用。默认 CI 另有一个负向
-  门禁步，断言「显式 ON 且缺前缀必须 configure 失败」。
-- 资源身份与清理都 fail-closed：`run_acceptance.sh` 拉容器前校验
-  recipe 身份（manifest 与 CMakeCache 前缀一致、组件 commit 与 `cache_key`
-  互绑、每个已记录 `.so` 的 `sha256`、`svc_a` 的 `ldd` 逐个解析到对应私有
-  前缀且无 `not found`），teardown 只删/只复核自己创建的对象，`docker`
-  查询失败同样计为未证实并让退出码非零。
-
-详见 [`examples/dual_service/README.md`](examples/dual_service/README.md)。
+[示例总览](examples/README.md) 按需求索引每个例程的公开面、运行条件与边界。
 
 ## 文档地图
 
-- 跨仓公共规范（设计/编码/Review/用例）：[bbtools-pub README](https://github.com/yqm-307/bbtools-pub/blob/main/README.md)（`third-party/bbtools-pub` 固定 submodule，clone 后 `git submodule update --init --recursive`）
-- 架构基调（设计真源）：[`docs/architecture/distributed-framework-baseline.md`](docs/architecture/distributed-framework-baseline.md)
-- 验收矩阵（测试设计，非实测结果）：[`docs/architecture/distributed-framework-validation-matrix.md`](docs/architecture/distributed-framework-validation-matrix.md)
-- 开发流程与本地验证：[`docs/guides/development.md`](docs/guides/development.md)
-- 示例总览（需求→例程→公开 API/边界）：[`examples/README.md`](examples/README.md)
-- 示例：[`examples/getvalue/README.md`](examples/getvalue/README.md)、
-  [`examples/two_service/README.md`](examples/two_service/README.md)、
-  [`examples/dual_service/README.md`](examples/dual_service/README.md)、
-  [`examples/lifecycle_matrix/README.md`](examples/lifecycle_matrix/README.md)、
-  [`examples/rpc_policy/README.md`](examples/rpc_policy/README.md)、
-  [`examples/component_services/README.md`](examples/component_services/README.md)、
-  [`examples/ecommerce_cluster/README.md`](examples/ecommerce_cluster/README.md)
-- Agent 协作与门禁：[`AGENTS.md`](AGENTS.md)
-- CI 说明：[`docs/guides/ci.md`](docs/guides/ci.md)
-- 测试规范：[`docs/guides/testing.md`](docs/guides/testing.md)
+- 跨仓公共规范（设计/编码/Review/用例）：`third-party/bbtools-pub`（固定 submodule）。
+- 架构基调（设计真源）：[distributed-framework-baseline.md](docs/architecture/distributed-framework-baseline.md)。
+- 框架契约（目标设计 + 已实现边界）：[framework-contract.md](docs/architecture/framework-contract.md)。
+- 验收矩阵（测试设计，非实测结果）：[distributed-framework-validation-matrix.md](docs/architecture/distributed-framework-validation-matrix.md)。
+- 开发流程与本地验证：[development.md](docs/guides/development.md)。
+- 测试规范：[testing.md](docs/guides/testing.md)；CI 说明：[ci.md](docs/guides/ci.md)。
+- 网络宿主与 RPC V2：[http-host.md](docs/guides/http-host.md)。
+- 示例总览：[examples/README.md](examples/README.md)。
+- Agent 协作与门禁：[AGENTS.md](AGENTS.md)。

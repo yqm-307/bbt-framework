@@ -5,7 +5,7 @@
 
 namespace bbt::framework {
 
-result<bbt::infra::CallOptions> AdaptCallOptions(
+bbt_co_async(result<bbt::infra::CallOptions>) AdaptCallOptions(
     const RequestContext*  parent,
     const CallOptions&     options,
     const CallEgressHooks& hooks)
@@ -69,7 +69,7 @@ result<bbt::infra::CallOptions> AdaptCallOptions(
         if (!seq)
             return result<bbt::infra::CallOptions>::err(seq.error());
     }
-    auto io = hooks.initiate_io(out);
+    auto io = bbt_co_await hooks.initiate_io(out);
     if (!io)
         return result<bbt::infra::CallOptions>::err(io.error());
 

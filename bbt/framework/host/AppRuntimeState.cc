@@ -22,7 +22,7 @@ result<std::string> AppRuntimeState::FindRoute(
     return result<std::string>::ok(it->second);
 }
 
-result<bbt::infra::rpc::Response> AppRuntimeState::Send(
+bbt_co_async(result<bbt::infra::rpc::Response>) AppRuntimeState::Send(
     const bbt::infra::rpc::Request& env,
     const bbt::infra::CallOptions& options) const {
     auto endpoint = FindRoute(env.Service());
@@ -64,25 +64,17 @@ result<bbt::infra::rpc::Response> AppRuntimeState::Send(
                 MakeError(ErrorCode::TimedOut,
                           "rpc policy tightened deadline already expired"));
     }
-
     if (default_egress)
-        return default_egress->Call(target, env, opt);
+        return bbt_co_await default_egress->Call(target, env, opt);
     if (!seam_send)
         return result<bbt::infra::rpc::Response>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "CoApp: rpc_send egress not configured"));
-    return seam_send(target, env, opt);
+    return bbt_co_await seam_send(target, env, opt);
 }
 
-void AppRuntimeState::Publish(
-    std::shared_ptr<InboundDispatcher> d,
-    std::map<std::string, std::shared_ptr<const RpcMethodTable>> t,
-    std::map<std::string, std::shared_ptr<ICoService>> inst,
-    std::shared_ptr<ActorRegistry> reg) {
+void AppRuntimeState::Publish(std::shared_ptr<InboundDispatcher> d) {
     std::lock_guard<std::mutex> lock(mtx);
-    tables   = std::move(t);
-    instances = std::move(inst);
-    registry = std::move(reg);
     /**
      * 最后开放接纳
      */
@@ -95,9 +87,15 @@ void AppRuntimeState::Release() noexcept {
      */
     std::lock_guard<std::mutex> lock(mtx);
     dispatcher.reset();
-    tables.clear();
-    instances.clear();
-    registry.reset();
+}
+
+void AppRuntimeState::RemoveDispatch(const std::string& service) noexcept {
+    std::shared_ptr<InboundDispatcher> dispatcher;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        dispatcher = this->dispatcher;
+    }
+    if (dispatcher) dispatcher->RemoveService(service);
 }
 
 result<bbt::infra::rpc::Response> AppRuntimeState::Dispatch(

@@ -4,8 +4,9 @@
  */
 #include <string>
 #include <bbt/example/ecommerce/v1/ecommerce.pb.h>
-#include <bbt/framework/ServiceContext.hpp>
-#include <bbt/framework/CoRpc.hpp>
+#include <bbt/framework/RequestContext.hpp>
+#include <bbt/framework/CallOptions.hpp>
+#include <bbt/framework/Result.hpp>
 #ifdef EC_STORAGE_AVAILABLE
 #include <bbt/framework/MongoDbResource.hpp>
 #endif
@@ -19,10 +20,14 @@ struct StorageConfig {
 StorageConfig& Storage();
 bbt::framework::result<void> ValidateOrder(const v1::OrderRequest& request);
 bool SamePayload(const v1::Record& record, const v1::OrderRequest& request);
-void StorageHop(const bbt::framework::ServiceContext& context, const char* service,
-                const char* method, const std::string& id, bool ok, int code = 0);
+void StorageHop(const char* service, const char* method, const std::string& id,
+                bool ok, int code = 0);
 #ifdef EC_STORAGE_AVAILABLE
-bbt::infra::CallOptions StorageBudget(const bbt::framework::ServiceContext& context);
+/**
+ * 出站后端预算取入站受管上下文 deadline：无受管上下文即如实失败，
+ * 不退化为无限等待。
+ */
+bbt::framework::result<bbt::infra::CallOptions> StorageBudget();
 bbt::framework::result<v1::Record> ReadRecord(bbt::framework::MongoDbResource& db,
                                               const std::string& id, const bbt::infra::CallOptions& options);
 bbt::framework::result<v1::Record> InsertRecord(bbt::framework::MongoDbResource& db,

@@ -1,12 +1,12 @@
 /**
- * framework v2 受管对象基类实现：身份观察面与 subject 绑定表。
+ * framework 受管对象基类实现：身份观察面与 subject 绑定表。
  */
 
 #include <mutex>
 
 #include <bbt/framework/Actor.hpp>
 #include <bbt/framework/Component.hpp>
-#include <bbt/framework/Service.hpp>
+#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/internal/Registry.hpp>
 #include <bbt/framework/internal/ServiceBase.hpp>
 
@@ -80,19 +80,19 @@ bool detail::ObjectBase::_FindBoundCopy(const std::type_info& type,
  * ---- CoComponent::Info ----
  */
 
-ObjectInfo v2::CoComponent::Info() const { return _ObjectInfo(); }
+ObjectInfo CoComponent::Info() const { return _ObjectInfo(); }
 
 /**
  * ---- CoServiceBase ----
  */
 
-ObjectInfo v2::CoServiceBase::Info() const { return _ObjectInfo(); }
+ObjectInfo CoServiceBase::Info() const { return _ObjectInfo(); }
 
 /**
  * ---- CoActor::Info ----
  */
 
-ActorInfo v2::CoActor::Info() const {
+ActorInfo CoActor::Info() const {
     ActorInfo out;
     auto r = _ObjectHandle().Info();
     if (r) {

@@ -1,11 +1,11 @@
 /**
- * framework v2 公共值层实现：Options 校验、ObjectHandle/ObserverToken 的
+ * framework 公共值层实现：Options 校验、ObjectHandle/ObserverToken 的
  * Registry 委托、AppObjectAddress 校验、ComponentBorrow 释放。
  */
 
 #include <bbt/framework/Address.hpp>
 #include <bbt/framework/Object.hpp>
-#include <bbt/framework/Service.hpp>
+#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/internal/Registry.hpp>
 
 namespace bbt::framework {
@@ -18,6 +18,33 @@ result<void> ServiceOptions::Validate() const {
     if (m_max_inflight == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
             "ServiceOptions: max_inflight must be a finite positive value"));
+    if (m_execution == ExecutionPolicy::ActorSerial) {
+        if (m_max_serial_keys == 0)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "ServiceOptions: ActorSerial requires max_serial_keys > 0"));
+        if (m_serial_queue_capacity == 0)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "ServiceOptions: ActorSerial requires serial_queue_capacity > 0"));
+    } else {
+        if (m_max_serial_keys != 0 || m_serial_queue_capacity != 0)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "ServiceOptions: Concurrent must not create serial queues"));
+    }
+    if (m_ordered_ingress.enabled) {
+        if (m_execution != ExecutionPolicy::ActorSerial)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "ServiceOptions: ordered_ingress only allowed with ActorSerial"));
+        if (m_ordered_ingress.max_ordered_streams == 0 ||
+            m_ordered_ingress.max_cached_results == 0 ||
+            m_ordered_ingress.max_cached_result_bytes == 0)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "ServiceOptions: ordered_ingress limits must be finite positive values"));
+    } else if (m_ordered_ingress.max_ordered_streams != 0 ||
+               m_ordered_ingress.max_cached_results != 0 ||
+               m_ordered_ingress.max_cached_result_bytes != 0) {
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+            "ServiceOptions: disabled ordered_ingress requires all three limits to be 0"));
+    }
     return result<void>::ok();
 }
 

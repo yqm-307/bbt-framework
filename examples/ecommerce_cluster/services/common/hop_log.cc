@@ -45,8 +45,8 @@ void LogHop(const HopRecord& record) {
     std::fflush(stdout);
 }
 
-std::string InboundRequestId(const bbt::framework::ServiceContext& context) {
-    auto current = context.request();
+std::string InboundRequestId() {
+    auto current = bbt::framework::CurrentRequestContext();
     return current ? current.value()->request_id : std::string{};
 }
 

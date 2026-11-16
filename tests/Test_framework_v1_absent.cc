@@ -1,12 +1,16 @@
 /**
- * framework 侧 V1 面缺席的负向检查（framework.v1_absent）。
+ * framework 侧旧面缺席的负向检查（framework.v1_absent）。
  *
  * 判据分两层，均不依赖「跑起来能连上」：
- * 1) 编译层正向对照：本 TU 只 include V2 公开面并实际使用 Request/Response/
- * RpcEgress/InstallRpcAdmission 类型——证明 V2 面在场且可编译；
- * 2) 文本层缺席：扫描 bbt/framework/ 的产品源码与 CMake，断言旧 RPC 面
- * （LegacyHeaders/x-bbt 信封头族/RpcEnvelope/RpcAddress/RpcInboundBridge/
- * RpcEgressProfile/HttpEgress/双桥安装入口/旧能力宏）零命中。
+ * 1) 编译层正向对照：本 TU 只 include 唯一公开聚合头 Framework.hpp 并实际
+ * 使用 Request/Response/RpcEgress/InstallRpcAdmission 类型——证明唯一
+ * bbt::framework 面在场且可编译；
+ * 2) 文本层缺席：扫描 bbt/framework/ 的产品源码与 CMake，断言旧面零命中：
+ *    旧 RPC 面（LegacyHeaders/x-bbt 信封头族/RpcEnvelope/RpcAddress/
+ *    RpcInboundBridge/RpcEgressProfile/HttpEgress/双桥安装入口/旧能力宏）
+ *    与旧 App/Service 对象模型（ICoService/CoAppOptions/add_service/
+ *    add_resource/ServiceContext/ShutdownState/HostLifecycle/v2 命名空间/
+ *    co_service_name/V2.hpp）。
  *
  * 扫描范围刻意排除本文件自身与 tests/ 目录：本测试的判据字符串本身必须
  * 出现，否则无法表达「什么不该存在」。裸 RpcHandler 不是残留证据
@@ -20,11 +24,13 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include <bbt/framework/CoApp.hpp>
+#include <bbt/framework/Framework.hpp>
+#include <bbt/framework/internal/AppRuntimeState.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 #include <bbt/infra/rpc/Request.hpp>
 #include <bbt/infra/rpc/Response.hpp>
@@ -46,9 +52,11 @@ struct Forbidden {
 };
 
 /**
- * 旧 RPC 面的文本指纹。只列「出现即证明旧面仍在」的精确 token：
+ * 旧面文本指纹。只列「出现即证明旧面仍在」的精确 token：
  * - x-bbt 信封头族（x-bbt-err-* 是 HTTP 错误映射，保留，故不列）；
- * - 旧值类型/旧桥/旧 profile 枚举/旧能力宏。
+ * - 旧值类型/旧桥/旧 profile 枚举/旧能力宏；
+ * - 旧 App/Service 对象模型符号与 v2 命名空间壳（用户裁决：唯一
+ *   bbt::framework 公开命名空间，不保留 v2 别名/聚合壳）。
  */
 constexpr Forbidden kForbidden[] = {
     {"x-bbt-service", "x-bbt-service"},
@@ -73,6 +81,17 @@ constexpr Forbidden kForbidden[] = {
     {"HttpTransport.hpp", "rpc/HttpTransport.hpp"},
     {"BBT_FRAMEWORK_HAS_RPC_WIRE", "BBT_FRAMEWORK_HAS_RPC_WIRE"},
     {"BBT_FRAMEWORK_HAS_RPC_TCP", "BBT_FRAMEWORK_HAS_RPC_TCP"},
+    {"ICoService", "ICoService"},
+    {"CoAppOptions", "CoAppOptions"},
+    {"add_service", "add_service"},
+    {"add_resource", "add_resource"},
+    {"ServiceContext", "ServiceContext"},
+    {"ShutdownState", "ShutdownState"},
+    {"HostLifecycle", "HostLifecycle"},
+    {"namespace v2", "namespace v2"},
+    {"v2::", "v2::"},
+    {"co_service_name", "co_service_name"},
+    {"V2.hpp", "V2.hpp"},
 };
 
 bool IsScannedFile(const fs::path& p) {
@@ -106,9 +125,10 @@ std::string ReadAll(const fs::path& p) {
 BOOST_AUTO_TEST_SUITE(framework_v1_absent)
 
 /**
- * 正向对照：V2 公开面可编译、可用（本 TU 已 include 并实例化）。
+ * 正向对照：唯一 bbt::framework 公开面可编译、可用（本 TU 已 include
+ * Framework.hpp 并实例化）。
  */
-BOOST_AUTO_TEST_CASE(v2_surface_compiles_and_is_usable) {
+BOOST_AUTO_TEST_CASE(single_api_surface_compiles_and_is_usable) {
     inf::rpc::Request request("svc.echo", "Echo");
     request.SetRequestId("rid-1")
         .SetReply(inf::rpc::ReplyMode::Required)
@@ -122,16 +142,18 @@ BOOST_AUTO_TEST_CASE(v2_surface_compiles_and_is_usable) {
     BOOST_CHECK(response.Payload().empty());
 
     /**
-     * 安装入口与出站入口都是 V2 名字（类型可用即证明头已就位）。
+     * 安装入口与出站入口都是唯一 API 名字（类型可用即证明头已就位）。
      */
-    using AdmissionFn = void (*)(fw::InfraHttpHost&, fw::CoApp&);
+    using AdmissionFn = void (*)(fw::InfraHttpHost&,
+                                 std::shared_ptr<fw::AppRuntimeState>);
     AdmissionFn admission = static_cast<AdmissionFn>(&fw::InstallRpcAdmission);
     BOOST_CHECK(admission != nullptr);
     BOOST_CHECK(sizeof(fw::RpcEgress) > 0);
 }
 
 /**
- * 旧桥文件必须已删除（存在即失败）。
+ * 旧桥/旧宿主/旧对象模型文件必须已删除（存在即失败）；唯一聚合头与新
+ * 接线在场。
  */
 BOOST_AUTO_TEST_CASE(legacy_bridge_headers_are_gone) {
     const fs::path root(kSourceRoot);
@@ -140,8 +162,21 @@ BOOST_AUTO_TEST_CASE(legacy_bridge_headers_are_gone) {
     BOOST_CHECK(!fs::exists(root / "bbt/framework/host/RpcHttpBridge.cc"));
     BOOST_CHECK(!fs::exists(root / "bbt/framework/host/RpcWireBridge.cc"));
     /**
-     * 新接线在场。
+     * 旧 App/Service 对象模型面已删（聚合壳 V2.hpp 与旧生命周期宿主同）。
      */
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/App.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/Service.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/V2.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/ICoService.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/ServiceContext.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/ShutdownState.hpp"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/host/HostLifecycle.cc"));
+    BOOST_CHECK(!fs::exists(root / "bbt/framework/host/App.cc"));
+    /**
+     * 唯一聚合头与新接线在场。
+     */
+    BOOST_CHECK(fs::exists(root / "bbt/framework/Framework.hpp"));
+    BOOST_CHECK(fs::exists(root / "bbt/framework/internal/NetworkHost.hpp"));
     BOOST_CHECK(fs::exists(root / "bbt/framework/internal/RpcBridge.hpp"));
     BOOST_CHECK(fs::exists(root / "bbt/framework/host/RpcBridge.cc"));
 }

@@ -18,16 +18,21 @@ label 表达测试性质（`unit`/`integration`/`live`/`perf`），profile 表�
 | 真实服务 | `live` | Redis/Mongo 等真实外部服务 | 发布 Gate / 专门手动任务 |
 | 性能 | `perf` | 基线、压力、疲劳 | 性能相关改动、定时、发布 |
 
-当前注册面（`-DNEED_TEST=ON` + `bbt_infra_rpc_net` 在场，25 项）：
+注册面以 `tests/CMakeLists.txt` 与 `examples/*/CMakeLists.txt` 为准（不在本文复制计数，避免与源码漂移）：
 
-- `smoke` 18 项：12 个 `unit` 用例 + 6 个快速 `integration`（`framework.close_gate`、
-  `framework.inbound_http`、`framework.ordered_ingress_rpc`、`framework.rpc_xlang`、
-  `framework.egress_request_phase`、`framework.rpc_matrix`）。
-- 非 smoke `integration` 7 项：`framework.shutdown`（真实 runtime 排空，
-  全套实测 ~107s）、6 个 `examples.*`（跨进程真实协作）——不进普通 CI smoke。
-- `live` 条件注册：`framework.resource_live_{redis,mongo,combined}` 仅在
-  `bbt::infra_redis_net`/`bbt::infra_mongo` 目标在场时注册；环境缺后端时进程
-  以 77 退出配合 `SKIP_RETURN_CODE` 标 Skipped，不伪装通过。
+- `smoke` label：`framework.*` 中 `unit` 与快速 `integration` 用例，由 `-L smoke` 选中。
+  `framework.close_gate`、`framework.inbound_http`、`framework.ordered_ingress_rpc`、`framework.rpc_xlang`、
+  `framework.egress_request_phase`、`framework.rpc_matrix` 带 `smoke;integration`；其余 `framework.*` unit 用例带 `smoke;unit`。
+- 非 smoke `integration`：`framework.shutdown`（真实 runtime 排空，全套实测约 107s），以及全部 `examples.*`
+  （跨进程真实协作）——不进普通 CI smoke。
+- `live` 条件注册：`framework.resource_live_{redis,mongo,combined}` 仅在 `bbt::infra_redis_net` /
+  `bbt::infra_mongo` 目标在场时注册；`BBT_REQUIRE_RESOURCE_LIVE_TESTS=ON` 时缺模块即 configure 失败。
+  环境缺后端时进程以 77 退出配合 `SKIP_RETURN_CODE` 标 Skipped，不伪装通过。
+  **注意**：`Test_framework_resource_live.cc` 与 `Test_framework_resource_combined.cc`
+  已迁移到当前公共 API（受管组件 `CoInstallComponent` + 声明式 `BindComponent` +
+  `Borrow()`，`CoStart/CoWaitShutdownRequest/CoStop` 生命周期）；live 目标可构建
+  但未经真实后端运行验证，不能作为通过证据。
+- `examples.ecommerce_cluster` 仅在 `bbt::infra_consul` 存在且 `BBT_CONSUL_BINARY` 指向可执行文件时注册。
 
 ## 2. 执行契约（统一入口）
 

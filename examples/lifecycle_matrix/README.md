@@ -1,40 +1,59 @@
-# examples/lifecycle_matrix — 容量 / 并发上下文 / 关闭生命周期验收（Issue #5 / EX-T4）
+# examples/lifecycle_matrix — 容量 / 并发上下文 / 关闭生命周期验收
 
 一个**自有 fixture 进程** + 外部 **Python 驱动器**，经**真实公开入口**验证框架的
 容量、并发上下文与关闭生命周期行为：
 
-- fixture：公开 `CoApp`（`local_identity` 显式）+ 真实 loopback V2 会话宿主，
-  注册公开 `CoService<T>`（`lifecycle::LifecycleGateService`）；业务
-  schema / typed codec **完整复用 #4 的 getvalue**（`getvalue_proto` +
-  `ProtoCodec` 特化），#5 不另造第二套 schema/协议/codec；
-- 驱动器：复用唯一 V2 codec（`tests/rpc_v2_wire.py`）走真实
-  `SessionFrame` 会话（Hello/HelloAck + u32be）。
+- fixture：公开 `bbt::framework` 唯一 API（`CoApp::Create` + `AppOptions` 链式装配，
+  `local_identity` 显式）+ 真实 loopback V2 会话宿主，经 `CoInstallService` 注册
+  公开 `CoService<>`（`lifecycle::LifecycleGateService`），经 `CoInstallComponent`
+  注册关闭序列观测组件（`CloseJournal`）；业务 schema / typed codec **完整复用
+  getvalue**（`getvalue_proto` + `ProtoCodec` 特化），本示例不另造第二套
+  schema/协议/codec；
+- 驱动器：复用唯一 V2 codec（`tests/rpc_v2_wire.py`）走真实 `SessionFrame` 会话
+  （Hello/HelloAck + u32be）。
 
 ```
 driver ──V2 会话──▶ fixture(自有进程, 动态 loopback)
                        └ CoApp → LifecycleGateService
                               Hold(挂起/占容量) / Fast(即时)
+                       └ CloseJournal 组件（OnStop 观测关闭序列）
 ```
 
 > `auth_state=unauthenticated_loopback`：本验收只证明公开 App/Service 消费面、
-> 容量与生命周期行为，**不证明**身份来源可信或授权完成（认证轨道见 #38）。
+> 容量与生命周期行为，**不证明**身份来源可信或授权完成。
 
 ## 为什么不是「测试缝/桩」
 
-严格遵守 #5 边界：只使用公开头（`CoApp.hpp`/`CoService.hpp`/`ICoService` 的
-`call`/`RpcMethods.hpp`/`ICoCloseable.hpp`），另按 #4 已验收示例口径使用
-coroutine 的进程级启动配置访问头 `bbt/coroutine/detail/GlobalConfig.hpp`（仅在
-调度器启动前设置栈大小/静态线程数）与公开同步原语
-`bbt/coroutine/sync/CoWaiter.hpp`（handler 的验收挂起点）。**不使用**
-`framework/internal/`、Binder、`CoAppSeam`、`MakeCoAppForTest`、
+只使用公开头（`CoApp.hpp` / `CoService.hpp` / `CoComponent.hpp` / `RpcMethods.hpp` /
+`RequestContext.hpp`），另按 getvalue 已验收示例口径使用 coroutine 的进程级启动
+配置访问头 `bbt/coroutine/detail/GlobalConfig.hpp`（仅在调度器启动前设置栈大小/
+静态线程数）与公开同步原语 `bbt/coroutine/sync/CoWaiter.hpp`（handler 的验收挂起
+点）。**不使用** `framework/internal/`、Binder、`CoAppSeam`、`MakeCoAppForTest`、
 `DispatchInboundForTest`、`INetworkHost` 桩或任何发送函数注入；不创建额外
-`io_thread`（只调用公开 `CoApp::run()`/`request_shutdown()`）。
+`io_thread`（关闭由公开 `RequestShutdown()` 触发，主协程亲自 `CoStop` 收口）。
+
+装配序列与 getvalue/two_service 同口径：`g_scheduler->Start()` 后把
+`CoApp::Create` → `CoInstallService` / `CoInstallComponent` → `CoStart` →
+`BoundEndpoint` → `CoWaitShutdownRequest` → `CoStop` 投递进受管协程。
 
 验收控制面（**仅验收用**，不是生产注入）：fixture 的 stdin 逐行命令
-`shutdown` → `request_shutdown()`；`open` → 放行进程内验收闩 `OpenGate`；
+`shutdown` → `RequestShutdown()`；`open` → 放行进程内验收闩 `OpenGate`；
 `quit`/EOF → 收尾。断言全部基于 journal 事件、V2 响应与进程退出码，
 驱动器不用固定 sleep 猜时序：先等 journal 里的可观察握手（`handler_entered`/
 `handler_resumed`/`shutdown_state`）再推进。
+
+## 状态与退出码（本示例口径）
+
+- journal 的 `state=<int>` = `bbt::framework::AppState` 枚举序：
+  `4=Stopping`、`5=StopIncomplete`（收口未竟、保留 owner 可再推进）、
+  `6=Stopped`（收口完成）。
+- 退出码：`0`=按期优雅收口（`State()==Stopped` 且无 pending）；`2`=安装/启动
+  失败；`3`=StopIncomplete 后在途 handler 迟到完成且逐对象收口完成；
+  `4`=收口未竟；`5`=绑定不符/绑定超时；`6`=journal 打开失败；`90`=用法错误。
+- `CoStop` 的期限耗尽时框架如实置 `AppState::StopIncomplete` 并保留 owner
+  （不再无界续等）；fixture 的迟到路径据此**等在途 handler 真实终态**
+  （有限轮询 `PendingCleanup()`），再逐对象 `CoUninstallService` /
+  `CoUninstallComponent` 完成收口——不跳过排空、不削弱关闭断言。
 
 ## 构建与运行（一条路径）
 
@@ -58,9 +77,9 @@ ctest --test-dir <build> -R '^examples\.lifecycle_matrix$' --output-on-failure
 | `r4-overloaded` | 容量满（2 项在途）时新请求 `Fast` | V2 错误 `error.code=7`（Overloaded）；该请求**未进 handler**（`Fast` 的 `handler_entered` journal 无 `r3-probe`）——耗尽即拒、不无界排队 |
 | `r4-recovered` | 放行后新探测请求 | `success=true`（容量恢复接纳，非原调用 retry） |
 | `r4-byte-limit` | 发送帧 body（8128B）> `NetworkLimits.max_body_bytes`（4096） | 解码边界拒绝：`SESSION_ERROR(ProtocolError)` 或 link 退役后的 EOF/reset（均算真实拒绝，读超时判失败）；随后正常请求仍成功（服务器健康） |
-| `r5-graceful` | 一次正常请求后 stdin `shutdown` | 退出码 0；journal `rc=0 state=3(Closed) owner_closed=1 pending=0`；`resource_close` 恰一次且发生在最后一次 handler 事件**之后**（handler 排空后同步 Close） |
-| `r5-shutdown-incomplete` | 在途 `Hold` 被闩扣住时 `shutdown`（step_budget=300ms） | 退出码 3（`kExitShutdownLate`）；进入 `ShutdownIncomplete` 时 `pending≥1`、fixture 仍存活、owner 未被 Close、新请求 `connection-refused`（拒新）；放行后 `handler_resumed` 在 `resource_close` **之前**、进程如期退出（迟到完成无 UAF） |
-| `r5-hard-kill` | 在途 `Hold` 被扣住时 supervisor `SIGKILL` | 进程 `rc=-9`；journal 含 `handler_entered`（未完成证据），**无** `event=shutdown`/`resource_close`/`state=3`——只标未完成/未知，**不称优雅完成** |
+| `r5-graceful` | 一次正常请求后 stdin `shutdown` | 退出码 0；journal `rc=0 state=6(Stopped) owner_closed=1 pending=0`；`resource_close` 恰一次且发生在最后一次 handler 事件**之后**（handler 排空后组件 OnStop 同步收口） |
+| `r5-shutdown-incomplete` | 在途 `Hold` 被闩扣住时 `shutdown`（CoStop 期限=300ms） | 进入 `AppState::StopIncomplete`（journal `state=5`）时 `pending≥1`、fixture 仍存活、CloseJournal 未被 OnStop（owner 保留）、新请求被拒（`served` 之外的任一拒绝形态）；退出码 3（迟到收尾）；放行后 `handler_resumed` 在 `resource_close` **之前**、终局 `pending=0 owner_closed=1`（迟到完成无 UAF） |
+| `r5-hard-kill` | 在途 `Hold` 被扣住时 supervisor `SIGKILL` | 进程 `rc=-9`；journal 含 `handler_entered`（未完成证据），**无** `event=shutdown`/`resource_close`/`state=6`——只标未完成/未知，**不称优雅完成** |
 
 journal 每行均带 `auth_state=unauthenticated_loopback`；`peer_principal` 来自真实
 transport（loopback 无认证 → 空串），不被 metadata 升级。
@@ -69,19 +88,26 @@ transport（loopback 无认证 → 空串），不被 metadata 升级。
 
 - **迟到回复送达不是框架承诺**：`r5-shutdown-incomplete` 中关闭序列在 handler
   返回后即同步收口网络，迟到完成的**回复**可能不再写出（本机实测 `delivered=false`）；
-  无 UAF 的正面证据是「进程如期以 rc=3 退出 + handler 恢复记录在案 + 资源 Close
+  无 UAF 的正面证据是「进程如期以 rc=3 退出 + handler 恢复记录在案 + 组件 OnStop
   在迟到完成之后」，不是回复送达。
-- **ActorSerial / mailbox 容量维度未覆盖**：本票约束「不启 ActorSerial」，故
+- **StopIncomplete 的推进路径**：网络宿主已被同步 Close 后，再次 `CoStop` 不会
+  重复排空——宿主已记录关闭原因时跳过 `WaitHandlersDone`，直接以更晚期限推进
+  对象收口（`docs/architecture/framework-contract.md` §12.3，rpc_matrix
+  `r8_shutdown_incomplete_late_completion` 实测可推进至 Stopped）。本 fixture
+  的迟到路径另有编排：不再次 `CoStop`，经逐对象 `CoUninstall*` 完成收口，故
+  App 状态停留在 `StopIncomplete`（journal `state=5`），`pending=0` 与组件
+  OnStop 是收口完成的判定依据。
+- **ActorSerial / mailbox 容量维度未覆盖**：本示例只用 Concurrent，故
   `mailbox_capacity` 耗尽路径不在此切片（服务容量维度以 Concurrent 的
   `max_inflight` 覆盖）。
 - **出站 / 跨 hop 预算未在本切片重验**：本 fixture 无静态路由（未配置即
-  `NotFound`）；Service→Service 真实出站与预算矩阵由 #4 的
-  `examples.getvalue.s2s` / `framework.getvalue_codec` / `framework.rpc_matrix`
-  承载。
+  `NotFound`）；Service→Service 真实出站与预算矩阵由 `examples.getvalue.s2s` /
+  `examples.two_service` 承载。
 - **单进程自有 fixture**：本切片是「一个 fixture 进程 + 外部 driver」的独立网络/
-  进程证据；**两个独立 CoApp 进程 + 静态路由（EX-T3）** 不在本目录。
+  进程证据；**两个独立 CoApp 进程 + 静态路由** 不在本目录。
 - **关闭观测的时序**：`shutdown_state` 由 fixture 观测线程轮询「变化即记录」；
-  瞬时 `Closing` 相位可能被轮询错过（信息项，不作断言）。
-- **未跑 sanitizer**：本切片未在 ASan/TSan/UBSan 下重跑；迟到完成无 UAF 的证据是有界退出、handler 恢复记录和 Close 顺序，不等同 sanitizer 结论。
+  瞬时 `Stopping` 相位可能被轮询错过（信息项，不作断言）。
+- **未跑 sanitizer**：本切片未在 ASan/TSan/UBSan 下重跑；迟到完成无 UAF 的证据
+  是有界退出、handler 恢复记录和 OnStop 顺序，不等同 sanitizer 结论。
 - **真实后端 / Compose / 认证**：无 Redis/Mongo、无容器编排、无认证 adapter；
-  不替代 #8/#9/#38，也不替代真实身份的至少性结论。
+  不替代真实身份的至少性结论。

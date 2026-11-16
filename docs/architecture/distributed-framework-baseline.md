@@ -26,7 +26,7 @@
 
 已读代码表明：
 
-- `CoApp` 已装配真实 HTTP 宿主和出站桥，按服务名查静态路由；不能再把整个仓库描述为“尚无构建入口”。`AGENTS.md` 中该旧进度与 README 有冲突，本次落库同步修正。[L01,L02,L03]
+- `CoApp` 已装配真实 HTTP 宿主与 RPC 出站（`RpcEgress`），按服务名查静态路由；仓库已有构建入口，不应再描述为“尚无构建入口”。[L01,L02,L03]
 - `CallOptionsAdapter` 已实施父子 deadline 取最小、顶层必须有限预算和出站前过期拒绝；业务级取消由调用方按 `CoXxx` 返回值决定，不由框架提供单操作取消令牌。[L04]
 - `RequestScope` 以协程 id 维护请求上下文，非协程场景另按 thread id；需要保护这个语义，不把普通 thread_local 当请求作用域。[L05]
 - `ActorMailbox` 是一个本地单消费者 drain coroutine，handler 挂起时不释放该 Actor 的执行资格。它是执行策略，不是跨节点目录或分布式唯一 owner 的证明。[L06]
@@ -236,7 +236,7 @@ Envoy 区分面向上游调用的 circuit breaking 与面向本进程资源耗�
 
 发现变更存在延迟，所以不能等远端都看见注销再本地拒新。数据面必须能对到达旧实例的新请求给出明确拒绝，状态调用不自动跨 owner 重放。
 
-现有 `HostLifecycle` 超过优雅关闭预算会标记 incomplete 然后无界续等，避免未关闭资源被释放。[L13] 将来必须明确区分：
+当前 `CoStop` 超过有限 deadline 会标记 `StopIncomplete` 并保留 owner，允许以更晚期限再次推进，不无界续等，也不强制释放仍被引用的资源。[L13] 必须明确区分：
 
 1. 进程内安全收口是否完成；
 2. 编排系统给进程的硬退出时限。
@@ -258,9 +258,9 @@ Envoy 区分面向上游调用的 circuit breaking 与面向本进程资源耗�
 - 每次请求记录 method、operation/attempt、选中实例及代际、route/config revision、队列时间、执行时间、结果知识状态。指标标签不放用户 id/actor key/request id，避免高基数。
 - 服务健康拆成 liveness、readiness、draining 与控制面陈旧；“进程活着”不等于“可承接新的有状态写入”。
 
-已读 `RpcHttpBridge` 只是在当时代码位置承担 HTTP/RPC 映射，本轮不直接迁移它。后续应把稳定 wire 编码/验证收敛给 infra，framework 保留组装与策略，迁移须对已有消费者兼容。[L14]
+早期 `RpcHttpBridge` 只是在当时代码位置承担 HTTP/RPC 映射，已删除（见下方现状更新）。后续应把稳定 wire 编码/验证收敛给 infra，framework 保留组装与策略，迁移须对已有消费者兼容。[L14]
 
-> 现状更新：`RpcHttpBridge`/`RpcWireBridge` 已按 `bbtools-infra/docs/decisions/0022-rpc-single-protocol.md` 删除，RPC 只走 V2 会话（`SessionFrame`）；本节保留为当时的决策记录。
+> 现状更新：`RpcHttpBridge`/`RpcWireBridge` 已按 infra ADR 0022（`bbtools-infra/docs/decisions/0022-rpc-single-protocol.md`）删除，RPC 只走 V2 会话（`SessionFrame`）；本节保留为当时的决策记录。
 
 需要补证的协议问题：现有桥的显式请求头没有列出跨进程 budget 字段；错误回复只列 code/domain/domain_code/message。应以完整集成链实测核对预算和结构化 details 是否保真，不能因内存类型有字段就宣称线上具备。[L11,L14]
 

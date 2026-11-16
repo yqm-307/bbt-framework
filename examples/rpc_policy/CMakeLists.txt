@@ -1,7 +1,7 @@
 # examples/rpc_policy — 公开出站策略 fixture。
 #
-# 一个公开 CoApp（caller+callee 两服务 + 自环静态路由）经真实 V2 会话
-# socket 回环；caller handler 出站经公开策略 CoAppOptions::rpc_policy。
+# 一个公开受管 CoApp（caller+callee 两服务 + 自环静态路由）经真实 V2 会话
+# socket 回环；caller handler 出站经公开策略 AppOptions::SetRpcPolicy。
 # 只用公开面（bbt/framework/CoApp.hpp + RpcPolicy.hpp + getvalue 业务），不触
 # internal seam。本目录只在 examples/ 入口被加入时构建（根 CMakeLists：
 # NEED_TEST=ON 且 bbt_infra_rpc_net 已注册），与 examples/getvalue 同一前置。
@@ -20,7 +20,7 @@ target_compile_options(rpc_policy PRIVATE -Wall -Wextra)
 
 # 真实运行验收：自有进程 + 动态 loopback 端口 + getvalue 切片的 Python 标准库 wire codec；
 # 每场景独立进程（一 CoApp 一策略），断言 Allow/Reject/期限只缩不放/收紧过期/
-# 路由先于策略/装饰器两虚调用/关闭后存活期 listener 探针 refused（run 返回后、
+# 路由先于策略/装饰器两虚调用/关闭后存活期 listener 探针 refused（CoStop 返回后、
 # 进程退出前 fixture 自发探针；只证存活期 listener 已关，不证零额外 I/O）。
 add_test(
     NAME examples.rpc_policy

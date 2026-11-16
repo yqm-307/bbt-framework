@@ -1,8 +1,9 @@
 # ecommerce_cluster — 动态发现与真实订单结算
 
 一个可执行文件按角色运行，gateway、catalog、order、settlement 各有声明和实现目录，
-验收时各自运行在独立进程。业务经 `CoService::call<Req, Resp>` / `ProtoMethod`
-发送真实 protobuf RPC；服务地址来自 Consul 健康视图，不注入静态实例地址。
+验收时各自运行在独立进程。业务经 `bbt_co_await CoServiceBase::call<Req, Resp>` /
+`ProtoMethod` 发送真实 protobuf RPC（受管协程内）；服务地址来自 Consul 健康视图，
+不注入静态实例地址。
 
 报价模式保留 `Checkout → Quote → Price`，`run.py` 继续验收原 28 项动态发现行为。
 存储模式必须显式传 `--storage`，提供独立 Redis/Mongo 配置；缺构建资源或后端即失败。
@@ -28,7 +29,7 @@ Gateway.GetBill → Settlement.GetBill → Mongo bills
 | `services/common/hop_log.hpp` / `.cc` | 报价逐跳日志和入站 envelope ID |
 | `services/common/node_identity.hpp` / `.cc` | 进程与 incarnation 身份 |
 | `discovery.hpp` / `.cc` | Consul blocking query、自注册/注销、DynamicRouteTable 发布 |
-| `ecommerce_cluster_main.cc` | 参数、CoApp / 服务 / 资源工厂装配和生命周期 |
+| `ecommerce_cluster_main.cc` | 参数、发现组件创建/启动/关闭、CoApp / 服务 / 受管组件装配和生命周期 |
 | `proto/bbt/example/ecommerce/v1/ecommerce.proto` | 唯一业务 schema；生成物只进 build |
 | `run.py` / `run_storage.py` | 原动态发现驱动 / 自有真实后端存储驱动 |
 
@@ -83,9 +84,14 @@ build/local/examples/ecommerce_cluster/ecommerce_cluster order \
 ```
 
 把 `order` 分别换成 `gateway`、`catalog`、`settlement` 启动四个进程；每个进程
-输出动态 `event=ready endpoint=...`，stdin EOF 触发注销和优雅关闭。Redis 仅由
-Catalog 的 `RedisNetResource` 使用；Order/Settlement 各由 `MongoDbResource` 持有
-自己的集合资源，均经 `CoApp::add_resource` 工厂创建并由宿主关闭。Mongo URI 建议
+输出动态 `event=ready endpoint=...`，stdin EOF 触发注销和优雅关闭。存储模式下
+Redis 由 Catalog 声明绑定的 `RedisNetResource`（"cache"）使用，其 OnStart 显式
+建连，不可达即启动失败；Order/Settlement 各绑定自己的 `MongoDbResource`
+（"orders"/"bills"），经 `CoApp::CoInstallComponent` 装配为受管组件并由 CoStop
+统一收口，服务 OnStart 的空文档读探针保证后端不可达时不进入 ready。Consul
+发现组件由 main 在宿主线程创建/启动/关闭（启动先于服务装配与网络装配，
+等价旧 add_resource 工厂相位），自注册/注销经受管协程 await 其公开方法。
+Mongo URI 建议
 传 `retryWrites=false`，明确关闭驱动层写重试；示例 RPC 自身也不自动重试写请求。
 
 金额全用整数分。`OrderRequest` 由稳定 `order_id`、sku、int64 数量、优惠分组成；

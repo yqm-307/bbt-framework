@@ -513,7 +513,7 @@ std::optional<fw::result<inf::rpc::Response>> CallEgress(
     state->opt = opt;
     bool succ = false;
     g_scheduler->RegistCoroutineTask([state] {
-        state->out.emplace(
+        state->out.emplace(bbt_co_await
             state->egress->Call(state->target, state->env, state->opt));
         state->done.CountDown();
     },

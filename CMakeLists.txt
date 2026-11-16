@@ -80,29 +80,22 @@ add_subdirectory(bbt/framework)
 # 每个公共头单独编译 TU，验证头文件自给
 set(BBT_FRAMEWORK_PUBLIC_HEADERS
     Result.hpp
-    CoRpc.hpp
+    Address.hpp
+    Object.hpp
+    Component.hpp
+    Actor.hpp
+    CoService.hpp
+    CoApp.hpp
     Route.hpp
     CallOptions.hpp
     OrderedTypes.hpp
     OrderedSession.hpp
     RequestContext.hpp
-    ServiceContext.hpp
     ExecutionPolicy.hpp
-    ShutdownState.hpp
     RpcMethods.hpp
     RpcPolicy.hpp
-    ICoService.hpp
-    CoService.hpp
     CoRpc.hpp
-    CoApp.hpp
     DynamicRouteTable.hpp
-    Object.hpp
-    Address.hpp
-    Service.hpp
-    Component.hpp
-    Actor.hpp
-    App.hpp
-    V2.hpp
     Framework.hpp)
 # RedisNetResource.hpp 依赖新 net Redis 入口公开头（bbt::infra_redis_net
 # 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
@@ -146,17 +139,15 @@ set(BBT_FRAMEWORK_INTERNAL_HEADERS
     internal/MethodTable.hpp
     internal/RequestScope.hpp
     internal/CallOptionsAdapter.hpp
-    internal/HostLifecycle.hpp
+    internal/NetworkHost.hpp
     internal/InboundDispatcher.hpp
     internal/InfraHttpHost.hpp
     internal/ActorMailbox.hpp
-    internal/ActorRegistry.hpp
     internal/OrderedIngress.hpp
     internal/Registry.hpp
     internal/RpcBridge.hpp
     internal/CoAppSeam.hpp
     internal/ErrorDomainRule.hpp
-    internal/ResourceClose.hpp
     internal/ObjectBase.hpp
     internal/ServiceBase.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")

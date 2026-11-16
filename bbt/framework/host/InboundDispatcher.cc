@@ -3,6 +3,7 @@
 #include <chrono>
 #include <boost/scope/scope_exit.hpp>
 #include <cstdint>
+#include <shared_mutex>
 #include <limits>
 #include <optional>
 #include <string_view>
@@ -100,11 +101,29 @@ Error ErrInvalid(std::string what) {
 
 InboundDispatcher::InboundDispatcher(
     std::map<std::string, ServiceEntry> services) {
+    std::unique_lock<std::shared_mutex> lk(m_services_mtx);
     for (auto& [name, e] : services) {
         auto ps = std::make_unique<PerService>();
         ps->entry = std::move(e);
         m_services.emplace(name, std::move(ps));
     }
+}
+
+void InboundDispatcher::RemoveService(const std::string& service) {
+    std::unique_ptr<PerService> removed;
+    {
+        std::unique_lock<std::shared_mutex> lk(m_services_mtx);
+        auto it = m_services.find(service);
+        if (it == m_services.end()) return;
+        removed = std::move(it->second);
+        m_services.erase(it);
+    }
+    /**
+     * 摘表后闭邮箱：不再接纳新任务，已接纳等待项由 drain 消费完
+     * （ActorMailbox::Close 语义）。对象收口路径经执行租约等待真实终态。
+     */
+    std::lock_guard<std::mutex> lk(removed->mb_mtx);
+    for (auto& [_, mb] : removed->mailboxes) mb->Close();
 }
 
 result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
@@ -202,11 +221,16 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
     /**
      * 3. 服务与方法查找；schema 不符显式失败，不等 handler 随机失败。
      */
-    auto svc_it = m_services.find(request.Service());
-    if (svc_it == m_services.end())
-        return result<Response>::err(MakeError(ErrorCode::NotFound,
-                                               "inbound dispatch: unregistered service '" + request.Service() + "'"));
-    PerService& svc = *svc_it->second;
+    PerService* svc_ptr = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lk(m_services_mtx);
+        auto svc_it = m_services.find(request.Service());
+        if (svc_it == m_services.end())
+            return result<Response>::err(MakeError(ErrorCode::NotFound,
+                                                   "inbound dispatch: unregistered service '" + request.Service() + "'"));
+        svc_ptr = svc_it->second.get();
+    }
+    PerService& svc = *svc_ptr;
     const RpcMethod* method = svc.entry.table->find(request.Method());
     if (method == nullptr)
         return result<Response>::err(MakeError(ErrorCode::NotFound,
@@ -222,7 +246,7 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
      * 4. 服务级接纳上限：容量耗尽拒绝，不无限排队。
      */
     if (svc.inflight.fetch_add(1, std::memory_order_acq_rel) >=
-        svc.entry.options.max_inflight) {
+        svc.entry.options.MaxInflight()) {
         svc.inflight.fetch_sub(1, std::memory_order_acq_rel);
         return result<Response>::err(MakeError(ErrorCode::Overloaded,
                                                "inbound dispatch: service '" + request.Service() +
@@ -264,7 +288,7 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
 
         std::shared_ptr<OrderedIngress> ordered_ingress;
         std::optional<OrderedIngress::Admission> ordered_admission;
-        if (svc.entry.options.ordered_ingress) {
+        if (svc.entry.options.OrderedIngress().enabled) {
             ordered_ingress = svc.entry.ordered_ingress;
             if (!ordered_ingress)
                 return result<Response>::err(MakeError(
@@ -335,14 +359,17 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
             return result<Response>::err(std::move(error));
         };
 
-        auto inst = svc.entry.registry->GetOrCreate(request.Service(),
-                                                    key.value());
-        if (!inst)
-            return finish_ordered_error(std::move(inst.error()));
+        CoServiceBase* instance = svc.entry.instance;
+        if (!instance)
+            return finish_ordered_error(MakeError(
+                ErrorCode::RuntimeUnavailable,
+                "service instance not bound"));
         auto mailbox = _MailboxFor(svc, key.value());
         if (!mailbox)
             return finish_ordered_error(MakeError(
-                ErrorCode::InternalError, "mailbox create failed"));
+                ErrorCode::Overloaded,
+                "inbound dispatch: service '" + request.Service() +
+                    "' reached max serial keys"));
 
         /**
          * 每请求一个 CoWaiter：登记成功后（on_registered 内）再
@@ -368,17 +395,36 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
         wo.deadline = ctx->deadline;
         /**
          * method 指向分发表项共享的 RpcMethodTable（AppRuntimeState 持有）；
-         * 网络 handler 超时后，邮箱 drain 仍可能在 run 收束后继续执行，不能把
+         * 网络 handler 超时后，邮箱 drain 仍可能在收口后继续执行，不能把
          * 该裸指针带过 Release。方法描述是不可变且可复制的，按值封装进任务，
-         * 连同 inst 的 shared_ptr 一起保证迟到任务不悬空。
+         * 连同 mailbox 的 shared_ptr 一起保证迟到任务不悬空；服务对象指针
+         * 只在 Release 前的分发窗口内有效（CoApp 收口序：排空先于销毁）。
          */
         RpcMethod method_copy = *method;
         const WaitStatus st = waiter->WaitWithCallback(wo, [&]() -> bool {
+            const auto lease_acquire = svc.entry.lease_acquire;
+            const auto lease_release = svc.entry.lease_release;
             auto enq = mailbox->TryEnqueue(
-                [ctx, method = std::move(method_copy), inst, slot, waiter,
+                [ctx, method = std::move(method_copy), instance, slot, waiter,
+                 lease_acquire, lease_release,
                  payload = request.Payload()]() mutable {
+                    /**
+                     * 执行租约在任务真实执行时取得：gate 已封 → 本任务以
+                     * Closed 落定，不进业务（已接纳不等于可执行越过收口门）。
+                     */
+                    if (lease_acquire && !lease_acquire()) {
+                        slot->r = result<std::vector<std::uint8_t>>::err(
+                            MakeError(ErrorCode::Closed,
+                                      "actor handler refused: service closing"));
+                        waiter->Notify();
+                        return;
+                    }
+                    struct LeaseGuard {
+                        const std::function<void()>& release;
+                        ~LeaseGuard() { if (release) release(); }
+                    } lease_guard{lease_release};
                     RequestScope scope(ctx);
-                    slot->r = method.invoke(*inst.value(), payload);
+                    slot->r = method.invoke(*instance, payload);
                     waiter->Notify();
                 });
             if (!enq) {
@@ -435,14 +481,26 @@ result<bbt::infra::rpc::Response> InboundDispatcher::Dispatch(
         /**
          * Concurrent：派发协程内联执行，实例并发安全由业务负责。
          */
-        auto& inst = svc.entry.instance;
-        if (!inst)
+        auto* instance = svc.entry.instance;
+        if (!instance)
             return result<Response>::err(MakeError(
                 ErrorCode::RuntimeUnavailable,
                 "service instance not bound"));
+        /**
+         * 执行租约：gate 已封（对象收口中）→ Closed 拒绝，不进业务。
+         */
+        if (svc.entry.lease_acquire && !svc.entry.lease_acquire())
+            return result<Response>::err(MakeError(
+                ErrorCode::Closed,
+                "inbound dispatch: service '" + request.Service() +
+                    "' is closing"));
+        struct LeaseGuard {
+            const std::function<void()>& release;
+            ~LeaseGuard() { if (release) release(); }
+        } lease_guard{svc.entry.lease_release};
         RequestScope scope(ctx);
         ready();
-        auto r = method->invoke(*inst, request.Payload());
+        auto r = method->invoke(*instance, request.Payload());
         if (!r) {
             if (auto valid = ValidateErrorAtBoundary(r.error()); !valid)
                 return result<Response>::err(std::move(valid.error()));
@@ -465,7 +523,14 @@ ActorMailbox::SPtr InboundDispatcher::_MailboxFor(
     auto it = svc.mailboxes.find(actor_key);
     if (it != svc.mailboxes.end())
         return it->second;
-    auto mb = ActorMailbox::Create(svc.entry.options.mailbox_capacity);
+    /**
+     * 串行 key 数封顶（ServiceOptions::MaxSerialKeys）：超过即拒绝新 key，
+     * 不静默扩容；已建立的 key 继续服务。
+     */
+    if (svc.entry.options.MaxSerialKeys() != 0 &&
+        svc.mailboxes.size() >= svc.entry.options.MaxSerialKeys())
+        return nullptr;
+    auto mb = ActorMailbox::Create(svc.entry.options.SerialQueueCapacity());
     svc.mailboxes.emplace(actor_key, mb);
     return mb;
 }

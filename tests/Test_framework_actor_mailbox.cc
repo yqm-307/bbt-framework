@@ -1,7 +1,6 @@
 /**
  * 执行策略校验矩阵、ActorSerial 缺 key 提取器启动失败、
- * Actor 邮箱保序/非重入/容量/异常续跑/Close、跨 Actor 并发、
- * ActorRegistry 至多一次与上限。
+ * Actor 邮箱保序/非重入/容量/异常续跑/Close、跨 Actor 并发。
  * 并发用例用条件变量屏障构造真实重叠窗口：handler 在 drain 协程内被
  * 屏障拦停，另一个执行体获得完整进入机会；禁止 sleep 凑时序。
  */
@@ -25,10 +24,9 @@
 #include <bbt/framework/CoApp.hpp>
 
 /**
- * 邮箱/注册表/方法表是机器面：显式包含 internal 头。
+ * 邮箱/方法表是机器面：显式包含 internal 头。
  */
 #include <bbt/framework/internal/ActorMailbox.hpp>
-#include <bbt/framework/internal/ActorRegistry.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
 
 namespace fw = bbt::framework;
@@ -177,88 +175,102 @@ public:
         fw::ActorMethodAt<&AllKeyedService::B, std::int32_t>("b"));
 };
 
-/**
- * 注册表测试服务：构造计数验证「至多一次」。无 RPC 方法声明 → 空表。
- */
-class CountingService final : public fw::CoService<CountingService> {
-public:
-    CountingService() { s_ctor_count.fetch_add(1); }
-    static constexpr std::string_view kServiceName = "counting";
-    static std::atomic<int> s_ctor_count;
-};
-std::atomic<int> CountingService::s_ctor_count{0};
-
 constexpr std::chrono::milliseconds kWait{5000};
 
 BOOST_AUTO_TEST_SUITE(framework_f2a)
 
 /**
- * ValidateServiceOptions 合法/非法矩阵。
+ * Options::Validate 合法/非法矩阵：执行策略（ServiceOptions）与
+ * Actor 类型额度（ActorOptions）分别校验；错误信息指明违规字段。
  */
 BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
-    const fw::ServiceOptions actor_base{
-        fw::ExecutionPolicy::ActorSerial,
-        /*max_inflight*/ 64,
-        /*mailbox_capacity*/ 16,
-        /*max_actors*/ 8,
-        /*ordered_ingress*/ false,
-        /*max_ordered_streams*/ 0,
-        /*max_cached_results*/ 0,
-        /*max_cached_result_bytes*/ 0};
+    const auto actor_base = fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::ActorSerial)
+        .SetMaxInflight(64)
+        .SetMaxSerialKeys(16)
+        .SetSerialQueueCapacity(64);
     /**
      * BOOST_CHECK 只记录表达式文本，不要求操作数可流式输出（result<T>）。
      */
-    BOOST_CHECK(fw::ValidateServiceOptions(actor_base));
+    BOOST_CHECK(actor_base.Validate());
 
-    fw::ServiceOptions concurrent = actor_base;
-    concurrent.execution = fw::ExecutionPolicy::Concurrent;
-    concurrent.mailbox_capacity = 0;
-    concurrent.max_actors = 0;
-    BOOST_CHECK(fw::ValidateServiceOptions(concurrent));
+    auto concurrent = fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::Concurrent)
+        .SetMaxInflight(64);
+    BOOST_CHECK(concurrent.Validate());
 
-    fw::ServiceOptions ordered = actor_base;
-    ordered.ordered_ingress = true;
-    ordered.max_ordered_streams = 4;
-    ordered.max_cached_results = 32;
-    ordered.max_cached_result_bytes = 4096;
-    BOOST_CHECK(fw::ValidateServiceOptions(ordered));
+    auto ordered = fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::ActorSerial)
+        .SetMaxInflight(64)
+        .SetMaxSerialKeys(16)
+        .SetSerialQueueCapacity(64)
+        .SetOrderedIngress(fw::OrderedIngressOptions{
+            true, /*max_ordered_streams*/ 4,
+            /*max_cached_results*/ 32,
+            /*max_cached_result_bytes*/ 4096});
+    BOOST_CHECK(ordered.Validate());
 
-    auto expect_invalid = [](fw::ServiceOptions o, const char* field) {
-        auto r = fw::ValidateServiceOptions(o);
+    const auto actor_opts = fw::ActorOptions{}
+        .SetMaxActors(8)
+        .SetMailboxCapacity(16)
+        .SetAggregateQueueCapacity(64);
+    BOOST_CHECK(actor_opts.Validate());
+
+    auto expect_invalid = [](auto r, const char* field) {
         BOOST_REQUIRE(!r);
         BOOST_CHECK(r.error().code == fw::ErrorCode::InvalidArgument);
         BOOST_TEST(r.error().message.find(field) != std::string::npos);
     };
 
-    { auto o = actor_base; o.max_inflight = 0;
-      expect_invalid(o, "max_inflight"); }
-    { auto o = actor_base; o.mailbox_capacity = 0;
-      expect_invalid(o, "mailbox_capacity"); }
-    { auto o = actor_base; o.max_actors = 0;
-      expect_invalid(o, "max_actors"); }
-    { auto o = concurrent; o.mailbox_capacity = 1;
-      expect_invalid(o, "mailbox_capacity"); }
-    { auto o = concurrent; o.max_actors = 1;
-      expect_invalid(o, "max_actors"); }
+    { auto o = actor_base; o.SetMaxInflight(0);
+      expect_invalid(o.Validate(), "max_inflight"); }
+    { auto o = actor_base; o.SetMaxSerialKeys(0);
+      expect_invalid(o.Validate(), "max_serial_keys"); }
+    { auto o = actor_base; o.SetSerialQueueCapacity(0);
+      expect_invalid(o.Validate(), "serial_queue_capacity"); }
+    /**
+     * Concurrent 不得创建串行队列
+     */
+    { auto o = concurrent; o.SetMaxSerialKeys(1);
+      expect_invalid(o.Validate(), "serial"); }
+    { auto o = concurrent; o.SetSerialQueueCapacity(1);
+      expect_invalid(o.Validate(), "serial"); }
     /**
      * ordered_ingress 用在 Concurrent 上必须被拒。
      */
-    { auto o = concurrent; o.ordered_ingress = true;
-      o.max_ordered_streams = 1; o.max_cached_results = 1;
-      o.max_cached_result_bytes = 1;
-      expect_invalid(o, "ordered_ingress"); }
-    { auto o = ordered; o.max_ordered_streams = 0;
-      expect_invalid(o, "max_ordered_streams"); }
-    { auto o = ordered; o.max_cached_results = 0;
-      expect_invalid(o, "max_cached_results"); }
-    { auto o = ordered; o.max_cached_result_bytes = 0;
-      expect_invalid(o, "max_cached_result_bytes"); }
-    { auto o = actor_base; o.max_ordered_streams = 1;
-      expect_invalid(o, "max_ordered_streams"); }
-    { auto o = actor_base; o.max_cached_results = 1;
-      expect_invalid(o, "max_cached_results"); }
-    { auto o = actor_base; o.max_cached_result_bytes = 1;
-      expect_invalid(o, "max_cached_result_bytes"); }
+    { auto o = concurrent;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 1, 1, 1});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    { auto o = ordered;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 0, 32, 4096});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    { auto o = ordered;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 0, 4096});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    { auto o = ordered;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 32, 0});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    /**
+     * 禁用 ordered_ingress 时三项上限必须为 0。
+     */
+    { auto o = actor_base;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{false, 1, 0, 0});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    { auto o = actor_base;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{false, 0, 1, 0});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    { auto o = actor_base;
+      o.SetOrderedIngress(fw::OrderedIngressOptions{false, 0, 0, 1});
+      expect_invalid(o.Validate(), "ordered_ingress"); }
+    /**
+     * Actor 类型额度三项均为有限正值。
+     */
+    { auto o = actor_opts; o.SetMaxActors(0);
+      expect_invalid(o.Validate(), "max_actors"); }
+    { auto o = actor_opts; o.SetMailboxCapacity(0);
+      expect_invalid(o.Validate(), "mailbox_capacity"); }
+    { auto o = actor_opts; o.SetAggregateQueueCapacity(0);
+      expect_invalid(o.Validate(), "aggregate_queue_capacity"); }
 }
 
 /**
@@ -483,72 +495,14 @@ BOOST_AUTO_TEST_CASE(mailbox_close_stops_admission) {
 }
 
 /**
- * Registry：同 key 至多一次（返回同一实例、工厂只调一次）、key 可读回、
- * max_actors 超限拒绝、未注册服务拒绝。
+ * 旧 ActorRegistry::GetOrCreate 工厂面（同 key 至多一次、max_actors 上限、
+ * 激活失败不留半实例）在唯一 API 中已删除：CoInstallActor 只登记类型，
+ * Actor 实例动态创建经后续 CoCreateActor 切片。被删能力在当前公开面上
+ * 不存在可断言的实现——按「不把未实现能力改成成功」，原
+ * registry_at_most_once_and_max_actors / registry_failed_activation_leaves_no_partial
+ * 两个用例随旧面删除，不迁移为空断言；类型登记/查找语义由
+ * framework.v2_core 的 actor_type_registration 覆盖。
  */
-BOOST_AUTO_TEST_CASE(registry_at_most_once_and_max_actors) {
-    fw::ActorRegistry reg;
-    BOOST_REQUIRE(reg.RegisterService<CountingService>("svc", 2));
-    const int before = CountingService::s_ctor_count.load();
-
-    auto a1 = reg.GetOrCreate("svc", "k1");
-    BOOST_REQUIRE(a1);
-    auto a1b = reg.GetOrCreate("svc", "k1");
-    BOOST_REQUIRE(a1b);
-    /**
-     * 同一实例
-     */
-    BOOST_TEST(a1.value().get() == a1b.value().get());
-    BOOST_TEST(CountingService::s_ctor_count.load() == before + 1);
-    BOOST_REQUIRE(a1.value()->co_actor_key().has_value());
-    BOOST_TEST(a1.value()->co_actor_key().value() == "k1");
-
-    auto a2 = reg.GetOrCreate("svc", "k2");
-    BOOST_REQUIRE(a2);
-    BOOST_TEST(a2.value().get() != a1.value().get());
-
-    auto a3 = reg.GetOrCreate("svc", "k3");
-    BOOST_REQUIRE(!a3);
-    BOOST_CHECK(a3.error().code == fw::ErrorCode::Overloaded);
-    BOOST_TEST(a3.error().message.find("max_actors") != std::string::npos);
-    BOOST_TEST(reg.ActorCount("svc") == std::size_t{2});
-
-    auto unreg = reg.GetOrCreate("no-such-service", "k");
-    BOOST_REQUIRE(!unreg);
-    BOOST_CHECK(unreg.error().code == fw::ErrorCode::NotFound);
-}
-
-/**
- * 激活失败不留半激活对象：不占位不计数，同 key 重试可成功。
- */
-BOOST_AUTO_TEST_CASE(registry_failed_activation_leaves_no_partial) {
-    fw::ActorRegistry reg;
-    std::atomic<int> calls{0};
-    BOOST_REQUIRE(reg.RegisterFactory("boom",
-        [&calls]() -> std::shared_ptr<fw::ICoService> {
-            if (calls.fetch_add(1) == 0)
-                throw std::runtime_error("ctor fail");
-            return std::static_pointer_cast<fw::ICoService>(
-                std::make_shared<CountingService>());
-        }, 1));
-
-    auto r1 = reg.GetOrCreate("boom", "k");
-    BOOST_REQUIRE(!r1);
-    BOOST_CHECK(r1.error().code == fw::ErrorCode::InternalError);
-    BOOST_TEST(reg.ActorCount("boom") == std::size_t{0});
-
-    auto r2 = reg.GetOrCreate("boom", "k");
-    BOOST_REQUIRE(r2);
-    BOOST_TEST(calls.load() == 2);
-    BOOST_REQUIRE(r2.value()->co_actor_key().has_value());
-    BOOST_TEST(r2.value()->co_actor_key().value() == "k");
-    BOOST_TEST(reg.ActorCount("boom") == std::size_t{1});
-
-    auto r3 = reg.GetOrCreate("boom", "k");
-    BOOST_REQUIRE(r3);
-    BOOST_TEST(r3.value().get() == r2.value().get());
-    BOOST_TEST(calls.load() == 2);
-}
 
 BOOST_AUTO_TEST_SUITE_END()
 

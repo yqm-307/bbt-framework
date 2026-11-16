@@ -2,7 +2,6 @@
 
 #include <utility>
 
-#include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/internal/AppRuntimeState.hpp>
 #include <bbt/framework/internal/ErrorDomainRule.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
@@ -19,14 +18,10 @@ void InstallRpcAdmission(InfraHttpHost& host, std::shared_ptr<AppRuntimeState> s
     });
 }
 
-void InstallRpcAdmission(InfraHttpHost& host, CoApp& app) {
-    InstallRpcAdmission(host, app.m_state);
-}
-
 RpcEgress::RpcEgress(std::weak_ptr<InfraHttpHost> host) : m_host(std::move(host)) {}
 
-result<bbt::infra::rpc::Response> RpcEgress::Call(std::string_view target,
-                                                  const bbt::infra::rpc::Request& request, const bbt::infra::CallOptions& options) {
+bbt_co_async(result<bbt::infra::rpc::Response>) RpcEgress::Call(std::string_view target,
+                                                              const bbt::infra::rpc::Request& request, const bbt::infra::CallOptions& options) {
     auto host = m_host.lock();
     auto client = host ? host->rpc_client() : nullptr;
     if (!client)
@@ -43,8 +38,8 @@ result<bbt::infra::rpc::Response> RpcEgress::Call(std::string_view target,
     return reply;
 }
 
-result<void> RpcEgress::Send(std::string_view target, const bbt::infra::rpc::Request& request,
-                             const bbt::infra::rpc::SendOptions& options) {
+bbt_co_async(result<void>) RpcEgress::Send(std::string_view target, const bbt::infra::rpc::Request& request,
+                                           const bbt::infra::rpc::SendOptions& options) {
     auto host = m_host.lock();
     auto client = host ? host->rpc_client() : nullptr;
     if (!client)

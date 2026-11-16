@@ -27,17 +27,22 @@ bool SamePayload(const v1::Record& r, const v1::OrderRequest& q) {
     return r.order_id() == q.order_id() && r.sku() == q.sku() && r.qty() == q.qty() &&
            r.discount_cents() == q.discount_cents();
 }
-void StorageHop(const ServiceContext& ctx, const char* service, const char* method,
+void StorageHop(const char* service, const char* method,
                 const std::string& id, bool ok, int code) {
     std::printf("event=storage_hop service=%s method=%s order_id=%s request_id=%s pid=%s instance=%s ok=%d code=%d\n",
-                service, method, SafeToken(id) ? id.c_str() : "invalid", InboundRequestId(ctx).c_str(),
+                service, method, SafeToken(id) ? id.c_str() : "invalid", InboundRequestId().c_str(),
                 Node().process_id.c_str(), Node().instance_id.c_str(), ok ? 1 : 0, code);
     std::fflush(stdout);
 }
 #ifdef EC_STORAGE_AVAILABLE
 using bbt::infra::mongo::MongoDocument;
-bbt::infra::CallOptions StorageBudget(const ServiceContext& ctx) {
-    return bbt::infra::CallOptions{ctx.request().value()->deadline};
+result<bbt::infra::CallOptions> StorageBudget() {
+    auto ctx = CurrentRequestContext();
+    if (!ctx)
+        return result<bbt::infra::CallOptions>::err(std::move(ctx.error()));
+    bbt::infra::CallOptions options;
+    options.deadline = ctx.value()->deadline;
+    return result<bbt::infra::CallOptions>::ok(options);
 }
 namespace {
 /**

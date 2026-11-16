@@ -1,19 +1,25 @@
 /**
- * DynamicRouteTable 与 CoApp::find_route 的动态优先语义。
+ * DynamicRouteTable 与出站路由门的动态优先语义。
  *
  * 不联网、不启动 Scheduler：只断言公共面（Replace/Resolve/MarkUnavailable/
- * HasService 与 find_route 的静态回退边界）。真实注册中心链路由
- * examples.ecommerce_cluster 在真实 Consul 上验收。
+ * HasService 与 AppRuntimeState::FindRoute 路由门的静态回退边界）。真实注册
+ * 中心链路由 examples.ecommerce_cluster 在真实 Consul 上验收。
  */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <bbt/coroutine/coroutine.hpp>
 
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/DynamicRouteTable.hpp>
@@ -35,6 +41,49 @@ std::string Endpoint(std::uint16_t port) {
 std::vector<std::string> Endpoints(std::uint16_t a, std::uint16_t b) {
     return {Endpoint(a), Endpoint(b)};
 }
+
+/**
+ * 在受管协程内执行 fn（AppRuntimeState::Send 是协程可挂起调用，须经
+ * bbt_co_await 在协程上下文内消费）：经 g_scheduler 投递协程任务，
+ * 宿主线程用限时 std::cv 等其完成。
+ */
+template <class F>
+bool RunInManagedCoroutine(F&& fn,
+    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_scheduler->Start();
+    }
+    struct Slot {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      error;
+    };
+    auto slot = std::make_shared<Slot>();
+    auto f = std::forward<F>(fn);
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [slot, f = std::move(f)]() mutable {
+            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            std::lock_guard<std::mutex> lk(slot->mtx);
+            slot->done = true;
+            slot->cv.notify_all();
+        }, submitted);
+    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+    std::unique_lock<std::mutex> lk(slot->mtx);
+    const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
+    if (!done)
+        std::terminate();
+    if (slot->error) std::rethrow_exception(slot->error);
+    return done;
+}
+
+#define CO_TEST_CASE(name) \
+    static void name##_body(); \
+    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+    static void name##_body()
 
 } // namespace
 
@@ -213,45 +262,32 @@ BOOST_AUTO_TEST_CASE(table_revision_regression_installs_snapshot) {
     BOOST_CHECK_EQUAL(second.value(), "127.0.0.1:7002");
 }
 
-BOOST_AUTO_TEST_CASE(coapp_find_route_prefers_dynamic_without_static_fallback) {
-    auto table = std::make_shared<fw::DynamicRouteTable>();
-
-    fw::CoAppOptions options;
-    options.network_limits = bbt::infra::NetworkLimits{
-        8, 8, 16 * 1024, 64 * 1024, milliseconds{5000}};
-    options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = milliseconds{1000};
-    options.static_routes = {
-        fw::StaticRoute{"catalog", Endpoint(4999)},
-        fw::StaticRoute{"order", Endpoint(4998)},
-    };
-    options.dynamic_routes = table;
-    fw::CoApp app(options);
-
+BOOST_AUTO_TEST_CASE(route_gate_prefers_dynamic_without_static_fallback) {
     /**
-     * 静态路由语义保持：未进动态表的名字走静态项。
+     * 业务经 AppOptions::AddRoute/SetDynamicRoutes 配置出站路由；解析统一
+     * 走出站路由门（AppRuntimeState::FindRoute，旧 find_route 的唯一对应物）。
      */
-    auto order = app.find_route("order");
-    BOOST_REQUIRE(order);
-    BOOST_CHECK_EQUAL(order.value(), "127.0.0.1:4998");
+    fw::AppRuntimeState state;
+    state.routes.emplace("order", Endpoint(4998));
+    state.dynamic_routes = std::make_shared<fw::DynamicRouteTable>();
 
-    auto unknown = app.find_route("inventory");
+    auto unknown = state.FindRoute("inventory");
     BOOST_REQUIRE(!unknown);
     BOOST_CHECK(unknown.error().code == fw::ErrorCode::NotFound);
 
     /**
      * 动态表配置了同名服务 → 动态优先，静态 endpoint 不再可见。
      */
-    BOOST_REQUIRE(table->Replace("catalog", 1, {Endpoint(5001)}));
-    auto dynamic_hit = app.find_route("catalog");
+    BOOST_REQUIRE(state.dynamic_routes->Replace("catalog", 1, {Endpoint(5001)}));
+    auto dynamic_hit = state.FindRoute("catalog");
     BOOST_REQUIRE(dynamic_hit);
     BOOST_CHECK_EQUAL(dynamic_hit.value(), "127.0.0.1:5001");
 
     /**
      * 已配置动态服务变空 → NotFound，绝不回退到静态 4999。
      */
-    BOOST_REQUIRE(table->Replace("catalog", 2, {}));
-    auto empty = app.find_route("catalog");
+    BOOST_REQUIRE(state.dynamic_routes->Replace("catalog", 2, {}));
+    auto empty = state.FindRoute("catalog");
     BOOST_REQUIRE(!empty);
     BOOST_CHECK(empty.error().code == fw::ErrorCode::NotFound);
     BOOST_CHECK_NE(empty.error().message.find("no healthy instance"),
@@ -260,14 +296,21 @@ BOOST_AUTO_TEST_CASE(coapp_find_route_prefers_dynamic_without_static_fallback) {
     /**
      * 动态视图被标记不可用 → RuntimeUnavailable（同样不回退）。
      */
-    BOOST_REQUIRE(table->Replace("catalog", 3, Endpoints(5001, 5002)));
-    table->MarkUnavailable("catalog");
-    auto unavailable = app.find_route("catalog");
+    BOOST_REQUIRE(state.dynamic_routes->Replace("catalog", 3, Endpoints(5001, 5002)));
+    state.dynamic_routes->MarkUnavailable("catalog");
+    auto unavailable = state.FindRoute("catalog");
     BOOST_REQUIRE(!unavailable);
     BOOST_CHECK(unavailable.error().code == fw::ErrorCode::RuntimeUnavailable);
+
+    /**
+     * 静态路由语义保持：未进动态表的名字走静态项。
+     */
+    auto order = state.FindRoute("order");
+    BOOST_REQUIRE(order);
+    BOOST_CHECK_EQUAL(order.value(), "127.0.0.1:4998");
 }
 
-BOOST_AUTO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
+CO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
     struct Policy final : fw::RpcPolicy {
         int calls = 0;
         std::string endpoint;
@@ -295,7 +338,8 @@ BOOST_AUTO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
     std::vector<std::string> sent;
     state.seam_send = [&](std::string_view target,
                           const bbt::infra::rpc::Request& env,
-                          const bbt::infra::CallOptions&) {
+                          const bbt::infra::CallOptions&)
+        -> bbt_co_async(fw::result<bbt::infra::rpc::Response>) {
         BOOST_CHECK_EQUAL(policy->endpoint, std::string(target));
         sent.push_back(std::string(target));
         return fw::result<bbt::infra::rpc::Response>::ok(
@@ -306,7 +350,7 @@ BOOST_AUTO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
         .SetReply(bbt::infra::rpc::ReplyMode::Required)
         .SetTraffic(bbt::infra::rpc::TrafficClass::Service);
     bbt::infra::CallOptions options{std::chrono::steady_clock::now() + milliseconds{1000}};
-    BOOST_REQUIRE(state.Send(env, options));
+    BOOST_REQUIRE(bbt_co_await state.Send(env, options));
     BOOST_CHECK_EQUAL(sent.back(), "tcp://127.0.0.1:4998");
 
     /**
@@ -314,20 +358,20 @@ BOOST_AUTO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
      */
     env.SetService("catalog");
     BOOST_REQUIRE(table->Replace("catalog", 1, {}));
-    auto empty = state.Send(env, options);
+    auto empty = bbt_co_await state.Send(env, options);
     BOOST_REQUIRE(!empty);
     BOOST_CHECK(empty.error().code == fw::ErrorCode::NotFound);
     BOOST_REQUIRE(table->Replace("catalog", 2, {Endpoint(5001)}));
     std::this_thread::sleep_for(milliseconds{1});
-    auto stale = state.Send(env, options);
+    auto stale = bbt_co_await state.Send(env, options);
     BOOST_REQUIRE(!stale);
     BOOST_CHECK(stale.error().code == fw::ErrorCode::RuntimeUnavailable);
     table->MarkUnavailable("catalog");
-    auto unavailable = state.Send(env, options);
+    auto unavailable = bbt_co_await state.Send(env, options);
     BOOST_REQUIRE(!unavailable);
     BOOST_CHECK(unavailable.error().code == fw::ErrorCode::RuntimeUnavailable);
     env.SetService("unknown");
-    auto unknown = state.Send(env, options);
+    auto unknown = bbt_co_await state.Send(env, options);
     BOOST_REQUIRE(!unknown);
     BOOST_CHECK(unknown.error().code == fw::ErrorCode::NotFound);
     BOOST_CHECK_EQUAL(policy->calls, 1);
@@ -340,15 +384,15 @@ BOOST_AUTO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
     table = state.dynamic_routes;
     env.SetService("catalog");
     BOOST_REQUIRE(table->Replace("catalog", 3, Endpoints(5001, 5002)));
-    BOOST_REQUIRE(state.Send(env, options));
+    BOOST_REQUIRE(bbt_co_await state.Send(env, options));
     BOOST_CHECK_EQUAL(sent.back(), "tcp://127.0.0.1:5001");
-    BOOST_REQUIRE(state.Send(env, options));
+    BOOST_REQUIRE(bbt_co_await state.Send(env, options));
     BOOST_CHECK_EQUAL(sent.back(), "tcp://127.0.0.1:5002");
     BOOST_REQUIRE(table->Replace("catalog", 4, {Endpoint(5003)}));
-    BOOST_REQUIRE(state.Send(env, options));
+    BOOST_REQUIRE(bbt_co_await state.Send(env, options));
     BOOST_CHECK_EQUAL(sent.back(), "tcp://127.0.0.1:5003");
     policy->reject = true;
-    auto rejected = state.Send(env, options);
+    auto rejected = bbt_co_await state.Send(env, options);
     BOOST_REQUIRE(!rejected);
     BOOST_CHECK(rejected.error().code == fw::ErrorCode::Overloaded);
     BOOST_CHECK_EQUAL(policy->calls, 5);

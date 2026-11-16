@@ -67,20 +67,21 @@ public:
     ConsulDiscoveryComponent& operator=(const ConsulDiscoveryComponent&) = delete;
 
     /**
-     * 框架资源启动口（Scheduler 已启动、网络未创建）：拉起 watcher 并等待
-     * 每个 watch 服务的首个权威快照。任一失败 → App 启动失败。
+     * 启动口（宿主线程调用；Scheduler 已启动、服务装配与网络装配之前）：
+     * 拉起 watcher 并等待每个 watch 服务的首个权威快照。任一失败 →
+     * 进程启动失败（fail-closed，不留「静默无视图」）。
      */
     bbt::infra::result<void> Start();
 
     /**
-     * 自注册（协程上下文）：成功后记住 instance id 供 DeregisterSelf 使用。
+     * 自注册（受管协程上下文）：成功后记住 instance id 供 DeregisterSelf 使用。
      */
     bbt_co_async(bbt::infra::result<void>) RegisterSelf(
         std::string service, std::string instance_id, std::string address,
         std::uint16_t port);
 
     /**
-     * 注销本进程的登记（协程上下文，幂等）。
+     * 注销本进程的登记（受管协程上下文，幂等）。
      */
     bbt_co_async(bbt::infra::result<void>) DeregisterSelf();
 

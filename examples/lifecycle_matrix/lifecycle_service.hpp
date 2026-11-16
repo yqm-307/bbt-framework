@@ -5,8 +5,11 @@
  * 本头**只**为验收 fixture 服务，明确“仅验收用”：
  * - 业务 schema / typed codec 完整复用 getvalue 切片（getvalue_service.hpp +
  * get_value.proto）；不另造第二套 schema、协议或 codec；
- * - 不引用 framework/internal/、Binder、CoAppSeam、MakeCoAppForTest、
- * DispatchInboundForTest、INetworkHost 桩或任何发送注入；
+ * - 公开受管服务面：派生 bbt::framework::CoService<>（构造只接受
+ * detail::ConstructKey、析构 protected、Registry friend，经
+ * CoApp::CoInstallService 安装）；不引用 framework/internal/、Binder、
+ * CoAppSeam、MakeCoAppForTest、DispatchInboundForTest、INetworkHost 桩或任何
+ * 发送注入；
  * - 唯一的“控制”是进程内的验收闩 OpenGate：Hold 在其上以无界期限挂起
  * （让 worker 让出、在途计容量），由 fixture 的 stdin `open` 命令放行。
  * 这不是生产注入点，也不改变框架行为；业务语义不依赖它。
@@ -104,10 +107,21 @@ inline OpenGate& Gate() {
  * ── 验收服务：Hold（挂起/容量）+ Fast（即时）───────────────────────────────
  */
 class LifecycleGateService final
-    : public fw::CoService<LifecycleGateService> {
+    : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.LifecycleGateService";
+
+    explicit LifecycleGateService(fw::detail::ConstructKey key)
+        : fw::CoService<>(key) {}
+
+protected:
+    ~LifecycleGateService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+
+public:
 
     /**
      * Hold：快照受管上下文 → 记录 entered → 在验收闩上以无界期限挂起

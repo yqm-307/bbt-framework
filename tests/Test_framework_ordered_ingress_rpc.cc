@@ -1,17 +1,29 @@
 /**
  * OrderedIngress 真实 V2 会话接线验收。
  * 覆盖无票拒绝、grant、成功执行、重复重放、内容冲突与序号缺口；
- * 入站经真实 InfraHttpHost + InstallRpcAdmission + V2 Call（SessionFrame），
- * 出站客户端是互异身份的第二个会话 owner；不直接调用 InboundDispatcher。
+ * 入站经真实 InfraHttpHost + V2 Call（SessionFrame），出站客户端是互异身份
+ * 的第二个会话 owner；不直接调用业务 handler。
+ *
+ * 唯一公开 API 迁移：
+ * - 服务端装配为 CoInstallService + grant_ordered_stream + CoStart（受管
+ *   协程）；宿主经测试缝注入（本用例注入的是真实 InfraHttpHost 以便
+ *   观察真实 loopback），入站接线由测试侧 admission 复刻器完成（生产
+ *   InstallRpcAdmission 需要 m_runtime，候选公开面没有对应访问口——见
+ *   交接报告「公共缺口」）；DispatchInboundForTest 不接受 on_dispatched，
+ *   测试侧在挂起前先放行同步派发门（如实留档，本用例流量串行不依赖
+ *   门内并发序）。
  */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -24,10 +36,11 @@
 #include <bbt/framework/internal/RpcBridge.hpp>
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/Framework.hpp>
-#include <bbt/framework/internal/ActorRegistry.hpp>
 #include <bbt/framework/internal/CoAppSeam.hpp>
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
 #include <bbt/framework/internal/InboundDispatcher.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
+#include <bbt/framework/internal/NetworkHost.hpp>
 #include <bbt/framework/internal/OrderedIngress.hpp>
 #include <bbt/infra/rpc/Request.hpp>
 #include <bbt/infra/rpc/Response.hpp>
@@ -41,9 +54,10 @@ namespace {
 
 std::atomic<int>* g_hits = nullptr;
 
-class OrderedSvc final : public fw::CoService<OrderedSvc> {
+class OrderedSvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "ordered";
+    explicit OrderedSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
 
     fw::CoRpcResp Echo(fw::CoRpcReq req) {
         auto args = req.Parse<std::string, std::int32_t>();
@@ -71,7 +85,55 @@ public:
 
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&OrderedSvc::Echo, std::string>("echo"));
+
+protected:
+    ~OrderedSvc() noexcept override = default;
+private:
+    friend class fw::detail::Registry;
 };
+
+/**
+ * 取已安装服务的受管实例（锁内取 owner+指针，保活纪律与宿主一致）。
+ */
+template <class S>
+S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
+    const auto reg = app.RegistryForTest();
+    std::lock_guard<std::mutex> lk(reg->Mutex());
+    auto* e = reg->FindByTypeNameLocked(
+        fw::ObjectKind::Service, S::kServiceName);
+    if (!e) return nullptr;
+    owner = e->object;
+    return static_cast<S*>(e->object.get());
+}
+
+/**
+ * 测试侧入站接线复刻器：与生产 InstallRpcAdmission 同一纪律——同步派发门
+ * 在任何可挂起动作之前释放，回复经 ValidateErrorAtBoundary 边界校验。
+ * app 经 shared_ptr 槽位间接持有（装配在受管协程内完成后回填）。
+ */
+void InstallAdmissionForTest(
+    const std::shared_ptr<fw::InfraHttpHost>& host,
+    const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot) {
+    host->InstallRpcHandler(
+        [app_slot](const inf::rpc::Request& request,
+                   const std::function<void()>& dispatched)
+            -> fw::result<inf::rpc::Response> {
+            /**
+             * DispatchInboundForTest 不透传 on_dispatched（候选缝签名缺口，
+             * 见交接）：测试侧在挂起前先放行同步派发门；本文件流量串行，
+             * 不依赖门内并发序。
+             */
+            dispatched();
+            auto reply = fw::DispatchInboundForTest(**app_slot, request);
+            if (!reply) {
+                if (auto valid = fw::ValidateErrorAtBoundary(reply.error());
+                    !valid)
+                    return fw::result<inf::rpc::Response>::err(
+                        std::move(valid.error()));
+            }
+            return reply;
+        });
+}
 
 fw::CoRpcReq MakeRequest(const std::string& actor, std::int32_t value) {
     auto req = fw::CoRpcReq::From(std::tuple{actor, value});
@@ -112,78 +174,148 @@ struct CallState {
     std::atomic<bool> done{false};
 };
 
+/**
+ * 生命周期任务状态：装配在受管协程内完成（无效注册断言的证据经
+ * invalid_code 回传控制线程断言）。
+ */
+struct ServerState {
+    std::shared_ptr<std::shared_ptr<fw::CoApp>> app_slot =
+        std::make_shared<std::shared_ptr<fw::CoApp>>();
+    std::promise<bool>                       started;
+    std::atomic<bool>                        done{false};
+    int                                      rc{-1};
+    fw::ErrorCode                            invalid_code{};
+    bool                                     invalid_rejected{false};
+};
+
 struct Fixture {
     inf::NetworkLimits limits{64, 64, 16384, 65536,
                               std::chrono::milliseconds{30000}};
     std::shared_ptr<fw::InfraHttpHost> host;
     std::shared_ptr<fw::InfraHttpHost> client_runtime;
     std::shared_ptr<fw::RpcEgress> egress;
-    std::unique_ptr<fw::CoApp> app;
-    std::thread run_thread;
-    std::atomic<bool> run_done{false};
-    int run_rc = -1;
+    std::shared_ptr<ServerState> server = std::make_shared<ServerState>();
     std::string endpoint;
+
+    std::shared_ptr<fw::CoApp> App() const { return *server->app_slot; }
 
     void Start(std::atomic<int>& hits) {
         g_hits = &hits;
         host = std::make_shared<fw::InfraHttpHost>(
             limits, inf::ListenAddress{"127.0.0.1", 0}, "ordered-server");
-
-        fw::CoAppOptions options;
-        options.network_limits = limits;
-        options.listen = inf::ListenAddress{"127.0.0.1", 0};
-        options.shutdown_step_budget = std::chrono::milliseconds{2000};
-        options.local_identity = "ordered-server";
-
-        fw::CoAppSeam seam;
-        seam.host = host;
-        app = fw::MakeCoAppForTest(options, std::move(seam));
-        const fw::ServiceOptions invalid_concurrent{
-            fw::ExecutionPolicy::Concurrent, 64, 0, 0,
-            true, 8, 64, 65536};
-        const auto invalid_registration =
-            app->add_service<OrderedSvc>(invalid_concurrent);
-        BOOST_REQUIRE(!invalid_registration);
-        BOOST_CHECK_EQUAL(
-            static_cast<int>(invalid_registration.error().code),
-            static_cast<int>(fw::ErrorCode::InvalidArgument));
-
-        const fw::ServiceOptions service_options{
-            fw::ExecutionPolicy::ActorSerial, 64, 16, 8,
-            true, 8, 64, 65536};
-        BOOST_REQUIRE(app->add_service<OrderedSvc>(service_options));
-
-        fw::OrderedGrant grant;
-        grant.service = "ordered";
-        grant.actor_key = "acct-1";
-        grant.producer_id = "producer.test";
-        grant.producer_epoch = "producer-epoch-1";
-        grant.receiver_epoch = "receiver-epoch-1";
-        /**
-         * Infra HTTP loopback has no authenticated principal; empty means the
-         * anonymous loopback identity and is matched exactly by the ingress.
-         */
-        grant.peer_principal.clear();
-        BOOST_REQUIRE(app->grant_ordered_stream(std::move(grant)));
-        fw::InstallRpcAdmission(*host, *app);
+        InstallAdmissionForTest(host, server->app_slot);
 
         /**
          * Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
          */
-        g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
-        g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
-        run_thread = std::thread([this] {
-            run_rc = app->run();
-            run_done.store(true, std::memory_order_release);
-        });
+        if (!g_scheduler->IsInitialized()) {
+            g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
+            g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+            g_scheduler->Start();
+        }
+
+        {
+            bool submitted = false;
+            g_scheduler->RegistCoroutineTask(
+                [this] {
+                    auto st = server;
+                    auto set_rc = [&](int rc) {
+                        st->rc = rc;
+                        st->done.store(true, std::memory_order_release);
+                    };
+                    try {
+                        fw::AppOptions options;
+                        options.SetLimits(64, 64, 64, 64)
+                            .SetShutdownBudget(
+                                std::chrono::milliseconds{2000})
+                            .SetLifecycleBudget(
+                                std::chrono::milliseconds{2000})
+                            .SetNetworkLimits(limits)
+                            .SetLocalIdentity("ordered-server");
+                        *st->app_slot = fw::MakeCoAppForTest(
+                            options, fw::CoAppSeam{host, {}});
+                        auto& app = *st->app_slot;
+
+                        const fw::ServiceOptions invalid_concurrent =
+                            fw::ServiceOptions{}
+                                .SetExecution(fw::ExecutionPolicy::Concurrent)
+                                .SetMaxInflight(64)
+                                .SetOrderedIngress(fw::OrderedIngressOptions{
+                                    /*enabled*/ true, 8, 64, 65536});
+                        const auto invalid_registration = bbt_co_await
+                            app->CoInstallService<OrderedSvc>(
+                                invalid_concurrent);
+                        st->invalid_rejected = !invalid_registration;
+                        if (invalid_registration)
+                            st->invalid_code =
+                                invalid_registration.error().code;
+
+                        const fw::ServiceOptions service_options =
+                            fw::ServiceOptions{}
+                                .SetExecution(fw::ExecutionPolicy::ActorSerial)
+                                .SetMaxInflight(64)
+                                .SetMaxSerialKeys(8)
+                                .SetSerialQueueCapacity(16)
+                                .SetOrderedIngress(fw::OrderedIngressOptions{
+                                    /*enabled*/ true, 8, 64, 65536});
+                        auto r = bbt_co_await
+                            app->CoInstallService<OrderedSvc>(service_options);
+                        if (!r) { set_rc(2); return; }
+
+                        fw::OrderedGrant grant;
+                        grant.service = "ordered";
+                        grant.actor_key = "acct-1";
+                        grant.producer_id = "producer.test";
+                        grant.producer_epoch = "producer-epoch-1";
+                        grant.receiver_epoch = "receiver-epoch-1";
+                        /**
+                         * Infra HTTP loopback has no authenticated principal; empty means the
+                         * anonymous loopback identity and is matched exactly by the ingress.
+                         */
+                        grant.peer_principal.clear();
+                        if (auto g = app->grant_ordered_stream(std::move(grant));
+                            !g) { set_rc(2); return; }
+
+                        if (auto s = bbt_co_await app->CoStart(); !s) {
+                            set_rc(2); return;
+                        }
+                        st->started.set_value(true);
+                        { auto _r = bbt_co_await app->CoWaitShutdownRequest(); (void)_r; }
+                        { auto _r = bbt_co_await app->CoStop(); (void)_r; }
+                        set_rc(app->State() == fw::AppState::Stopped ? 0 : 4);
+                    } catch (...) {
+                        try { st->started.set_value(false); } catch (...) {}
+                        set_rc(2);
+                    }
+                }, submitted);
+            if (!submitted) {
+                server->rc = 2;
+                server->done.store(true, std::memory_order_release);
+            }
+        }
+
+        auto started = server->started.get_future();
+        BOOST_REQUIRE_MESSAGE(
+            started.wait_for(std::chrono::seconds{15}) ==
+                std::future_status::ready &&
+                started.get(),
+            "server task did not start");
 
         const auto until = Clock::now() + std::chrono::seconds{15};
-        while (endpoint.empty() && !run_done.load(std::memory_order_acquire) &&
+        while (endpoint.empty() && !server->done.load() &&
                Clock::now() < until) {
             endpoint = host->bound_endpoint();
             std::this_thread::yield();
         }
         BOOST_REQUIRE_MESSAGE(!endpoint.empty(), "HTTP loopback did not bind");
+
+        /**
+         * 非法注册断言（候选选项违例在服务装配期如实拒绝）。
+         */
+        BOOST_REQUIRE(server->invalid_rejected);
+        BOOST_CHECK_EQUAL(
+            static_cast<int>(server->invalid_code),
+            static_cast<int>(fw::ErrorCode::InvalidArgument));
 
         auto runtime = std::make_shared<fw::InfraHttpHost>(
             limits, inf::ListenAddress{"127.0.0.1", 0}, "ordered-client");
@@ -204,7 +336,7 @@ struct Fixture {
             [state, request, target, egress = egress] {
                 inf::CallOptions options;
                 options.deadline = Clock::now() + std::chrono::seconds{10};
-                state->out.emplace(egress->Call(target, request, options));
+                state->out.emplace(bbt_co_await egress->Call(target, request, options));
                 state->done.store(true, std::memory_order_release);
             },
             registered);
@@ -218,7 +350,8 @@ struct Fixture {
     }
 
     /**
-     * 直接派发（机器面）：Context 由 infra 填充，测试不伪造入站事实。
+     * 直接派发（机器面）：Context 由测试构造（无 infra 填充），断言
+     * Dispatcher + OrderedIngress 组件语义核与重放边界。
      */
     fw::result<inf::rpc::Response> CallDirect(
         fw::InboundDispatcher& dispatcher, const inf::rpc::Request& env) {
@@ -246,10 +379,14 @@ struct Fixture {
          */
         if (client_runtime)
             client_runtime->Close();
-        if (app)
-            app->request_shutdown();
-        if (run_thread.joinable())
-            run_thread.join();
+        if (App())
+            App()->RequestShutdown();
+        const auto until = Clock::now() + std::chrono::seconds{10};
+        while (!server->done.load(std::memory_order_acquire) &&
+               Clock::now() < until)
+            std::this_thread::yield();
+        if (host)
+            host->Close();
         g_hits = nullptr;
     }
 };
@@ -310,9 +447,14 @@ BOOST_AUTO_TEST_CASE(ordered_direct_error_boundary_matches_replay) {
     Fixture fixture;
     fixture.Start(hits);
 
-    auto registry = std::make_shared<fw::ActorRegistry>();
-    BOOST_REQUIRE(registry->RegisterFactory(
-        "ordered", [] { return std::make_shared<OrderedSvc>(); }, 16));
+    /**
+     * 直挂分发表项：受管实例 + 独立 OrderedIngress（与生产装配同一配置
+     * 来源）；无执行租约（无网络簿记的测试构造，lease 为空直接执行）。
+     */
+    std::shared_ptr<void> owner;
+    auto* instance = ManagedService<OrderedSvc>(*fixture.App(), owner);
+    BOOST_REQUIRE(instance != nullptr);
+
     auto table = std::make_shared<const fw::RpcMethodTable>(
         fw::BuildMethodTable<OrderedSvc>());
     auto created = fw::OrderedIngress::Create(
@@ -326,12 +468,21 @@ BOOST_AUTO_TEST_CASE(ordered_direct_error_boundary_matches_replay) {
     grant.producer_epoch = "producer-epoch-1";
     grant.receiver_epoch = "receiver-epoch-1";
     BOOST_REQUIRE(ingress->GrantStream(grant));
-    const fw::ServiceOptions opts{
-        fw::ExecutionPolicy::ActorSerial, 64, 16, 8,
-        true, 8, 64, 65536};
+    const fw::ServiceOptions opts =
+        fw::ServiceOptions{}
+            .SetExecution(fw::ExecutionPolicy::ActorSerial)
+            .SetMaxInflight(64)
+            .SetMaxSerialKeys(8)
+            .SetSerialQueueCapacity(16)
+            .SetOrderedIngress(fw::OrderedIngressOptions{
+                /*enabled*/ true, 8, 64, 65536});
     std::map<std::string, fw::InboundDispatcher::ServiceEntry> services;
-    services.emplace("ordered", fw::InboundDispatcher::ServiceEntry{
-                                    opts, table, nullptr, registry, ingress});
+    fw::InboundDispatcher::ServiceEntry entry;
+    entry.options = opts;
+    entry.table = std::move(table);
+    entry.instance = instance;
+    entry.ordered_ingress = ingress;
+    services.emplace("ordered", std::move(entry));
     fw::InboundDispatcher dispatcher(std::move(services));
 
     const auto invalid = MakeEnvelope("invalid-1", "acct-1", -2, 1);
@@ -371,10 +522,13 @@ BOOST_AUTO_TEST_CASE(ordered_direct_error_boundary_matches_replay) {
 }
 
 BOOST_AUTO_TEST_CASE(ordered_ingress_rejects_concurrent_service_options) {
-    const fw::ServiceOptions invalid{
-        fw::ExecutionPolicy::Concurrent, 64, 0, 0,
-        true, 8, 64, 65536};
-    const auto validated = fw::ValidateServiceOptions(invalid);
+    const fw::ServiceOptions invalid =
+        fw::ServiceOptions{}
+            .SetExecution(fw::ExecutionPolicy::Concurrent)
+            .SetMaxInflight(64)
+            .SetOrderedIngress(fw::OrderedIngressOptions{
+                /*enabled*/ true, 8, 64, 65536});
+    const auto validated = invalid.Validate();
     BOOST_REQUIRE(!validated);
     BOOST_CHECK_EQUAL(static_cast<int>(validated.error().code),
                       static_cast<int>(fw::ErrorCode::InvalidArgument));

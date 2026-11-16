@@ -1,6 +1,6 @@
 #pragma once
 /**
- * framework v2 Actor 基类（契约 §5）。
+ * framework Actor 基类（契约 §5）。
  *
  * CoActor 与 CoComponent/CoService 共用 internal/ObjectBase.hpp 的身份基。本头只
  * 声明 ActorId/MailBox 身份面、生命周期与绑定 hook，以及 kActorType 声明 trait。
@@ -23,7 +23,6 @@ namespace bbt::framework {
  */
 class MonitorWriter;
 
-namespace v2 {
 
 /**
  * GetComponent 静态断言的基类；实例化点须含 Component.hpp
@@ -34,14 +33,14 @@ class CoComponent;
  * @brief 受管 Actor 基类，提供 ActorId 与 MailBox 身份面。
  *
  * @par 职责
- * 暴露 Actor 的稳定 ActorId 与邮箱地址，并承接 v2::CoApp 在 Actor 销毁与绑定变化
+ * 暴露 Actor 的稳定 ActorId 与邮箱地址，并承接 CoApp 在 Actor 销毁与绑定变化
  * 时调用的业务 hook。
  *
  * @par 不负责
  * 本切片不执行消息分发、邮箱串行化或动态创建实例。
  *
  * @par 约束
- * 只能经 v2::CoApp::CoInstallActor 登记类型。派生类构造只接受
+ * 只能经 CoApp::CoInstallActor 登记类型。派生类构造只接受
  * detail::ConstructKey，析构为 protected 或 private。
  */
 class CoActor : public detail::ObjectBase {
@@ -73,7 +72,7 @@ protected:
     /**
      * @brief 取本 Actor 实例已绑定依赖的类型化句柄。
      *
-     * 绑定表由 v2::CoApp::CoBindComponent 成功后回填（subject=本实例）。
+     * 绑定表由 CoApp::CoBindComponent 成功后回填（subject=本实例）。
      *
      * @tparam C 依赖组件类型。
      * @param name 绑定时使用的组件逻辑名。
@@ -94,7 +93,7 @@ protected:
     /**
      * @brief Actor 实例销毁钩子，在实例登记移除前执行。
      *
-     * 调用点：v2::CoApp 的 Stop 收口。同步执行，抛出的异常被捕获并
+     * 调用点：CoApp 的 Stop 收口。同步执行，抛出的异常被捕获并
      * 记入 LifecycleFailures，不向外传播。
      */
     virtual void OnDestroy() {}
@@ -125,7 +124,7 @@ private:
     MailBox m_mailbox;
 
     friend class detail::Registry;
-    friend class ::bbt::framework::v2::CoApp;
+    friend class CoApp;
 };
 
 /**
@@ -157,7 +156,7 @@ result<ComponentHandle<C>> CoActor::GetComponent(std::string_view name) const {
         return result<ComponentHandle<C>>::err(MakeError(
             ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
     static_assert(std::is_base_of_v<CoComponent, C>,
-        "GetComponent: C must derive from framework::v2::CoComponent");
+        "GetComponent: C must derive from CoComponent");
     BoundComponent b;
     if (!_FindBoundCopy(typeid(C), name, &b))
         return result<ComponentHandle<C>>::err(MakeError(
@@ -167,5 +166,4 @@ result<ComponentHandle<C>> CoActor::GetComponent(std::string_view name) const {
         detail::MakeComponentHandle<C>(b.object, b.binding_generation));
 }
 
-} // namespace v2
 } // namespace bbt::framework

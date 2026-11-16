@@ -2,7 +2,7 @@
 
 /**
  * @file Registry.hpp
- * @brief framework v2 受管对象注册表的内部机器面契约。
+ * @brief framework 受管对象注册表的内部机器面契约。
  *
  * 单一 Registry 实体统一簿记 Service/Actor/Component；每条目强持有对象，
  * 并记录 generation、状态与 binding。观察者注册和在途 lease 单独保存在
@@ -44,12 +44,10 @@
 
 namespace bbt::framework {
 
-namespace v2 {
 class CoServiceBase;
 class CoComponent;
 class CoActor;
 class CoApp;
-} // namespace v2
 
 namespace detail {
 
@@ -233,6 +231,17 @@ public:
         const LifecycleOptions& life) const {
         if (auto d = life.RawDeadline()) return *d;
         return DefaultDeadline();
+    }
+    /**
+     * 关闭收口的单轮总期限：显式 SetDeadline 优先使用，未显式设置时回填
+     * shutdown_budget（而非 lifecycle_budget——后者服务普通生命周期步）。
+     * 返回的是本轮唯一绝对 deadline，同一轮收口的各子步骤共享它、不得
+     * 各自重置为新窗口。
+     */
+    bbt::coroutine::Deadline ResolveShutdownDeadline(
+        const LifecycleOptions& life) const {
+        if (auto d = life.RawDeadline()) return *d;
+        return std::chrono::steady_clock::now() + m_limits.shutdown_budget;
     }
     bbt::coroutine::Deadline DeadlineFromNow() const {
         return DefaultDeadline();
@@ -445,6 +454,12 @@ public:
      * hook 协程结束时由任务体归还：--hooks_in_flight 并唤醒等待者。
      */
     void NoteHookSettled(const ObjectId& id) noexcept;
+    /**
+     * 入站分发执行租约：与生命周期 hook 共用 hooks_in_flight 计数与
+     * 收口等待（对象销毁路径经「等前序 hook 归零」自动覆盖在途分发）。
+     * 条目不存在或 gate 已封（销毁中）→ false，调用方按 Closed 拒绝。
+     */
+    bool AcquireDispatchLease(const ObjectId& id);
 
     /**
      * ---- 组件依赖拓扑（锁内计算，返回 id 顺序）----

@@ -2,7 +2,7 @@
 /**
  * bbt-framework Service→Service 出站 caller 业务（应用层）。
  *
- * 只用公开面：CoApp 装配的显式静态路由 + CoService + ICoService::call<Req,Resp>
+ * 只用公开面：CoApp 装配的显式静态路由 + CoService + CoServiceBase::call<Req,Resp>
  * （typed 出站 seam，schema 由生成物 descriptor 推导）。业务不接触 envelope/
  * codec/发送注入点/http::Client。
  *
@@ -15,6 +15,8 @@
 
 #include <chrono>
 #include <string_view>
+
+#include <bbt/coroutine/syntax/Async.hpp>
 
 #include <bbt/example/v1/get_value.pb.h>
 
@@ -33,10 +35,21 @@
 namespace getvalue {
 
 class GetValueCallerService final
-    : public bbt::framework::CoService<GetValueCallerService> {
+    : public bbt::framework::CoService<> {
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.GetValueCallerService";
+
+    explicit GetValueCallerService(bbt::framework::detail::ConstructKey key)
+        : bbt::framework::CoService<>(key) {}
+
+protected:
+    ~GetValueCallerService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+
+public:
     /**
      * caller 默认转发目标（callee 进程宿主）。schema 真源 = .proto descriptor。
      */
@@ -54,22 +67,22 @@ public:
         "bbt.example.v1.BlackholeService";
 
     bbt::framework::CoRpcResp Forward(bbt::framework::CoRpcReq req) {
-        return _ForwardTo(req, kCalleeService, bbt::framework::CallOptions{});
+        return bbt_co_await _ForwardTo(req, kCalleeService, bbt::framework::CallOptions{});
     }
 
     bbt::framework::CoRpcResp ForwardExpired(bbt::framework::CoRpcReq req) {
         bbt::framework::CallOptions opt;
         opt.deadline = std::chrono::steady_clock::now() -
             std::chrono::milliseconds{1};
-        return _ForwardTo(req, kCalleeService, opt);
+        return bbt_co_await _ForwardTo(req, kCalleeService, opt);
     }
 
     bbt::framework::CoRpcResp ForwardNoRoute(bbt::framework::CoRpcReq req) {
-        return _ForwardTo(req, kNoRouteService, bbt::framework::CallOptions{});
+        return bbt_co_await _ForwardTo(req, kNoRouteService, bbt::framework::CallOptions{});
     }
 
     bbt::framework::CoRpcResp ForwardBlackhole(bbt::framework::CoRpcReq req) {
-        return _ForwardTo(req, kBlackholeService, bbt::framework::CallOptions{});
+        return bbt_co_await _ForwardTo(req, kBlackholeService, bbt::framework::CallOptions{});
     }
 
     static constexpr auto kRpcMethods = bbt::framework::RpcMethods(
@@ -94,16 +107,17 @@ private:
     /**
      * 真实 typed 出站：解析入站业务 payload → call<Req,Resp>（descriptor 推导
      * schema、预算继承父请求、路由门、发送由框架完成）→ 回填 callee 响应。
+     * 转发本身协程可挂起，经 bbt_co_await 消费。
      */
-    bbt::framework::CoRpcResp _ForwardTo(
+    bbt_co_async(bbt::framework::CoRpcResp) _ForwardTo(
         bbt::framework::CoRpcReq req, std::string_view target,
         const bbt::framework::CallOptions& opt) {
         using bbt::framework::CoRpcResp;
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
         if (!parsed)
             return CoRpcResp::Error(parsed.error());
-        auto reply = this->call<bbt::example::v1::GetValueRequest,
-                                bbt::example::v1::GetValueResponse>(
+        auto reply = bbt_co_await call<bbt::example::v1::GetValueRequest,
+                                           bbt::example::v1::GetValueResponse>(
             target, "GetValue", parsed.value(), {}, opt);
         if (!reply)
             return CoRpcResp::Error(reply.error());

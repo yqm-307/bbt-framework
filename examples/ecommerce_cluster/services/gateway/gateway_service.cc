@@ -5,6 +5,8 @@
 #include <string>
 #include <utility>
 
+#include <bbt/coroutine/syntax/Async.hpp>
+
 #include "services/common/hop_log.hpp"
 #include "services/common/node_identity.hpp"
 #include "services/common/proto_codec.hpp"
@@ -14,7 +16,7 @@ namespace ecommerce {
 using namespace bbt::framework;
 
 CoRpcResp GatewayService::Checkout(CoRpcReq req) {
-    HopRecord hop{kGatewayService, "Checkout", InboundRequestId(context()),
+    HopRecord hop{kGatewayService, "Checkout", InboundRequestId(),
                   kOrderService, "Quote", true, 0};
     auto fail = [&hop](Error error) {
         hop.ok = false;
@@ -38,7 +40,7 @@ CoRpcResp GatewayService::Checkout(CoRpcReq req) {
     v1::QuoteRequest quote_req;
     quote_req.set_sku(sku);
     quote_req.set_qty(qty);
-    auto quote = this->call<v1::QuoteRequest, v1::QuoteResponse>(
+    auto quote = bbt_co_await call<v1::QuoteRequest, v1::QuoteResponse>(
         std::string(kOrderService), "Quote", quote_req);
     if (!quote) return fail(quote.error());
 
@@ -59,8 +61,8 @@ CoRpcResp GatewayService::CreateOrder(CoRpcReq req) {
         return CoRpcResp::Error(q.error());
     if (!Storage().enabled)
         return CoRpcResp::Error(MakeError(ErrorCode::RuntimeUnavailable, "storage mode required"));
-    auto reply = this->call<v1::OrderRequest, v1::Record>(std::string(kOrderService), "CreateOrder", q.value());
-    StorageHop(context(), "gateway", "CreateOrder", q.value().order_id(), bool(reply),
+    auto reply = bbt_co_await call<v1::OrderRequest, v1::Record>(std::string(kOrderService), "CreateOrder", q.value());
+    StorageHop("gateway", "CreateOrder", q.value().order_id(), bool(reply),
                reply ? 0 : static_cast<int>(reply.error().code));
     if (!reply)
         return CoRpcResp::Error(reply.error());
@@ -72,8 +74,8 @@ CoRpcResp GatewayService::GetOrder(CoRpcReq req) {
         return CoRpcResp::Error(q.error());
     if (!Storage().enabled)
         return CoRpcResp::Error(MakeError(ErrorCode::RuntimeUnavailable, "storage mode required"));
-    auto reply = this->call<v1::LookupRequest, v1::Record>(std::string(kOrderService), "GetOrder", q.value());
-    StorageHop(context(), "gateway", "GetOrder", q.value().order_id(), bool(reply),
+    auto reply = bbt_co_await call<v1::LookupRequest, v1::Record>(std::string(kOrderService), "GetOrder", q.value());
+    StorageHop("gateway", "GetOrder", q.value().order_id(), bool(reply),
                reply ? 0 : static_cast<int>(reply.error().code));
     if (!reply)
         return CoRpcResp::Error(reply.error());
@@ -85,8 +87,8 @@ CoRpcResp GatewayService::GetBill(CoRpcReq req) {
         return CoRpcResp::Error(q.error());
     if (!Storage().enabled)
         return CoRpcResp::Error(MakeError(ErrorCode::RuntimeUnavailable, "storage mode required"));
-    auto reply = this->call<v1::LookupRequest, v1::Record>(std::string(kSettlementService), "GetBill", q.value());
-    StorageHop(context(), "gateway", "GetBill", q.value().order_id(), bool(reply),
+    auto reply = bbt_co_await call<v1::LookupRequest, v1::Record>(std::string(kSettlementService), "GetBill", q.value());
+    StorageHop("gateway", "GetBill", q.value().order_id(), bool(reply),
                reply ? 0 : static_cast<int>(reply.error().code));
     if (!reply)
         return CoRpcResp::Error(reply.error());

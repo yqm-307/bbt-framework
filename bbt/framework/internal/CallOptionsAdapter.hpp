@@ -20,6 +20,8 @@
 
 #include <bbt/infra/NetworkTypes.hpp>
 
+#include <bbt/coroutine/syntax/Async.hpp>
+
 #include <bbt/framework/CallOptions.hpp>
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/Result.hpp>
@@ -39,16 +41,20 @@ struct CallEgressHooks {
     /**
      * 发起 I/O：把装配好的 infra::CallOptions 交给下游发送；
      * 空 → RuntimeUnavailable（真实出站接线由宿主注入点提供）。
+     * 真实出站可挂起当前协程，注入点按协程可挂起函数声明，适配器经
+     * bbt_co_await 消费。
      */
-    std::function<result<void>(const bbt::infra::CallOptions&)> initiate_io;
+    std::function<bbt_co_async(result<void>)(
+        const bbt::infra::CallOptions&)> initiate_io;
 };
 
 /**
  * parent 为空 = 顶层入口。成功路径：装配 infra::CallOptions →（若
  * ordered）消耗序号 → 发起 I/O，返回实际传给下游的 infra::CallOptions。
- * 任何失败路径都不发起 I/O、不消耗序号。
+ * 任何失败路径都不发起 I/O、不消耗序号。发起 I/O 的注入点可挂起当前
+ * 协程，本函数因此整体是协程等待语法下的可挂起调用。
  */
-result<bbt::infra::CallOptions> AdaptCallOptions(
+bbt_co_async(result<bbt::infra::CallOptions>) AdaptCallOptions(
     const RequestContext* parent,
     const CallOptions&    options,
     const CallEgressHooks& hooks);

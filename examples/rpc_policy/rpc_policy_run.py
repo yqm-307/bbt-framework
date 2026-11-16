@@ -15,9 +15,10 @@
   5. expired   —— 收紧到已过期：调用方 I/O 前 TimedOut、callee 零 hit；
   6. decorator —— 外层包内层：两个虚 Preflight 各一次、顺序固定（outer→inner）；
   7. noroute   —— 未配置静态路由：NotFound、Preflight 计数为 0（路由先于策略）；
-  8. shutdown  —— stdin EOF → 收束 rc=0/state=Closed/owner 同步 Close，且 fixture
-                  在 `app.run()` 返回后、进程退出前对自己 bound 端口发一次有界
-                  探针（journal event=listener_probe），driver 核该事件为 refused。
+  8. shutdown  —— stdin EOF → RequestShutdown → CoStop 收束 rc=0/state=Stopped/
+                  owner 组件 OnStop 记账，且 fixture 在 `CoStop` 返回后、进程
+                  退出前对自己 bound 端口发一次有界探针（journal
+                  event=listener_probe），driver 核该事件为 refused。
 
 关闭后断言的对象是**存活期探针事件**（B1）：进程回收后再 connect 必然
 ECONNREFUSED，与框架是否关闭 listener 无关，那种断言恒真、不构成证据。本驱动
@@ -189,7 +190,7 @@ def reap(name, proc, failures):
 
 
 def listener_probe(entries):
-    """fixture 存活期（app.run 返回后、进程退出前）对自己 bound 端口的探针事件。
+    """fixture 存活期（CoStop 返回后、进程退出前）对自己 bound 端口的探针事件。
 
     B1：这是「关闭后 listener 已关」唯一可用的真实 oracle。进程回收后再探端口
     必然 ECONNREFUSED，那种断言恒真——不构成证据，故不再探、也不再认。
@@ -203,13 +204,13 @@ def listener_probe(entries):
 def listener_probe_ok(probe, port):
     """存活期探针的判绿条件（唯一真值口径；scratch 负例直接复用本函数）。
 
-    必须同时满足：事件存在、phase 为 after_run_before_exit、探的端口就是本次
+    必须同时满足：事件存在、phase 为 after_stop_before_exit、探的端口就是本次
     服务过真实 RPC 的那个端口、result=refused、errno=ECONNREFUSED。超时或任何
     其它 errno（result=error）→ 不判绿。
     """
     return (
         probe is not None
-        and probe.get("phase") == "after_run_before_exit"
+        and probe.get("phase") == "after_stop_before_exit"
         and probe.get("port") == str(port)
         and probe.get("result") == "refused"
         and probe.get("errno") == str(errno.ECONNREFUSED)
@@ -245,7 +246,7 @@ def scenario(fixture, mode, work_root, calls, assert_fn, timeout):
         entries = read_journal(journal_file)
         assert_fn(port, responses, entries)
 
-        # 关闭：stdin EOF → request_shutdown → run 收束。
+        # 关闭：stdin EOF → RequestShutdown → 主协程 CoStop 收束。
         if proc.stdin:
             proc.stdin.close()
         try:
@@ -262,7 +263,7 @@ def scenario(fixture, mode, work_root, calls, assert_fn, timeout):
         ok = (
             rc == 0
             and shutdown_rec.get("rc") == "0"
-            and shutdown_rec.get("state") == "3"  # ShutdownState::Closed
+            and shutdown_rec.get("state") == "Stopped"  # AppState::Stopped
             and shutdown_rec.get("owner_closed") == "1"
             and count_event(entries, "resource_close") == 1
         )

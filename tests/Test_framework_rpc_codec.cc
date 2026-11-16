@@ -1,11 +1,18 @@
 /**
  * CoRpcReq/CoRpcResp 公共面：位置参数、尾部协议错误、业务错误原样传递、
  * protobuf codec seam 与 ActorMethodAt 位置 key。
+ * 服务实例断言运行在真实受管协程（受管构造要求协程上下文）。
  */
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -13,8 +20,13 @@
 #include <utility>
 #include <vector>
 
+#include <bbt/coroutine/coroutine.hpp>
+
+#include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/Framework.hpp>
+#include <bbt/framework/internal/CoAppSeam.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
+#include <bbt/framework/internal/NetworkHost.hpp>
 
 namespace fw = bbt::framework;
 
@@ -111,9 +123,11 @@ static_assert(std::is_same_v<
         std::declval<const FakeProto&>())),
     fw::result<fw::CoRpcReq>>);
 
-class Calculator final : public fw::CoService<Calculator> {
+class Calculator final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "calculator";
+
+    explicit Calculator(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
 
     fw::CoRpcResp Add(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t, std::string>();
@@ -140,14 +154,20 @@ public:
         fw::Method<&Calculator::Add>("add"),
         fw::Method<&Calculator::Reject>("reject"),
         fw::Method<&Calculator::ProtoEcho>("proto_echo"));
+
+protected:
+    ~Calculator() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 /**
  * ActorMethodAt 位置 key：index>0 的字符串 key 与默认 index=0 的整型 key。
  */
-class Directory final : public fw::CoService<Directory> {
+class Directory final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "directory";
+
+    explicit Directory(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
 
     fw::CoRpcResp Lookup(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t, std::string>();
@@ -163,6 +183,10 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&Directory::Lookup, std::string, 1>("lookup"),
         fw::ActorMethodAt<&Directory::ById, std::int32_t>("by_id"));
+
+protected:
+    ~Directory() noexcept override = default;
+    friend class fw::detail::Registry;
 };
 
 fw::CoRpcReq Request(std::int32_t n, std::string name) {
@@ -171,16 +195,109 @@ fw::CoRpcReq Request(std::int32_t n, std::string name) {
     return std::move(req).value();
 }
 
+/**
+ * 不接纳请求也不启动的宿主桩：受管对象断言不需要真实 I/O。
+ */
+class StubNetHost final : public fw::INetworkHost {
+public:
+    fw::result<void> Create() override { return fw::result<void>::ok(); }
+    fw::result<void> Start() override { return fw::result<void>::ok(); }
+    void StopAccepting() noexcept override {}
+    fw::result<void> WaitHandlersDone(bbt::coroutine::Deadline) override {
+        return fw::result<void>::ok();
+    }
+    void Close() noexcept override {}
+};
+
+std::shared_ptr<fw::CoApp> MakeApp() {
+    return fw::MakeCoAppForTest(
+        fw::AppOptions{}
+            .SetLimits(64, 64, 64, 64)
+            .SetShutdownBudget(std::chrono::milliseconds{2000})
+            .SetLifecycleBudget(std::chrono::milliseconds{2000}),
+        fw::CoAppSeam{std::make_shared<StubNetHost>(), {}});
+}
+
+/**
+ * 取已安装服务的受管实例（锁内取 owner+指针，保活纪律与宿主一致；
+ * 返回的 owner 由调用方持有，invoke 调用期对象不可销毁）。
+ */
+template <class S>
+S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
+    const auto reg = app.RegistryForTest();
+    std::lock_guard<std::mutex> lk(reg->Mutex());
+    auto* e = reg->FindByTypeNameLocked(
+        fw::ObjectKind::Service, S::kServiceName);
+    if (!e) return nullptr;
+    owner = e->object;
+    return static_cast<S*>(e->object.get());
+}
+
+/**
+ * 在受管协程内执行 fn：经 g_scheduler 投递协程任务，宿主线程用
+ * 限时 std::cv 等其完成（宿主线程的 CV 等待不违反 worker 阻塞禁令）。
+ * 返回 false 表示任务未在预算内完成（防挂死测试进程）。
+ */
+template <class F>
+bool RunInManagedCoroutine(F&& fn,
+    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+    /**
+     * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
+     */
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
+        g_scheduler->Start();
+    }
+    struct Slot {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      error;
+    };
+    auto slot = std::make_shared<Slot>();
+    auto f = std::forward<F>(fn);
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [slot, f = std::move(f)]() mutable {
+            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            std::lock_guard<std::mutex> lk(slot->mtx);
+            slot->done = true;
+            slot->cv.notify_all();
+        }, submitted);
+    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+    std::unique_lock<std::mutex> lk(slot->mtx);
+    const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
+    /**
+     * 不让仍在途任务使用已退出的测试栈。
+     */
+    if (!done)
+        std::terminate();
+    if (slot->error) std::rethrow_exception(slot->error);
+    return done;
+}
+
+#define CO_TEST_CASE(name) \
+    static void name##_body(); \
+    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+    static void name##_body()
+
 } // namespace
 
-BOOST_AUTO_TEST_CASE(positional_roundtrip_and_method_table) {
-    Calculator service;
+CO_TEST_CASE(positional_roundtrip_and_method_table) {
+    auto app = MakeApp();
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<Calculator>(
+        fw::ServiceOptions{}.SetMaxInflight(8)));
+    std::shared_ptr<void> owner;
+    auto* service = ManagedService<Calculator>(*app, owner);
+    BOOST_REQUIRE(service != nullptr);
+
     const auto table = fw::BuildMethodTable<Calculator>();
     BOOST_REQUIRE(table.find("add") != nullptr);
     BOOST_TEST(table.find("add")->request_schema ==
                std::string(fw::kCoRpcPositionalSchema));
 
-    auto out = table.find("add")->invoke(service,
+    auto out = table.find("add")->invoke(*service,
         Request(41, "answer").payload());
     BOOST_REQUIRE(out);
     fw::CoRpcReq response(std::move(out.value()));
@@ -202,17 +319,23 @@ BOOST_AUTO_TEST_CASE(trailing_payload_is_protocol_error) {
                static_cast<int>(fw::ErrorCode::ProtocolError));
 }
 
-BOOST_AUTO_TEST_CASE(business_error_is_preserved) {
-    Calculator service;
+CO_TEST_CASE(business_error_is_preserved) {
+    auto app = MakeApp();
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<Calculator>(
+        fw::ServiceOptions{}.SetMaxInflight(8)));
+    std::shared_ptr<void> owner;
+    auto* service = ManagedService<Calculator>(*app, owner);
+    BOOST_REQUIRE(service != nullptr);
+
     const auto table = fw::BuildMethodTable<Calculator>();
-    auto out = table.find("reject")->invoke(service, {});
+    auto out = table.find("reject")->invoke(*service, {});
     BOOST_REQUIRE(!out);
     BOOST_TEST(static_cast<int>(out.error().code) ==
                static_cast<int>(fw::ErrorCode::InvalidArgument));
     BOOST_TEST(out.error().message == "rejected");
 }
 
-BOOST_AUTO_TEST_CASE(parse_error_mapping) {
+CO_TEST_CASE(parse_error_mapping) {
     /**
      * 空 payload → 头部截断 → ProtocolError。
      */
@@ -235,15 +358,20 @@ BOOST_AUTO_TEST_CASE(parse_error_mapping) {
     /**
      * 分发边界：handler 内 Parse 失败经 CoRpcResp::Error 原样透出。
      */
-    Calculator service;
+    auto app = MakeApp();
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<Calculator>(
+        fw::ServiceOptions{}.SetMaxInflight(8)));
+    std::shared_ptr<void> owner;
+    auto* service = ManagedService<Calculator>(*app, owner);
+    BOOST_REQUIRE(service != nullptr);
     const auto table = fw::BuildMethodTable<Calculator>();
-    auto out = table.find("add")->invoke(service, {0xFF});
+    auto out = table.find("add")->invoke(*service, {0xFF});
     BOOST_REQUIRE(!out);
     BOOST_TEST(static_cast<int>(out.error().code) ==
                static_cast<int>(fw::ErrorCode::ProtocolError));
 }
 
-BOOST_AUTO_TEST_CASE(proto_codec_seam) {
+CO_TEST_CASE(proto_codec_seam) {
     static_assert(fw::rpc_detail::is_proto_codec_v<FakeProto>);
     static_assert(!fw::rpc_detail::is_proto_codec_v<std::string>);
     static_assert(!fw::rpc_detail::is_proto_codec_v<std::int32_t>);
@@ -305,15 +433,27 @@ BOOST_AUTO_TEST_CASE(proto_codec_seam) {
     /**
      * 经方法表分发的整包回路：同一服务上 proto 方法与位置方法共存。
      */
-    Calculator service;
+    auto app = MakeApp();
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<Calculator>(
+        fw::ServiceOptions{}.SetMaxInflight(8)));
+    std::shared_ptr<void> owner;
+    auto* service = ManagedService<Calculator>(*app, owner);
+    BOOST_REQUIRE(service != nullptr);
     const auto table = fw::BuildMethodTable<Calculator>();
-    auto out = table.find("proto_echo")->invoke(service, via_from.payload());
+    auto out = table.find("proto_echo")->invoke(*service, via_from.payload());
     BOOST_REQUIRE(out);
     BOOST_TEST(out.value() == via_from.payload());
 }
 
-BOOST_AUTO_TEST_CASE(actor_method_at_positional_key) {
-    Directory service;
+CO_TEST_CASE(actor_method_at_positional_key) {
+    auto app = MakeApp();
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<Directory>(
+        fw::ServiceOptions{}.SetMaxInflight(8)));
+    std::shared_ptr<void> owner;
+    auto* service = ManagedService<Directory>(*app, owner);
+    BOOST_REQUIRE(service != nullptr);
+    (void)service;
+
     const auto table = fw::BuildMethodTable<Directory>();
     const fw::RpcMethod* lookup = table.find("lookup");
     BOOST_REQUIRE(lookup != nullptr);

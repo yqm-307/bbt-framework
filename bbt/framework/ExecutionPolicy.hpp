@@ -1,39 +1,17 @@
 #pragma once
 /**
- * 执行策略与服务级装配选项（业务面）。
- * 所有字段必须显式填写，不提供默认值。
- * ValidateServiceOptions 落实装配期规则；「容量耗尽返回 Overloaded」
- * 属运行期行为，不在此检查。
+ * 服务执行策略（业务面）。
+ * Concurrent：派发协程内联执行，服务级 max_inflight 接纳计数封顶。
+ * ActorSerial：按方法声明的 key 提取器取 actor key，每个 key 一条
+ * 串行邮箱队列（容量 ServiceOptions::SerialQueueCapacity），同一 key
+ * 至多一条 handler 在执行；key 数受 ServiceOptions::MaxSerialKeys 封顶。
+ *
+ * 「容量耗尽返回 Overloaded」属运行期行为，装配期不在此检查；
+ * 装配期规则由 ServiceOptions::Validate 落实。
  */
-
-#include <cstddef>
-
-#include <bbt/framework/Result.hpp>
 
 namespace bbt::framework {
 
 enum class ExecutionPolicy { Concurrent, ActorSerial };
-
-struct ServiceOptions {
-    ExecutionPolicy execution;
-    std::size_t max_inflight;
-    std::size_t mailbox_capacity;
-    std::size_t max_actors;
-    bool ordered_ingress;
-    std::size_t max_ordered_streams;
-    std::size_t max_cached_results;
-    std::size_t max_cached_result_bytes;
-};
-
-/**
- * 装配期校验：
- * - max_inflight 必须 > 0；
- * - ActorSerial 要求 mailbox_capacity > 0 且 max_actors > 0；
- * Concurrent 要求两者均为 0（不创建邮箱）；
- * - ordered_ingress 只允许 ActorSerial；启用时三项有序上限均 > 0，
- * 禁用时均为 0。
- * 违规返回 err(InvalidArgument)，message 中指明违规字段名。
- */
-result<void> ValidateServiceOptions(const ServiceOptions& options);
 
 } // namespace bbt::framework

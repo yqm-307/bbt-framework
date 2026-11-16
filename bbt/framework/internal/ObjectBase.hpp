@@ -1,6 +1,6 @@
 #pragma once
 /**
- * framework v2 受管对象身份基类（internal）。
+ * framework 受管对象身份基类（internal）。
  *
  * Component / ServiceBase / Actor 共用的身份簿记基：保存 Registry 回填的非拥有
  * ObjectHandle（weak Registry + id + generation），以及「本对象作为绑定发起方」
@@ -92,7 +92,7 @@ private:
     mutable std::mutex            m_bound_mtx;
     std::vector<BoundComponent>   m_bound_components;
 
-    friend class ::bbt::framework::v2::CoApp;
+    friend class ::bbt::framework::CoApp;
     friend class detail::Registry;
 };
 

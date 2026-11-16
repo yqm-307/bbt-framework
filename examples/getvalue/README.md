@@ -62,8 +62,9 @@ template <> struct ProtoCodec<bbt::example::v1::GetValueRequest> {
 };
 }
 
-class GetValueService final : public fw::CoService<GetValueService> {
+class GetValueService final : public fw::CoService<> {
   static constexpr std::string_view kServiceName = "bbt.example.v1.GetValueService";
+  explicit GetValueService(fw::detail::ConstructKey k);
   fw::CoRpcResp GetValue(fw::CoRpcReq req) {        // req.ParseProto<GetValueRequest>()
     ...                                             // fw::CoRpcResp::FromProto(resp)
   }
@@ -74,20 +75,28 @@ class GetValueService final : public fw::CoService<GetValueService> {
 };
 ```
 
-服务端装配（[`getvalue_server.cc`](getvalue_server.cc)）：公开 `CoAppOptions`
-显式声明会话身份，V2 入站由框架默认装配——
+服务端装配（[`getvalue_server.cc`](getvalue_server.cc)）：普通 main +
+协程入口（`g_scheduler->Start` 后把装配/启动/收口投递进受管协程），
+公开 `AppOptions` 显式声明会话身份，V2 入站由框架默认装配——
 
 ```cpp
-fw::CoAppOptions options;
-options.listen = {"127.0.0.1", 0};               // 动态端口，仅 loopback
-options.local_identity = "getvalue-server";      // V2 会话身份必填
-fw::CoApp app(options);
-app.add_service<getvalue::GetValueService>({ExecutionPolicy::Concurrent, 64, 0,0,false,0,0,0});
-app.run();
+auto options = fw::AppOptions{}
+    .SetLimits(64, 64, 64, 64)
+    .SetNetworkLimits(...)
+    .Listen("127.0.0.1:0")                          // 动态端口，仅 loopback
+    .SetShutdownBudget(3s).SetLifecycleBudget(3s)
+    .SetLocalIdentity("getvalue-server");           // V2 会话身份必填
+auto app = fw::CoApp::Create(options);              // 仅受管协程内
+bbt_co_await app->CoInstallService<getvalue::GetValueService>(
+    fw::ServiceOptions{}.SetExecution(fw::ExecutionPolicy::Concurrent)
+                        .SetMaxInflight(64));
+bbt_co_await app->CoStart();
+bbt_co_await app->CoWaitShutdownRequest();          // stdin EOF → RequestShutdown
+bbt_co_await app->CoStop();
 ```
 
 框架侧（V2 唯一消费面）：
-- `bbt/framework/CoApp.hpp`：`CoAppOptions::local_identity`
+- `bbt/framework/Object.hpp`：`AppOptions::SetLocalIdentity`
   （必填，映射 `rpc::ClientOptions::SetLocalIdentity`）；无 profile/旧桥选择；
 - `bbt/framework/internal/RpcBridge.hpp`：
   `InstallRpcAdmission`（`rpc::AdmissionHandler` → 框架有界队列/worker）与
@@ -155,17 +164,18 @@ journal 断言：`budget1/schema/route` 被拒请求**未进 handler**；
 - **真实验收驱动器** `getvalue_s2s_run.py`（ctest `examples.getvalue.s2s`，TIMEOUT 120）：
   两进程 + 真实黑障端点；结构化结果全部带 `auth_state=unauthenticated_loopback`。
 
-### 非法静态路由：公开入口，run 启动任何组件前拒绝
+### 非法静态路由：公开入口，启动任何组件前拒绝
 
 `getvalue_caller` 增加一个公开验收子命令，构造三类**非法**静态路由后经公开
-`CoApp`/`add_service`/`add_resource`/`run` 装配（不使用任何测试缝）：
+`CoApp::Create`/`CoInstallComponent`/`CoInstallService`/`CoStart` 装配
+（不使用任何测试缝）：
 
 ```
 getvalue_caller badroute <kind> <result_file>
   kind ∈ {empty-service, empty-endpoint, duplicate}
 ```
 
-| kind | 非法输入 | `_ValidateConfig` 拒绝原因（`lifecycle_failures` 恰 1 条） |
+| kind | 非法输入 | 启动前校验拒绝原因（`LifecycleFailures` 恰 1 条） |
 |---|---|---|
 | `empty-service` | 空 `service_name` | `CoApp: static route with empty service_name` |
 | `empty-endpoint` | 空 `endpoint` | `CoApp: static route '<name>' has empty endpoint` |
@@ -174,10 +184,10 @@ getvalue_caller badroute <kind> <result_file>
 （V2 的 endpoint 是单一字符串，`transport` 维度与旧 profile 选择已随 V1 删除。）
 
 机器可读观测（进程自写 `<result_file>` JSON；断言由驱动器独立核对，不信任自报
-`status`）：`rc==1`（`HostLifecycle::kExitRejected`，启动任何组件前返回）、
+`status`）：`rc==1`（CoStart 拒绝，映射旧 `kExitRejected`，启动任何组件前返回）、
 `lifecycle_failures` 恰 1 条且含对应原因、`bound_endpoint==""`（未绑定任何 ready
-端口）、`resource_factory_calls==0`（经公开 `add_resource` 注册的延迟工厂未被调用，
-证明拒绝发生在资源/网络/服务启动之前）。四项均带
+端口）、`resource_factory_calls==0`（已安装 `CoComponent` 的 OnStart 未被调用，
+证明拒绝发生在组件/网络/服务启动之前）。四项均带
 `auth_state=unauthenticated_loopback`。`getvalue_s2s_run.py` 以四个**有界**子进程
 运行上述三例，并入 `RESULTS`/`_FAILURES` 与清理后的总判定（超时/异常/崩溃一律记
 fail 并回收自有进程）。
@@ -188,8 +198,8 @@ fail 并回收自有进程）。
   此时**未配置目标**的出站调用在运行期由 `find_route` 门拒绝为 `NotFound`
   （`s2s-noroute` 场景）——这是运行期路由未命中，**不是**启动期配置拒绝。
 - **空字段 / 重复 `service_name` 非法**：`service_name`/`endpoint` 任一
-  为空，或两条路由同名，都在 `run()` 启动任何组件前被拒绝（本子命令三例）。
-- **端点格式检查未纳入该断言**：当前 `_ValidateConfig` 只判空，不做 endpoint 结构
+  为空，或两条路由同名，都在 CoStart 启动任何组件前被拒绝（本子命令三例）。
+- **端点格式检查未纳入该断言**：当前 `_ValidateNetworkConfig` 只判空，不做 endpoint 结构
   （如缺端口）或 transport 白名单语义校验；本切片**不新增**这些语义，也不声称它们
   被拒绝。
 - 未覆盖：EX-T4 容量/并发/迟到 lifecycle 矩阵、EX-T5 整体验收、认证/授权（#38）。
@@ -201,7 +211,7 @@ fail 并回收自有进程）。
   protobuf 业务 codec（实测 SIGSEGV）。示例 server 经 coroutine **公开配置入口**
   `g_bbt_coroutine_config`（GlobalConfig 访问宏；头
   `bbt/coroutine/detail/GlobalConfig.hpp`，见 coroutine agent-docs
-  api-reference.md §12）在 `app.run()` 前把栈调到 512KB——该配置非线程安全、
+  api-reference.md §12）在调度器 `Start` 前把栈调到 512KB——该配置非线程安全、
   process-global。**512KB 只范围化覆盖本示例负载**；框架默认 12KB 栈对任意
   protobuf 业务（更大/更深嵌套 payload）不保证安全，属框架层待办。本切片未新增
   CoApp 栈配置层、未改默认 runtime。
@@ -235,9 +245,9 @@ fail 并回收自有进程）。
 | C++ typed codec seam | `bbt::framework::rpc_detail::ProtoCodec<T>` 特化 |
 | C++ 声明 | `fw::ProtoMethod<&Svc::GetValue, Req, Resp>("GetValue")` |
 | 业务 API | `CoRpcReq::ParseProto<T>()` / `CoRpcResp::FromProto(msg)` |
-| 会话身份 | `CoAppOptions::local_identity`（必填，peer 必须互异） |
+| 会话身份 | `AppOptions::SetLocalIdentity`（必填，peer 必须互异） |
 | 入站装配 | 框架默认 `InstallRpcAdmission`（`rpc::AdmissionHandler` → 分发器） |
 | 出站 | `RpcEgress::Call/Send`（`rpc::CoRpcClient`，同一 V2 会话） |
-| typed 出站调用 | `service.call<Req, Resp>(service_name, method, req, ...)`（schema 由 descriptor 推导） |
+| typed 出站调用 | `bbt_co_await service.call<Req, Resp>(service_name, method, req, ...)`（schema 由 descriptor 推导；受管协程内） |
 | wire | infra V2 `SessionFrame`（`session_frame.proto`）+ u32be 分帧 + Hello/HelloAck |
 | 运行/验收 | ctest `examples.getvalue.xlang`、`framework.getvalue_codec` |

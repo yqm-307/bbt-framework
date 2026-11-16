@@ -291,7 +291,7 @@ ok=1
 [ "$DOWN_RC"  -eq 0 ] || { echo "driver(down) reported failures"; ok=0; }
 [ "$DRIVER_TEE_RC" -eq 0 ] || { echo "driver log tee failed"; ok=0; }
 [ "$DOWN_TEE_RC" -eq 0 ] || { echo "driver(down) log tee failed"; ok=0; }
-# kExitOk = 0：按期优雅关闭（HostLifecycle::Run 返回码，示例不引用
+# rc=0：按期优雅关闭（主协程 CoStop 成功且 AppState::Stopped；示例不引用
 # internal 头故脚本按 0 判定）。
 [ "$A_RC" -eq 0 ] || { echo "svc_a did not shut down cleanly"; ok=0; }
 [ "$B_RC" -eq 0 ] || { echo "svc_b did not shut down cleanly"; ok=0; }

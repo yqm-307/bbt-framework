@@ -1,15 +1,15 @@
 #include "services/catalog/catalog_service.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <charconv>
 #include <cstdio>
 #include "services/common/storage.hpp"
-#ifdef EC_STORAGE_AVAILABLE
-#include <bbt/framework/RedisNetResource.hpp>
-#endif
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include <bbt/coroutine/syntax/Async.hpp>
 
 #include "services/common/hop_log.hpp"
 #include "services/common/node_identity.hpp"
@@ -18,6 +18,27 @@
 namespace ecommerce {
 
 using namespace bbt::framework;
+
+#ifdef EC_STORAGE_AVAILABLE
+result<void> CatalogService::OnStart() {
+    if (!Storage().enabled) return result<void>::ok();
+    /**
+     * 显式建连（组件命令面要求在受管协程调用；OnStart 相位天然满足）：
+     * Redis 不可达即启动失败（fail-closed，等价旧工厂「Connected 才交付」）。
+     */
+    auto cache = GetComponent<RedisNetResource>("cache");
+    if (!cache) return result<void>::err(std::move(cache.error()));
+    auto borrow = cache.value().Borrow();
+    if (!borrow) return result<void>::err(std::move(borrow.error()));
+    const auto budget = bbt::infra::CallOptions{
+        std::chrono::steady_clock::now() + std::chrono::seconds{3}};
+    auto connected = bbt_co_await borrow.value().Get().Connect(budget);
+    if (!connected)
+        return result<void>::err(MakeError(ErrorCode::Unavailable,
+                                           "redis startup: " + connected.error().message));
+    return result<void>::ok();
+}
+#endif // EC_STORAGE_AVAILABLE
 
 namespace {
 
@@ -34,7 +55,7 @@ std::int64_t UnitPriceCents(std::string_view sku) {
 } // namespace
 
 CoRpcResp CatalogService::Price(CoRpcReq req) {
-    HopRecord hop{kCatalogService, "Price", InboundRequestId(context()), {}, {},
+    HopRecord hop{kCatalogService, "Price", InboundRequestId(), {}, {},
                   true, 0};
     auto fail = [&hop](Error error) {
         hop.ok = false;
@@ -54,12 +75,17 @@ CoRpcResp CatalogService::Price(CoRpcReq req) {
     std::int64_t unit = UnitPriceCents(sku);
 #ifdef EC_STORAGE_AVAILABLE
     if (Storage().enabled && unit > 0) {
-        auto cache = context().resource<RedisNetResource>("cache");
+        auto cache = GetComponent<RedisNetResource>("cache");
         if (!cache)
             return fail(MakeError(ErrorCode::RuntimeUnavailable, "cache resource missing"));
-        const auto budget = StorageBudget(context());
+        auto borrow = cache.value().Borrow();
+        if (!borrow)
+            return fail(MakeError(ErrorCode::RuntimeUnavailable, "cache resource missing"));
+        auto budget = StorageBudget();
+        if (!budget)
+            return fail(budget.error());
         const std::string key = Storage().key_prefix + ":price:" + sku;
-        auto value = bbt_co_await cache->Get(key, budget);
+        auto value = bbt_co_await borrow.value().Get().Get(key, budget.value());
         if (!value)
             return fail(value.error());
         if (value.value()) {
@@ -68,14 +94,14 @@ CoRpcResp CatalogService::Price(CoRpcReq req) {
             if (parsed_price.ec != std::errc{} || parsed_price.ptr != text.data() + text.size() || unit <= 0)
                 return fail(MakeError(ErrorCode::ProtocolError, "invalid cached price"));
         } else {
-            auto set = bbt_co_await cache->Set(key, std::to_string(unit), budget);
+            auto set = bbt_co_await borrow.value().Get().Set(key, std::to_string(unit), budget.value());
             if (!set)
                 return fail(set.error());
         }
         std::printf("event=cache result=%s key=%s order_id=%s pid=%s\n",
                     value.value() ? "hit" : "miss", key.c_str(), parsed.value().order_id().c_str(), Node().process_id.c_str());
         std::fflush(stdout);
-        StorageHop(context(), "catalog", "Price", parsed.value().order_id(), true);
+        StorageHop("catalog", "Price", parsed.value().order_id(), true);
     }
 #endif
     if (unit <= 0)

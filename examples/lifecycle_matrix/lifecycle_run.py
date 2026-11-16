@@ -13,8 +13,8 @@
      - S3 并发挂起两项，放行后上下文/协程不串（req_id/co_id 跨挂起一致）；
      - S3 客户端读超时后 work 仍物理在途占容量（新请求精确 Overloaded）；
      - R4 服务容量耗尽 → Overloaded（不无界排队）+ 字节上限维度；
-     - R5 正常拒新 / drain / 同步 Close / release；
-     - R5 ShutdownIncomplete 保留强持有、迟到完成、晚到无 UAF；
+     - R5 正常拒新 / drain / 同步 Close / release（AppState::Stopped）；
+     - R5 StopIncomplete 保留强持有、迟到完成、晚到无 UAF；
      - R5 外部 supervisor 硬杀只留「未完成」证据、不称优雅完成。
   4. 收尾：stdin 触发关闭、有限等待；异常路径回收自有进程。
 
@@ -65,6 +65,15 @@ def check(cond, label, scenario):
     if not cond:
         _FAILURES.append(f"{scenario}: {label}")
         print(f"FAIL {scenario}: {label}", file=sys.stderr)
+
+
+# fixture journal 的 state 值 = bbt::framework::AppState 枚举序（唯一 API 的
+# 应用状态面，替代旧 ShutdownState 四态）：
+#   0=Created 1=Starting 2=Running 3=Paused 4=Stopping
+#   5=StopIncomplete(收口未竟,保留 owner 可再推进) 6=Stopped(收口完成)
+APPSTATE_STOPPING = "4"
+APPSTATE_STOP_INCOMPLETE = "5"
+APPSTATE_STOPPED = "6"
 
 
 def finish(scenario, ok, extra=None):
@@ -205,6 +214,8 @@ class Fixture:
         self.port = None
         self.expect_rc = 0            # 预期退出码（graceful/正常）
         self.expect_signal = None     # 预期信号（supervisor 硬杀）
+        # 退出码 3 = fixture 的「迟到收尾」：CoStop 期限耗尽进入
+        # StopIncomplete，在途 handler 放行后逐对象收口完成（见 fixture 头注）。
 
     def start(self, timeout):
         self.port = wait_port(self.port_file, self.proc, timeout)
@@ -473,7 +484,7 @@ def scenario_r5_graceful(fx):
     check(stopped, "fixture did not exit after shutdown", "r5-graceful")
     rc = fx.proc.returncode
     es = fx.entries()
-    saw_closing = any(e.get("state") == "1" for e in es
+    saw_closing = any(e.get("state") == APPSTATE_STOPPING for e in es
                       if e.get("event") == "shutdown_state")
     shutdowns = [e for e in es if e.get("event") == "shutdown"]
     rec = shutdowns[-1] if shutdowns else {}
@@ -483,7 +494,8 @@ def scenario_r5_graceful(fx):
                                               "handler_resumed")), default=-1)
     i_close = event_index(es, "resource_close")
     ok = (rc == 0
-          and rec.get("rc") == "0" and rec.get("state") == "3"
+          and rec.get("rc") == "0"
+          and rec.get("state") == APPSTATE_STOPPED
           and rec.get("owner_closed") == "1" and rec.get("pending") == "0"
           and len(closes) == 1 and i_close > last_handler)
     check(ok, f"rc={rc} shutdown={rec} closes={len(closes)} "
@@ -497,7 +509,7 @@ def scenario_r5_graceful(fx):
 
 
 def scenario_r5_shutdown_incomplete(binpath, workdir):
-    """R5 ShutdownIncomplete：在途关闭 → 保留强持有 → 迟到完成 → rc=3；拒新；晚到无 UAF。"""
+    """R5 StopIncomplete：在途关闭 → 保留强持有 → 迟到完成 → rc=3；拒新；晚到无 UAF。"""
     fx = Fixture(binpath, workdir, "b-incomplete", 4, 300)
     try:
         fx.start(20)
@@ -519,13 +531,15 @@ def scenario_r5_shutdown_incomplete(binpath, workdir):
         es = wait_journal(
             fx.journal,
             lambda es: any(e.get("event") == "shutdown_state"
-                           and e.get("state") == "2" for e in es),
+                           and e.get("state") == APPSTATE_STOP_INCOMPLETE
+                           for e in es),
             8, fx.proc)
         inc = [e for e in es if e.get("event") == "shutdown_state"
-               and e.get("state") == "2"]
+               and e.get("state") == APPSTATE_STOP_INCOMPLETE]
         alive = fx.alive()
         no_close_yet = not any(e.get("event") == "resource_close" for e in es)
-        check(bool(inc), "ShutdownIncomplete not observed", "r5-shutdown-incomplete")
+        check(bool(inc), "StopIncomplete not observed",
+              "r5-shutdown-incomplete")
         check(alive, "fixture exited during ShutdownIncomplete",
               "r5-shutdown-incomplete")
         check(no_close_yet, "resource Close called while ShutdownIncomplete",
@@ -580,7 +594,7 @@ def scenario_r5_shutdown_incomplete(binpath, workdir):
         check(stopped, "fixture did not exit after late completion",
               "r5-shutdown-incomplete")
         rc = fx.proc.returncode
-        fx.expect_rc = 3   # kExitShutdownLate：迟到收尾已全部完成
+        fx.expect_rc = 3   # 迟到收尾：StopIncomplete 后逐对象收口完成
         es = fx.entries()
         shutdowns = [e for e in es if e.get("event") == "shutdown"]
         rec = shutdowns[-1] if shutdowns else {}
@@ -588,10 +602,11 @@ def scenario_r5_shutdown_incomplete(binpath, workdir):
         i_close = event_index(es, "resource_close")
         closes = len([e for e in es if e.get("event") == "resource_close"])
         resumed_rec = es[i_resumed] if i_resumed >= 0 else {}
-        # 迟到完成无 UAF：进程如期以 rc=3(kExitShutdownLate) 退出（非崩溃信号），
-        # handler 恢复记录在案，且资源 Close 发生在迟到完成之后。
+        # 迟到完成无 UAF：进程如期以 rc=3(迟到收尾) 退出（非崩溃信号），
+        # handler 恢复记录在案，资源 OnStop 收口发生在迟到完成之后。
         ok = (rc == 3
-              and rec.get("rc") == "3" and rec.get("state") == "3"
+              and rec.get("rc") == "3"
+              and rec.get("state") == APPSTATE_STOP_INCOMPLETE
               and rec.get("owner_closed") == "1" and rec.get("pending") == "0"
               and i_resumed >= 0 and i_close >= 0 and i_resumed < i_close
               and closes == 1
@@ -663,7 +678,8 @@ def scenario_r5_hard_kill(binpath, workdir):
                            for e in es)
         has_close = any(e.get("event") == "resource_close" for e in es)
         has_closed_state = any(e.get("event") == "shutdown_state"
-                               and e.get("state") == "3" for e in es)
+                               and e.get("state") == APPSTATE_STOPPED
+                               for e in es)
         not_graceful = (not has_shutdown and not has_graceful
                         and not has_close and not has_closed_state)
         check(has_entered, "journal missing incomplete marker (handler_entered)",

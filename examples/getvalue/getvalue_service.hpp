@@ -139,10 +139,21 @@ private:
  * 负载非法/类型错误由 ProtoCodec::Decode 返回 ProtocolError，原样经错误信封
  * 回传；miss 返回 found=false。
  */
-class GetValueService final : public bbt::framework::CoService<GetValueService> {
+class GetValueService final : public bbt::framework::CoService<> {
 public:
     static constexpr std::string_view kServiceName =
         "bbt.example.v1.GetValueService";
+
+    explicit GetValueService(bbt::framework::detail::ConstructKey key)
+        : bbt::framework::CoService<>(key) {}
+
+protected:
+    ~GetValueService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+
+public:
 
     bbt::framework::CoRpcResp GetValue(bbt::framework::CoRpcReq req) {
         using bbt::framework::CoRpcResp;

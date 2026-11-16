@@ -4,14 +4,14 @@
  *
  * 字段固定为 service/method/request_id/downstream/downstream_method/pid/
  * instance/ok/code，值不含空格，驱动器与人工读同一份文本。request_id 来自
- * 入站 envelope（context().request()），各跳独立。存储模式的 order_id
+ * 入站受管上下文（CurrentRequestContext），各跳独立。存储模式的 order_id
  * 才是跨进程关联同一订单的稳定业务键。
  */
 
 #include <string>
 #include <string_view>
 
-#include <bbt/framework/ServiceContext.hpp>
+#include <bbt/framework/RequestContext.hpp>
 
 namespace ecommerce {
 
@@ -54,6 +54,6 @@ void LogHop(const HopRecord& record);
 /**
  * @brief 取入站 request_id；非受管调用返回空串，日志如实留空而不自造。
  */
-std::string InboundRequestId(const bbt::framework::ServiceContext& context);
+std::string InboundRequestId();
 
 } // namespace ecommerce

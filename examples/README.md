@@ -5,15 +5,15 @@
 
 | 需求 | 例程 | 公开面 | 边界 |
 |---|---|---|---|
-| 组件式业务复用：两个 Service 共享一个受管组件实例 | [`component_services/`](component_services/README.md) | `v2::CoApp::CoInstallComponent/CoInstallService`、`ServiceOptions::BindComponent`、`CoService<C>::GetComponent`、`ComponentHandle::Borrow` | 同进程、同一 App/Registry 内共享实例；跨进程只能复用代码/协议 |
-| 组件热拔插与 hook | 同上 | `CoBindComponent/CoUnbindComponent`、`CoUninstallComponent/CoInstallComponent`、`CoComponent` 生命周期/`OnBindingChanged`、`CoObserve`/`ObserverToken`、`App::LifecycleFailures` | 换的是受管组件实例，不是 dlopen/代码热更新；不跨进程热共享 |
+| 组件式业务复用：两个 Service 共享一个受管组件实例 | [`component_services/`](component_services/README.md) | `CoApp::CoInstallComponent/CoInstallService`、`ServiceOptions::BindComponent`、`CoService::GetComponent`、`ComponentHandle::Borrow` | 同进程、同一 App/Registry 内共享实例；跨进程只能复用代码/协议 |
+| 组件热拔插与 hook | 同上 | `CoBindComponent/CoUnbindComponent`、`CoUninstallComponent/CoInstallComponent`、`CoComponent` 生命周期/`OnBindingChanged`、`CoObserve`/`ObserverToken`、`LifecycleFailures` | 换的是受管组件实例，不是 dlopen/代码热更新；不跨进程热共享 |
 | 跨进程模块复用（代码层） | 同上（`node` 模式） | 同一业务头 `store.hpp` 在独立进程各自装配 | 两个进程各有独立组件实例，不是 RPC、不是集群、不是服务发现 |
-| 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `CoApp::add_service`、`kRpcMethods`、V2 会话（`SessionFrame`）+ `ProtoCodec` | 需要 protobuf 前缀与 `bbt_infra_rpc_net`；单服务 |
-| 双进程 Service→Service 调用 | [`two_service/`](two_service/README.md) | `this->call<Req,Resp>`、`find_route` 静态路由、真实 V2 会话 | 两个互异 identity 的 CoApp 进程；不证明发现或认证 |
-| 出站调用策略 | [`rpc_policy/`](rpc_policy/README.md) | `RpcPolicy`、`CoRpcReq/Resp` | 复用 getvalue 业务，callee 为独立 CoApp 进程 |
-| 容量 / 并发上下文 / 关闭生命周期 | [`lifecycle_matrix/`](lifecycle_matrix/README.md) | `ExecutionPolicy::Concurrent`、`max_inflight`、`ShutdownIncomplete`、`request_shutdown` | 真实 loopback V2 会话，不代表生产部署 |
-| 多进程 + 真实 Redis/Mongo 资源 | [`dual_service/`](dual_service/README.md) | `add_resource` 工厂/`ICoCloseable`、真实 Redis/Mongo 客户端 | 显式 opt-in（`BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON`）；资源示例，不是注册中心 |
-| 真实注册中心 + 多进程动态发现（gateway→order→catalog，catalog 双实例） | [`ecommerce_cluster/`](ecommerce_cluster/README.md) | `DynamicRouteTable`/`CoAppOptions::dynamic_routes`、`CoApp::find_route` 动态优先、`bbt::infra_consul`、`add_resource` 工厂 | 需真实 Consul 二进制与 `BBT_INFRA_CONSUL=ON`；TCP check 健康、5s 陈旧边界、每服务 round-robin、无重试/权重 |
+| 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `CoService` + `kRpcMethods`（`ProtoMethod`）、V2 会话（`SessionFrame`）+ `ProtoCodec` | 需要 protobuf 前缀与 `BBT_INFRA_RPC_NET=ON`；单服务 |
+| 双进程 Service→Service 调用 | [`two_service/`](two_service/README.md) | `CoServiceBase::call<Req,Resp>`、`AppOptions::AddRoute` 静态路由、真实 V2 会话 | 两个互异 identity 的 CoApp 进程；不证明发现或认证 |
+| 出站调用策略 | [`rpc_policy/`](rpc_policy/README.md) | `AppOptions::SetRpcPolicy`、`RpcPolicy`、`CoRpcReq/Resp` | 复用 getvalue 业务，callee 为独立 CoApp 进程 |
+| 容量 / 并发上下文 / 关闭生命周期 | [`lifecycle_matrix/`](lifecycle_matrix/README.md) | `ServiceOptions::SetExecution(Concurrent)`、`SetMaxInflight`、`AppState`（`StopIncomplete`）、`RequestShutdown`、`CoWaitShutdownRequest` | 真实 loopback V2 会话，不代表生产部署 |
+| 多进程 + 真实 Redis/Mongo 资源 | [`dual_service/`](dual_service/README.md) | `CoInstallComponent<RedisNetResource / MongoDbResource>`、`BindComponent`、`GetComponent` + `Borrow` | 显式 opt-in（`BBT_ENABLE_DUAL_SERVICE_EXAMPLE=ON`）；资源示例，不是注册中心；live 验收需外部后端 |
+| 真实注册中心 + 多进程动态发现（gateway→order→catalog，catalog 双实例） | [`ecommerce_cluster/`](ecommerce_cluster/README.md) | `AppOptions::SetDynamicRoutes`（`DynamicRouteTable`）、`bbt::infra_consul`、`CoComponent` 装配与自注册 | 需真实 Consul 二进制与 `BBT_INFRA_CONSUL=ON`；TCP check 健康、5s 陈旧边界、每服务 round-robin、无重试/权重 |
 
 ## 运行 component_services
 
@@ -61,12 +61,10 @@ detail=...` 可机器判定。
 
 ## 运行 ecommerce_cluster（真实注册中心 + 动态发现）
 
-Issue #70 第五项已实现：framework 侧新增 `DynamicRouteTable`（公开扩展，经
-`CoAppOptions::dynamic_routes` 接入 `find_route`，动态配置的服务名优先于静态路由），
-infra 侧新增 `bbt::infra_consul`（Consul agent HTTP adapter）。示例
-`ecommerce_cluster/` 用真实 Consul + 多进程（gateway → order → catalog 双实例）
-验收落点变化、陈旧边界与恢复；细节与边界见
-[`ecommerce_cluster/README.md`](ecommerce_cluster/README.md)。
+`AppOptions::SetDynamicRoutes` 接入的 `DynamicRouteTable` 为公开扩展：发现提供方发布快照，出站按逻辑服务名解析，
+已配置的服务名优先于静态路由且不回退。infra 侧 `bbt::infra_consul` 为 Consul agent HTTP adapter。
+示例 `ecommerce_cluster/` 用真实 Consul + 多进程（gateway → order → catalog 双实例）验收落点变化、
+陈旧边界与恢复；细节与边界见 [`ecommerce_cluster/README.md`](ecommerce_cluster/README.md)。
 
 除上面 component_services 的配置外，本示例还需要：
 
