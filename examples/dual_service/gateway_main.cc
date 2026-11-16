@@ -2,8 +2,8 @@
  * examples/dual_service/gateway_main.cc — svc_b：网关服务进程。
  *
  * 业务形态：单进程托管一个 Concurrent 服务 "gateway"，handler 内经
- * this->call 真实跨进程调用 storage（static_routes 显式白名单，目标
- * endpoint 由命令行传入）。演示：
+ * CoServiceBase::call 真实跨进程调用 storage（static_routes 显式白名单，
+ * 目标 endpoint 由命令行传入）。演示：
  * fetch(key)          → storage.get 透传（含 miss → NotFound 透传）
  * store(key, value)   → storage.put 透传
  * explode()           → 业务错误（InternalError）不经网络直达客户端
@@ -15,7 +15,9 @@
  * remaining_budget_ms 的来源，出站子预算/父预算才能真正到达对端服务端
  * （见 SlowCall 注释）。
  *
- * 优雅关闭同 svc_a：SIGINT/SIGTERM → watcher 线程 request_shutdown。
+ * 优雅关闭同 svc_a：SIGINT/SIGTERM → watcher 线程 RequestShutdown → 主协程
+ * CoWaitShutdownRequest 返回后亲自 CoStop 收口；退出码 0 = 按期收束，
+ * 2 = 安装/启动失败，4 = 收口未竟，64 = 用法错误。
  */
 
 #include <atomic>
@@ -23,11 +25,14 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
 #include <bbt/coroutine/coroutine.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
 
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/CoApp.hpp>
@@ -44,22 +49,25 @@ namespace {
  */
 constexpr std::int64_t kSlowCallSubBudgetMs = 600;
 
-class GatewaySvc final : public fw::CoService<GatewaySvc> {
+class GatewaySvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "gateway";
 
+    explicit GatewaySvc(fw::detail::ConstructKey key)
+        : fw::CoService<>(key) {}
+
     fw::CoRpcResp Fetch(fw::CoRpcReq req) {
         /**
-         * 跨进程调用：static_routes["storage"] → http://<svc_a>/rpc。
+         * 跨进程调用：static_routes["storage"] → <svc_a host:port>。
          * 远端业务错误（NotFound）原样透传给本进程调用方。
          */
-        auto resp = this->call("storage", "get", req);
+        auto resp = bbt_co_await call("storage", "get", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
 
     fw::CoRpcResp Store(fw::CoRpcReq req) {
-        auto resp = this->call("storage", "put", req);
+        auto resp = bbt_co_await call("storage", "put", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
@@ -68,7 +76,7 @@ public:
         /**
          * 清理本轮 key 用：透传 storage.del（Redis DEL + Mongo DeleteOne）。
          */
-        auto resp = this->call("storage", "del", req);
+        auto resp = bbt_co_await call("storage", "del", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
@@ -82,7 +90,7 @@ public:
 
     fw::CoRpcResp SlowCall(fw::CoRpcReq req) {
         /**
-         * 显式给 storage 一个 600ms 子预算（两参数重载：CallOptions 经
+         * 显式给 storage 一个 600ms 子预算（CallOptions.deadline 经
          * AdaptCallOptions 与父预算取 min，不会延长父预算）。预算随
          * V2 Call 的 remaining_budget_ms 到达 storage，服务端继承后
          * 在其 deadline 到期时如实 TimedOut；本进程再把该错误透传给 driver。
@@ -90,7 +98,7 @@ public:
         fw::CallOptions o;
         o.deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds{kSlowCallSubBudgetMs};
-        auto resp = this->call("storage", "sleep_ms", req, {}, o);
+        auto resp = bbt_co_await call("storage", "sleep_ms", req, {}, o);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
@@ -100,7 +108,7 @@ public:
          * 失败路径：static_routes 未配置 "no.such.service" →
          * find_route NotFound，不发起任何网络 I/O。
          */
-        auto resp = this->call("no.such.service", "ping", req);
+        auto resp = bbt_co_await call("no.such.service", "ping", req);
         if (!resp) return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
@@ -112,6 +120,12 @@ public:
         fw::Method<&GatewaySvc::Explode>("explode"),
         fw::Method<&GatewaySvc::SlowCall>("slowcall"),
         fw::Method<&GatewaySvc::Missing>("missing"));
+
+protected:
+    ~GatewaySvc() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
 };
 
 std::atomic_bool g_stop{false};
@@ -161,57 +175,135 @@ int main(int argc, char** argv) {
     const std::string storage_ep = argv[2];
 
     /**
-     * handler 内嵌套出站调用（入站 → this->call → HTTP client →
+     * handler 内嵌套出站调用（入站 → call → HTTP client →
      * 等回包），协程栈按实测放大到 64KB。
      */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
 
-    fw::CoAppOptions opts;
-    opts.network_limits = bbt::infra::NetworkLimits{
-        /*max_connections*/ 128,
-        /*max_inflight*/    64,
-        /*max_header_bytes*/16384,
-        /*max_body_bytes*/  65536,
-        /*incoming_timeout*/std::chrono::milliseconds{30000}};
-    opts.listen = bbt::infra::ListenAddress{"127.0.0.1", port};
-    /**
-     * V2 会话身份必填；gateway 与 storage 进程使用互异身份。
-     */
-    opts.local_identity = "dual-gateway";
-    /**
-     * 出站白名单：仅允许名为 "storage" 的逻辑目标，endpoint 为真实
-     * host:port——没有自动发现，也未配置的目标一律 NotFound。
-     */
-    opts.static_routes = {
-        fw::StaticRoute{"storage", storage_ep}};
-    opts.shutdown_step_budget = std::chrono::milliseconds{2000};
+    InstallSignals();
+    g_scheduler->Start();
 
-    fw::CoApp app{opts};
-    if (auto r = app.add_service<GatewaySvc>(fw::ServiceOptions{
-            fw::ExecutionPolicy::Concurrent,
-            /*max_inflight*/ 64, 0, 0, false, 0, 0, 0});
-        !r) {
-        std::fprintf(stderr, "[svc_b] add_service failed: %s\n",
-                     r.error().message.c_str());
-        return 65;
+    auto options = fw::AppOptions{}
+        .SetLimits(128, 128, 64, 64)
+        .SetNetworkLimits(bbt::infra::NetworkLimits{
+            /*max_connections*/ 128,
+            /*max_inflight*/    64,
+            /*max_header_bytes*/16384,
+            /*max_body_bytes*/  65536,
+            /*incoming_timeout*/std::chrono::milliseconds{30000}})
+        .Listen("127.0.0.1:" + std::to_string(port))
+        /**
+         * V2 会话身份必填；gateway 与 storage 进程使用互异身份。
+         */
+        .SetLocalIdentity("dual-gateway")
+        /**
+         * 出站白名单：仅允许名为 "storage" 的逻辑目标，endpoint 为真实
+         * host:port——没有自动发现，也未配置的目标一律 NotFound。
+         */
+        .AddRoute("storage", storage_ep)
+        .SetShutdownBudget(std::chrono::milliseconds{2000})
+        .SetLifecycleBudget(std::chrono::milliseconds{30000});
+
+    /**
+     * 装配/启动/等待关闭/收口全部在受管协程内（Co* 入口的 CoRuntimeOnly
+     * 强约束）；App 指针发布给 watcher 线程只做 RequestShutdown；退出码经
+     * promise 回传（0 = CoStop 成功且 Stopped，2 = 安装/启动失败，
+     * 4 = 收口未竟）。
+     */
+    std::promise<int>                rc_slot;
+    std::shared_ptr<fw::CoApp>       app_handle;
+    std::mutex                       app_mtx;
+    std::atomic_bool                 app_done{false};
+
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [options = std::move(options), storage_ep, &rc_slot, &app_handle,
+         &app_mtx, &app_done]() mutable {
+            auto finish = [&](int rc) {
+                app_done.store(true, std::memory_order_release);
+                rc_slot.set_value(rc);
+            };
+            auto app = fw::CoApp::Create(std::move(options), "dual-gateway");
+            if (!app) {
+                std::fprintf(stderr, "[svc_b] CoApp::Create failed\n");
+                finish(4);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(app_mtx);
+                app_handle = app;
+            }
+            auto svc_install = bbt_co_await app->CoInstallService<GatewaySvc>(
+                fw::ServiceOptions{}
+                    .SetExecution(fw::ExecutionPolicy::Concurrent)
+                    .SetMaxInflight(64));
+            if (!svc_install) {
+                std::fprintf(stderr, "[svc_b] CoInstallService failed: %s\n",
+                             svc_install.error().message.c_str());
+                finish(2);
+                return;
+            }
+            auto started = bbt_co_await app->CoStart(
+                fw::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds{30}));
+            if (!started) {
+                std::fprintf(stderr, "[svc_b] CoStart failed: %s\n",
+                             started.error().message.c_str());
+                for (const auto& f : app->LifecycleFailures())
+                    std::fprintf(stderr,
+                                 "[svc_b] lifecycle_failure: %s\n",
+                                 f.message.c_str());
+                finish(2);
+                return;
+            }
+            std::printf("[svc_b] gateway service up endpoint=%s "
+                        "(storage -> %s)\n",
+                        app->BoundEndpoint().c_str(), storage_ep.c_str());
+            std::fflush(stdout);
+            const auto waited = bbt_co_await app->CoWaitShutdownRequest();
+            (void)waited;
+            auto stopped = bbt_co_await app->CoStop(
+                fw::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds{5}));
+            for (const auto& f : app->LifecycleFailures())
+                std::fprintf(stderr, "[svc_b] lifecycle_failure: %s\n",
+                             f.message.c_str());
+            finish(stopped && app->State() == fw::AppState::Stopped ? 0 : 4);
+        },
+        submitted);
+    if (!submitted) {
+        std::fprintf(stderr, "[svc_b] coroutine task rejected\n");
+        return 4;
     }
 
-    InstallSignals();
-    std::thread watcher([&app] {
-        while (!g_stop.load(std::memory_order_acquire))
+    /**
+     * watcher（同 svc_a）：app 已发布且 stop flag 置位才发一次
+     * RequestShutdown；app_done 覆盖主协程早退路径。
+     */
+    std::thread watcher([&] {
+        for (;;) {
+            std::shared_ptr<fw::CoApp> h;
+            {
+                std::lock_guard<std::mutex> lk(app_mtx);
+                h = app_handle;
+            }
+            if (h && g_stop.load(std::memory_order_acquire)) {
+                h->RequestShutdown();
+                return;
+            }
+            if (app_done.load(std::memory_order_acquire))
+                return;
             std::this_thread::sleep_for(std::chrono::milliseconds{20});
-        app.request_shutdown();
+        }
     });
 
-    std::printf("[svc_b] gateway service starting on 127.0.0.1:%u "
-                "(storage -> %s)\n", port, storage_ep.c_str());
-    std::fflush(stdout);
-    const int rc = app.run();
+    const int rc = rc_slot.get_future().get();
     g_stop.store(true, std::memory_order_release);
     watcher.join();
-    std::printf("[svc_b] run() returned %d, shutdown_state=%d\n",
-                rc, static_cast<int>(app.shutdown_state()));
+    std::printf("[svc_b] exit rc=%d\n", rc);
     std::fflush(stdout);
     return rc;
 }

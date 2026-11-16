@@ -5,7 +5,7 @@
 两个服务绑定同一个 App scope 的 `"pricing"` 实例，因此互相看到对方写入的
 状态——这不是两个服务各建一份副本。
 
-全部代码只用公开 v2 面，不启网络、不依赖 RPC/protobuf、不需要 Redis/Mongo：
+全部代码只用公开 `bbt::framework` 面，不启网络、不依赖 RPC/protobuf、不需要 Redis/Mongo：
 
 | 文件 | 作用 |
 |---|---|
@@ -26,7 +26,7 @@
    组件的 `s_constructed == 1` 与场景借用读到的 `catalog_items=1`、
    `cart_qty=2` 共同证明两个 subject 用的是同一个实例。
 3. **热拔插**：解绑两个 subject → `CoUninstallComponent` 卸载旧实例（`OnStop`
-   真实挂起 20ms，deadline 2s）→ 用同一逻辑名 `"pricing"` 装入 v2（单价
+   真实挂起 20ms，deadline 2s）→ 用同一逻辑名 `"pricing"` 装入第二个版本（单价
    1500）。旧 `ComponentHandle::Borrow()` 返回 `Closed`，重装后
    `FindComponent` 的 id/generation 变化，App 仍在 Running 时新组件直接
    Running；新实例状态是干净的（`catalog_items=0`），不继承旧状态。
@@ -36,9 +36,9 @@
    `ObserverToken` 在观察窗口内收到状态事件（含旧实例的 `Destroyed`），显式
    `Revoke()` 后 `IsActive()` 为 false 且不再派发新事件。
 6. **失败与收口**：第二个 App 装一个 `OnStart` 失败的组件。`CoStart` 返回
-   `InternalError` 且 App 诚实停在 Running；组件状态 `Failed`、`last_error`
-   相位 `start`，`App::LifecycleFailures()` 有对应记录。最后 `CoStop` 用有限
-   deadline 收口，`PendingCleanup()` 为空。
+   `InternalError` 且 App 置 `Running`（部分启动诚实反映，不回滚）；组件状态
+   `Failed`、`last_error` 相位 `start`，`App::LifecycleFailures()` 有对应记录。
+   最后 `CoStop` 用有限 deadline 收口，`PendingCleanup()` 为空。
 
 `node` 模式在**独立进程**里用同一个 `store.hpp` 装配自己的组件实例；驱动器
 并发启动两个进程（单价 700 / 1300），断言 PID 不同、各自总额只由本进程

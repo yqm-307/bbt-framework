@@ -1,7 +1,7 @@
 #pragma once
 /**
  * 有序调用票据（OrderedStamp）与调用选项（CallOptions，业务面）。
- * 票据由 OrderedSession 签发，ICoService 在调用时读取票据字段写入
+ * 票据由 OrderedSession 签发，受管服务在调用时读取票据字段写入
  * fw.* 系统元数据；本面不提供票据的创建入口。
  * OrderedStamp::State 持有 OrderedTicket（序号、request_id、发送绑定内容）。
  */
@@ -18,7 +18,7 @@
 
 namespace bbt::framework {
 
-class ICoService;
+class CoServiceBase;
 class OrderedSession;
 
 class OrderedStamp {
@@ -32,7 +32,7 @@ private:
     std::shared_ptr<State> state_;
     explicit OrderedStamp(std::shared_ptr<State> state) noexcept;
     friend class OrderedSession;
-    friend class ICoService;
+    friend class CoServiceBase;
 };
 
 struct CallOptions {
@@ -44,7 +44,7 @@ struct CallOptions {
  * —— 以下为内部实现细节；State 是 OrderedStamp 的私有成员类型，
  * 外部代码无法命名或构造，票据字段不可由业务修改。
  * State 持有 OrderedTicket，sequence、绑定请求内容经
- * OrderedSession/ICoService 友元读写；拷贝 OrderedStamp 共享同一
+ * OrderedSession/CoServiceBase 友元读写；拷贝 OrderedStamp 共享同一
  * 票据，保证重发语义作用于同一状态。
  */
 struct OrderedStamp::State {

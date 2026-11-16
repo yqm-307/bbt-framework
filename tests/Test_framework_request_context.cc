@@ -80,7 +80,8 @@ struct SpyHooks {
     fw::CallEgressHooks     hooks;
 
     SpyHooks() {
-        hooks.initiate_io = [this](const bbt::infra::CallOptions& o) {
+        hooks.initiate_io = [this](const bbt::infra::CallOptions& o)
+            -> bbt_co_async(fw::result<void>) {
             ++io_calls;
             last_io_options = o;
             return fw::result<void>::ok();
@@ -124,6 +125,48 @@ struct SchedulerFixture {
     }
 };
 
+/**
+ * 在受管协程内执行 fn（bbt_co_await 消费点要求协程上下文）：经
+ * g_scheduler 投递协程任务，宿主线程用限时 std::cv 等其完成。
+ */
+template <class F>
+bool RunInManagedCoroutine(F&& fn,
+    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
+        g_scheduler->Start();
+    }
+    struct Slot {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      error;
+    };
+    auto slot = std::make_shared<Slot>();
+    auto f = std::forward<F>(fn);
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [slot, f = std::move(f)]() mutable {
+            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            std::lock_guard<std::mutex> lk(slot->mtx);
+            slot->done = true;
+            slot->cv.notify_all();
+        }, submitted);
+    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+    std::unique_lock<std::mutex> lk(slot->mtx);
+    const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
+    if (!done)
+        std::terminate();
+    if (slot->error) std::rethrow_exception(slot->error);
+    return done;
+}
+
+#define CO_TEST_CASE(name) \
+    static void name##_body(); \
+    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+    static void name##_body()
+
 fw::OrderedGrant MakeGrant(const std::string& tag) {
     fw::OrderedGrant g;
     g.service        = "svc." + tag;
@@ -144,7 +187,7 @@ BOOST_AUTO_TEST_SUITE(framework_f1a)
 /**
  * 用例 1：缺省 deadline 继承父请求剩余预算；父预算变小后取到的值随之变小。
  */
-BOOST_AUTO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
+CO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
     SpyHooks spy;
     const auto d_far  = Clock::now() + std::chrono::seconds{60};
     const auto d_near = Clock::now() + std::chrono::seconds{5};
@@ -155,11 +198,11 @@ BOOST_AUTO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
      * deadline 缺省
      */
     fw::CallOptions opt;
-    auto r1 = fw::AdaptCallOptions(parent_far.get(), opt, spy.hooks);
+    auto r1 = bbt_co_await fw::AdaptCallOptions(parent_far.get(), opt, spy.hooks);
     BOOST_REQUIRE(r1);
     BOOST_CHECK(r1.value().deadline == d_far);
 
-    auto r2 = fw::AdaptCallOptions(parent_near.get(), opt, spy.hooks);
+    auto r2 = bbt_co_await fw::AdaptCallOptions(parent_near.get(), opt, spy.hooks);
     BOOST_REQUIRE(r2);
     BOOST_CHECK(r2.value().deadline == d_near);
     BOOST_CHECK(spy.io_calls == 2);
@@ -168,20 +211,20 @@ BOOST_AUTO_TEST_CASE(default_deadline_inherits_parent_remaining_budget) {
 /**
  * 用例 2：显式期限不得延长父预算（取最小值）；短于父预算则取显式值。
  */
-BOOST_AUTO_TEST_CASE(explicit_deadline_cannot_extend_parent_budget) {
+CO_TEST_CASE(explicit_deadline_cannot_extend_parent_budget) {
     SpyHooks spy;
     const auto parent_d = Clock::now() + std::chrono::seconds{10};
     auto parent = MakeCtx("p", parent_d);
 
     fw::CallOptions longer;
     longer.deadline = parent_d + std::chrono::seconds{50};
-    auto r1 = fw::AdaptCallOptions(parent.get(), longer, spy.hooks);
+    auto r1 = bbt_co_await fw::AdaptCallOptions(parent.get(), longer, spy.hooks);
     BOOST_REQUIRE(r1);
     BOOST_CHECK(r1.value().deadline == parent_d);
 
     fw::CallOptions shorter;
     shorter.deadline = parent_d - std::chrono::seconds{5};
-    auto r2 = fw::AdaptCallOptions(parent.get(), shorter, spy.hooks);
+    auto r2 = bbt_co_await fw::AdaptCallOptions(parent.get(), shorter, spy.hooks);
     BOOST_REQUIRE(r2);
     BOOST_CHECK(r2.value().deadline == *shorter.deadline);
 }
@@ -189,11 +232,11 @@ BOOST_AUTO_TEST_CASE(explicit_deadline_cannot_extend_parent_budget) {
 /**
  * 用例 3：顶层入口无有限期限 → 配置失败（明确错误，不是默认无限）。
  */
-BOOST_AUTO_TEST_CASE(top_level_requires_finite_deadline) {
+CO_TEST_CASE(top_level_requires_finite_deadline) {
     SpyHooks spy;
 
     fw::CallOptions none;
-    auto r1 = fw::AdaptCallOptions(nullptr, none, spy.hooks);
+    auto r1 = bbt_co_await fw::AdaptCallOptions(nullptr, none, spy.hooks);
     BOOST_REQUIRE(!r1);
     BOOST_CHECK(r1.error().code == fw::ErrorCode::InvalidArgument);
     BOOST_CHECK(spy.io_calls == 0);
@@ -204,7 +247,7 @@ BOOST_AUTO_TEST_CASE(top_level_requires_finite_deadline) {
      * 显式无限同样拒绝
      */
     inf.deadline = co::Deadline::max();
-    auto r2 = fw::AdaptCallOptions(nullptr, inf, spy.hooks);
+    auto r2 = bbt_co_await fw::AdaptCallOptions(nullptr, inf, spy.hooks);
     BOOST_REQUIRE(!r2);
     BOOST_CHECK(r2.error().code == fw::ErrorCode::InvalidArgument);
     BOOST_CHECK(spy.io_calls == 0);
@@ -213,11 +256,11 @@ BOOST_AUTO_TEST_CASE(top_level_requires_finite_deadline) {
 /**
  * 用例 4：已过期 → TimedOut，且下游 I/O 未发起、序号未消耗。
  */
-BOOST_AUTO_TEST_CASE(expired_returns_timedout_before_any_io) {
+CO_TEST_CASE(expired_returns_timedout_before_any_io) {
     SpyHooks spy;
     auto parent = MakeCtx("p", Clock::now() - std::chrono::milliseconds{1});
     fw::CallOptions opt;
-    auto r1 = fw::AdaptCallOptions(parent.get(), opt, spy.hooks);
+    auto r1 = bbt_co_await fw::AdaptCallOptions(parent.get(), opt, spy.hooks);
     BOOST_REQUIRE(!r1);
     BOOST_CHECK(r1.error().code == fw::ErrorCode::TimedOut);
     BOOST_CHECK(spy.io_calls == 0);
@@ -228,7 +271,7 @@ BOOST_AUTO_TEST_CASE(expired_returns_timedout_before_any_io) {
      */
     fw::CallOptions past;
     past.deadline = Clock::now() - std::chrono::milliseconds{1};
-    auto r2 = fw::AdaptCallOptions(nullptr, past, spy.hooks);
+    auto r2 = bbt_co_await fw::AdaptCallOptions(nullptr, past, spy.hooks);
     BOOST_REQUIRE(!r2);
     BOOST_CHECK(r2.error().code == fw::ErrorCode::TimedOut);
     BOOST_CHECK(spy.io_calls == 0);
@@ -329,7 +372,7 @@ BOOST_AUTO_TEST_CASE(layered_types_not_interchangeable) {
  * infra::CallOptions 只承载 deadline；出站装配成功路径验证 budget、
  * sequence 绑定和 I/O 注入。
  */
-BOOST_AUTO_TEST_CASE(success_path_consumes_sequence_and_initiates_io) {
+CO_TEST_CASE(success_path_consumes_sequence_and_initiates_io) {
     auto session_r = fw::OrderedSession::Open(MakeGrant("f1a9"));
     BOOST_REQUIRE(session_r);
     auto session = session_r.value();
@@ -351,7 +394,7 @@ BOOST_AUTO_TEST_CASE(success_path_consumes_sequence_and_initiates_io) {
     auto parent = MakeCtx("p", parent_d);
     fw::CallOptions opt;
     opt.ordered = stamp;
-    auto r = fw::AdaptCallOptions(parent.get(), opt, spy.hooks);
+    auto r = bbt_co_await fw::AdaptCallOptions(parent.get(), opt, spy.hooks);
     BOOST_REQUIRE(r);
     BOOST_CHECK(spy.seq_calls == 1);
     BOOST_CHECK(spy.io_calls == 1);

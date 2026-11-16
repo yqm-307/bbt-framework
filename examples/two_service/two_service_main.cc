@@ -1,14 +1,14 @@
 /**
- * bbt-framework Service→Service fixture（两个互异 identity 的真实 CoApp）。
+ * bbt-framework Service→Service fixture（两个互异 identity 的真实 CoApp 进程）。
  *
- * V2 会话拒绝 self-connection：同一 identity 的出站不得拨回自身。框架又约束
- * 进程内同一时刻至多一个活跃 CoApp。因此本 fixture 由驱动器启动两个进程：
+ * V2 会话拒绝 self-connection：同一 identity 的出站不得拨回自身；单个 CoApp 只持
+ * 一个 local_identity。因此本 fixture 由驱动器启动两个进程：
  *
  * caller 进程（local_identity=two-service-caller）
- * CoApp 宿主 getvalue::GetValueCallerService；其 handler 经公开
- * ICoService::call<Req,Resp> 按显式静态路由向 callee 进程发起真实 V2 Call
+ *   CoApp 宿主 getvalue::GetValueCallerService；其 handler 经受保护的
+ *   CoServiceBase::call<Req,Resp> 按显式静态路由向 callee 进程发起真实 V2 Call。
  * callee 进程（local_identity=two-service-callee）
- * CoApp 宿主 getvalue::GetValueService；入站经同一 V2 会话分发
+ *   CoApp 宿主 getvalue::GetValueService；入站经同一 V2 会话分发。
  *
  * 两个进程身份互异且都与驱动器客户端互异，不存在自环；调用只走「静态路由
  * 门 + 真实 TCP 会话」这一条公开路径。
@@ -17,18 +17,20 @@
  * （getvalue_service.hpp / getvalue_caller.hpp + getvalue.proto），不另造
  * schema、协议、错误信封或第二套 codec。
  *
- * 不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
+ * 装配口径与 getvalue 两进程一致：g_scheduler->Start() 后把
+ * Create → CoInstall* → CoStart → BoundEndpoint → CoWaitShutdownRequest → CoStop
+ * 投递进受管协程；不使用 internal/、Binder、CoAppSeam、MakeCoAppForTest、
  * DispatchInboundForTest、INetworkHost 桩或任何发送注入；不创建额外 io_thread
- * （只调用公开 CoApp::run / request_shutdown）。
+ * （stdin EOF → RequestShutdown 仅置位并唤醒 waiter，主协程亲自 CoStop 收口）。
  *
  * argv:
- * two_service callee <port_file> <meta_file> <journal_file>
- * two_service caller <port_file> <callee_ep> <meta_file> <journal_file>
- * 就绪：绑定成功后写 port_file（动态 loopback 端口）与 meta_file；
- * 关闭：stdin EOF → request_shutdown() → run() 返回后写 shutdown 记录并退出。
+ *   two_service callee <port_file> <meta_file> <journal_file>
+ *   two_service caller <port_file> <callee_ep> <meta_file> <journal_file>
+ * 就绪：CoStart 后经 BoundEndpoint 回读动态 loopback 端口写 port_file 与 meta_file；
+ * 关闭：stdin EOF → RequestShutdown → CoStop 收口后写 shutdown 记录并退出。
  *
  * 两个进程共同 append 同一 journal（O_APPEND 整行写入），驱动器据此核对
- * handler 计数与「handler 排空后资源同步 Close」的真实先后。
+ * handler 计数与「handler 排空后组件 OnStop 同步收口」的真实先后。
  *
  * 所有结构化结果标注 auth_state=unauthenticated_loopback。
  */
@@ -37,19 +39,20 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #include <unistd.h>
 
+#include <bbt/coroutine/coroutine.hpp>
+#include <bbt/coroutine/detail/Define.hpp>
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
 
 #include <bbt/framework/CoApp.hpp>
+#include <bbt/framework/Component.hpp>
 
 /**
  * caller 服务（公开面）
@@ -96,69 +99,79 @@ void AppendCalleeHandlerEntered(const std::string& request_id,
 }
 
 /**
- * 生命周期观测资源（公开 `add_resource<ICoCloseable>` 面）：只用于断言关闭
- * 序列在 handler 排空后**同步** Close 一次。不伪造任何后端。
+ * 生命周期观测组件（公开 `CoInstallComponent` 面）：旧 `add_resource<ICoCloseable>`
+ * 的对应物——OnStop 在 _StopImpl 中被调用，其时网络宿主已 StopAccepting 且入站
+ * handler 已排空，故可用于断言「关闭序列在 handler 排空后**同步**收口一次」。
+ * 不伪造任何后端。
  */
-class CloseJournal final : public inf::ICoCloseable {
+class CloseJournal final : public fw::CoComponent {
 public:
-    void Close() noexcept override {
-        bool first = false;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            first = !m_closed;
-            m_closed = true;
-        }
-        if (first)
-            Journal(std::string("event=resource_close auth_state=") + kAuthState);
-    }
-    bool IsClosed() const noexcept override {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        return m_closed;
-    }
+    struct Options {};
+
+    explicit CloseJournal(fw::detail::ConstructKey key, Options)
+        : fw::CoComponent(key) {}
+
+    /**
+     * OnStop 完成计数：宿主线程在退出码交付后读它写 owner_closed。
+     */
+    inline static std::atomic<int> s_stop_calls{0};
+
+protected:
+    ~CloseJournal() noexcept override = default;
 
 private:
-    mutable std::mutex m_mtx;
-    bool m_closed = false;
+    friend class bbt::framework::detail::Registry;
+
+protected:
+    fw::result<void> OnStop() override {
+        const int n = s_stop_calls.fetch_add(1) + 1;
+        if (n == 1)
+            Journal(std::string("event=resource_close auth_state=") + kAuthState);
+        return fw::result<void>::ok();
+    }
 };
 
-fw::ServiceOptions ConcurrentOpts() {
-    return fw::ServiceOptions{fw::ExecutionPolicy::Concurrent,
-                              /*max_inflight*/ 64,
-                              /*mailbox_capacity*/ 0, /*max_actors*/ 0,
-                              /*ordered_ingress*/ false,
-                              /*max_ordered_streams*/ 0,
-                              /*max_cached_results*/ 0,
-                              /*max_cached_result_bytes*/ 0};
-}
-
-fw::CoAppOptions BaseOptions(std::string identity) {
-    fw::CoAppOptions options;
-    options.network_limits = inf::NetworkLimits{
-        /*max_connections*/ 64, /*max_inflight*/ 64,
-        /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
-        /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    /**
-     * 内核分配动态 loopback 端口；就绪后由 bound_endpoint 回读。
-     */
-    options.listen = inf::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    /**
-     * V2 会话身份必填；caller/callee/驱动器三方互异。
-     */
-    options.local_identity = std::move(identity);
-    return options;
-}
-
-std::string BoundEndpointOrEmpty(fw::CoApp& app, int timeout_ms) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::string bound = app.bound_endpoint();
-        if (!bound.empty())
-            return bound;
-        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+const char* AppStateName(fw::AppState s) {
+    switch (s) {
+        case fw::AppState::Created:        return "Created";
+        case fw::AppState::Starting:       return "Starting";
+        case fw::AppState::Running:        return "Running";
+        case fw::AppState::Paused:         return "Paused";
+        case fw::AppState::Stopping:       return "Stopping";
+        case fw::AppState::StopIncomplete: return "StopIncomplete";
+        case fw::AppState::Stopped:        return "Stopped";
     }
-    return {};
+    return "Unknown";
+}
+
+fw::ServiceOptions ServiceOpts() {
+    return fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::Concurrent)
+        .SetMaxInflight(64);
+}
+
+fw::AppOptions BaseOptions(std::string identity) {
+    return fw::AppOptions{}
+        .SetLimits(64, 64, 64, 64)
+        .SetNetworkLimits(inf::NetworkLimits{
+            /*max_connections*/ 64, /*max_inflight*/ 64,
+            /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
+            /*incoming_timeout*/ std::chrono::milliseconds{30000}})
+        /**
+         * 内核分配动态 loopback 端口；就绪后由 BoundEndpoint 回读。
+         */
+        .Listen("127.0.0.1:0")
+        .SetShutdownBudget(std::chrono::milliseconds{3000})
+        .SetLifecycleBudget(std::chrono::milliseconds{3000})
+        /**
+         * V2 会话身份必填；caller/callee/驱动器三方互异。
+         */
+        .SetLocalIdentity(std::move(identity));
+}
+
+fw::LifecycleOptions DeadlineSec(int sec) {
+    return fw::LifecycleOptions{}.SetDeadline(
+        std::chrono::steady_clock::now() + std::chrono::seconds{sec});
 }
 
 void WriteTextFile(const std::string& path, const std::string& text,
@@ -187,48 +200,112 @@ std::string SchemaMeta(const std::string& local_identity) {
 }
 
 /**
- * 等待 stdin EOF 后优雅关闭。
+ * 装配结果跨协程/线程交接：与 getvalue 两进程同一口径。
+ * endpoint 经 promise 交给宿主线程写端口文件；App 指针发布后宿主线程只做
+ * RequestShutdown（幂等 noexcept，任意线程可调）；退出码经 promise 回传。
+ * rc 映射：0=按期优雅收口且 State()==Stopped，2=安装/启动失败，
+ * 4=Create 失败或收口未竟，5=宿主侧绑定超时。
  */
-void ServeUntilEof(fw::CoApp& app) {
+struct HostSlots {
+    std::promise<std::string>  bound_ep;
+    std::promise<int>          rc_slot;
+    std::shared_ptr<fw::CoApp> app_handle;
+    std::mutex                 app_mtx;
+};
+
+/**
+ * 宿主侧通用等待段：等 endpoint → 超时则触发关闭请求按 5 退出（协程侧已如实
+ * 写入启动相位退出码，promise 单次写入，宿主不二次写）；成功写 port/meta →
+ * 阻塞读 stdin EOF → RequestShutdown。返回 false 表示绑定超时。
+ */
+bool WaitBoundAndServe(HostSlots& slots, const std::string& port_file,
+                       const std::string& meta_file,
+                       const std::string& meta_text, const char* who) {
+    auto bound = slots.bound_ep.get_future();
+    if (bound.wait_for(std::chrono::seconds{10}) !=
+        std::future_status::ready) {
+        {
+            std::lock_guard<std::mutex> lk(slots.app_mtx);
+            if (slots.app_handle) slots.app_handle->RequestShutdown();
+        }
+        std::fprintf(stderr, "two_service %s did not bind\n", who);
+        return false;
+    }
+    const std::string endpoint = bound.get();
+    WriteTextFile(port_file, std::to_string(PortOf(endpoint)), "port");
+    WriteTextFile(meta_file, meta_text, "meta");
+    std::fprintf(stderr, "two_service %s up endpoint=%s\n", who,
+                 endpoint.c_str());
+
     char buf[8];
     while (::read(STDIN_FILENO, buf, sizeof(buf)) > 0) {
     }
-    app.request_shutdown();
+    /**
+     * stdin EOF：native 线程发关闭请求（仅置位并唤醒唯一 waiter；
+     * 主协程亲自 CoStop 收口）。
+     */
+    {
+        std::lock_guard<std::mutex> lk(slots.app_mtx);
+        if (slots.app_handle) slots.app_handle->RequestShutdown();
+    }
+    return true;
 }
 
 int RunCallee(const std::string& port_file, const std::string& meta_file) {
     getvalue::SetServedHook(&AppendCalleeHandlerEntered);
 
-    fw::CoApp app{BaseOptions(kCalleeIdentity)};
-    if (auto r = app.add_service<getvalue::GetValueService>(ConcurrentOpts()); !r) {
-        std::fprintf(stderr, "callee: add_service failed: %s\n",
-                     r.error().message.c_str());
+    HostSlots slots;
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [options = BaseOptions(kCalleeIdentity), &slots]() mutable {
+            auto app = fw::CoApp::Create(options, "two-service-callee");
+            if (!app) {
+                std::fprintf(stderr, "callee: CoApp::Create failed\n");
+                slots.rc_slot.set_value(4);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(slots.app_mtx);
+                slots.app_handle = app;
+            }
+            auto install = bbt_co_await app->CoInstallService<
+                getvalue::GetValueService>(ServiceOpts());
+            if (!install) {
+                std::fprintf(stderr, "callee: CoInstallService failed: %s\n",
+                             install.error().message.c_str());
+                slots.rc_slot.set_value(2);
+                return;
+            }
+            auto started = bbt_co_await app->CoStart(DeadlineSec(5));
+            if (!started) {
+                std::fprintf(stderr, "callee: CoStart failed: %s\n",
+                             started.error().message.c_str());
+                slots.rc_slot.set_value(2);
+                return;
+            }
+            slots.bound_ep.set_value(app->BoundEndpoint());
+            const auto waited = bbt_co_await app->CoWaitShutdownRequest();
+            (void)waited;
+            auto stopped = bbt_co_await app->CoStop(DeadlineSec(3));
+            slots.rc_slot.set_value(
+                stopped && app->State() == fw::AppState::Stopped ? 0 : 4);
+        },
+        submitted);
+    if (!submitted) {
+        std::fprintf(stderr, "callee: coroutine task rejected\n");
         return 4;
     }
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
-    const std::string bound = BoundEndpointOrEmpty(app, 10000);
-    if (bound.empty()) {
-        app.request_shutdown();
-        if (runner.joinable())
-            runner.join();
-        std::fprintf(stderr, "callee: bind did not become ready rc=%d\n", rc);
+    const std::string meta_text =
+        "process=callee\ncaller_service=" +
+        std::string(getvalue::GetValueCallerService::kServiceName) +
+        "\ncallee_service=" +
+        std::string(getvalue::GetValueCallerService::kCalleeService) + "\n" +
+        SchemaMeta(kCalleeIdentity);
+    if (!WaitBoundAndServe(slots, port_file, meta_file, meta_text, "callee"))
         return 5;
-    }
-    WriteTextFile(port_file, std::to_string(PortOf(bound)), "port");
-    WriteTextFile(meta_file,
-                  "process=callee\ncaller_service=" +
-                      std::string(getvalue::GetValueCallerService::kServiceName) +
-                      "\ncallee_service=" +
-                      std::string(getvalue::GetValueCallerService::kCalleeService) +
-                      "\n" + SchemaMeta(kCalleeIdentity),
-                  "meta");
-    std::fprintf(stderr, "two_service callee up endpoint=%s\n", bound.c_str());
 
-    ServeUntilEof(app);
-    if (runner.joinable())
-        runner.join();
+    const int rc = slots.rc_slot.get_future().get();
     Journal(std::string("event=callee_shutdown rc=") + std::to_string(rc) +
             " auth_state=" + kAuthState);
     return rc;
@@ -236,61 +313,97 @@ int RunCallee(const std::string& port_file, const std::string& meta_file) {
 
 int RunCaller(const std::string& port_file, const std::string& callee_ep,
               const std::string& meta_file) {
-    fw::CoAppOptions options = BaseOptions(kCallerIdentity);
+    fw::AppOptions options = BaseOptions(kCallerIdentity);
     /**
      * 唯一静态路由：callee 服务名 → callee 进程的显式 endpoint。未配置的目标
      * 一律 NotFound，不存在自动发现或进程内直连捷径。
      */
-    options.static_routes = {fw::StaticRoute{
-        std::string(getvalue::GetValueCallerService::kCalleeService), callee_ep}};
+    options.AddRoute(
+        std::string(getvalue::GetValueCallerService::kCalleeService),
+        callee_ep);
 
-    fw::CoApp app{std::move(options)};
-    if (auto r = app.add_service<getvalue::GetValueCallerService>(ConcurrentOpts());
-        !r) {
-        std::fprintf(stderr, "caller: add_service failed: %s\n",
-                     r.error().message.c_str());
+    HostSlots slots;
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [options = std::move(options), &slots]() mutable {
+            auto app = fw::CoApp::Create(options, "two-service-caller");
+            if (!app) {
+                std::fprintf(stderr, "caller: CoApp::Create failed\n");
+                slots.rc_slot.set_value(4);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(slots.app_mtx);
+                slots.app_handle = app;
+            }
+            auto install = bbt_co_await app->CoInstallService<
+                getvalue::GetValueCallerService>(ServiceOpts());
+            if (!install) {
+                std::fprintf(stderr, "caller: CoInstallService failed: %s\n",
+                             install.error().message.c_str());
+                slots.rc_slot.set_value(2);
+                return;
+            }
+            /**
+             * 关闭观测组件：旧 add_resource<CloseJournal> 的对应物；App scope、
+             * 不被服务绑定，只在 CoStop 收口相位同步 OnStop 一次。
+             */
+            auto comp = bbt_co_await app->CoInstallComponent<CloseJournal>(
+                "close-journal", CloseJournal::Options{});
+            if (!comp) {
+                std::fprintf(stderr, "caller: CoInstallComponent failed: %s\n",
+                             comp.error().message.c_str());
+                slots.rc_slot.set_value(2);
+                return;
+            }
+            auto started = bbt_co_await app->CoStart(DeadlineSec(5));
+            if (!started) {
+                std::fprintf(stderr, "caller: CoStart failed: %s\n",
+                             started.error().message.c_str());
+                slots.rc_slot.set_value(2);
+                return;
+            }
+            slots.bound_ep.set_value(app->BoundEndpoint());
+            const auto waited = bbt_co_await app->CoWaitShutdownRequest();
+            (void)waited;
+            auto stopped = bbt_co_await app->CoStop(DeadlineSec(3));
+            slots.rc_slot.set_value(
+                stopped && app->State() == fw::AppState::Stopped ? 0 : 4);
+        },
+        submitted);
+    if (!submitted) {
+        std::fprintf(stderr, "caller: coroutine task rejected\n");
         return 4;
     }
-    auto owner = std::make_shared<CloseJournal>();
-    if (auto r = app.add_resource<CloseJournal>(owner); !r) {
-        std::fprintf(stderr, "caller: add_resource failed: %s\n",
-                     r.error().message.c_str());
-        return 4;
-    }
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
-    const std::string bound = BoundEndpointOrEmpty(app, 10000);
-    if (bound.empty()) {
-        app.request_shutdown();
-        if (runner.joinable())
-            runner.join();
-        std::fprintf(stderr, "caller: bind did not become ready rc=%d\n", rc);
+    const std::string meta_text =
+        "process=caller\ncaller_service=" +
+        std::string(getvalue::GetValueCallerService::kServiceName) +
+        "\ncallee_service=" +
+        std::string(getvalue::GetValueCallerService::kCalleeService) +
+        "\nstatic_route=" +
+        std::string(getvalue::GetValueCallerService::kCalleeService) + "->" +
+        callee_ep + "\n" + SchemaMeta(kCallerIdentity);
+    if (!WaitBoundAndServe(slots, port_file, meta_file, meta_text, "caller"))
         return 5;
+
+    const int rc = slots.rc_slot.get_future().get();
+    /**
+     * State() 原子读、任意线程可调；owner_closed 读组件 OnStop 计数
+     * （happens-after：rc_slot 在 CoStop 返回后才写入）。
+     */
+    std::shared_ptr<fw::CoApp> app;
+    {
+        std::lock_guard<std::mutex> lk(slots.app_mtx);
+        app = slots.app_handle;
     }
-    WriteTextFile(port_file, std::to_string(PortOf(bound)), "port");
-    WriteTextFile(meta_file,
-                  "process=caller\ncaller_service=" +
-                      std::string(getvalue::GetValueCallerService::kServiceName) +
-                      "\ncallee_service=" +
-                      std::string(getvalue::GetValueCallerService::kCalleeService) +
-                      "\nstatic_route=" +
-                      std::string(getvalue::GetValueCallerService::kCalleeService) +
-                      "->" + callee_ep + "\n" + SchemaMeta(kCallerIdentity),
-                  "meta");
-    std::fprintf(stderr, "two_service caller up endpoint=%s callee=%s\n",
-                 bound.c_str(), callee_ep.c_str());
-
-    ServeUntilEof(app);
-    if (runner.joinable())
-        runner.join();
-
-    const int state = static_cast<int>(app.shutdown_state());
+    const char* state = app ? AppStateName(app->State()) : "Unknown";
+    const int owner_closed = CloseJournal::s_stop_calls.load() > 0 ? 1 : 0;
     Journal(std::string("event=shutdown rc=") + std::to_string(rc) +
-            " state=" + std::to_string(state) + " owner_closed=" +
-            (owner->IsClosed() ? "1" : "0") + " auth_state=" + kAuthState);
-    std::fprintf(stderr, "two_service caller rc=%d state=%d owner_closed=%d\n",
-                 rc, state, owner->IsClosed() ? 1 : 0);
+            " state=" + state + " owner_closed=" +
+            std::to_string(owner_closed) + " auth_state=" + kAuthState);
+    std::fprintf(stderr, "two_service caller rc=%d state=%s owner_closed=%d\n",
+                 rc, state, owner_closed);
     return rc;
 }
 
@@ -321,6 +434,12 @@ int main(int argc, char* argv[]) {
      */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
+
+    /**
+     * 普通 main + 协程入口：CoApp::Create 与全部 Co* 入口要求受管协程上下文，
+     * 先启动 runtime，再把宿主流程投递进受管协程。
+     */
+    g_scheduler->Start();
 
     if (mode == "callee")
         return RunCallee(port_file, argv[3]);

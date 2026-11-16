@@ -1,6 +1,6 @@
 # examples/component_services — 组件式服务：共享组件、热拔插、hook、observer。
 #
-# 只依赖 bbt::framework（v2 对象面）与标准库/线程；不需要 RPC/protobuf、
+# 只依赖 bbt::framework 与标准库/线程；不需要 RPC/protobuf、
 # Redis/Mongo 或任何外部服务。fixture 是普通 main + 受管协程，Python 标准库
 # 驱动器并发跑独立 node 进程并断言 journal，`examples.component_services`
 # 注册为 integration 测试。

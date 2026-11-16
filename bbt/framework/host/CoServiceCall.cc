@@ -1,5 +1,5 @@
 /**
- * ICoService::call 的机器面半身。
+ * CoServiceBase::call 的机器面半身。
  *
  * 公共头的 call<Reply> 模板只做编译期 codec 选择与请求编码；本文件
  * 承接类型擦除后的发送路径：受管校验、隐式请求上下文、envelope 组装、
@@ -8,17 +8,18 @@
  * 封包校验。成功返回回复 payload 字节，解码回公共头完成。
  */
 
-#include <bbt/framework/ICoService.hpp>
+#include <bbt/framework/internal/ServiceBase.hpp>
 
 #include <optional>
 #include <utility>
 
+#include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/RequestContext.hpp>
 #include <bbt/framework/internal/CallOptionsAdapter.hpp>
 
 namespace bbt::framework {
 
-result<std::vector<std::uint8_t>> ICoService::_CallSend(
+bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
     std::string_view service_name,
     std::string_view method_name,
     std::string_view request_schema,
@@ -29,12 +30,9 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
 {
     using Err = result<std::vector<std::uint8_t>>;
 
-    if (m_object_info.id == 0)
+    if (!m_send)
         return Err::err(MakeError(ErrorCode::RuntimeUnavailable,
             "call: service is not hosted by CoApp"));
-    /**
-     * 隐式上下文：从当前受管请求取得；非受管协程 → InvalidContext。
-     */
     auto ctx = CurrentRequestContext();
     if (!ctx)
         return Err::err(ctx.error());
@@ -90,8 +88,8 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
     if (m_send) {
         hooks.initiate_io =
             [this, &env, &reply_env](const bbt::infra::CallOptions& o)
-                -> result<void> {
-                auto r = m_send(env, o);
+                -> bbt_co_async(result<void>) {
+                auto r = bbt_co_await m_send(env, o);
                 if (!r)
                     return result<void>::err(std::move(r.error()));
                 reply_env = std::move(r.value());
@@ -117,7 +115,7 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
                 return ordered_session->BindForSend(stamp, c);
             };
     }
-    auto adapted = AdaptCallOptions(ctx.value().get(), options, hooks);
+    auto adapted = bbt_co_await AdaptCallOptions(ctx.value().get(), options, hooks);
     if (!adapted)
         return Err::err(std::move(adapted.error()));
     if (!reply_env.has_value())
@@ -136,6 +134,38 @@ result<std::vector<std::uint8_t>> ICoService::_CallSend(
         return Err::err(MakeError(ErrorCode::ProtocolError,
             "call: reply envelope mismatch"));
     return Err::ok(reply_env->Payload());
+}
+
+/**
+ * 非 typed 出站：业务已持有 CoRpcReq（位置参数或 FromProto 编码本体），
+ * schema 取 CoRpc 的通用位置参数声明——与 fw::Method 声明的方法表项一致；
+ * 与 typed 路径共用同一 _CallSend 机器面（受管校验/envelope/deadline/路由
+ * 门/回复校验），不再复制第二套发送逻辑。
+ */
+bbt_co_async(result<CoRpcResp>) CoServiceBase::call(
+    std::string_view service_name, std::string_view method_name,
+    const CoRpcReq& request, const RouteFields& custom,
+    const CallOptions& options)
+{
+    auto reply = bbt_co_await _CallSend(
+        service_name, method_name,
+        std::string(kCoRpcPositionalSchema),
+        std::string(kCoRpcPositionalSchema),
+        request.payload(), custom, options);
+    if (!reply)
+        return result<CoRpcResp>::err(std::move(reply.error()));
+    return result<CoRpcResp>::ok(
+        CoRpcResp::FromPayload(std::move(reply.value())));
+}
+
+std::string CoServiceBase::_NextRequestId() const {
+    /**
+     * 进程内单调序号：request_id 的非票据来源（有序调用用票据
+     * request_id）。对象 id 来自 Registry 身份句柄。
+     */
+    return "req-" + Handle().Id() + "-" +
+        std::to_string(
+            s_call_seq.fetch_add(1, std::memory_order_relaxed) + 1);
 }
 
 } // namespace bbt::framework

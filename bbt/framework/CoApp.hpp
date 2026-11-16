@@ -1,444 +1,515 @@
 #pragma once
-
 /**
- * @file CoApp.hpp
- * @brief 声明业务宿主装配根及其配置类型。
+ * 应用装配根（唯一公开宿主）：受管对象、绑定、生命周期与真实网络面。
+ * 所有 Co 入口在副作用前检查当前协程；只读快照和 RequestShutdown 可跨域调用。
+ * 网络装配：CoStart 校验网络配置后装配 InfraHttpHost + RPC admission +
+ * RpcEgress（V2 双向会话），服务方法表经 Registry 受管对象分发；未配置
+ * 监听则不装配网络宿主（纯受管对象面，分发/出站如实 RuntimeUnavailable）。
+ * 出站路由门：先查已装配动态路由表，再回退静态路由，两者皆无 → NotFound。
+ *
+ * CoApp 唯一创建路径是静态工厂 Create（内部经 coroutine MakeCoObject 真实
+ * creator/统计接管）；构造为 private，业务不能栈构造或直接 new。
+ * 关闭语义（简单 Close）：CoStop/CoUninstall* 直接收口——拒绝新操作，
+ * 在有限 deadline 内收口后在途责任（borrow/hook）至真实终态并销毁对象；
+ * deadline 耗尽保留 owner、返回诚实的不完整状态（StopIncomplete/
+ * UninstallIncomplete），允许再次以新的期限调用推进；框架不新增
+ * drain/receipt/多阶段协议，等待顺序与业务任务编排由用户控制。
  */
 
 #include <atomic>
-#include <chrono>
-#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
-#include <bbt/infra/ICoCloseable.hpp>
-#include <bbt/infra/NetworkTypes.hpp>
-#include <bbt/infra/rpc/Request.hpp>
-#include <bbt/infra/rpc/Response.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
+#include <bbt/coroutine/object/CoObject.hpp>
+#include <bbt/coroutine/object/CoRuntimeOnly.hpp>
 
-#include <bbt/framework/ExecutionPolicy.hpp>
-#include <bbt/framework/DynamicRouteTable.hpp>
-#include <bbt/framework/ICoService.hpp>
-#include <bbt/framework/OrderedTypes.hpp>
+#include <bbt/framework/Address.hpp>
+#include <bbt/framework/Object.hpp>
 #include <bbt/framework/Result.hpp>
-#include <bbt/framework/ServiceContext.hpp>
-#include <bbt/framework/ShutdownState.hpp>
+#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/internal/MethodTable.hpp>
+#include <bbt/framework/internal/Registry.hpp>
 
 namespace bbt::framework {
 
 class ActorRegistry;
-class HostLifecycle;
-class RpcEgress;
-class InboundDispatcher;
+class INetworkHost;
 class InfraHttpHost;
 class OrderedIngress;
-class INetworkHost;
-class RpcPolicy;
 struct AppRuntimeState;
-struct CoAppOptions;
-struct CoAppSeam;
 
 /**
- * 内部入口友元（internal/ 下声明）：测试缝构造与默认入站线桥安装。
+ * 内部入口友元（internal/ 下声明）：测试缝构造与测试侧入站分发观察口。
  */
-std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions options,
-                                        CoAppSeam seam);
-void InstallRpcAdmission(InfraHttpHost& host, CoApp& app);
-
-/** @brief 将服务名映射到显式配置的出站地址。 */
-struct StaticRoute {
-    std::string              service_name;
-    std::string address;
-};
+std::shared_ptr<CoApp> MakeCoAppForTest(AppOptions options, struct CoAppSeam seam);
+result<bbt::infra::rpc::Response> DispatchInboundForTest(
+    CoApp&, const bbt::infra::rpc::Request&);
 
 /**
- * @brief CoApp 默认宿主的网络、路由与关闭预算配置。
- *
- * 各配置项在 run() 启动组件前校验；静态路由为空时不允许出站目标。
+ * Registry 拥有业务对象；App self entry 与观察索引均不反向保活 App。
  */
-struct CoAppOptions {
-    bbt::infra::NetworkLimits network_limits;
-    bbt::infra::ListenAddress listen;
-    std::vector<StaticRoute>  static_routes;
-    std::chrono::milliseconds shutdown_step_budget;
+class CoApp : public bbt::coroutine::CoObject,
+              public bbt::coroutine::CoRuntimeOnly {
     /**
-     * 会话身份必填；trusted-network identity 不是认证凭据。
+     * 测试缝构造与测试侧入站分发观察口（internal/CoAppSeam.hpp）。
      */
-    std::string local_identity;
-    /**
-     * 策略在构造时提供；nullptr 使用默认策略。m_options 持有策略至 CoApp 析构。
-     */
-    std::shared_ptr<RpcPolicy> rpc_policy{};
-    /**
-     * 可选动态路由表：发现提供方（应用侧组件）发布快照，出站按逻辑服务名解析。
-     * 非空时其已配置的服务名优先于 static_routes，且不回退静态 endpoint。
-     */
-    std::shared_ptr<DynamicRouteTable> dynamic_routes{};
-};
-
-/**
- * @brief 业务宿主装配根（service-actor/v2）。
- *
- * 默认装配使用 InfraHttpHost + RPC admission + RpcEgress（V2 双向会话）；测试替换经 internal/CoAppSeam.hpp。
- *
- * 启动前校验：运行时配置与静态路由在 run 前校验；find_route 只认显式配置
- * 的静态路由与已装配动态路由表，不存在「自动连任意服务」。
- *
- * 生命周期约束：进程内同一时刻至多一个活跃 CoApp。通过单活跃宿主检查后，
- * 同一 CoApp 的 run() 只执行一次；若因已有活跃宿主被拒绝，该次调用不消耗实例的 run 次数。
- */
-class CoApp {
-    /**
-     * 测试缝构造仅经 internal MakeCoAppForTest 到达；默认入站线桥
-     * 经 InstallRpcAdmission 安装，两者均在 internal/ 下声明。
-     */
-    friend std::unique_ptr<CoApp> MakeCoAppForTest(CoAppOptions,
-                                                   CoAppSeam);
-    friend void InstallRpcAdmission(InfraHttpHost&, CoApp&);
-    /**
-     * 测试侧入站分发观察口（internal/CoAppSeam.hpp）：转发私有
-     * dispatch_inbound，不新增业务可见面。
-     */
+    friend std::shared_ptr<CoApp> MakeCoAppForTest(AppOptions, struct CoAppSeam);
     friend result<bbt::infra::rpc::Response> DispatchInboundForTest(
         CoApp&, const bbt::infra::rpc::Request&);
 
 public:
     /**
-     * @brief 从默认装配路径构造：宿主/出站/线桥全部由框架装配。
-     *
-     * 运行时配置全部字段须显式填写；启动前校验在 run() 入口执行，
-     * 不在构造期联网或建线程。
+     * @brief 唯一创建入口：经 coroutine MakeCoObject 接管真实 creator 与
+     *        created/destroyed 统计，返回强引用 owner。
+     * @pre 必须在受管协程上下文调用（CoRuntimeOnly 强约束，构造期即检查）。
+     * @param options 装配选项；AppOptions::Validate 在 Start 时强制校验。
+     * @param name 观测名（CoObjectInfo.name；默认 "app"）。
+     * @return shared_ptr<CoApp>（业务 owner 强引用边界）。
      */
-    explicit CoApp(CoAppOptions options);
+    static std::shared_ptr<CoApp> Create(AppOptions options,
+                                         std::string name = "app");
+
+    /**
+     * 只释放自身资源，不隐式执行生命周期 hook。
+     */
     ~CoApp();
 
     CoApp(const CoApp&) = delete;
     CoApp& operator=(const CoApp&) = delete;
 
     /**
-     * @brief 注册服务。
-     *
-     * @tparam T  继承 ICoService 且默认可构造的服务类型。
-     * @param options  服务配置，必须显式指定执行策略。
-     * @return 成功为 ok；ServiceOptions 非法/ActorSerial 无 key 提取器/
-     *         服务名为空或重复/注册窗口关闭 → err(InvalidArgument/Closed)。
-     *
-     * @note 失败不登记半成品；run 开始后调用返回 Closed。
+     * ---- Install/Uninstall ----
      */
-    template <class T>
-    result<void> add_service(ServiceOptions options) {
-        static_assert(std::is_base_of_v<ICoService, T>,
-            "CoApp::add_service: T must derive from ICoService");
-        static_assert(std::is_default_constructible_v<T>,
-            "CoApp::add_service: service type must be default constructible");
-
-        if (auto r = ValidateServiceOptions(options); !r)
-            return r;
-
-        RpcMethodTable table;
-        try {
-            table = BuildMethodTable<T>();
-        } catch (const std::invalid_argument& e) {
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                std::string("add_service: ") + e.what()));
-        } catch (const std::exception& e) {
-            return result<void>::err(MakeError(ErrorCode::InternalError,
-                std::string("add_service: method table failed: ") +
-                e.what()));
-        }
-        if (auto r = ValidateActorKeying(table, options.execution); !r)
-            return r;
-
-        /**
-         * 原型仅取服务名；构造期不得发起 I/O
-         */
-        T proto;
-        const std::string name{proto.co_service_name()};
-        if (name.empty())
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_service: empty service name"));
-
-        ServiceEntry entry;
-        entry.options = options;
-        entry.table   = std::move(table);
-        entry.factory = []() -> std::shared_ptr<ICoService> {
-            return std::static_pointer_cast<ICoService>(
-                std::make_shared<T>());
-        };
-
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_registration_open)
-            return result<void>::err(MakeError(ErrorCode::Closed,
-                "add_service: registration closed (run already started)"));
-        if (m_services.count(name) != 0)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_service: duplicate service '" + name + "'"));
-        m_services.emplace(name, std::move(entry));
-        return result<void>::ok();
-    }
+    /**
+     * @brief 安装受管组件（App/Service/Actor scope）。
+     * @tparam C 组件类型，必须继承 CoComponent、构造只接受 ConstructKey、
+     *         析构 protected/private（static_assert 强制）。
+     * @param name 组件逻辑名（同一 scope+owner+type 下唯一；空名 InvalidArgument）。
+     * @param options C::Options 构造参数（按值传递，装配期移交给受控构造）。
+     * @param placement 归属范围与 owner（Service/Actor scope 必须 SetOwner，
+     *        App scope 禁止显式 owner）。
+     * @param life 生命周期选项。
+     * @return 成功 ok；App 已 Stopped 返回 Closed，重名/placement 非法
+     *         InvalidArgument，构造异常 InternalError，OnInstall 失败原错误
+     *         透出且组件进入 InstallFailed（可 Find/卸载，不自动回滚）。
+     *         App 已 Running 时成功安装后继续 OnStart，失败组件进入 Failed。
+     */
+    template <class C>
+    bbt_co_async(result<void>) CoInstallComponent(
+        std::string name, typename C::Options options,
+        const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    /**
+     * @brief 卸载受管组件。
+     * @tparam C 组件类型。
+     * @param name 组件逻辑名。
+     * @param placement 归属范围与 owner。
+     * @param life 生命周期选项（收口期限）。
+     * @return 成功 ok；未找到 NotFound；仍有未解绑边或控制面操作进行中
+     *         Overloaded；收口（borrow 排空/OnStop）超时组件记
+     *         UninstallIncomplete 并记 LifecycleFailure，保留 owner 待
+     *         再次调用推进；OnStop 失败同样保留 owner 记 UninstallIncomplete。
+     */
+    template <class C>
+    bbt_co_async(result<void>) CoUninstallComponent(
+        std::string_view name, const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    /**
+     * @brief 安装服务。
+     * @tparam S 服务类型，必须继承 CoService\<...\>（CoServiceBase）、构造只接受
+     *         ConstructKey、析构 protected/private；须声明非空 kServiceName。
+     * @param options ServiceOptions（Validate 要求 max_inflight 有限正值）；
+     *        其中声明的 BindComponent 条目在安装时逐个展开绑定。
+     * @return 成功 ok；App 已 Stopped 返回 Closed，重名/缺 kServiceName
+     *         InvalidArgument；声明绑定失败原错误透出且已完成绑定被解绑；
+     *         OnInstall 失败服务进入 InstallFailed（已成功的绑定不自动解绑）。
+     *         App 已 Running 时成功后继续 OnStart，失败服务进入 Failed。
+     */
+    template <class S>
+    bbt_co_async(result<void>) CoInstallService(ServiceOptions options = {});
+    /**
+     * @brief 卸载服务。
+     * @tparam S 服务类型（以 kServiceName 定位）。
+     * @param life 生命周期选项（收口期限）。
+     * @return 成功 ok；未注册 NotFound。收口顺序：封该服务为 subject 的绑定
+     *         并等 borrow 排空 → OnStop → OnUninstall → 移除登记；
+     *         任一收口步超时/失败保留 owner 记 UninstallIncomplete。
+     */
+    template <class S>
+    bbt_co_async(result<void>) CoUninstallService(const LifecycleOptions& life = {});
+    /**
+     * @brief 登记 Actor 类型（不创建实例）。
+     * @tparam A Actor 类型，必须继承 CoActor 并声明非空 kActorType。
+     * @param options ActorOptions（Validate 要求三项额度有限正值）。
+     * @return 成功 ok；App 已 Stopped 返回 Closed，类型重复/缺 kActorType
+     *         InvalidArgument。实例创建经后续 CoCreateActor 切片。
+     */
+    template <class A>
+    bbt_co_async(result<void>) CoInstallActor(ActorOptions options = {});
+    /**
+     * @brief 卸载 Actor 类型。
+     * @tparam A Actor 类型。
+     * @return 成功 ok；类型未注册 NotFound；仍有存活实例 Overloaded。
+     */
+    template <class A>
+    bbt_co_async(result<void>) CoUninstallActor(const LifecycleOptions& life = {});
 
     /**
-     * @brief 装配无名默认资源客户端。
-     *
-     * @tparam R 资源类型。
-     * @param resource 非空资源指针；空指针返回 InvalidArgument。
-     * @return 成功为 ok；重复键/run 开始后 → InvalidArgument/Closed。
+     * ---- Find ----
      */
-    template <class R>
-    result<void> add_resource(std::shared_ptr<R> resource) {
-        return _AddResource<R>(kDefaultResourceName,
-            std::move(resource));
-    }
+    /**
+     * @brief 按服务名查非拥有句柄。
+     * @param service 服务名（kServiceName）。
+     * @return 成功 ObjectHandle；未注册 NotFound。
+     */
+    result<ObjectHandle> FindService(std::string_view service) const;
+    /**
+     * @brief 按 ActorId 查非拥有句柄。
+     * @param id (type, key)。
+     * @return 成功 ObjectHandle；未注册 NotFound。
+     */
+    result<ObjectHandle> FindActor(const ActorId& id) const;
+    /**
+     * @brief 按类型+名字+归属查组件句柄。
+     * @tparam C 组件类型。
+     * @param name 组件逻辑名。
+     * @param placement 归属范围与 owner。
+     * @return 成功 ObjectHandle；placement 非法 InvalidArgument，未找到 NotFound。
+     */
+    template <class C>
+    result<ObjectHandle> FindComponent(
+        std::string_view name, const ComponentOptions& placement = {}) const;
 
     /**
-     * @brief 装配命名资源客户端。
-     *
-     * @tparam R 资源类型。
-     * @param name 资源名，非空。
-     * @param resource 非空资源指针；空指针/空名/重复键 → InvalidArgument；
-     *                 run 开始后 → Closed。
+     * ---- Bind/Unbind ----
      */
-    template <class R>
-    result<void> add_resource(std::string_view name,
-                              std::shared_ptr<R> resource) {
-        if (name.empty())
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: empty resource name"));
-        return _AddResource<R>(name, std::move(resource));
-    }
+    /**
+     * @brief 把组件绑定给 subject 并发放类型化句柄。
+     * @tparam C 组件类型；subject 为 Service 时 C 必须在其声明集合内。
+     * @param subject 绑定发起方（Service/Actor/其他组件的 ObjectHandle；
+     *        必须属于本 App Registry，App handle 非法）。
+     * @param name 目标组件逻辑名。
+     * @param placement 目标组件归属。
+     * @param life 生命周期选项。
+     * @return 成功 ComponentHandle<C>（携带 binding generation）；subject
+     *         失效 NotFound，subject 属其他 Registry InvalidArgument，
+     *         类型未在 Service 声明集合内 InvalidArgument，目标未找到
+     *         NotFound，重复绑定 InvalidArgument，额度满 Overloaded，
+     *         目标封门 Closed。绑定成功后 subject 的 OnBindingChanged 在
+     *         Registry 锁外同步调用（subject owner 以 callback lease
+     *         保活整个锁外 hook），hook 抛异常只记 LifecycleFailure，
+     *         绑定不回滚。
+     */
+    template <class C>
+    bbt_co_async(result<ComponentHandle<C>>) CoBindComponent(
+        const ObjectHandle& subject, std::string_view name,
+        const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    /**
+     * @brief 解绑组件：封该绑定新 borrow 并等已有 borrow 排空。
+     * @return 成功 ok；目标/subject 未找到 NotFound，subject 属其他
+     *         Registry InvalidArgument；排空超时原错误透出并记
+     *         LifecycleFailure（retiring 边保留待再次调用收口）。
+     *         排空完成后锁外派发 bound=false 事件。
+     */
+    template <class C>
+    bbt_co_async(result<void>) CoUnbindComponent(
+        const ObjectHandle& subject, std::string_view name,
+        const ComponentOptions& placement = {},
+        const LifecycleOptions& life = {});
+    /**
+     * @brief 非拥有关系边（本切片未实现）。
+     * @return 恒 UnsupportedRoute。
+     */
+    bbt_co_async(result<void>) CoBindObject(const ObjectHandle& subject,
+                            const ObjectHandle& target);
+    /**
+     * @brief 解绑非拥有关系边（本切片未实现）。
+     * @return 恒 UnsupportedRoute。
+     */
+    bbt_co_async(result<void>) CoUnbindObject(const ObjectHandle& subject,
+                              const ObjectHandle& target);
 
     /**
-     * @brief 装配延迟工厂资源（在 Scheduler 启动后、绑定 Service 之前创建）。
-     *
-     * factory 须返回 `result<std::shared_ptr<R>>`；实例若暴露 `Start()` 且返回
-     * `result<void>` 则由框架调用一次；若继承 `ICoCloseable` 则由关闭序列统一
-     * Close()。任一资源创建/启动失败 → 启动失败回退，不留半装配资源。
-     *
-     * @param name     资源名，非空；空名/空工厂/重复键 → InvalidArgument；
-     *                 run 开始后 → Closed。
-     * @param factory  可调用对象，签名 `result<std::shared_ptr<R>>()`。
+     * @brief 订阅 target 的状态事件。
+     * @param observer 观察者对象句柄（卸载时其 token 自动撤销）。
+     * @param target 被观察对象句柄。两个句柄都必须属于本 App Registry。
+     * @param callback 事件回调（锁外执行，载荷为 owning ObjectStateEvent；
+     *        Revoke 后不再新派发，已派发的在途回调由 callback lease 排空）。
+     * @return 成功 ObserverToken（析构即 Revoke）；额度满/对象失效返回错误。
      */
-    template <class R, class F,
-              class = std::enable_if_t<
-                  std::is_invocable_r_v<result<std::shared_ptr<R>>, F>>>
-    result<void> add_resource(std::string_view name, F&& factory) {
-        if (name.empty())
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: empty resource name"));
-        return _AddResourceFactory<R>(name, std::forward<F>(factory));
-    }
+    bbt_co_async(result<ObserverToken>) CoObserve(const ObjectHandle& observer,
+                                  const ObjectHandle& target,
+                                  ObjectObserver callback);
 
     /**
-     * @brief 出站目标解析。
-     *
-     * 先查 CoAppOptions::dynamic_routes：该表已配置此服务名时只返回其解析
-     * 结果（空集合 NotFound / 陈旧 RuntimeUnavailable），不回退静态项——否则
-     * 已配置动态服务的全空状态会被静态地址掩盖。未配置时回退 static_routes；
-     * 两者都没有 → err(NotFound)。run 前后均可调用；出站分发必须经此门，
-     * 不允许绕过。
+     * @brief 本 App 在 Registry 中的非拥有句柄。
      */
-    result<std::string> find_route(
-        std::string_view service_name) const;
+    ObjectHandle Handle() const;
+
+    bbt_co_async(result<void>) CoWaitShutdownRequest(
+        const bbt::coroutine::WaitOptions& wait = {});
 
     /**
      * @brief 安装接收端有序流授权。
      *
-     * 仅允许在 run() 前调用；run 开始后返回 Closed。service 必须已注册
-     * 且启用 ordered_ingress，授权字段由调用方提供，不自动创建未知服务
-     * 或隐式放宽其他匹配条件。
+     * 仅允许在 CoStart 前调用；已启动后返回 Closed。service 必须已安装
+     * 且 ServiceOptions 启用有序入口，授权字段由调用方提供，不自动创建
+     * 未知服务或隐式放宽其他匹配条件。
      */
     result<void> grant_ordered_stream(OrderedGrant grant);
-
-    /**
-     * @brief 已托管实例观察口。
-     *
-     * Concurrent 服务返回启动期绑定的单实例；ActorSerial 服务返回
-     * err(InvalidArgument)（实例按 key 经 actor_registry() 激活）；
-     * 未注册名 → err(NotFound)；尚未 run/已关闭 → err(RuntimeUnavailable)。
-     */
-    result<std::shared_ptr<ICoService>> find_service(
-        std::string_view service_name) const;
-
-    /**
-     * @brief ActorSerial 实例注册表（分发/测试观察用）；未启动 → nullptr。
-     */
-    ActorRegistry* actor_registry() const noexcept;
-
-    /**
-     * @brief 控制线程入口：启动 → 等待关闭请求 → 收束 → 返回。
-     *
-     * 返回码即 internal::HostLifecycle::kExit*。进程内同一时刻至多一个
-     * 活跃 CoApp；通过该检查后，同一 CoApp 仅允许一次 run()，违反时返回
-     * kExitRejected。因已有活跃宿主而被拒绝的调用不消耗此次数。
-     */
-    int run();
-
-    /**
-     * @brief 请求关闭：幂等、noexcept，任意线程可调用。
-     *
-     * 早于 run 的调用会让 run 完成启动后立即进入关闭序列。
-     */
-    void request_shutdown() noexcept;
-
-    /**
-     * @brief 当前关闭状态。
-     *
-     * 尚未运行时为 Running；提前请求关闭后为 Closing。
-     * run 生命周期已进入后，在关闭期间反映生命周期状态（可能为 ShutdownIncomplete）；
-     * 正常关闭或 HostLifecycle 启动失败完成后为 Closed。run 前配置校验拒绝时，
-     * lifecycle 尚未建立，状态保持此前的 Running 或提前请求后的 Closing。
-     */
-    ShutdownState shutdown_state() const noexcept;
-
-    /**
-     * @brief 收尾未完成项观测（转发自生命周期状态机）。
-     */
-    std::vector<std::string> pending_cleanup() const;
-    /**
-     * @brief 启动/关闭阶段失败项观测（转发自生命周期状态机）。
-     */
-    std::vector<std::string> lifecycle_failures() const;
 
     /**
      * @brief 默认宿主的实际绑定接入点（"host:port"）。
      *
      * 仅默认装配路径有值；未监听/测试缝 → 空串。
      */
-    std::string bound_endpoint() const;
+    std::string BoundEndpoint() const;
+
+    /**
+     * ---- 生命周期 ----
+     */
+    /**
+     * @brief 启动：组件按依赖拓扑 OnStart，再 Service 按安装顺序 OnStart。
+     * @param life 生命周期选项；本步所有 hook 共享同一有限 deadline。
+     * @return 全部成功 ok；已 Stopped/StopIncomplete 返回 Closed，非
+     *         Created/Paused 返回 Overloaded；协程上下文调用返回
+     *         InvalidContext。首个 hook 失败原错误透出、该对象记 Failed，
+     *         App 仍置 Running（部分启动诚实反映）。
+     */
+    /**
+     * @brief 暂停：对 Running 服务逐个 OnPause（受管协程）。
+     * @return 全部成功 ok；非 Running 返回 InvalidArgument；协程上下文
+     *         InvalidContext；首个失败即停止并透出错误，其后服务不再暂停，
+     *         该服务记 Failed。
+     */
+    /**
+     * @brief 恢复：对 Paused 服务逐个 OnResume（受管协程）。
+     * @return 全部成功 ok；非 Paused 返回 InvalidArgument；协程上下文
+     *         InvalidContext；首个失败即停止并透出错误，其后服务不再恢复，
+     *         该服务记 Failed。
+     */
+    /**
+     * @brief 停止（简单 Close）：拒新后逆序收口 Service → Actor → scoped
+     *        Component → App Component；每个对象先排空 borrow 再 OnStop。
+     *        各分支独立推进，失败记 LifecycleFailure 并继续。
+     * @return ok（收口未竟时 App 置 StopIncomplete，经 PendingCleanup 观察，
+     *        允许再次 CoStop 以更晚期限推进）。协程上下文 InvalidContext。
+     *        Stop 后不能 Start；框架内不新增 drain/receipt/多阶段协议，
+     *        等待顺序与业务任务编排由用户控制。
+     */
+    /**
+     * @brief 受管协程启动入口：与 Start 相同语义，在当前受管协程内执行。
+     * @pre 必须在受管协程上下文调用；宿主/非协程上下文返回 InvalidContext。
+     *      本 App hook 执行中的协程再调同对象生命周期入口同样
+     *      InvalidContext（自等待）。
+     */
+    bbt_co_async(result<void>) CoStart(const LifecycleOptions& life = {});
+    /**
+     * @brief 受管协程暂停入口（语义同 Pause；上下文约束同 CoStart）。
+     */
+    bbt_co_async(result<void>) CoPause(const LifecycleOptions& life = {});
+    /**
+     * @brief 受管协程恢复入口（语义同 Resume；上下文约束同 CoStart）。
+     */
+    bbt_co_async(result<void>) CoResume(const LifecycleOptions& life = {});
+    /**
+     * @brief 受管协程停止入口（语义同 Stop；上下文约束同 CoStart）。
+     */
+    bbt_co_async(result<void>) CoStop(const LifecycleOptions& life = {});
+    /**
+     * @brief 外部线程请求关闭（幂等、noexcept；唤醒 shutdown 等待，不执行 Stop）。
+     */
+    void RequestShutdown() noexcept;
+    /**
+     * @brief App 当前状态。
+     */
+    AppState State() const noexcept { return m_state.load(); }
+
+    /**
+     * @brief 收口未完成项快照（bounded ring）。
+     */
+    std::vector<CleanupInfo> PendingCleanup() const;
+    /**
+     * @brief 生命周期失败记录快照（bounded ring）。
+     */
+    std::vector<LifecycleFailure> LifecycleFailures() const;
+
+    /**
+     * @brief 测试观察口（非稳定 API）：供本仓单测断言内部簿记。
+     */
+    std::shared_ptr<detail::Registry> RegistryForTest() const {
+        return m_registry;
+    }
 
 private:
-    struct ServiceEntry {
-        ServiceOptions options;
-        RpcMethodTable table;
-        std::function<std::shared_ptr<ICoService>()> factory;
-        std::shared_ptr<OrderedIngress> ordered_ingress;
-    };
-
     /**
-     * 资源装配记录：登记期建立，运行期只读（关闭序列消费 closeable）。
-     * factory 为空表示 shared_ptr 预创建入口；instance 始终持有已装配实例
-     * （预创建即登记时填入，工厂入口在启动成功后填入），供关闭序列与
-     * ShutdownIncomplete 期间强持有。
+     * @brief 受控构造：仅 Create 工厂可调用（private + friend 自身静态成员）。
      */
-    struct ResourceSpec {
-        std::function<result<std::shared_ptr<void>>()> factory;
-        /**
-         * 类型擦除的 Start 调用（仅当 R 提供 result<void> Start()）；
-         * 与类型擦除的 ICoCloseable 视图（仅当 R 继承 ICoCloseable）。
-         */
-        std::function<result<void>(const std::shared_ptr<void>&)> start;
-        std::function<std::shared_ptr<bbt::infra::ICoCloseable>(
-            const std::shared_ptr<void>&)>                      as_closeable;
-        std::shared_ptr<void>                                 instance;
-        /**
-         * 关闭序列幂等标记
-         */
-        bool closed{false};
-    };
-    using ResourceSpecMap = std::unordered_map<ResourceKey, ResourceSpec,
-                                               ResourceKeyHash>;
-
-    /**
-     * 检测 R 是否提供 result<void> R::Start()（资源可选启动口）。
-     */
-    template <class R, class = void>
-    struct HasResourceStart : std::false_type {};
-    template <class R>
-    struct HasResourceStart<R,
-        std::void_t<decltype(std::declval<R*>()->Start())>>
-        : std::is_same<decltype(std::declval<R*>()->Start()), result<void>> {};
-
-    template <class R>
-    static ResourceSpec _MakeSpec() {
-        ResourceSpec spec;
-        if constexpr (HasResourceStart<R>::value) {
-            spec.start = [](const std::shared_ptr<void>& p) -> result<void> {
-                return std::static_pointer_cast<R>(p)->Start();
-            };
-        }
-        if constexpr (std::is_base_of_v<bbt::infra::ICoCloseable, R>) {
-            spec.as_closeable =
-                [](const std::shared_ptr<void>& p)
-                    -> std::shared_ptr<bbt::infra::ICoCloseable> {
-                return std::static_pointer_cast<bbt::infra::ICoCloseable>(
-                    std::static_pointer_cast<R>(p));
-            };
-        }
-        return spec;
-    }
-
-    template <class R>
-    result<void> _AddResource(std::string_view name,
-                              std::shared_ptr<R> resource) {
-        if (!resource)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: null resource"));
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_registration_open)
-            return result<void>::err(MakeError(ErrorCode::Closed,
-                "add_resource: registration closed (run already started)"));
-        ResourceKey key{detail::ResourceTypeId<R>(), std::string{name}};
-        ResourceSpec spec = _MakeSpec<R>();
-        spec.instance = std::move(resource);
-        const std::shared_ptr<void> inst = spec.instance;
-        if (!m_resource_specs.emplace(key, std::move(spec)).second)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: duplicate resource key"));
-        /**
-         * 预创建实例立即可见：m_resources 是 service 的实例视图。
-         */
-        m_resources->emplace(std::move(key), std::move(inst));
-        return result<void>::ok();
-    }
-
-    template <class R, class F>
-    result<void> _AddResourceFactory(std::string_view name, F&& factory) {
-        /**
-         * 归一成 std::function 再判空：lambda 等 callable 无 operator!，
-         * std::function 的显式 bool 转换才表达「空工厂」。
-         */
-        std::function<result<std::shared_ptr<R>>()> fn =
-            std::forward<F>(factory);
-        if (!fn)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: null factory"));
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_registration_open)
-            return result<void>::err(MakeError(ErrorCode::Closed,
-                "add_resource: registration closed (run already started)"));
-        ResourceKey key{detail::ResourceTypeId<R>(), std::string{name}};
-        ResourceSpec spec = _MakeSpec<R>();
-        spec.factory =
-            [f = std::move(fn)]() mutable
-                -> result<std::shared_ptr<void>> {
-                auto r = f();
-                if (!r)
-                    return result<std::shared_ptr<void>>::err(
-                        std::move(r.error()));
-                return result<std::shared_ptr<void>>::ok(
-                    std::shared_ptr<void>(std::move(r.value())));
-            };
-        if (!m_resource_specs.emplace(std::move(key), std::move(spec)).second)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "add_resource: duplicate resource key"));
-        return result<void>::ok();
-    }
-
+    explicit CoApp(AppOptions options);
     /**
      * 测试缝构造：显式注入宿主与出站发送；仅 MakeCoAppForTest 可达。
      */
-    CoApp(CoAppOptions options, CoAppSeam seam);
+    CoApp(AppOptions options, struct CoAppSeam seam);
+    /**
+     * @brief shared_ptr 本体的删除同样只经 Create 返回的 owner（不开放 new/delete）。
+     */
+    friend struct std::default_delete<CoApp>;
 
+    /**
+     * Service/Component 共用执行体，仅在 App.cc 实例化；hook 成员指针保留类型。
+     * 调度器执行的 hook 由任务持有 owner，调用方用 CoWaiter 挂起等待。
+     */
+    template <class T>
+    result<void> _RunHookCo(
+        const ObjectId& id, result<void> (T::*hook)(),
+        const char* phase, bbt::coroutine::Deadline deadline);
+    /**
+     * 安装/卸载 hook 在已通过门禁的调用协程内、Registry 锁外执行。
+     */
+    template <class T>
+    result<void> _RunHook(
+        const ObjectId& id, result<void> (T::*hook)(),
+        const char* phase);
+    template <class T>
+    void _RunVoidHook(
+        const ObjectId& id, void (T::*hook)(),
+        const char* phase) noexcept;
+    result<void> _RunActorCreate(const ObjectId& id);
+    void         _RunActorDestroy(const ObjectId& id) noexcept;
+    /**
+     * OnStop 执行 + 前序 hook 在途检查。成功 ok；失败/前序未达真实终态时
+     * 经 `abort` 记录并完成收口失败收尾（abort 已带 EndOp 与状态转换）。
+     * `abort` 由调用方给出，用于区分「返回错误」与「void 收口路径仅记录」
+     * 两种退出形态。
+     */
+    template <class T, class Abort>
+    result<void> _EnsureHookSettled(
+        const ObjectId& id, result<void> (T::*hook)(),
+        const char* op_name, bbt::coroutine::Deadline deadline,
+        Abort&& abort);
+    /**
+     * 对象收口尾部：撤销其签发的 observer token、FinishDestroy 移除登记、
+     * 排空 inactive observer lease、锁外派发事件并归还 owner。
+     * `on_entry`（可空）在持锁且条目存在时执行服务侧清理。
+     */
+    void _FinishObject(
+        const ObjectId& id,
+        const std::function<void(detail::RegistryEntry&)>& on_entry = {});
+    /**
+     * OnBindingChanged 锁外派发：subject 经 owner lease 保活（并发卸载不能
+     * 先于本调用销毁对象），异常只记 LifecycleFailure——绑定/解绑不回滚。
+     */
+    void _NotifyBindingChanged(ObjectKind kind, void* subj,
+                               const BindingEvent& be, const char* op);
+
+    /**
+     * Install/Uninstall 的类型擦除执行体。
+     */
+    result<void> _InstallComponentImpl(
+        const std::type_info& ctype, std::string name,
+        const ComponentOptions& placement, const LifecycleOptions& life,
+        std::function<CoComponent*(detail::ConstructKey)> make,
+        std::function<void(CoComponent*)> destroy);
+    result<void> _UninstallComponentImpl(
+        const std::type_info& ctype, std::string_view name,
+        const ComponentOptions& placement, const LifecycleOptions& life);
+
+    result<void> _InstallServiceImpl(
+        const std::type_info& stype, std::string service_name,
+        const ServiceOptions& options,
+        std::function<CoServiceBase*(detail::ConstructKey)> make,
+        std::function<void(CoServiceBase*)> destroy,
+        const std::vector<detail::ComponentBindingDecl>& decls);
+    result<void> _UninstallServiceImpl(std::string_view type_name,
+                                       const LifecycleOptions& life);
+
+    result<void> _InstallActorTypeImpl(
+        const std::type_info& atype, std::string actor_type,
+        const ActorOptions& options,
+        std::function<CoActor*(detail::ConstructKey)> make,
+        std::function<void(CoActor*)> destroy);
+    result<void> _UninstallActorTypeImpl(std::string_view actor_type,
+                                         const LifecycleOptions& life);
+
+    result<std::pair<ObjectHandle, std::uint64_t>> _BindComponentImpl(
+        const std::type_info& ctype, const ObjectHandle& subject,
+        std::string_view name, const ComponentOptions& placement,
+        const LifecycleOptions& life);
+    result<void> _UnbindComponentImpl(
+        const std::type_info& ctype, const ObjectHandle& subject,
+        std::string_view name, const ComponentOptions& placement,
+        const LifecycleOptions& life);
+    result<ObjectHandle> _FindComponentImpl(
+        const std::type_info& ctype, std::string_view name,
+        const ComponentOptions& placement) const;
+
+    /**
+     * Service 声明绑定：按 decls 逐个 CoBindComponent(subject=service)；
+     * 任一失败把本服务已完成的绑定解绑（契约：必需依赖缺失 → NotFound/
+     * 原错误，不虚报事务回滚——已解绑动作本身完成并记录）。
+     */
+    result<void> _ApplyServiceBindings(
+        const ObjectHandle& service_handle,
+        const std::vector<detail::ComponentBindingDecl>& decls,
+        const LifecycleOptions& life);
+
+    /**
+     * 生命周期转换体：仅由已通过门禁的 Co 入口调用。
+     */
+    result<void> _StartImpl(const LifecycleOptions& life);
+    /**
+     * 启动失败回退：对已启动对象（组件/服务）按逆序执行完整收口
+     * （borrow 排空 → OnStop → OnUninstall → 销毁），不销毁失败对象与
+     * 未启动对象；各步独立推进，失败只记 LifecycleFailure 不中断回退。
+     */
+    void _RollbackStart(const std::vector<ObjectId>& started,
+                        bbt::coroutine::Deadline deadline) noexcept;
+    result<void> _PauseImpl(const LifecycleOptions& life);
+    result<void> _ResumeImpl(const LifecycleOptions& life);
+    result<void> _StopImpl(const LifecycleOptions& life);
+
+    /**
+     * ---- 网络面（装配/收口，机器面实现见 host/CoApp.cc）----
+     */
+    /**
+     * run 前校验的对应物：listen/限额/身份/静态路由在启动网络宿主前校验，
+     * 任何失败都在启动任何组件回退之前返回。
+     */
+    result<void> _ValidateNetworkConfig() const;
+    /**
+     * 出站发送注入点（CoServiceBase::RpcSendFn 的供给者）：回调复制
+     * AppRuntimeState 的 shared_ptr——不捕获 this、不借用 CoApp 成员；
+     * 路由门/策略/发送实现全部在状态内。真实出站可挂起当前协程。
+     */
+    CoServiceBase::RpcSendFn _MakeEgress();
+    /**
+     * 把出站注入点绑定到指定服务对象（安装路径与运行期补装共用）。
+     */
+    void _BindEgressToService(const std::string& service_name);
+    /**
+     * 启动期网络绑定：按 Registry 服务对象构建分发表项（含有序入口装配与
+     * 授权流应用）、Publish 运行时状态、宿主 Create/Start。任一步失败由
+     * 调用方按启动失败回退（已发布状态先撤销接纳）。宿主 Create/Start 经
+     * native 辅助线程执行（infra rpc 服务器 Start 要求 native host
+     * context），deadline 由调用方给出。
+     */
+    result<void> _StartNetworkPhase(bbt::coroutine::Deadline deadline);
+    /**
+     * 收口期网络步骤：StopAccepting → 在 native 辅助线程等宿主排空
+     * （协程路径不经 std::cv 阻塞 worker），排空被证实返回 ok；预算耗尽
+     * 或宿主 Close 打断都表示「排空未被证实」，如实透出错误。
+     */
+    result<void> _DrainNetwork(bbt::coroutine::Deadline deadline);
     /**
      * 入站分发入口（机器面）：由入站线桥（InstallRpcAdmission）在
      * 受管协程内调用；未启动/已收束 → err(RuntimeUnavailable)。
@@ -448,72 +519,280 @@ private:
         const bbt::infra::rpc::Request& request);
 
     /**
-     * run 前校验，不启动任何组件
+     * 上下文校验：Co 入口在非协程上下文 /
+     * 生命周期 hook 执行中同协程再调生命周期入口 → InvalidContext。
      */
-    result<void> _ValidateConfig() const;
-    /**
-     * Scheduler::Start 后建立对象身份
-     */
-    result<void> _BindServices();
-    /**
-     * on_scheduler_started 相位内先 _StartResources
-     * （factory Create→Start→登记实例视图）再 _BindServices；关闭序列在
-     * handler 排空后（on_handlers_drained）与回退路径（on_release）统一
-     * 经 _CloseResources 同步收束。两者幂等（ResourceSpec::closed）。
-     */
-    result<void> _StartResources();
-    void         _CloseResources() noexcept;
-    void         _ReleaseServices() noexcept;
-    /**
-     * find_route 路由门 + 出站实现（ICoService::RpcSendFn 是
-     * ICoService 的私有别名；CoApp 经友元命名）。
-     */
-    ICoService::RpcSendFn _MakeEgress();
+    result<void> _CheckCoContext() const;
 
-    const CoAppOptions              m_options;
-    std::shared_ptr<INetworkHost>   m_network_host;
+    /**
+     * Stop 逆序收口：Service → Actor 实例 → scoped Component → App
+     * Component（后两者按依赖逆拓扑）。各分支独立推进，失败记
+     * LifecycleFailure 并继续。
+     */
+    void _StopAll(bbt::coroutine::Deadline deadline);
+    void _DestroyService(const ObjectId& id,
+                         bbt::coroutine::Deadline deadline);
+    void _DestroyComponent(const ObjectId& id,
+                           bbt::coroutine::Deadline deadline);
+    void _DestroyActor(const ObjectId& id);
+    /**
+     * 收口步失败统一出口：记 LifecycleFailure、标 incomplete 态、EndOp。
+     */
+    void _AbortDestroy(const ObjectId& id, const char* operation,
+                       const char* phase, const Error& err,
+                       ObjectState incomplete_state) noexcept;
+
+    result<void> _RegisterAppObject();
+    /**
+     * owner 校验：句柄必须属于本 Registry；Service scope 的 owner 必须是
+     * Service；Actor scope 的 owner 必须是已创建 actor 实例；App scope
+     * 不允许显式 owner。
+     */
+    result<void> _ValidateOwner(const ComponentOptions& placement,
+                                ObjectId* out_owner_id);
+    /**
+     * 组件→组件依赖环检查（锁内）：subject 是 CoComponent 时，加入
+     * (subject → target) 边不得成环。返回 true 表示成环。
+     */
+    bool _WouldFormCycleLocked(const ObjectId& subject_id,
+                               const ObjectId& target_id) const;
+
+    const AppOptions                  m_options;
+    std::shared_ptr<detail::Registry> m_registry;
+    std::atomic<AppState>             m_state{AppState::Created};
+
+    /**
+     * ---- 网络面（构造期装配，CoStart 期启动，CoStop 期收口）----
+     * 运行期持有的受管对象放进 m_state（AppRuntimeState）：入站 handler
+     * 闭包与出站回调复制该 shared_ptr，不借用本对象成员、不捕获 this。
+     * ShutdownIncomplete/StopIncomplete 期间仍由 m_state 强持有出站依赖。
+     */
+    mutable std::mutex                m_net_mtx;
+    std::shared_ptr<INetworkHost>     m_network_host;
     /**
      * 默认装配路径的具体宿主（弱持有观察；生命周期归 m_network_host）。
      * 测试缝注入路径为空。
      */
-    std::shared_ptr<InfraHttpHost>  m_default_host;
+    std::shared_ptr<InfraHttpHost>    m_default_host;
+    /**
+     * 测试缝注入路径标记：缝宿主不要求显式 listen（桩宿主自证）。
+     */
+    bool                              m_seam_host{false};
+    std::shared_ptr<AppRuntimeState>  m_runtime;
+    /**
+     * 服务网络簿记：方法表与安装选项（安装期写入；CoStart 构建
+     * 分发表项；grant 校验消费）。与 Registry 登记一致以服务名为键。
+     */
+    struct ServiceRecord {
+        ServiceOptions options;
+        RpcMethodTable table;
+        std::shared_ptr<OrderedIngress> ordered_ingress;
+    };
+    std::map<std::string, ServiceRecord> m_service_records;
+    std::vector<OrderedGrant>            m_pending_ordered_grants;
+    bool                                 m_network_published{false};
+    std::atomic_bool                  m_shutdown_req{false};
+    std::atomic_bool                  m_lifecycle_active{false};
+    ObjectHandle                      m_self;
+    bool                              m_app_entry_registered = false;
 
-    mutable std::mutex              m_mtx;
-    std::map<std::string, ServiceEntry>   m_services;
-    std::map<std::string, std::string> m_routes;
-    std::shared_ptr<ResourceMap>    m_resources{
-        std::make_shared<ResourceMap>()};
     /**
-     * 资源装配记录表（登记期写入，启动期消费 factory、关闭期消费
-     * closeable/instance/closed）；与 m_resources 同受 m_mtx 保护。
+     * 请求只置持久 flag 并通知单一 Co waiter，不执行 Stop。
      */
-    ResourceSpecMap                 m_resource_specs;
-    bool                            m_registration_open{true};
+    std::mutex                        m_run_mtx;
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> m_shutdown_waiter;
 
     /**
-     * 运行期持有的受管对象放进 m_state（AppRuntimeState）：入站 handler
-     * 闭包与出站回调复制该 shared_ptr，不借用本对象成员、不捕获 this。
-     * ShutdownIncomplete 期间仍由 m_state 强持有。
+     * 生命周期 hook 当前执行协程 id（0=无）：hook 内同协程再调生命周期
+     * 入口据此判自等待 → InvalidContext。非协程上下文恒 0。
      */
-    std::shared_ptr<AppRuntimeState> m_state;
-
-    std::atomic_bool                m_ran_once{false};
-    std::atomic_bool                m_shutdown_req{false};
-    /**
-     * run 内局部生命周期对象的地址发布点。发布/读取/清空共用 m_lifecycle_mtx：
-     * 读取者在锁内完成「取指针 + 成员访问」，run 线程在同一把锁内清空指针，
-     * 故清空（以及随后的局部对象析构）必然排在任何读取者退出访问之后——
-     * 裸原子指针只保证指针值可见，不能 pin 住 run 栈上局部对象的寿命，读取者
-     * 可能进入已析构对象（CondVar destroy vs broadcast）。锁不跨阻塞的
-     * lifecycle.Run() 持有，也不与 m_mtx 形成反向嵌套。
-     */
-    mutable std::mutex m_lifecycle_mtx;
-    HostLifecycle* m_lifecycle{nullptr};
-    std::atomic<ShutdownState> m_parked_state{ShutdownState::Running};
-    /**
-     * run 前校验失败原因
-     */
-    std::vector<std::string> m_early_failures;
+    std::shared_ptr<std::atomic<std::uint64_t>> m_hook_co =
+        std::make_shared<std::atomic<std::uint64_t>>(0);
 };
+
+/**
+ * ---- 模板实现区：上段类定义只声明，以下类外定义保持对使用点可见 ----
+ */
+
+template <class C>
+bbt_co_async(result<void>) CoApp::CoInstallComponent(
+    std::string name, typename C::Options options,
+    const ComponentOptions& placement, const LifecycleOptions& life) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoComponent, C>,
+        "CoInstallComponent: C must derive from CoComponent");
+    static_assert(!std::is_default_constructible_v<C>,
+        "CoInstallComponent: C constructor must accept only ConstructKey");
+    static_assert(!std::is_destructible_v<C>,
+        "CoInstallComponent: C destructor must be protected or private");
+    return _InstallComponentImpl(
+        typeid(C), std::move(name), placement, life,
+        [opts = std::move(options)](detail::ConstructKey k) mutable
+            -> CoComponent* {
+            return detail::Registry::NewManaged<C>(k, std::move(opts));
+        },
+        [](CoComponent* p) { detail::Registry::DeleteManaged<C>(
+            static_cast<C*>(p)); });
+}
+
+template <class C>
+bbt_co_async(result<void>) CoApp::CoUninstallComponent(
+    std::string_view name, const ComponentOptions& placement,
+    const LifecycleOptions& life) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoComponent, C>,
+        "CoUninstallComponent: C must derive from CoComponent");
+    return _UninstallComponentImpl(typeid(C), name, placement, life);
+}
+
+template <class S>
+bbt_co_async(result<void>) CoApp::CoInstallService(ServiceOptions options) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoServiceBase, S>,
+        "CoInstallService: S must derive from CoService<...>");
+    static_assert(!std::is_default_constructible_v<S>,
+        "CoInstallService: S constructor must accept only ConstructKey");
+    static_assert(!std::is_destructible_v<S>,
+        "CoInstallService: S destructor must be protected or private");
+    if (auto r = options.Validate(); !r) return r;
+
+    std::string name = CoServiceStaticName<S>::Get();
+    if (name.empty())
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+            "CoInstallService: S must declare a non-empty kServiceName"));
+
+    /**
+     * 方法表在安装期展开：非法签名走编译错误，重复/空方法名在此处
+     * 抛 std::invalid_argument（启动期暴露，不等首个请求）。
+     * ActorSerial 服务的每个方法都必须经 ActorMethodAt 安装 key 提取器。
+     */
+    RpcMethodTable table;
+    try {
+        table = BuildMethodTable<S>();
+    } catch (const std::invalid_argument& e) {
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+            std::string("CoInstallService: ") + e.what()));
+    } catch (const std::exception& e) {
+        return result<void>::err(MakeError(ErrorCode::InternalError,
+            std::string("CoInstallService: method table failed: ") +
+                e.what()));
+    }
+    if (auto r = ValidateActorKeying(table, options.Execution()); !r)
+        return r;
+
+    const auto decls = options.ComponentBindings();
+    auto r = _InstallServiceImpl(
+        typeid(S), name, options,
+        [](detail::ConstructKey k) -> CoServiceBase* {
+            return detail::Registry::NewManaged<S>(k);
+        },
+        [](CoServiceBase* p) { detail::Registry::DeleteManaged<S>(
+            static_cast<S*>(p)); }, decls);
+    if (!r) return r;
+
+    /**
+     * 网络簿记登记 + 出站注入点绑定：受管校验/envelope/路由门/发送
+     * 全部在框架内部；服务对象一经安装即可经 bbt_co_await call 出站
+     *（未启动时由路由门/宿主如实 RuntimeUnavailable）。Registry 已拒绝同名
+     * 重复登记，此处 emplace 失败属簿记不变量破坏，如实失败。
+     */
+    {
+        std::lock_guard<std::mutex> lk(m_net_mtx);
+        if (!m_service_records.emplace(name,
+                ServiceRecord{options, std::move(table), nullptr}).second)
+            return result<void>::err(MakeError(ErrorCode::InternalError,
+                "CoInstallService: duplicate service record '" + name + "'"));
+    }
+    _BindEgressToService(name);
+    return result<void>::ok();
+}
+
+template <class S>
+bbt_co_async(result<void>) CoApp::CoUninstallService(const LifecycleOptions& life) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoServiceBase, S>,
+        "CoUninstallService: S must derive from CoService<...>");
+    std::string name = CoServiceStaticName<S>::Get();
+    if (name.empty())
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+            "CoUninstallService: S must declare kServiceName"));
+    return _UninstallServiceImpl(name, life);
+}
+
+template <class A>
+bbt_co_async(result<void>) CoApp::CoInstallActor(ActorOptions options) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoActor, A>,
+        "CoInstallActor: A must derive from CoActor");
+    static_assert(!std::is_default_constructible_v<A>,
+        "CoInstallActor: A constructor must accept only ConstructKey");
+    static_assert(!std::is_destructible_v<A>,
+        "CoInstallActor: A destructor must be protected or private");
+    if (auto r = options.Validate(); !r) return r;
+
+    std::string type = CoActorStaticName<A>::Get();
+    if (type.empty())
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+            "CoInstallActor: A must declare a non-empty kActorType"));
+
+    return _InstallActorTypeImpl(
+        typeid(A), std::move(type), options,
+        [](detail::ConstructKey k) -> CoActor* {
+            return detail::Registry::NewManaged<A>(k);
+        },
+        [](CoActor* p) { detail::Registry::DeleteManaged<A>(
+            static_cast<A*>(p)); });
+}
+
+template <class A>
+bbt_co_async(result<void>) CoApp::CoUninstallActor(const LifecycleOptions& life) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoActor, A>,
+        "CoUninstallActor: A must derive from CoActor");
+    std::string type = CoActorStaticName<A>::Get();
+    if (type.empty())
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+            "CoUninstallActor: A must declare kActorType"));
+    return _UninstallActorTypeImpl(type, life);
+}
+
+template <class C>
+result<ObjectHandle> CoApp::FindComponent(
+    std::string_view name, const ComponentOptions& placement) const {
+    static_assert(std::is_base_of_v<CoComponent, C>,
+        "FindComponent: C must derive from CoComponent");
+    return _FindComponentImpl(typeid(C), name, placement);
+}
+
+template <class C>
+bbt_co_async(result<ComponentHandle<C>>) CoApp::CoBindComponent(
+    const ObjectHandle& subject, std::string_view name,
+    const ComponentOptions& placement, const LifecycleOptions& life) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<ComponentHandle<C>>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoComponent, C>,
+        "CoBindComponent: C must derive from CoComponent");
+    auto r = _BindComponentImpl(typeid(C), subject, name, placement, life);
+    if (!r) return result<ComponentHandle<C>>::err(std::move(r.error()));
+    return result<ComponentHandle<C>>::ok(
+        detail::MakeComponentHandle<C>(r.value().first, r.value().second));
+}
+
+template <class C>
+bbt_co_async(result<void>) CoApp::CoUnbindComponent(
+    const ObjectHandle& subject, std::string_view name,
+    const ComponentOptions& placement, const LifecycleOptions& life) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoComponent, C>,
+        "CoUnbindComponent: C must derive from CoComponent");
+    return _UnbindComponentImpl(typeid(C), subject, name, placement, life);
+}
 
 } // namespace bbt::framework

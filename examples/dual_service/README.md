@@ -7,32 +7,34 @@ infra 唯一 V2 profile（`SessionFrame` + u32be 分帧 + Hello/HelloAck，
 ```
 driver ──wire──> svc_b(gateway) ──wire──> svc_a(storage)
                  fetch/store/del/          put/get/del/sleep_ms
-                 slowcall/missing/explode  Redis+Mongo 资源（add_resource）
-                 this->call("storage",…)
+                 slowcall/missing/explode  Redis+Mongo 受管组件
+                 bbt_co_await call("storage",…)（受管协程内）
 ```
 
 - `svc_a` 托管 `storage` 服务（Concurrent），真实后端经
-  `CoApp::add_resource<RedisNetResource>("cache", factory)` 与
-  `add_resource<MongoDbResource>("docs", factory)` 工厂装配为命名资源，
-  handler 经 `context().resource<...>` 取用；无 KvStore 替身。
+  `CoInstallComponent<RedisNetResource>("cache", …)` 与
+  `CoInstallComponent<MongoDbResource>("docs", …)` 装配为 App scope 受管
+  组件，服务经 `ServiceOptions::BindComponent<C>(name)` 声明绑定，handler
+  经 `GetComponent<C>(name)->Borrow()` 借用；无 KvStore 替身。
   Redis 侧消费 infra 新 net 入口（`bbt::infra::redis::CoRedisCli`，
-  `net::Engine` + 数值 `net::Address`），经框架 `RedisNetResource`
-  适配进 `ICoCloseable` 关闭序列：Create 在控制线程完成 Engine Run 线程
-  拉起 + 等 Running + client 装配，`Connect` 只允许在协程上下文调用——
-  工厂在交付前**显式 Connect**（投递到 Scheduler 并等待），否则 handler
-  首个命令会得到 `RuntimeUnavailable "redis: not connected"`。地址只
-  接受数值 IPv4/IPv6，主机名在装配期如实 `EX_USAGE`。
+  `net::Engine` + 数值 `net::Address`），经框架 `RedisNetResource` 适配进
+  受管组件生命周期：组件 `OnStart` 拉起自有 Engine Run 线程 + 等 Running +
+  `CoRedisCli::Create`（只装配不拨号），`Connect` 只允许在协程上下文调用——
+  `StorageSvc::OnStart` 在受管协程内借 "cache" **显式 Connect**（5s 预算），
+  失败即服务 `Failed` 并参与启动失败回退，否则 handler 首个命令会得到
+  `RuntimeUnavailable "redis: not connected"`。地址只接受数值
+  IPv4/IPv6，主机名在装配期如实 `EX_USAGE`。
   Mongo 侧消费 infra 新 owner/句柄入口（`bbt::infra::mongo::CoMongoDb`
-  + `CoMongoColl`），经框架 `MongoDbResource` 适配进同一关闭序列：
+  + `CoMongoColl`），经框架 `MongoDbResource` 适配进同一收口序列：
   `MongoRuntimeConfig` 只携带连接预算（uri/worker_threads/max_queue/
   四个 driver 超时），`database`/`collection` 目标值由
-  `MongoDbResource::Create` 绑定为集合句柄——`Validate` + owner
-  `Create`/`Start` + `Collection` 在控制线程一次完成。`Close()` 先
-  句柄门禁（只封该集合接纳）再 owner 同步物理收口（返回即 ops 清空
-  + worker 全退）；命令面经 `bbt_co_await` 消费，含多文档入口
+  `MongoDbResource::Options::SetTarget` 绑定为集合句柄——组件 `OnStart`
+  内 `Validate` + owner `Create`/`Start` + `Collection` 一次完成。
+  `OnStop` 先句柄门禁（只封该集合接纳）再 owner 同步物理收口（返回即
+  ops 清空 + worker 全退）；命令面经 `bbt_co_await` 消费，含多文档入口
   `InsertMany`/`Find`/`UpdateMany`/`DeleteMany`/`CountDocuments`
   （本示例只用 `UpdateOne`/`FindOne`/`DeleteOne` 的 upsert/find/delete）。
-- `svc_b` 托管 `gateway` 服务，`static_routes` 把 `storage` 显式指到
+- `svc_b` 托管 `gateway` 服务，`AddRoute` 把 `storage` 显式指到
   `svc_a` 的真实 `host:port`——未配置目标一律 `NotFound`，无自动发现。
 - `driver` 是第三个进程：`net::Engine + rpc::CoRpcClient`，用 infra 公开头
   （`rpc/CoRpcClient.hpp`、`rpc/Request.hpp`、`rpc/Response.hpp`）发真实 V2 Call
@@ -57,11 +59,11 @@ driver 按序执行并各自打印 PASS/FAIL + 实际结果：
 5. `slowcall` → **服务端预算继承**（见下）。
 6. `del` 本轮 key + 复核 `fetch` → `NotFound`（只清本轮命名空间）。
 7. storage 下线 → `fetch` 返回 `TransportError`（连接失败如实上报）。
-8. `SIGINT`/`SIGTERM` 优雅关闭（`run()` 返回 0）。
+8. `SIGINT`/`SIGTERM` 优雅关闭（`CoStop` 成功 + `AppState::Stopped` → 进程 rc 0）。
 
 ### 场景 5：服务端继承预算（不是「仅客户端超时」）
 
-`gateway.slowcall` 经 `this->call("storage","sleep_ms",req,{},
+`gateway.slowcall` 经 `bbt_co_await call("storage","sleep_ms",req,{},
 CallOptions{now+600ms})` 给 storage 一个显式**子预算**（`AdaptCallOptions`
 取 min，不得延长父预算）。该预算随 CALL 帧的 `remaining_budget_ms` 到达
 storage，服务端据此在 handler 内中断 `sleep_ms` 并**自行**返回 `TimedOut`；

@@ -3,11 +3,11 @@
  * 位置参数 RPC 公共面（业务面）。
  *
  * CoRpcReq/CoRpcResp 只拥有 payload 与错误结果；线格式不暴露给业务。
- * 通用位置参数 codec（字节规则/schema/错误码）的唯一实现下沉到
- * bbt::infra::rpc（bbt/infra/rpc/codec/PositionalCodec.hpp）；本头 rpc_detail 只保留
- * 兼容薄层转发，不复制第二套字节规则。ProtoCodec<T> 继承 infra 默认
- * trait seam，既有 `bbt::framework::rpc_detail::ProtoCodec<X>` 特化继续
- * 有效，仍不引入 protobuf 头。
+ * 通用位置参数 codec（字节规则/schema/错误码）的唯一实现在
+ * bbt::infra::rpc（bbt/infra/rpc/codec/PositionalCodec.hpp），framework 侧
+ * 直接消费。rpc_detail 只保留 protobuf codec trait seam：ProtoCodec<T>
+ * 继承 infra 默认 seam，业务对 `bbt::framework::rpc_detail::ProtoCodec<X>`
+ * 的显式特化继续生效，仍不引入 protobuf 头。
  */
 
 #include <cstddef>
@@ -28,32 +28,14 @@ namespace bbt::framework {
 namespace rpc_detail {
 
 /**
- * 通用位置参数 codec 的唯一实现在 bbt::infra::rpc::*；下面只做名字转发，
- * 保持旧 rpc_detail 调用点（本仓 MethodTable/ICoService 及未来消费方）不变，
- * 不引入第二套字节规则。result/Error 与 infra 同一类型（framework/Result.hpp
- * 即 infra 的别名），转发不产生类型转换。
+ * 通用位置参数 codec 的唯一实现在 bbt::infra::rpc::*（EncodeTuple/
+ * DecodeTuple/DecodeAt 等）；本头不再转发名字，调用方直接消费 infra
+ * 公开实现。result/Error 与 infra 同一类型（framework/Result.hpp
+ * 即 infra 的别名）。这里只保留 protobuf codec trait seam：
  */
 
-using bbt::infra::rpc::WireType;
-
-template <class T> using Decay = bbt::infra::rpc::Decay<T>;
-
-template <class T> inline constexpr bool is_bytes_v = bbt::infra::rpc::is_bytes_v<T>;
-
-template <class T> inline constexpr WireType wire_type_v = bbt::infra::rpc::wire_type_v<T>;
-
-template <class T> inline constexpr bool scalar_supported_v = bbt::infra::rpc::scalar_supported_v<T>;
-
-using bbt::infra::rpc::PutU32;
-using bbt::infra::rpc::TakeU32;
-using bbt::infra::rpc::EncodeOne;
-using bbt::infra::rpc::DecodeOne;
-using bbt::infra::rpc::DecodeAt;
-using bbt::infra::rpc::DecodeTuple;
-using bbt::infra::rpc::EncodeTuple;
-
 /**
- * protobuf codec 兼容 trait seam：继承 infra 默认 seam，令既有显式特化
+ * protobuf codec trait seam：继承 infra 默认 seam，令既有显式特化
  * `template\<\> struct bbt::framework::rpc_detail::ProtoCodec<X> { ... }` 继续
  * 生效——用户特化仍是 framework 层的自由度，infra 不认识业务 proto 类型，
  * 也不新增第二 registry。
@@ -89,7 +71,7 @@ public:
                 return result<CoRpcReq>::err(std::move(encoded.error()));
             return result<CoRpcReq>::ok(CoRpcReq(std::move(encoded.value())));
         } else {
-            auto encoded = rpc_detail::EncodeTuple(std::tuple<T>{value},
+            auto encoded = bbt::infra::rpc::EncodeTuple(std::tuple<T>{value},
                                                    std::index_sequence<0>{});
             if (!encoded)
                 return result<CoRpcReq>::err(std::move(encoded.error()));
@@ -99,7 +81,7 @@ public:
 
     template <class... Ts>
     static result<CoRpcReq> From(const std::tuple<Ts...>& values) {
-        auto encoded = rpc_detail::EncodeTuple(values,
+        auto encoded = bbt::infra::rpc::EncodeTuple(values,
                                                std::index_sequence_for<Ts...>{});
         if (!encoded)
             return result<CoRpcReq>::err(std::move(encoded.error()));
@@ -136,14 +118,14 @@ public:
             if constexpr (rpc_detail::is_proto_codec_v<T>)
                 return rpc_detail::ProtoCodec<T>::Decode(m_payload);
             else {
-                auto tup = rpc_detail::DecodeTuple<Ts...>(m_payload,
+                auto tup = bbt::infra::rpc::DecodeTuple<Ts...>(m_payload,
                     std::index_sequence_for<Ts...>{});
                 if (!tup)
                     return result<T>::err(std::move(tup.error()));
                 return result<T>::ok(std::move(std::get<0>(tup.value())));
             }
         } else {
-            return rpc_detail::DecodeTuple<Ts...>(m_payload,
+            return bbt::infra::rpc::DecodeTuple<Ts...>(m_payload,
                 std::index_sequence_for<Ts...>{});
         }
     }
@@ -175,7 +157,7 @@ public:
             if (!encoded) return Error(std::move(encoded.error()));
             return FromPayload(std::move(encoded.value()));
         } else {
-            auto encoded = rpc_detail::EncodeTuple(std::tuple<T>{value},
+            auto encoded = bbt::infra::rpc::EncodeTuple(std::tuple<T>{value},
                                                     std::index_sequence<0>{});
             if (!encoded) return Error(std::move(encoded.error()));
             return FromPayload(std::move(encoded.value()));
@@ -184,7 +166,7 @@ public:
 
     template <class... Ts>
     static CoRpcResp From(const std::tuple<Ts...>& values) {
-        auto encoded = rpc_detail::EncodeTuple(values,
+        auto encoded = bbt::infra::rpc::EncodeTuple(values,
                                                std::index_sequence_for<Ts...>{});
         if (!encoded) return Error(std::move(encoded.error()));
         return FromPayload(std::move(encoded.value()));

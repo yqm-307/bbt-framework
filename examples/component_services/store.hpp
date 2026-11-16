@@ -6,7 +6,7 @@
  * 目录价，CartService 在绑定变化时写入购物车行；两个服务绑定同一个 App
  * scope 的 "pricing" 实例，因此互相看得到对方写入的状态。
  *
- * 本头只演示公开 v2 面：CoComponent/CoService、声明式
+ * 本头只演示公开受管面：CoComponent/CoService、声明式
  * ServiceOptions::BindComponent、ComponentHandle::Borrow、生命周期与绑定
  * hook。同一份头被主例程与独立 node 进程各自装配——进程内共享的是组件实例，
  * 跨进程只共享代码，不共享对象。
@@ -23,15 +23,15 @@
 #include <vector>
 
 #include <bbt/coroutine/coroutine.hpp>
-#include <bbt/framework/V2.hpp>
+#include <bbt/framework/Framework.hpp>
 
 namespace shop {
 
 /**
- * 只在本业务命名空间内收窄框架名字：这些是 public v2 面，写全限定名会淹没
+ * 只在本业务命名空间内收窄框架名字：这些是公开受管面，写全限定名会淹没
  * 业务语义。不做全局 using namespace，消费者不受影响。
  */
-namespace v2 = bbt::framework::v2;
+namespace fw = bbt::framework;
 using bbt::framework::result;
 using bbt::framework::ErrorCode;
 using bbt::framework::MakeError;
@@ -81,7 +81,7 @@ inline void Emit(const std::string& line) {
 /**
  * @brief 共享的价格/购物车组件。只能经 CoApp::CoInstallComponent 创建。
  */
-class PriceBook final : public v2::CoComponent {
+class PriceBook final : public fw::CoComponent {
 public:
     /**
      * @brief 装配参数：版本、目录单价、停止时挂起毫秒、是否让 OnStart 失败。
@@ -94,7 +94,7 @@ public:
     };
 
     explicit PriceBook(ConstructKey key, Options o)
-        : v2::CoComponent(key),
+        : fw::CoComponent(key),
           m_version(o.version),
           m_unit_price(o.unit_price_cents),
           m_halt_ms(o.halt_ms),
@@ -226,12 +226,12 @@ private:
  * @brief 目录服务：安装时声明式绑定 "pricing"，启动时写入目录价。
  */
 class CatalogService final
-    : public v2::CoService<PriceBook> {
+    : public fw::CoService<PriceBook> {
 public:
     static constexpr std::string_view kServiceName = "catalog";
 
     explicit CatalogService(ConstructKey key)
-        : v2::CoService<PriceBook>(key) {}
+        : fw::CoService<PriceBook>(key) {}
 
 protected:
     ~CatalogService() noexcept override = default;
@@ -302,7 +302,7 @@ protected:
 /**
  * @brief 购物车服务：运行期被显式绑定后，在绑定 hook 中写购物车行。
  */
-class CartService final : public v2::CoService<PriceBook> {
+class CartService final : public fw::CoService<PriceBook> {
 public:
     static constexpr std::string_view kServiceName = "cart";
     /**
@@ -311,7 +311,7 @@ public:
     static constexpr int kQtyPerBinding = 2;
 
     explicit CartService(ConstructKey key)
-        : v2::CoService<PriceBook>(key) {}
+        : fw::CoService<PriceBook>(key) {}
 
 protected:
     ~CartService() noexcept override = default;

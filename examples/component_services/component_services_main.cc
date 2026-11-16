@@ -2,7 +2,7 @@
  * bbt-framework 组件式服务示例：共享组件、运行期热拔插、hook 与观察者。
  *
  * 形态：普通 main 启动 coroutine runtime，再把场景投递进受管协程；场景内部
- * 只使用公开 v2 面（v2::CoApp::Create、CoInstall/CoUninstall/CoBind/CoUnbind、
+ * 只使用公开受管面（CoApp::Create、CoInstall/CoUninstall/CoBind/CoUnbind、
  * CoStart/CoStop/CoObserve、ComponentHandle::Borrow）。不使用 internal/ 缝、
  * 不启网络、不依赖 RPC/protobuf。
  *
@@ -44,12 +44,11 @@
 #include <unistd.h>
 
 #include <bbt/coroutine/coroutine.hpp>
-#include <bbt/framework/V2.hpp>
+#include <bbt/framework/Framework.hpp>
 
 #include "store.hpp"
 
 namespace fw = bbt::framework;
-namespace v2 = bbt::framework::v2;
 
 namespace {
 
@@ -115,7 +114,7 @@ void RunHookFailureScenario();
 void RunSharedScenario() {
     Emit("event=scenario_start mode=shared pid=" + Pid());
 
-    auto app = v2::CoApp::Create(MakeAppOptions());
+    auto app = fw::CoApp::Create(MakeAppOptions());
     if (!app) {
         Check(false, "create_app", "null_owner");
         return;
@@ -365,7 +364,7 @@ void RunSharedScenario() {
  */
 void RunHookFailureScenario() {
     Emit("event=scenario_start mode=hook_failure pid=" + Pid());
-    auto app = v2::CoApp::Create(MakeAppOptions());
+    auto app = fw::CoApp::Create(MakeAppOptions());
     if (!app) {
         Check(false, "failure_create_app", "null_owner");
         return;
@@ -390,8 +389,12 @@ void RunHookFailureScenario() {
     Check(!started && started.error().code == fw::ErrorCode::InternalError,
           "hook_failure_surfaces_error",
           started ? "unexpected_ok" : Err(started.error()));
+    /**
+     * 启动失败不回滚（冻结契约）：原错误透出后 App 置 Running（部分启动
+     * 诚实反映）；失败对象记 Failed、可 Find 可卸载，不是「全部回滚」。
+     */
     Check(app->State() == fw::AppState::Running,
-          "partial_start_reports_running",
+          "start_failure_app_running_object_failed",
           "state=" + Int(int(app->State())));
 
     auto info = comp.value().Info();
@@ -433,7 +436,7 @@ void RunHookFailureScenario() {
 void RunNodeScenario(int price_cents) {
     Emit("event=scenario_start mode=node pid=" + Pid() +
          " price=" + Int(price_cents));
-    auto app = v2::CoApp::Create(MakeAppOptions());
+    auto app = fw::CoApp::Create(MakeAppOptions());
     if (!app) {
         Check(false, "node_create_app", "null_owner");
         return;

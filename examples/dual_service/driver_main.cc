@@ -3,8 +3,9 @@
  *
  * 独立进程：自起 Scheduler + net::Engine + infra 公开的 V2 会话客户端
  * (bbt::infra::rpc::CoRpcClient)，向 gateway 发真实 RPC。只依赖 infra 公开头
- * （net/Engine、rpc/CoRpcClient、rpc/Request、rpc/Response）与 framework 公开面
- * （CoRpc 位置参数 codec）——不引用 framework internal 头，也不手写第二套
+ * （net/Engine、rpc/CoRpcClient、rpc/Request、rpc/Response）与 framework
+ * 公开受管面（CoRpcReq/CoRpcResp 位置参数 codec、Error/ErrorCode、
+ * kCoRpcPositionalSchema）——不引用 framework internal 头，也不手写第二套
  * SessionFrame/u32be/Hello 编解码：wire 的唯一实现是 infra 的 V2 会话。
  *
  * V2 会话的预算语义：CallOptions.deadline 同时是客户端等待上限与 wire

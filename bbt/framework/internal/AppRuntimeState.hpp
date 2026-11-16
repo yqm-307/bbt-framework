@@ -8,7 +8,7 @@
  * 自带其需要的全部对象。
  *
  * 关闭序列（on_release → Release）切断本对象指向业务对象的全部边：
- * dispatcher/tables/instances/registry 一并放弃，不再接纳新分发。在途分发
+ * dispatcher 一并放弃，不再接纳新分发。在途分发
  * 已取走本地 dispatcher 强引用继续执行，分发表项各自强持有
  * table/registry/instance/egress，不依赖本对象继续存活。由此 CoApp 正常
  * 收束后本对象可被完全回收——业务对象内的出站回调只指向出站依赖
@@ -30,7 +30,8 @@
 #include <bbt/infra/rpc/Request.hpp>
 #include <bbt/infra/rpc/Response.hpp>
 
-#include <bbt/framework/ICoService.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
+
 #include <bbt/framework/DynamicRouteTable.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
@@ -39,7 +40,6 @@
 
 namespace bbt::framework {
 
-class ActorRegistry;
 class RpcEgress;
 class InboundDispatcher;
 
@@ -58,12 +58,11 @@ struct AppRuntimeState {
 
     /**
      * run 期受管对象（mtx 保护）。Publish 填入；Release 全部放弃。
+     * 服务对象本体由 Registry 强持有；分发链路只在 Publish 与 Release
+     * 之间经 dispatcher 表项访问它们（排空先于 Release，见 CoApp 收口序）。
      */
     std::mutex mtx;
-    std::shared_ptr<InboundDispatcher>                  dispatcher;
-    std::map<std::string, std::shared_ptr<const RpcMethodTable>> tables;
-    std::map<std::string, std::shared_ptr<ICoService>>           instances;
-    std::shared_ptr<ActorRegistry>                              registry;
+    std::shared_ptr<InboundDispatcher> dispatcher;
 
     /**
      * 查询与真实出站共用路由门：动态已配置服务不回退静态地址。
@@ -73,19 +72,16 @@ struct AppRuntimeState {
     /**
      * 出站发送（机器面）：路由门 → 公开策略 Preflight → 默认 RpcEgress 或
      * 测试缝发送。回调复制本对象的 shared_ptr，不捕获 CoApp this。
+     * 真实出站可挂起当前协程，消费端经 bbt_co_await 解包。
      */
-    result<bbt::infra::rpc::Response> Send(
+    bbt_co_async(result<bbt::infra::rpc::Response>) Send(
         const bbt::infra::rpc::Request& env,
         const bbt::infra::CallOptions& options) const;
 
     /**
-     * 绑定完成：填入受管对象表并开放接纳（Publish 与 Release 互斥配对）。
+     * 绑定完成：填入分发表并开放接纳（Publish 与 Release 互斥配对）。
      */
-    void Publish(
-        std::shared_ptr<InboundDispatcher> d,
-        std::map<std::string, std::shared_ptr<const RpcMethodTable>> t,
-        std::map<std::string, std::shared_ptr<ICoService>> inst,
-        std::shared_ptr<ActorRegistry> reg);
+    void Publish(std::shared_ptr<InboundDispatcher> d);
 
     /**
      * 收束：拒新分发并放弃全部受管对象引用；在途分发靠本地强引用与
@@ -100,6 +96,12 @@ struct AppRuntimeState {
     result<bbt::infra::rpc::Response> Dispatch(
         const bbt::infra::rpc::Request& request,
         const std::function<void()>& on_dispatched = {});
+
+    /**
+     * 运行期移除单个服务分发表项（卸载路径；在途执行由对象收口经
+     * 执行租约等待）。未发布/已收束为空操作。
+     */
+    void RemoveDispatch(const std::string& service) noexcept;
 };
 
 } // namespace bbt::framework

@@ -3,25 +3,20 @@
 # 获得 result/Codec 与 coroutine 运行时（含 include 路径传播）；
 # InfraHttpHost 消费 infra 已验收的 HTTP 实现目标。
 add_library(bbt_framework STATIC
-    ExecutionPolicy.cc
     internal/MethodTable.cc
     actor/ActorMailbox.cc
-    actor/ActorRegistry.cc
     actor/OrderedSession.cc
     actor/OrderedIngress.cc
-    host/App.cc
     host/AppRuntimeState.cc
     host/CallOptionsAdapter.cc
     host/CoApp.cc
     host/CoServiceCall.cc
     host/DynamicRouteTable.cc
-    host/HostLifecycle.cc
     host/InboundDispatcher.cc
     host/InfraHttpHost.cc
     host/Object.cc
     host/Registry.cc
     host/RequestScope.cc
-    host/ResourceClose.cc
     host/RpcBridge.cc
     host/Service.cc)
 add_library(bbt::framework ALIAS bbt_framework)

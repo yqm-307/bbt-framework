@@ -2,7 +2,7 @@
 /**
  * RPC 方法表（机器面，internal/）。
  * 业务用 fw::Method / fw::ActorMethodAt / fw::RpcMethods 声明方法清单
- * （声明糖见公共头 RpcMethods.hpp，业务在 CoService<T>::kRpcMethods
+ * （声明糖见公共头 RpcMethods.hpp，业务在 CoService<...>::kRpcMethods
  * 上书写），本头把声明展开为类型擦除的分发闭包：handler 签名统一
  * CoRpcResp(CoRpcReq)，负载经位置参数 codec（CoRpc.hpp）；actor key
  * 取自位置参数下标（ActorMethodAt），不再有手写提取 lambda。
@@ -22,11 +22,13 @@
 
 #include <bbt/infra/Codec.hpp>
 
+#include <bbt/infra/rpc/codec/PositionalCodec.hpp>
+
 #include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/CoRpc.hpp>
-#include <bbt/framework/ICoService.hpp>
 #include <bbt/framework/Result.hpp>
 #include <bbt/framework/RpcMethods.hpp>
+#include <bbt/framework/internal/ServiceBase.hpp>
 
 namespace bbt::framework {
 
@@ -62,7 +64,7 @@ struct rpc_traits<CoRpcResp (Service::*)(const CoRpcReq&)> {
 
 struct RpcMethod {
     using Invoker = std::function<result<std::vector<std::uint8_t>>(
-        ICoService&, const std::vector<std::uint8_t>&)>;
+        CoServiceBase&, const std::vector<std::uint8_t>&)>;
     using KeyExtractor = std::function<result<std::string>(
         const std::vector<std::uint8_t>&)>;
 
@@ -145,9 +147,9 @@ template <class MemberPtr>
 RpcMethod::Invoker MakeCoRpcInvoker(MemberPtr handler) {
     using Traits = rpc_traits<MemberPtr>;
     using Service = typename Traits::service_type;
-    static_assert(std::is_base_of_v<ICoService, Service>,
-                  "RpcMethods: Service must derive from ICoService");
-    return [handler](ICoService& base,
+    static_assert(std::is_base_of_v<CoServiceBase, Service>,
+                  "RpcMethods: Service must derive from CoService<...>");
+    return [handler](CoServiceBase& base,
                      const std::vector<std::uint8_t>& payload)
         -> result<std::vector<std::uint8_t>> {
         try {
@@ -175,7 +177,7 @@ template <class Key, std::size_t Index>
 RpcMethod::KeyExtractor MakePositionalKeyExtractor() {
     return [](const std::vector<std::uint8_t>& payload)
         -> result<std::string> {
-        auto decoded = rpc_detail::DecodeAt<Key>(payload, Index);
+        auto decoded = bbt::infra::rpc::DecodeAt<Key>(payload, Index);
         if (!decoded)
             return result<std::string>::err(std::move(decoded.error()));
         try {

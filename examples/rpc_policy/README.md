@@ -14,10 +14,10 @@ infra owner·限额·关联·Close 约束。
   `Reject`（拒绝，零 I/O）。
 - `RpcPolicy::Preflight(const RpcCallView&)`：唯一受控虚拟点。
 
-组装点：`CoAppOptions::rpc_policy`（`std::shared_ptr<RpcPolicy>`，构造期选择；
+组装点：`AppOptions::SetRpcPolicy(std::shared_ptr<RpcPolicy>)`（构造期选择；
 `nullptr` = 默认 no-op，行为与今天逐字一致）。
 
-插入点：`CoApp::_MakeEgress()` 在静态路由门（`find_route`）**之后**、发送
+插入点：策略在静态路由门（`find_route`）**之后**、发送
 **之前**调用一次；V2 会话（`RpcEgress` → `rpc::CoRpcClient`）是唯一出站路径，没有
 profile 或旧 envelope 分支。
 
@@ -26,7 +26,7 @@ profile 或旧 envelope 分支。
 caller/callee 是**两个互异 identity 的真实 CoApp 进程**（V2 拒绝
 self-connection，框架约束进程内至多一个活跃 CoApp）：caller 进程
 （`rpc-policy-caller`）宿主 `PolicyCallerService`，其 handler 内经
-`this->call<Req,Resp>` 出站，经 V2 会话到达 callee 进程
+`bbt_co_await call<Req,Resp>` 出站，经 V2 会话到达 callee 进程
 （`rpc-policy-callee`）宿主的 `PolicyCalleeService`。**只用公开面**，不 include
 `internal/`、不用 `CoAppSeam`/`MakeCoAppForTest`/发送注入。
 
@@ -42,8 +42,8 @@ self-connection，框架约束进程内至多一个活跃 CoApp）：caller 进�
 | `expired` | 收紧到已过期 → I/O 前 `TimedOut`；callee 0 次（同上：计数为观测） |
 | `decorator` | 外层包内层：两虚 `Preflight` 各一次、序 `outer→inner` |
 | `noroute` | 未配置静态路由 → `NotFound`；`Preflight` 计数 0（路由先于策略） |
-| `shutdown` | stdin EOF → `rc=0`/`Closed`/owner 同步 Close |
-| `shutdown.after-close` | fixture 在 `app.run()` 返回后、**进程退出前**对自己 bound 端口做有界 nonblocking connect，journal `event=listener_probe phase=after_run_before_exit port=… result=… errno=…`；driver 断言 `result=refused` 且 `errno=ECONNREFUSED` 且 `port` 等于本次服务过真实 RPC 的端口 |
+| `shutdown` | stdin EOF → `RequestShutdown` → 主协程 `CoStop` 收口：`rc=0`/`AppState::Stopped`/owner 组件 OnStop 记账（journal `resource_close` 恰 1 条） |
+| `shutdown.after-close` | fixture 在 `CoStop` 返回后、**进程退出前**对自己 bound 端口做有界 nonblocking connect，journal `event=listener_probe phase=after_stop_before_exit port=… result=… errno=…`；driver 断言 `result=refused` 且 `errno=ECONNREFUSED` 且 `port` 等于本次服务过真实 RPC 的端口 |
 
 关闭后验收的判别性：探针必须发生在**进程与 `CoApp` 对象仍存活**时；进程回收后再
 `connect` 由内核必然 `ECONNREFUSED`，那类断言恒真、不构成证据（B1 已修）。探针的

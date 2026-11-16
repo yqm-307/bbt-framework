@@ -1,6 +1,6 @@
 #pragma once
 /**
- * framework v2 唯一地址/消息值层（契约 §5.1 最小落地）。
+ * framework 唯一地址/消息值层（契约 §5.1 最小落地）。
  *
  * AppObjectAddress 是可公开的目标地址值；MailBox 是它的可复制包装
  * （地址值，不是队列或 Actor 引用）。本地发送路径本切片不接业务消息

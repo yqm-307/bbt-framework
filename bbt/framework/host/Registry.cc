@@ -1,5 +1,5 @@
 /**
- * framework v2 受管对象注册表实现（见 internal/Registry.hpp 头部纪律）。
+ * framework 受管对象注册表实现（见 internal/Registry.hpp 头部纪律）。
  */
 
 #include <algorithm>
@@ -9,7 +9,7 @@
 #include <bbt/coroutine/coroutine.hpp>
 
 #include <bbt/framework/Component.hpp>
-#include <bbt/framework/Service.hpp>
+#include <bbt/framework/CoService.hpp>
 #include <bbt/framework/internal/Registry.hpp>
 
 namespace bbt::framework {
@@ -804,6 +804,14 @@ void Registry::NoteHookSettled(const ObjectId& id) noexcept {
     if (w) w->Notify();
 }
 
+bool Registry::AcquireDispatchLease(const ObjectId& id) {
+    std::lock_guard<std::mutex> lk(m_mtx);
+    auto* e = FindEntryLocked(id);
+    if (!e || e->gate_closed) return false;
+    ++e->hooks_in_flight;
+    return true;
+}
+
 /**
  * ---- 组件依赖拓扑 ----
  */
@@ -951,24 +959,24 @@ std::vector<LifecycleFailure> Registry::Failures() const {
 /**
  * ---- BorrowImpl（ComponentHandle<C>::Borrow 的类型擦除半身）----
  *
- * 返回 v2::CoComponent*（不擦为 void*）：派生类型 C 经
+ * 返回 CoComponent*（不擦为 void*）：派生类型 C 经
  * CoComponent*→C* static_cast 完成指针调整，多继承布局下不产生错误地址。
  */
 
-result<std::pair<std::shared_ptr<void>, v2::CoComponent*>> BorrowImpl(
+result<std::pair<std::shared_ptr<void>, CoComponent*>> BorrowImpl(
     const ObjectHandle& object, std::uint64_t binding_generation,
     bool allow_installing_borrow) {
     auto reg = object.m_reg.lock();
     if (!reg)
-        return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::err(
+        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
             MakeError(ErrorCode::Closed, "Borrow: registry closed"));
     std::lock_guard<std::mutex> lk(reg->Mutex());
     RegistryEntry* e = reg->FindEntryLocked(object.m_id);
     if (!e)
-        return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::err(
+        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
             MakeError(ErrorCode::Closed, "Borrow: object destroyed"));
     if (e->generation != object.m_generation)
-        return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::err(
+        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
             MakeError(ErrorCode::Closed, "Borrow: generation stale"));
     /**
      * subject_id 由调用方（service handle）给出——ComponentHandle 经
@@ -986,16 +994,16 @@ result<std::pair<std::shared_ptr<void>, v2::CoComponent*>> BorrowImpl(
         }
     }
     if (!found)
-        return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::err(
+        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
             MakeError(ErrorCode::Closed, "Borrow: binding invalidated"));
     auto lease = reg->AcquireBorrowLocked(*e, subject, binding_generation,
                                           allow_installing_borrow);
     if (!lease)
-        return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::err(
+        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
             std::move(lease.error()));
-    return result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>::ok(
+    return result<std::pair<std::shared_ptr<void>, CoComponent*>>::ok(
         std::make_pair(std::shared_ptr<void>(std::move(lease.value())),
-                       static_cast<v2::CoComponent*>(e->object.get())));
+                       static_cast<CoComponent*>(e->object.get())));
 }
 
 } // namespace detail

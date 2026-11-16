@@ -4,11 +4,11 @@
 由 ctest 调用：
   two_service_run.py --bin <two_service> --results <json>
 
-形态：**两个互异 identity 的真实 CoApp 进程**（V2 会话拒绝 self-connection，
-且框架约束进程内同一时刻至多一个活跃 CoApp）：
+形态：**两个互异 identity 的真实 CoApp 进程**（V2 会话拒绝 self-connection；
+单个 CoApp 只持一个 local_identity）：
   - callee 进程：local_identity=two-service-callee，宿主 GetValueService
   - caller 进程：local_identity=two-service-caller，宿主 GetValueCallerService；
-    handler 经公开 ICoService::call<Req,Resp> 按显式静态路由向 callee 发起
+    handler 经受保护 CoServiceBase::call<Req,Resp> 按显式静态路由向 callee 发起
     真实 V2 Call
 驱动器是与两者互异的第三个 identity（two-service-driver）。
 
@@ -17,8 +17,9 @@
   2. 经唯一 V2 codec（tests/rpc_v2_wire.py）打 caller 服务，
      覆盖 正常请求 / 业务错误 / 有限 deadline / 未配置路由；
   3. 读共享 journal：callee handler 只被真正到达的请求进入；关闭记录
-     rc=0、state=Closed、owner 同步 Close 且在最后一条 handler 进入之后；
-  4. 收尾：关 stdin 触发 request_shutdown，有限等待；异常路径回收自有进程。
+     rc=0、state=Stopped、观测组件 OnStop 同步收口且在最后一条 handler 进入之后；
+  4. 收尾：关 stdin 触发 RequestShutdown（仅置位，协程侧 CoStop 收口），
+     有限等待；异常路径回收自有进程。
 
 会话/分帧/握手/错误信封复用 tests/rpc_v2_wire.py；业务 payload 复用
 examples/getvalue/getvalue_client.py——不另造第二套 schema/codec。
@@ -241,7 +242,7 @@ def main():
         check(ok, f"got {env}", "miss")
         finish("miss", ok)
 
-        # 4) 业务错误：callee 的 InvalidArgument 经受保护的 this->call 原样回到
+        # 4) 业务错误：callee 的 InvalidArgument 经受保护的 call 原样回到
         #    调用方，再经正式 wire 信封回给驱动器（不被转成成功）。
         env = call(driver, "sc-empty", "Forward", key="")
         code = (v2.error_of(env) or {}).get("code")
@@ -304,7 +305,8 @@ def main():
         finish("no-route", ok)
 
         # 8) 关闭：caller 先失效（其 handler 已排空），callee 随后；
-        #    caller 的 CloseJournal 必须发生在最后一次 callee handler 进入之后。
+        #    caller 的 CloseJournal 组件 OnStop 必须发生在最后一次 callee
+        #    handler 进入之后（对应旧 add_resource 的同步 Close 语义）。
         meta = {}
         with open(caller_meta_file) as f:
             for line in f:
@@ -353,7 +355,7 @@ def main():
                          if e.get("peer_principal")]
         ok = (caller_rc == 0 and callee_exit == 0
               and shutdown_rec.get("rc") == "0"
-              and shutdown_rec.get("state") == "3"      # ShutdownState::Closed
+              and shutdown_rec.get("state") == "Stopped"  # AppState::Stopped
               and shutdown_rec.get("owner_closed") == "1"
               and len(callee_shutdown) == 1
               and callee_shutdown[0].get("rc") == "0"

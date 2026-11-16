@@ -1,11 +1,11 @@
 #pragma once
 #include <bbt/coroutine/object/CoRuntimeOnly.hpp>
 /**
- * framework v2 受管对象公共值层：id/generation/状态/info/handle/borrow/token。
+ * framework 受管对象公共值层：id/generation/状态/info/handle/borrow/token。
  *
  * 本头只承载契约 §3 的值类型与句柄面；Registry/生命周期实现见
- * internal/Registry.hpp，CoApp 装配面见 CoApp.hpp（v2 面经 Framework.hpp
- * 透出）。所有 handle 只携带「Registry 弱引用 + id + generation + 失效位」，
+ * internal/Registry.hpp，CoApp 装配面见 CoApp.hpp。所有 handle 只携带
+ * 「Registry 弱引用 + id + generation + 失效位」，
  * 不持有对象所有权；对象由对应 Registry 强持有并最终归 CoApp。
  */
 
@@ -24,11 +24,24 @@
 
 #include <bbt/coroutine/sync/WaitTypes.hpp>
 
+#include <bbt/infra/NetworkTypes.hpp>
+
 #include <bbt/framework/Address.hpp>
+#include <bbt/framework/DynamicRouteTable.hpp>
+#include <bbt/framework/ExecutionPolicy.hpp>
 #include <bbt/framework/Result.hpp>
+#include <bbt/framework/RpcPolicy.hpp>
 
 namespace bbt::framework {
-namespace v2 { class CoApp; class CoComponent; }
+
+/**
+ * @brief 受管对象装配根；Registry 与受管对象的唯一创建/生命周期入口。
+ */
+class CoApp;
+/**
+ * @brief 能力组件基类（Component.hpp）。
+ */
+class CoComponent;
 
 /**
  * @brief 受管对象的稳定逻辑标识；不是指针、fd 或协程 id。
@@ -118,7 +131,7 @@ enum class ObjectState {
 enum class ComponentScope { App, Service, Actor };
 
 /**
- * @brief v2::CoApp 自身生命周期状态。
+ * @brief CoApp 自身生命周期状态。
  */
 enum class AppState {
     /**
@@ -173,7 +186,7 @@ struct BindingLease;
 /**
  * @brief 受控构造钥匙（passkey）。
  *
- * 只有 Registry 与装配根 v2::CoApp 能构造/销毁受管对象；测试要构造受管类型，
+ * 只有 Registry 与装配根 CoApp 能构造/销毁受管对象；测试要构造受管类型，
  * 同样必须经 CoApp/Registry 走正式安装路径。私有构造显式提供（非
  * `= default`），使本类不是 aggregate，业务不能以
  * `detail::ConstructKey{}` 聚合初始化绕过受控创建。
@@ -182,13 +195,13 @@ class ConstructKey {
 private:
     ConstructKey() {}
     friend class Registry;
-    friend class ::bbt::framework::v2::CoApp;
+    friend class ::bbt::framework::CoApp;
 };
 
 /**
  * @brief ComponentHandle<C>::Borrow 的类型擦除半身（Registry.cc 实现）。
  *
- * 返回的对象地址是 `v2::CoComponent*` 而非 `void*`：CoComponent 可能不是
+ * 返回的对象地址是 `CoComponent*` 而非 `void*`：CoComponent 可能不是
  * 派生对象的首基类，经 CoComponent* 向 C* 的 static_cast 才由编译器完成
  * 正确的基类→派生指针调整（多继承安全）。
  *
@@ -198,7 +211,7 @@ private:
  *        （Registry 内已支持 Installed 借用，等待生命周期节点接线）。
  * @return 成功返回 (binding lease, 对象地址)；lease 归还计数由 BindingLease 析构驱动。
  */
-result<std::pair<std::shared_ptr<void>, v2::CoComponent*>> BorrowImpl(
+result<std::pair<std::shared_ptr<void>, CoComponent*>> BorrowImpl(
     const ObjectHandle& object, std::uint64_t binding_generation,
     bool allow_installing_borrow);
 
@@ -400,8 +413,8 @@ private:
 
     friend class detail::Registry;
     friend class CoApp;
-    friend class ::bbt::framework::v2::CoApp;
-    friend result<std::pair<std::shared_ptr<void>, v2::CoComponent*>>
+    friend class CoApp;
+    friend result<std::pair<std::shared_ptr<void>, CoComponent*>>
         detail::BorrowImpl(const ObjectHandle&, std::uint64_t, bool);
 };
 
@@ -502,7 +515,7 @@ private:
     /**
      * 装配窗口借 Installed 依赖
      */
-    friend class ::bbt::framework::v2::CoApp;
+    friend class CoApp;
 };
 
 namespace detail {
@@ -641,9 +654,34 @@ struct ComponentBindingDecl {
 } // namespace detail
 
 /**
+ * @brief 接收端有序流授权的服务级上限（OrderedIngress 的装配来源）。
+ *
+ * enabled=false 时三项上限必须为 0；enabled=true 时三项必须为有限正值，
+ * 且只允许 ActorSerial 服务（执行策略见 ServiceOptions::SetExecution）。
+ */
+struct OrderedIngressOptions {
+    bool enabled = false;
+    /**
+     * 最大授权流数。
+     */
+    std::size_t max_ordered_streams = 0;
+    /**
+     * 终态缓存条目上限。
+     */
+    std::size_t max_cached_results = 0;
+    /**
+     * 终态缓存字节上限。
+     */
+    std::size_t max_cached_result_bytes = 0;
+};
+
+/**
  * @brief Service 安装选项。
  *
- * Validate 要求 max_inflight 为有限正值。
+ * Validate 落实执行策略矩阵：Concurrent 要求 max_inflight > 0 且不创建
+ * 串行队列；ActorSerial 要求 max_inflight > 0、MaxSerialKeys > 0 且
+ * SerialQueueCapacity > 0；有序入口只允许 ActorSerial，启用时三项上限
+ * 均为有限正值，禁用时均为 0。
  */
 class ServiceOptions {
 public:
@@ -654,18 +692,28 @@ public:
         m_life = o; return *this;
     }
     /**
+     * @brief 执行策略（默认 Concurrent）。
+     */
+    ServiceOptions& SetExecution(ExecutionPolicy p) { m_execution = p; return *this; }
+    /**
      * @brief 最大在途请求数（必须 >0，Install 校验）。
      */
     ServiceOptions& SetMaxInflight(std::size_t n) { m_max_inflight = n; return *this; }
     /**
-     * @brief 按 key 串行的最大 key 数。
+     * @brief 按 key 串行的最大 key 数（ActorSerial 必须为有限正值）。
      */
     ServiceOptions& SetMaxSerialKeys(std::size_t n) { m_max_serial_keys = n; return *this; }
     /**
-     * @brief 串行队列容量。
+     * @brief 串行队列容量（ActorSerial 必须为有限正值）。
      */
     ServiceOptions& SetSerialQueueCapacity(std::size_t n) {
         m_serial_queue_capacity = n; return *this;
+    }
+    /**
+     * @brief 接收端有序流授权上限（只允许 ActorSerial）。
+     */
+    ServiceOptions& SetOrderedIngress(OrderedIngressOptions o) {
+        m_ordered_ingress = o; return *this;
     }
 
     /**
@@ -681,6 +729,10 @@ public:
      */
     const LifecycleOptions& Life() const noexcept { return m_life; }
     /**
+     * @brief 执行策略。
+     */
+    ExecutionPolicy Execution() const noexcept { return m_execution; }
+    /**
      * @brief 最大在途请求数。
      */
     std::size_t MaxInflight() const noexcept { return m_max_inflight; }
@@ -695,23 +747,31 @@ public:
         return m_serial_queue_capacity;
     }
     /**
+     * @brief 有序入口授权上限。
+     */
+    const OrderedIngressOptions& OrderedIngress() const noexcept {
+        return m_ordered_ingress;
+    }
+    /**
      * @brief 已声明的组件绑定列表。
      */
     const std::vector<detail::ComponentBindingDecl>& ComponentBindings()
         const noexcept { return m_component_bindings; }
 
     /**
-     * @brief 校验选项（max_inflight 必须为有限正值）。
+     * @brief 校验选项（执行策略矩阵，见类注释）。
      */
     result<void> Validate() const;
 private:
     LifecycleOptions m_life;
+    ExecutionPolicy  m_execution = ExecutionPolicy::Concurrent;
     /**
      * 0 = 未设；Install 校验 >0
      */
     std::size_t m_max_inflight = 0;
     std::size_t      m_max_serial_keys = 0;
     std::size_t      m_serial_queue_capacity = 0;
+    OrderedIngressOptions m_ordered_ingress;
     std::vector<detail::ComponentBindingDecl> m_component_bindings;
 };
 
@@ -810,16 +870,50 @@ private:
 };
 
 /**
- * @brief v2::CoApp 装配选项。
+ * @brief 显式配置的静态出站路由（服务名 → "host:port" endpoint）。
+ */
+struct StaticRoute {
+    std::string service_name;
+    std::string address;
+};
+
+/**
+ * @brief CoApp 装配选项。
  *
- * Validate 要求 SetLimits 四项额度为有限正值、shutdown/lifecycle budget 为正。
+ * Validate 要求 SetLimits 四项额度为有限正值、shutdown/lifecycle budget
+ * 为正。网络面字段（监听/路由/身份/策略/限额）在 CoStart 时校验：
+ * 未配置监听则本 App 不装配网络宿主（纯受管对象面）；配置了监听则
+ * listen host、local_identity、静态路由与 network_limits 全部校验。
  */
 class AppOptions {
 public:
     /**
-     * @brief 配置监听地址（本切片登记值，未接网络面）。
+     * @brief 配置监听地址："host:port"（port 0 = 随机端口）。格式非法时
+     *        登记为空 host，CoStart 校验拒绝；未配置则不装配网络宿主。
      */
-    AppOptions& Listen(std::string uri) { m_listen = std::move(uri); return *this; }
+    AppOptions& Listen(std::string uri) {
+        m_listen = std::move(uri);
+        m_listen_addr = bbt::infra::ListenAddress{};
+        if (!m_listen) return *this;
+        const auto colon = m_listen->rfind(':');
+        if (colon != std::string::npos) {
+            const std::string host = m_listen->substr(0, colon);
+            const std::string port = m_listen->substr(colon + 1);
+            bool numeric = !port.empty();
+            for (char c : port) numeric = numeric && (c >= '0' && c <= '9');
+            unsigned value = 0;
+            if (numeric) {
+                const unsigned long parsed = std::stoul(port);
+                value = static_cast<unsigned>(parsed);
+                numeric = parsed <= 0xFFFFu;
+            }
+            if (!host.empty() && numeric) {
+                m_listen_addr.host = host;
+                m_listen_addr.port = static_cast<std::uint16_t>(value);
+            }
+        }
+        return *this;
+    }
     /**
      * @brief 设置受管对象/绑定/观察者/事件队列额度（四项均须 >0）。
      * @param max_objects 最大受管对象数。
@@ -847,11 +941,50 @@ public:
     AppOptions& SetLifecycleBudget(std::chrono::milliseconds budget) {
         m_lifecycle_budget = budget; return *this;
     }
+    /**
+     * @brief 配置静态出站路由（重复服务名以首次为准，CoStart 校验拒绝重复）。
+     */
+    AppOptions& AddRoute(std::string service, std::string endpoint) {
+        m_static_routes.push_back(StaticRoute{std::move(service),
+                                              std::move(endpoint)});
+        return *this;
+    }
+    /**
+     * @brief 会话身份（必填当配置了监听；trusted-network identity 不是认证凭据）。
+     */
+    AppOptions& SetLocalIdentity(std::string identity) {
+        m_local_identity = std::move(identity); return *this;
+    }
+    /**
+     * @brief 出站策略；nullptr 使用默认策略（App 持有至析构）。
+     */
+    AppOptions& SetRpcPolicy(std::shared_ptr<RpcPolicy> policy) {
+        m_rpc_policy = std::move(policy); return *this;
+    }
+    /**
+     * @brief 可选动态路由表：发现提供方发布快照，出站按逻辑服务名解析；
+     *        已配置的服务名优先于静态路由且不回退。
+     */
+    AppOptions& SetDynamicRoutes(std::shared_ptr<DynamicRouteTable> table) {
+        m_dynamic_routes = std::move(table); return *this;
+    }
+    /**
+     * @brief 网络限额（帧上限/正文上限等；CoStart 校验）。
+     */
+    AppOptions& SetNetworkLimits(bbt::infra::NetworkLimits limits) {
+        m_network_limits = std::move(limits); return *this;
+    }
 
     /**
-     * @brief 监听地址（未设为空）。
+     * @brief 监听地址串（未设为空）。
      */
     const std::optional<std::string>& ListenUri() const noexcept { return m_listen; }
+    /**
+     * @brief 解析后的监听地址（host 非空即合法；port 0 = 随机端口）。
+     */
+    const bbt::infra::ListenAddress& ListenAddr() const noexcept {
+        return m_listen_addr;
+    }
     /**
      * @brief 最大受管对象数。
      */
@@ -882,6 +1015,32 @@ public:
     std::chrono::milliseconds LifecycleBudget() const noexcept {
         return m_lifecycle_budget;
     }
+    /**
+     * @brief 静态出站路由。
+     */
+    const std::vector<StaticRoute>& StaticRoutes() const noexcept {
+        return m_static_routes;
+    }
+    /**
+     * @brief 会话身份（未设为空）。
+     */
+    const std::string& LocalIdentity() const noexcept { return m_local_identity; }
+    /**
+     * @brief 出站策略（未设为空）。
+     */
+    const std::shared_ptr<RpcPolicy>& RpcPolicyPtr() const noexcept { return m_rpc_policy; }
+    /**
+     * @brief 动态路由表（未设为空）。
+     */
+    const std::shared_ptr<DynamicRouteTable>& DynamicRoutes() const noexcept {
+        return m_dynamic_routes;
+    }
+    /**
+     * @brief 网络限额。
+     */
+    const bbt::infra::NetworkLimits& NetworkLimits() const noexcept {
+        return m_network_limits;
+    }
 
     /**
      * @brief 校验选项（额度与预算必须为有限正值）。
@@ -889,6 +1048,12 @@ public:
     result<void> Validate() const;
 private:
     std::optional<std::string> m_listen;
+    bbt::infra::ListenAddress  m_listen_addr;
+    std::vector<StaticRoute>   m_static_routes;
+    std::string                m_local_identity;
+    std::shared_ptr<RpcPolicy> m_rpc_policy;
+    std::shared_ptr<DynamicRouteTable> m_dynamic_routes;
+    bbt::infra::NetworkLimits  m_network_limits;
     /**
      * 有限正值才放行；0 表示未设（Validate 拒绝）。
      */

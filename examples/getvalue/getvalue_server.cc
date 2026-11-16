@@ -18,12 +18,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
 
 #include <unistd.h>
 
+#include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/detail/Define.hpp>
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
 
@@ -68,7 +70,7 @@ int main(int argc, char* argv[]) {
      * 超过 coroutine 默认 12KB 栈。示例 server 经 coroutine **公开配置入口**
      * `g_bbt_coroutine_config`（= GlobalConfig 访问宏；头
      * bbt/coroutine/detail/GlobalConfig.hpp，见 coroutine agent-docs「配置」）显式把协程栈调到 512KB。
-     * - 该配置非线程安全，必须在调度器 Start 前（即 app.run() 前）设置；
+     * - 该配置非线程安全，必须在调度器 Start 前设置；
      * - 是 process-global：影响本进程全部协程，不是 per-service/per-request；
      * - 这是运行期资源配置，不是业务/协议语义。
      * 见 README「已知限制」：512KB 只覆盖本示例负载规模；框架默认 12KB 栈对
@@ -80,45 +82,107 @@ int main(int argc, char* argv[]) {
 
     getvalue::SetServedHook(&AppendHandlerEntry);
 
-    bbt::framework::CoAppOptions options;
-    options.network_limits = bbt::infra::NetworkLimits{
-        64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}};
-    options.listen = bbt::infra::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = std::chrono::milliseconds{3000};
     /**
-     * V2 会话身份必填；进程内每个会话 owner 使用明确身份。
+     * 普通 main + 协程入口：先启动 runtime，再把宿主流程投递进受管协程
+     * （装配/启动/等待关闭/收口全部在 Co 域；RequestShutdown 由 native
+     * stdin-EOF 路径发出，仅触发请求，不执行收口）。
      */
-    options.local_identity = "getvalue-server";
+    g_scheduler->Start();
 
-    bbt::framework::CoApp app(options);
-    if (auto r = app.add_service<getvalue::GetValueService>(
-            bbt::framework::ServiceOptions{
-                bbt::framework::ExecutionPolicy::Concurrent,
-                64, 0, 0, false, 0, 0, 0});
-        !r) {
-        std::fprintf(stderr, "add_service failed: %s\n", r.error().message.c_str());
+    auto options = bbt::framework::AppOptions{}
+        .SetLimits(64, 64, 64, 64)
+        .SetNetworkLimits(bbt::infra::NetworkLimits{
+            64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}})
+        .Listen("127.0.0.1:0")
+        .SetShutdownBudget(std::chrono::milliseconds{3000})
+        .SetLifecycleBudget(std::chrono::milliseconds{3000})
+        /**
+         * V2 会话身份必填；进程内每个会话 owner 使用明确身份。
+         */
+        .SetLocalIdentity("getvalue-server");
+
+    /**
+     * 装配结果跨协程/线程交接：endpoint 经 promise 交给宿主线程写端口
+     * 文件；App 指针发布后宿主线程只做 RequestShutdown（幂等 noexcept）；
+     * 退出码经 promise 回传（0=按期优雅收口，2=启动失败，4=收口未竟）。
+     */
+    std::promise<std::string> bound_ep;
+    std::promise<int>         rc_slot;
+    std::shared_ptr<bbt::framework::CoApp> app_handle;
+    std::mutex                  app_mtx;
+
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [options = std::move(options), &bound_ep, &rc_slot,
+         &app_handle, &app_mtx]() mutable {
+            auto app = bbt::framework::CoApp::Create(options,
+                                                     "getvalue-server");
+            if (!app) {
+                std::fprintf(stderr, "server: CoApp::Create failed\n");
+                rc_slot.set_value(4);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(app_mtx);
+                app_handle = app;
+            }
+            auto install = bbt_co_await app->CoInstallService<
+                getvalue::GetValueService>(
+                bbt::framework::ServiceOptions{}
+                    .SetExecution(bbt::framework::ExecutionPolicy::Concurrent)
+                    .SetMaxInflight(64));
+            if (!install) {
+                std::fprintf(stderr, "server: CoInstallService failed: %s\n",
+                             install.error().message.c_str());
+                rc_slot.set_value(2);
+                return;
+            }
+            auto started = bbt_co_await app->CoStart(
+                bbt::framework::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds{5}));
+            if (!started) {
+                std::fprintf(stderr, "server: CoStart failed: %s\n",
+                             started.error().message.c_str());
+                rc_slot.set_value(2);
+                return;
+            }
+            bound_ep.set_value(app->BoundEndpoint());
+            const auto waited = bbt_co_await app->CoWaitShutdownRequest();
+            (void)waited;
+            auto stopped = bbt_co_await app->CoStop(
+                bbt::framework::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds{3}));
+            rc_slot.set_value(
+                stopped && app->State() ==
+                               bbt::framework::AppState::Stopped
+                    ? 0
+                    : 4);
+        },
+        submitted);
+    if (!submitted) {
+        std::fprintf(stderr, "server: coroutine task rejected\n");
         return 4;
     }
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
-
     /**
-     * 轮询绑定地址（动态端口）。
+     * 轮询绑定地址（动态端口；CoStart 完成后由协程侧发布）。
      */
-    std::string endpoint;
-    for (int i = 0; i < 400; ++i) {
-        endpoint = app.bound_endpoint();
-        if (!endpoint.empty())
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{25});
-    }
-    if (endpoint.empty()) {
-        app.request_shutdown();
-        if (runner.joinable()) runner.join();
-        std::fprintf(stderr, "server did not bind (rc=%d)\n", rc);
+    auto bound = bound_ep.get_future();
+    if (bound.wait_for(std::chrono::seconds{10}) != std::future_status::ready) {
+        /**
+         * 启动相位已由协程侧如实写入 rc_slot（promise 单次写入）；宿主侧只
+         * 触发关闭请求后按启动失败退出，不二次写入。
+         */
+        {
+            std::lock_guard<std::mutex> lk(app_mtx);
+            if (app_handle) app_handle->RequestShutdown();
+        }
+        std::fprintf(stderr, "server did not bind\n");
         return 5;
     }
+    const std::string endpoint = bound.get();
     const auto colon = endpoint.rfind(':');
     const std::string port = endpoint.substr(colon + 1);
 
@@ -145,9 +209,15 @@ int main(int argc, char* argv[]) {
     char buf[8];
     while (::read(STDIN_FILENO, buf, sizeof(buf)) > 0) {
     }
-    app.request_shutdown();
-    if (runner.joinable())
-        runner.join();
+    /**
+     * stdin EOF：native 线程发关闭请求（仅置位并唤醒唯一 waiter；
+     * 主协程亲自 CoStop 收口）。
+     */
+    {
+        std::lock_guard<std::mutex> lk(app_mtx);
+        if (app_handle) app_handle->RequestShutdown();
+    }
+    const int rc = rc_slot.get_future().get();
     std::fprintf(stderr, "getvalue server rc=%d\n", rc);
     return rc;
 }

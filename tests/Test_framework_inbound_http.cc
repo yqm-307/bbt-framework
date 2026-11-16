@@ -11,7 +11,7 @@
  * _cross_worker                  绑定互不串扰；占用对端 worker 的
  * spinner 协程制造确定性跨 worker 恢复。
  * T3 unmanaged_coroutine_invalid     非受管协程经已托管服务实例调用
- * _context_end_to_end            this->call → 端到端真实 InvalidContext；
+ * _context_end_to_end            call → 端到端真实 InvalidContext；
  * 受管入站路径作正路径对照（真实回路）。
  * T4 outbound_deadline_min_and       出站期限缺省继承父预算、显式期限取
  * _expired_before_io             min；父预算过期 → 发起 I/O 前 TimedOut。
@@ -37,28 +37,31 @@
  * T1 承担。映射见本轮交接报告。
  * T9 dispatch_direct_timeout_late    DispatchDirect 超预算失败路径的 CoApp
  * _task_keeps_app_alive          所有权：注册任务停在调用 CoApp 之前，
- * 外部超时返回 InternalError；停 run 并
- * 放弃调用方强引用后 weak_ptr 证在途任务
- * 仍强持有 app；放行后任务真实执行，对已
- * 停止的 app 安全返回 RuntimeUnavailable
- * 并最终释放对 app 的强引用。
+ *                                   外部超时返回 InternalError；停受管任务并
+ *                                   放弃调用方强引用后 weak_ptr 证在途任务
+ *                                   仍强持有 app；放行后任务真实执行，对已
+ *                                   停止的 app 安全返回 RuntimeUnavailable
+ *                                   并最终释放对 app 的强引用。
  * T10 lifecycle_readers_survive_run_teardown
- * CoApp 生命周期对象共享寿命：run 收束期间
- * 并发读取关闭状态/待收尾/失败清单与请求关闭
- * 不得触到已析构的 HostLifecycle。
+ *                                   CoApp 生命周期对象共享寿命：受管任务
+ *                                   收束期间并发读取关闭状态/待收尾/失败清单
+ *                                   与请求关闭不得触到已析构的宿主对象。
  * T11 callrpc_late_completion_after_timeout
- * CallRpc 超预算返回后任务迟到完成：结果与
- * 完成信号在调用者/任务共享的堆状态上，不
- * 借用调用者栈对象。
- * T12 lifecycle_publish_revoked_on_run_exception
- * run 发布 m_lifecycle 后异常退出（宿主
- * WaitHandlersDone 抛出，越过 Run）也必须
- * 撤销发布：读口不得触到已析构的 run 局部
- * HostLifecycle。
+ *                                   CallRpc 超预算返回后任务迟到完成：结果与
+ *                                   完成信号在调用者/任务共享的堆状态上，不
+ *                                   借用调用者栈对象。
  *
- * 入站走真实 V2 会话（SessionFrame + u32be + Hello/HelloAck）：服务端是
- * InfraHttpHost + InstallRpcAdmission，客户端是互异 identity 的第二个会话
- * owner + RpcEgress::Call。业务负载使用 CoRpcReq/CoRpcResp 位置参数 codec。
+ * 唯一公开 API 迁移说明：
+ * - 旧 T12（lifecycle_publish_revoked_on_run_exception）删除：新模型没有
+ *   m_lifecycle 发布点（生命周期簿记由 Registry/CoApp 成员承载），宿主桩
+ *   WaitHandlersDone 抛出会经 native 辅助线程传播到 std::thread 入口
+ *   （std::terminate），原 UAF 观察面不存在对应物——删除如实留档。
+ * - 入站走真实 V2 会话（SessionFrame + u32be + Hello/HelloAck）：服务端是
+ *   InfraHttpHost + 测试侧 admission 复刻器（生产 InstallRpcAdmission 需
+ *   app.m_runtime，候选公开面无访问口——DispatchInboundForTest 不透传
+ *   on_dispatched，测试侧先放行同步派发门，见交接「公共缺口」），客户端是
+ *   互异 identity 的第二个会话 owner + RpcEgress::Call。业务负载使用
+ *   CoRpcReq/CoRpcResp 位置参数 codec。
  * 静态路由的 endpoint 值对 loopback 用 "self" 逻辑标记，测试缝发送闭包在
  * 发送时刻替换为宿主真实绑定地址——路由门（服务名白名单）仍完整生效。
  *
@@ -101,11 +104,12 @@
 #include <bbt/framework/CoApp.hpp>
 
 /**
- * 机器面（宿主/线桥/生命周期/测试缝构造）显式走 internal 头。
+ * 机器面（宿主/线桥/测试缝构造/边界校验）显式走 internal 头。
  */
 #include <bbt/framework/internal/CoAppSeam.hpp>
-#include <bbt/framework/internal/HostLifecycle.hpp>
+#include <bbt/framework/internal/ErrorDomainRule.hpp>
 #include <bbt/framework/internal/InfraHttpHost.hpp>
+#include <bbt/framework/internal/NetworkHost.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 
 namespace fw  = bbt::framework;
@@ -145,6 +149,22 @@ private:
 };
 
 constexpr std::chrono::milliseconds kWait{15000};
+
+/**
+ * 进程内唯一 runtime：native 测试宿主负责初始化；协程配置只在尚未
+ * 初始化时写入（非线程安全）。宿主/Engine/受管对象创建都依赖已
+ * Start 的调度器。
+ */
+void EnsureScheduler() {
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
+        /**
+         * 受管 handler 的嵌套出站链在 12KB 默认栈触底；沿用 64KB。
+         */
+        g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+        g_scheduler->Start();
+    }
+}
 
 /**
  * ── 协程闩（CoWaiter 上的单次放行语义）──
@@ -270,6 +290,7 @@ struct CtxSnapshot {
     std::string trace_id;
     co::Deadline    deadline{};
     std::uint64_t   co_id = 0;
+    co::detail::ProcesserId processer_id = BBT_COROUTINE_INVALID_PROCESSER_ID;
     std::thread::id tid{};
 };
 
@@ -350,6 +371,20 @@ struct ProbeState {
 
 std::shared_ptr<ProbeState> g_probe;
 
+/**
+ * 取已安装服务的受管实例（锁内取 owner+指针，保活纪律与宿主一致）。
+ */
+template <class S>
+S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
+    const auto reg = app.RegistryForTest();
+    std::lock_guard<std::mutex> lk(reg->Mutex());
+    auto* e = reg->FindByTypeNameLocked(
+        fw::ObjectKind::Service, S::kServiceName);
+    if (!e) return nullptr;
+    owner = e->object;
+    return static_cast<S*>(e->object.get());
+}
+
 CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     CtxSnapshot s;
     s.request_id     = c.request_id;
@@ -358,6 +393,9 @@ CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     s.trace_id       = c.trace_id.value_or("");
     s.deadline       = c.deadline;
     s.co_id          = co::GetLocalCoroutineId();
+    const auto processer = co::detail::Processer::TryGetLocalProcesser();
+    s.processer_id   = processer ? processer->GetId()
+                                 : BBT_COROUTINE_INVALID_PROCESSER_ID;
     s.tid            = std::this_thread::get_id();
     return s;
 }
@@ -381,9 +419,10 @@ fw::Error WaitErr(co::WaitStatus st, const char* what) {
  * "probe"：Concurrent；inspect 立即回显，wait_echo 在 per-rid 信号上
  * 真实挂起（用 ctx 的 deadline 作等待参数），恢复后再次快照上下文。
  */
-class ProbeSvc final : public fw::CoService<ProbeSvc> {
+class ProbeSvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "probe";
+    explicit ProbeSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
     fw::CoRpcResp Inspect(fw::CoRpcReq req) {
         auto value = IntArg(req);
         if (!value) return fw::CoRpcResp::Error(value.error());
@@ -421,14 +460,19 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&ProbeSvc::Inspect>("inspect"),
         fw::Method<&ProbeSvc::WaitEcho>("wait_echo"));
+protected:
+    ~ProbeSvc() noexcept override = default;
+private:
+    friend class fw::detail::Registry;
 };
 
 /**
  * "echo"：Concurrent 远端被调方；slow 在全局 slow 门上挂起。
  */
-class EchoSvc final : public fw::CoService<EchoSvc> {
+class EchoSvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "echo";
+    explicit EchoSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
     fw::CoRpcResp Ping(fw::CoRpcReq req) {
         return ReplyInt(IntArg(req));
     }
@@ -446,16 +490,21 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoSvc::Ping>("ping"),
         fw::Method<&EchoSvc::Slow>("slow"));
+protected:
+    ~EchoSvc() noexcept override = default;
+private:
+    friend class fw::detail::Registry;
 };
 
 /**
  * "caller"：Concurrent；在受管 handler 内发起到 echo 的真实远端调用。
  */
-class CallerSvc final : public fw::CoService<CallerSvc> {
+class CallerSvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "caller";
+    explicit CallerSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
     fw::CoRpcResp Dial(fw::CoRpcReq req) {
-        auto response = this->call("echo", "ping", req);
+        auto response = bbt_co_await call("echo", "ping", req);
         if (!response) return fw::CoRpcResp::Error(response.error());
         return response.value();
     }
@@ -472,7 +521,7 @@ public:
         auto gate = std::make_shared<CoGate>();
         bbtco [this, req, slot, gate]() {
             slot->co_id = co::GetLocalCoroutineId();
-            auto response = this->call("echo", "ping", req);
+            auto response = bbt_co_await this->call("echo", "ping", req);
             if (response)
                 slot->code = fw::ErrorCode::InternalError;
             else
@@ -488,25 +537,30 @@ public:
             static_cast<std::int32_t>(slot->code));
     }
     fw::result<fw::CoRpcResp> DirectDial(fw::CoRpcReq req) {
-        return this->call("echo", "ping", req);
+        return bbt_co_await call("echo", "ping", req);
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&CallerSvc::Dial>("dial"),
         fw::Method<&CallerSvc::SpawnDial>("spawn_dial"));
+protected:
+    ~CallerSvc() noexcept override = default;
+private:
+    friend class fw::detail::Registry;
 };
 
 /**
  * "relay"：Concurrent；三种出站期限形态，真实经 loopback 到 echo。
  */
-class RelaySvc final : public fw::CoService<RelaySvc> {
+class RelaySvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "relay";
+    explicit RelaySvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
     fw::CoRpcResp CallDefault(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
         if (!ctx) return fw::CoRpcResp::Error(ctx.error());
         g_probe->Snapshot(g_probe->before, ctx.value()->request_id,
                           SnapCtx(*ctx.value()));
-        auto response = this->call("echo", "ping", req);
+        auto response = bbt_co_await call("echo", "ping", req);
         if (!response) return fw::CoRpcResp::Error(response.error());
         return response.value();
     }
@@ -517,7 +571,7 @@ public:
                           SnapCtx(*ctx.value()));
         fw::CallOptions opt;
         opt.deadline = Clock::now() + std::chrono::minutes{10};
-        auto response = this->call("echo", "ping", req, {}, opt);
+        auto response = bbt_co_await call("echo", "ping", req, {}, opt);
         if (!response) return fw::CoRpcResp::Error(response.error());
         return response.value();
     }
@@ -536,7 +590,7 @@ public:
         p->expired_sends_before.store(
             p->egress_calls.load(std::memory_order_acquire),
             std::memory_order_release);
-        auto response = this->call("echo", "ping", req);
+        auto response = bbt_co_await call("echo", "ping", req);
         if (!response) return fw::CoRpcResp::Error(response.error());
         return response.value();
     }
@@ -544,6 +598,10 @@ public:
         fw::Method<&RelaySvc::CallDefault>("call_default"),
         fw::Method<&RelaySvc::CallLonger>("call_longer"),
         fw::Method<&RelaySvc::CallExpired>("call_expired"));
+protected:
+    ~RelaySvc() noexcept override = default;
+private:
+    friend class fw::detail::Registry;
 };
 
 /**
@@ -551,9 +609,10 @@ public:
  * （客户端填 "acct-<v>"）。Xfer 在远端（echo.slow）等待，XferFast 走
  * 即时远端；事件日志证明同 key 不重入、异 key 并发。
  */
-class AcctSvc final : public fw::CoService<AcctSvc> {
+class AcctSvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "acct";
+    explicit AcctSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
     fw::CoRpcResp Xfer(fw::CoRpcReq req) {
         auto args = AcctArgs(req);
         if (!args) return fw::CoRpcResp::Error(args.error());
@@ -563,7 +622,7 @@ public:
         const std::string rid = ctx.value()->request_id;
         p->Snapshot(p->before, rid, SnapCtx(*ctx.value()));
         p->Event("start:" + rid);
-        auto response = this->call(
+        auto response = bbt_co_await call(
             "echo", "slow", RequestInt(std::get<1>(args.value())));
         p->Event("end:" + rid);
         if (!response) return fw::CoRpcResp::Error(response.error());
@@ -578,7 +637,7 @@ public:
         const std::string rid = ctx.value()->request_id;
         p->Snapshot(p->before, rid, SnapCtx(*ctx.value()));
         p->Event("start:" + rid);
-        auto response = this->call(
+        auto response = bbt_co_await call(
             "echo", "ping", RequestInt(std::get<1>(args.value())));
         p->Event("end:" + rid);
         if (!response) return fw::CoRpcResp::Error(response.error());
@@ -587,6 +646,10 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&AcctSvc::Xfer, std::string>("xfer"),
         fw::ActorMethodAt<&AcctSvc::XferFast, std::string>("xfer_fast"));
+protected:
+    ~AcctSvc() noexcept override = default;
+private:
+    friend class fw::detail::Registry;
 };
 
 /**
@@ -594,27 +657,17 @@ public:
  */
 
 fw::ServiceOptions ConcurrentOpts() {
-    return fw::ServiceOptions{
-        fw::ExecutionPolicy::Concurrent,
-        /*max_inflight*/ 64,
-        /*mailbox_capacity*/ 0,
-        /*max_actors*/ 0,
-        /*ordered_ingress*/ false,
-        /*max_ordered_streams*/ 0,
-        /*max_cached_results*/ 0,
-        /*max_cached_result_bytes*/ 0};
+    return fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::Concurrent)
+        .SetMaxInflight(64);
 }
 
-fw::ServiceOptions ActorOpts(std::size_t mailbox_capacity = 16) {
-    return fw::ServiceOptions{
-        fw::ExecutionPolicy::ActorSerial,
-        /*max_inflight*/ 64,
-        mailbox_capacity,
-        /*max_actors*/ 8,
-        /*ordered_ingress*/ false,
-        /*max_ordered_streams*/ 0,
-        /*max_cached_results*/ 0,
-        /*max_cached_result_bytes*/ 0};
+fw::ServiceOptions ActorOpts(std::size_t serial_queue_capacity = 16) {
+    return fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::ActorSerial)
+        .SetMaxInflight(64)
+        .SetMaxSerialKeys(8)
+        .SetSerialQueueCapacity(serial_queue_capacity);
 }
 
 inf::NetworkLimits Limits(std::chrono::milliseconds incoming_timeout) {
@@ -627,40 +680,63 @@ inf::NetworkLimits Limits(std::chrono::milliseconds incoming_timeout) {
 }
 
 struct RunHandle {
-    /**
-     * 析构兜底：REQUIRE 早退时线程仍 joinable 会 terminate；
-     * 正常路径由 AppBox::Stop 先 request_shutdown 再 join。
-     */
-    ~RunHandle() { if (th.joinable()) th.detach(); }
-    std::thread       th;
     std::atomic<bool> done{false};
     int               rc{-1};
+    std::promise<bool> started;
 };
 
-std::unique_ptr<RunHandle> RunApp(fw::CoApp& app) {
-    /**
-     * Registered driver capacity: app server 2 + app 测试缝出站宿主 1 +
-     * 测试客户端宿主 1 + runnable worker 1 + spinner 占用 1。
-     */
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
-    /**
-     * 受管 handler 会在协程内做嵌套出站调用（入站派发 →
-     * this->call → 出站适配 → 发送闭包 → client->Request → 信号等待），
-     * 链上各帧携带 Error/result/envelope 等值类型；12KB 默认栈在首个
-     * 真实嵌套调用即触底（guard 页 SIGSEGV）。按真实工作负载放大栈。
-     */
-    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
-    auto h = std::make_unique<RunHandle>();
-    RunHandle* p = h.get();
-    h->th = std::thread([p, &app] {
-        p->rc = app.run();
-        p->done.store(true, std::memory_order_release);
-    });
-    return h;
+/**
+ * 旧 run() 退出码在本测试内的对应映射：
+ * kExitOk = 全部收口至 Stopped 且无 LifecycleFailure；
+ * kExitStartFailed = 装配或 CoStart 失败；
+ * kExitStopIncomplete = 收口未竟（曾记失败或 StopIncomplete 推进后才完成）。
+ */
+constexpr int kExitOk = 0;
+constexpr int kExitStartFailed = 2;
+constexpr int kExitStopIncomplete = 4;
+
+/**
+ * 在受管协程内执行 fn：经 g_scheduler 投递协程任务，宿主线程用
+ * 限时 std::cv 等其完成（宿主线程的 CV 等待不违反 worker 阻塞禁令）。
+ */
+template <class F>
+bool RunInManagedCoroutine(F&& fn,
+    std::chrono::milliseconds budget = std::chrono::milliseconds{10000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+    if (!g_scheduler->IsInitialized()) {
+        g_bbt_coroutine_config->m_cfg_static_thread_num = 7;
+        g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
+        g_scheduler->Start();
+    }
+    struct Slot {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      error;
+    };
+    auto slot = std::make_shared<Slot>();
+    auto f = std::forward<F>(fn);
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [slot, f = std::move(f)]() mutable {
+            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            std::lock_guard<std::mutex> lk(slot->mtx);
+            slot->done = true;
+            slot->cv.notify_all();
+        }, submitted);
+    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+    std::unique_lock<std::mutex> lk(slot->mtx);
+    const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
+    if (!done)
+        std::terminate();
+    if (slot->error) std::rethrow_exception(slot->error);
+    return done;
 }
 
 void JoinRun(const std::unique_ptr<RunHandle>& h) {
-    if (h->th.joinable()) h->th.join();
+    const auto until = Clock::now() + std::chrono::minutes{3};
+    while (!h->done.load(std::memory_order_acquire) && Clock::now() < until)
+        std::this_thread::yield();
 }
 
 /**
@@ -673,15 +749,15 @@ struct Spinner {
     std::atomic<std::thread::id> tid{};
 };
 
-std::shared_ptr<Spinner> LaunchSpinner() {
+std::shared_ptr<Spinner> LaunchSpinner(co::detail::ProcesserId target) {
     auto s = std::make_shared<Spinner>();
-    bbtco [s]() {
+    g_scheduler->RegistCoroutineTaskOn(target, [s]() {
         s->tid.store(std::this_thread::get_id(),
                      std::memory_order_release);
         s->spinning.store(true, std::memory_order_release);
         while (!s->release.load(std::memory_order_acquire))
             std::this_thread::yield();
-    };
+    });
     return s;
 }
 
@@ -709,9 +785,23 @@ struct AppBox {
     /**
      * CoApp 由夹具与在途派发任务共享强持有：DispatchDirect 超预算返回后
      * 任务仍可能迟到，app 由任务的 shared_ptr 保活，窗口内不悬垂。
+     * app_slot 同时给 admission 闭包间接寻址（装配在受管协程内完成后回填）。
      */
-    std::shared_ptr<fw::CoApp> app;
+    std::shared_ptr<std::shared_ptr<fw::CoApp>> app_slot =
+        std::make_shared<std::shared_ptr<fw::CoApp>>();
     std::unique_ptr<RunHandle> run;
+
+    std::shared_ptr<fw::CoApp> App() const { return *app_slot; }
+    /**
+     * 兼容旧 box.MutableApp() 写法：装配完成后返回同一 owner。
+     */
+    std::shared_ptr<fw::CoApp>& MutableApp() { return *app_slot; }
+    /**
+     * 首次 CoStop 后推进第二次收口的放行闩（StopIncomplete 用例使用）；
+     * 默认立即放行（正常关闭用例不依赖）。
+     */
+    std::shared_ptr<TestLatch> after_first_stop =
+        std::make_shared<TestLatch>(0);
 
     AppBox()                         = default;
     ~AppBox() { Stop(); }
@@ -721,23 +811,93 @@ struct AppBox {
     AppBox& operator=(const AppBox&) = delete;
 
     /**
-     * 幂等收尾：放行测试门/spinner → 请求关闭 → join run 线程。
+     * 幂等收尾：放行测试门/spinner → 请求关闭 → join 受管任务线程。
      * REQUIRE 早退路径同样走这里，保证不 terminate、不留运行中调度器。
      */
     void Stop() {
         for (auto& s : g_spinners)
             s->release.store(true, std::memory_order_release);
         if (g_probe) g_probe->CompleteAll();
+        after_first_stop->CountDown();
         /**
          * infra 关闭是同步契约：Close() 返回即物理释放，无需等待收束。
          */
         if (client_rt) client_rt->Close();
         if (egress_rt)
             egress_rt->Close();
-        if (app)       app->request_shutdown();
-        if (run && run->th.joinable()) run->th.join();
+        if (App())       App()->RequestShutdown();
+        if (run) JoinRun(run);
+        if (host)
+            host->Close();
     }
 };
+
+/**
+ * 受管服务端任务体：register_fn（装配）→ CoStart → 等关闭请求 →
+ * CoStop；全部生命周期入口必须在受管协程内执行。
+ */
+void ServerTaskBody(
+    const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot,
+    const std::shared_ptr<TestLatch>& after_first_stop,
+    RunHandle* h,
+    const std::function<fw::result<void>(fw::CoApp&)>& register_fn) {
+    auto set_rc = [&](int rc) {
+        h->rc = rc;
+        h->done.store(true, std::memory_order_release);
+    };
+    try {
+        auto app = *app_slot;
+        if (register_fn) {
+            auto r = register_fn(*app);
+            if (!r) { set_rc(kExitStartFailed); return; }
+        }
+        auto started = bbt_co_await app->CoStart();
+        if (!started) { set_rc(kExitStartFailed); return; }
+        h->started.set_value(true);
+        auto waited = bbt_co_await app->CoWaitShutdownRequest();
+        if (!waited) { set_rc(kExitStopIncomplete); return; }
+        { auto _r = bbt_co_await app->CoStop(); (void)_r; }
+        /**
+         * 收口未竟（Stopping/StopIncomplete）才等测试放行推进；已 Stopped
+         * 不等闩（避免每个用例白等闩窗期）。
+         */
+        if (app->State() == fw::AppState::StopIncomplete ||
+            app->State() == fw::AppState::Stopping) {
+            after_first_stop->WaitFor(std::chrono::minutes{2});
+            { auto _r2 = bbt_co_await app->CoStop(); (void)_r2; }
+        }
+        set_rc(app->State() == fw::AppState::Stopped &&
+                       app->LifecycleFailures().empty()
+                   ? kExitOk : kExitStopIncomplete);
+    } catch (...) {
+        try { h->started.set_value(false); } catch (...) {}
+        set_rc(kExitStartFailed);
+    }
+}
+
+/**
+ * 测试侧入站接线复刻器：与生产 InstallRpcAdmission 同一纪律——同步派发门
+ * 在任何可挂起动作之前释放，回复经 ValidateErrorAtBoundary 边界校验。
+ * 生产入口需要 app.m_runtime（候选公开面无访问口），测试侧经 app 槽位
+ * 转发 DispatchInboundForTest（不透传 on_dispatched 是候选缝签名缺口）。
+ */
+void InstallAdmissionForTest(
+    const std::shared_ptr<fw::InfraHttpHost>& host,
+    const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot) {
+    host->InstallRpcHandler(
+        [app_slot](const inf::rpc::Request& request,
+                   const std::function<void()>& dispatched)
+            -> fw::result<inf::rpc::Response> {
+            dispatched();
+            auto reply = fw::DispatchInboundForTest(**app_slot, request);
+            if (!reply) {
+                if (auto valid = fw::ValidateErrorAtBoundary(reply.error()); !valid)
+                    return fw::result<inf::rpc::Response>::err(
+                        std::move(valid.error()));
+            }
+            return reply;
+        });
+}
 
 std::shared_ptr<fw::InfraHttpHost> MakeHost(
     const inf::NetworkLimits& limits, const std::string& identity) {
@@ -752,18 +912,11 @@ std::shared_ptr<fw::InfraHttpHost> MakeHost(
 AppBox StartApp(std::chrono::milliseconds incoming_timeout,
                 std::chrono::milliseconds step_budget,
                 const std::vector<std::string>& routed,
-                const std::function<void(fw::CoApp&)>& register_fn) {
+                const std::function<fw::result<void>(fw::CoApp&)>& register_fn) {
     AppBox box;
     const auto limits = Limits(incoming_timeout);
     box.host = MakeHost(limits, "inbound-server");
-
-    fw::CoAppOptions opts;
-    opts.network_limits = limits;
-    opts.listen         = inf::ListenAddress{"127.0.0.1", 0};
-    for (const auto& s : routed)
-        opts.static_routes.push_back(fw::StaticRoute{s, "self"});
-    opts.shutdown_step_budget = step_budget;
-    opts.local_identity = "inbound-server";
+    InstallAdmissionForTest(box.host, box.app_slot);
 
     /**
      * 测试缝出站：路由地址是逻辑标记 "self"，发送闭包在发送时刻
@@ -773,19 +926,17 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
     auto host = box.host;
     auto egress_rt = MakeHost(limits, "inbound-egress");
     /**
-     * Engine/Client 是 CoObject：必须在调度器启动后创建（见下方 RunApp 之后
-     * 的 Create/Start）；RpcEgress 只保存宿主引用，可先构造。
+     * Engine/Client 是 CoObject：必须在调度器启动后创建（见下方受管任务
+     * 之后的 Create/Start）；RpcEgress 只保存宿主引用，可先构造。
      */
     box.egress_rt = egress_rt;
     box.egress = std::make_shared<fw::RpcEgress>(egress_rt);
 
-    fw::CoAppSeam seam;
-    seam.host = box.host;
-    seam.rpc_send =
+    fw::RpcSendAppFn send =
         [host, egress = box.egress](std::string_view target,
                                     const inf::rpc::Request& env,
                                     const inf::CallOptions& o)
-        -> fw::result<inf::rpc::Response> {
+        -> bbt_co_async(fw::result<inf::rpc::Response>) {
         if (g_probe) {
             g_probe->egress_calls.fetch_add(1, std::memory_order_acq_rel);
             g_probe->SetEgressDeadline(o.deadline);
@@ -800,18 +951,63 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
             return fw::result<inf::rpc::Response>::err(fw::MakeError(
                 fw::ErrorCode::RuntimeUnavailable,
                 "egress self endpoint not installed"));
-        return egress->Call("tcp://" + ep, env, o);
+        return bbt_co_await egress->Call("tcp://" + ep, env, o);
     };
 
-    box.app = fw::MakeCoAppForTest(opts, std::move(seam));
-    register_fn(*box.app);
+    /**
+     * 调度器必须在受管任务启动前初始化（栈大小在此设置；进程寿命单例）。
+     */
+    EnsureScheduler();
 
     /**
-     * 入站接线：唯一 V2 admission（与业务路径同源）。
+     * app 的创建/装配/启动全部在受管协程内（受管对象创建是
+     * CoRuntimeOnly）。受管任务由宿主线程直接投递，started 由
+     * ServerTaskBody 在 CoStart 成功后置位。
      */
-    fw::InstallRpcAdmission(*box.host, *box.app);
+    box.run = std::make_unique<RunHandle>();
+    RunHandle* h = box.run.get();
+    auto app_slot = box.app_slot;
+    auto host2 = box.host;
+    auto after_first_stop = box.after_first_stop;
+    {
+        bool submitted = false;
+        g_scheduler->RegistCoroutineTask(
+            [app_slot, host2, after_first_stop, h,
+             register_fn = std::move(register_fn),
+             limits, step_budget, routed, send = std::move(send)]() mutable {
+                try {
+                    auto opts = fw::AppOptions{}
+                        .SetLimits(64, 64, 64, 64)
+                        .SetShutdownBudget(step_budget)
+                        .SetLifecycleBudget(step_budget)
+                        .SetNetworkLimits(limits)
+                        .SetLocalIdentity("inbound-server");
+                    for (const auto& s : routed)
+                        opts.AddRoute(s, "self");
+                    *app_slot = fw::MakeCoAppForTest(
+                        opts, fw::CoAppSeam{host2, send});
+                } catch (...) {
+                    h->rc = kExitStartFailed;
+                    h->done.store(true, std::memory_order_release);
+                    try { h->started.set_value(false); } catch (...) {}
+                    return;
+                }
+                ServerTaskBody(app_slot, after_first_stop, h, register_fn);
+            }, submitted);
+        if (!submitted) {
+            h->rc = kExitStartFailed;
+            h->done.store(true, std::memory_order_release);
+            try { h->started.set_value(false); } catch (...) {}
+        }
+    }
 
-    box.run = RunApp(*box.app);
+    auto started = h->started.get_future();
+    BOOST_REQUIRE_MESSAGE(
+        started.wait_for(std::chrono::seconds{15}) ==
+                std::future_status::ready &&
+            started.get(),
+        "server task did not start");
+
     /**
      * 就绪判据：rpc server 完成 bind 后 bound_endpoint 非空（此时生命周期
      * 已过网络 Create/Start，处于服务中）。
@@ -819,13 +1015,12 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
     const auto until = Clock::now() + kWait;
     while (box.endpoint.empty()) {
         BOOST_REQUIRE_MESSAGE(!box.run->done.load(),
-            "app.run exited before listen, rc=" << box.run->rc);
+            "server task exited before listen, rc=" << box.run->rc);
         BOOST_REQUIRE(Clock::now() < until);
         box.endpoint = box.host->bound_endpoint();
         std::this_thread::yield();
     }
-    BOOST_REQUIRE(box.app->shutdown_state() ==
-                  fw::ShutdownState::Running);
+    BOOST_REQUIRE(box.App()->State() == fw::AppState::Running);
 
     auto crt = MakeHost(limits, "inbound-client");
     BOOST_REQUIRE(crt);
@@ -858,7 +1053,7 @@ fw::result<inf::rpc::Response> SendRpc(
     std::chrono::milliseconds budget) {
     inf::CallOptions o;
     o.deadline = Clock::now() + budget;
-    return egress->Call("tcp://" + endpoint, env, o);
+    return bbt_co_await egress->Call("tcp://" + endpoint, env, o);
 }
 
 /**
@@ -1018,7 +1213,7 @@ BOOST_AUTO_TEST_CASE(inbound_context_fields_land) {
                         std::chrono::milliseconds{2000},
                         /*routed*/{},
                         [](fw::CoApp& app) {
-        BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts()));
+        return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts());
     });
 
     /**
@@ -1094,7 +1289,7 @@ BOOST_AUTO_TEST_CASE(inbound_context_fields_land) {
     BOOST_CHECK(r5.error().code == fw::ErrorCode::TypeMismatch);
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 /**
@@ -1107,7 +1302,7 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
                         std::chrono::milliseconds{2000},
                         /*routed*/ {},
                         [](fw::CoApp& app) {
-                            BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts()));
+                            return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts());
                         });
 
     /**
@@ -1138,13 +1333,18 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
      * 选第一个落盘的 rid 作跨 worker 目标：占用它挂起前所在 worker。
      */
     const std::string target = g_probe->before.begin()->first;
-    const auto target_tid = g_probe->before.at(target).tid;
+    const auto target_snapshot = g_probe->before.at(target);
+    const auto target_processer = target_snapshot.processer_id;
+    const auto target_tid = target_snapshot.tid;
+    BOOST_REQUIRE(target_processer != BBT_COROUTINE_INVALID_PROCESSER_ID);
     std::shared_ptr<Spinner> held;
     for (int i = 0; i < 10 && !held; ++i) {
-        auto s = LaunchSpinner();
+        auto s = LaunchSpinner(target_processer);
         /**
-         * 有界等待其开始；被派到已占 worker 时永不启动 → 放行后重试。
+         * 定向首投仍允许调度器窃取；只接受真实在目标 worker 启动的探针。
+         * 未启动的探针也登记清理，避免遗留任务占用后续用例。
          */
+        g_spinners.push_back(s);
         const auto until = Clock::now() + std::chrono::seconds{2};
         while (!s->spinning.load(std::memory_order_acquire)) {
             if (Clock::now() > until) break;
@@ -1160,7 +1360,6 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
             s->release.store(true, std::memory_order_release);
     }
     BOOST_REQUIRE(held);
-    g_spinners.push_back(held);
 
     /**
      * 放行所有请求：恢复在被占 worker 上无法发生，目标请求必然
@@ -1212,7 +1411,7 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
     BOOST_TEST_MESSAGE("cross-worker switched=" << switched << "/" << kN);
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 /**
@@ -1224,13 +1423,14 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
                         std::chrono::milliseconds{2000},
                         /*routed*/{"echo"},
                         [](fw::CoApp& app) {
-        BOOST_REQUIRE(app.add_service<EchoSvc>(ConcurrentOpts()));
-        BOOST_REQUIRE(app.add_service<CallerSvc>(ConcurrentOpts()));
+        auto r = bbt_co_await app.CoInstallService<EchoSvc>(ConcurrentOpts());
+        if (!r) return r;
+        return bbt_co_await app.CoInstallService<CallerSvc>(ConcurrentOpts());
     });
 
     /**
      * (a) 受管 handler 内 spawn 的不受管子协程：已托管服务实例 +
-     * 非受管协程 → this->call 真实返回 InvalidContext（负载回传）。
+     * 非受管协程 → call 真实返回 InvalidContext（负载回传）。
      */
     auto r = CallRpc(box, MakeEnv("caller", "spawn_dial", "t3-a", 1));
     BOOST_REQUIRE(r);
@@ -1258,9 +1458,9 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
     /**
      * (b) 测试协程（不受管）直接调用已托管实例 → InvalidContext。
      */
-    auto svc = box.app->find_service("caller");
-    BOOST_REQUIRE(svc);
-    auto caller = std::static_pointer_cast<CallerSvc>(svc.value());
+    std::shared_ptr<void> svc_owner;
+    auto* caller = ManagedService<CallerSvc>(*box.App(), svc_owner);
+    BOOST_REQUIRE(caller != nullptr);
     TestLatch l{1};
     std::optional<fw::result<fw::CoRpcResp>> direct;
     bbtco [caller, &direct, &l]() {
@@ -1274,7 +1474,7 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
                 fw::ErrorCode::InvalidContext);
 
     /**
-     * (c) 受管路径正对照：handler 内 this->call 经 loopback 真实回路，
+     * (c) 受管路径正对照：handler 内 call 经 loopback 真实回路，
      * envelope → dispatch → 回复 → 解码全通。
      */
     auto ok = CallRpc(box, MakeEnv("caller", "dial", "t3-c", 42));
@@ -1285,7 +1485,7 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
     BOOST_CHECK(ok.value().RequestId() == "t3-c");
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 /**
@@ -1300,8 +1500,9 @@ BOOST_AUTO_TEST_CASE(outbound_deadline_min_and_expired_before_io) {
                         std::chrono::milliseconds{2000},
                         /*routed*/ {"echo"},
                         [](fw::CoApp& app) {
-                            BOOST_REQUIRE(app.add_service<EchoSvc>(ConcurrentOpts()));
-                            BOOST_REQUIRE(app.add_service<RelaySvc>(ConcurrentOpts()));
+                            auto r = bbt_co_await app.CoInstallService<EchoSvc>(ConcurrentOpts());
+                            if (!r) return r;
+                            return bbt_co_await app.CoInstallService<RelaySvc>(ConcurrentOpts());
                         });
 
     /**
@@ -1335,7 +1536,7 @@ BOOST_AUTO_TEST_CASE(outbound_deadline_min_and_expired_before_io) {
     BOOST_CHECK(g_probe->egress_calls.load() == sends_before);
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 /**
@@ -1347,7 +1548,7 @@ BOOST_AUTO_TEST_CASE(sync_close_on_control_thread) {
                         std::chrono::milliseconds{2000},
                         /*routed*/{},
                         [](fw::CoApp& app) {
-        BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts()));
+        return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts());
     });
     /**
      * 应用运行中的默认宿主已有真实 net::Engine。
@@ -1388,7 +1589,7 @@ BOOST_AUTO_TEST_CASE(sync_close_on_control_thread) {
     host2->Close();
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 /**
@@ -1403,8 +1604,9 @@ BOOST_AUTO_TEST_CASE(handler_drain_shutdown_late) {
                         std::chrono::milliseconds{300},
                         /*routed*/ {},
                         [](fw::CoApp& app) {
-                            BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts()));
+                            return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts());
                         });
+    box.after_first_stop = std::make_shared<TestLatch>(1);
 
     /**
      * 让 handler 停在 per-rid 门上：真实 in-flight 请求。
@@ -1422,26 +1624,35 @@ BOOST_AUTO_TEST_CASE(handler_drain_shutdown_late) {
      */
     BOOST_REQUIRE(g_probe->arrived.WaitFor(kWait));
 
-    box.app->request_shutdown();
+    box.App()->RequestShutdown();
     /**
      * 等状态机进入 ShutdownIncomplete（在途 handler 未排空）。
      */
     const auto until = Clock::now() + kWait;
-    while (box.app->shutdown_state() !=
-           fw::ShutdownState::ShutdownIncomplete) {
+    while (box.App()->State() !=
+           fw::AppState::StopIncomplete) {
         BOOST_REQUIRE(Clock::now() < until);
         std::this_thread::yield();
     }
-    const auto pending = box.app->pending_cleanup();
-    BOOST_REQUIRE(pending.size() == 1);
-    BOOST_CHECK(pending[0] == "WaitHandlersDone");
+    const auto failures = box.App()->LifecycleFailures();
+    BOOST_REQUIRE(!failures.empty());
+    bool drain_failed = false;
+    for (const auto& f : failures)
+        if (f.phase == "wait_handlers_done") drain_failed = true;
+    BOOST_CHECK(drain_failed);
     BOOST_CHECK(!box.run->done.load());
 
     /**
      * 迟到收尾：放行 in-flight handler → 排空 → 完整收束 → 非零返回。
      */
     g_probe->CompleteAll();
+    box.after_first_stop->CountDown();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
+    /**
+     * 客户端可能因关闭断链先返回；handler 的恢复与 after 快照是另一个
+     * 协程上的事实。等待真实恢复事件，不能用客户端完成代替服务端完成。
+     */
+    BOOST_REQUIRE(g_probe->WaitEvent("resumed:t6-h", kWait));
     /**
      * 在途 handler 被放行后真实跑完请求全程：handler 侧 after 快照为证。
      * 注意 infra 同步 Close 契约——owner Close 经 Abort 丢弃未发送响应、
@@ -1450,9 +1661,9 @@ BOOST_AUTO_TEST_CASE(handler_drain_shutdown_late) {
      */
     BOOST_CHECK(g_probe->At(g_probe->after, "t6-h").co_id != 0);
     JoinRun(box.run);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitShutdownLate);
-    BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(box.app->pending_cleanup().empty());
+    BOOST_CHECK(box.run->rc == kExitStopIncomplete);
+    BOOST_CHECK(box.App()->State() == fw::AppState::Stopped);
+    BOOST_CHECK(box.App()->PendingCleanup().empty());
 
     if (box.client_rt) box.client_rt->Close();
 }
@@ -1467,9 +1678,10 @@ BOOST_AUTO_TEST_CASE(actor_serial_remote_wait_no_reenter) {
                         std::chrono::milliseconds{2000},
                         /*routed*/{"echo"},
                         [](fw::CoApp& app) {
-        BOOST_REQUIRE(app.add_service<EchoSvc>(ConcurrentOpts()));
-        BOOST_REQUIRE(
-            app.add_service<AcctSvc>(ActorOpts(/*mailbox_capacity*/ 1)));
+        auto r = bbt_co_await app.CoInstallService<EchoSvc>(ConcurrentOpts());
+        if (!r) return r;
+        return bbt_co_await app.CoInstallService<AcctSvc>(
+            ActorOpts(/*serial_queue_capacity*/ 1));
     });
 
     TestLatch replies{4};
@@ -1591,7 +1803,7 @@ BOOST_AUTO_TEST_CASE(actor_serial_remote_wait_no_reenter) {
     BOOST_CHECK(g_probe->At(g_probe->before, queued).actor_key == "acct-1");
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 /**
@@ -1629,8 +1841,8 @@ BOOST_AUTO_TEST_CASE(dispatch_direct_timeout_late_task_keeps_app_alive)
 
     auto box =
         StartApp(milliseconds{30000}, milliseconds{2000},
-                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
-    std::weak_ptr<fw::CoApp> app_weak = box.app;
+                 /*routed*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts()); });
+    std::weak_ptr<fw::CoApp> app_weak = box.MutableApp();
 
     DispatchControl control;
     control.state = std::make_shared<CallState>();
@@ -1647,7 +1859,7 @@ BOOST_AUTO_TEST_CASE(dispatch_direct_timeout_late_task_keeps_app_alive)
     expired_control.before_dispatch = [expired_gate, expired_at] {
         return expired_gate->Park(expired_at);
     };
-    auto rejected = DispatchDirect(box.app, MakeEnv("probe", "inspect", "t9-expired", 5), kWait, expired_control);
+    auto rejected = DispatchDirect(box.MutableApp(), MakeEnv("probe", "inspect", "t9-expired", 5), kWait, expired_control);
     BOOST_REQUIRE(!rejected);
     BOOST_CHECK(rejected.error().code == fw::ErrorCode::InternalError);
     /**
@@ -1660,7 +1872,7 @@ BOOST_AUTO_TEST_CASE(dispatch_direct_timeout_late_task_keeps_app_alive)
     /**
      * (a) 任务停在门处、预算内不完结 → 外部超时返回 InternalError。
      */
-    auto r = DispatchDirect(box.app, MakeEnv("probe", "inspect", "t9-a", 5), milliseconds{300}, control);
+    auto r = DispatchDirect(box.MutableApp(), MakeEnv("probe", "inspect", "t9-a", 5), milliseconds{300}, control);
     BOOST_REQUIRE(!r);
     BOOST_CHECK(r.error().code == fw::ErrorCode::InternalError);
     /**
@@ -1676,8 +1888,8 @@ BOOST_AUTO_TEST_CASE(dispatch_direct_timeout_late_task_keeps_app_alive)
      * (b) 停止 run（收束路径释放 dispatcher）；放弃调用方与全局探针的引用。
      */
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
-    box.app.reset();
+    BOOST_CHECK(box.run->rc == kExitOk);
+    box.MutableApp().reset();
     g_probe.reset();
     /**
      * 仍由在途任务强持有
@@ -1707,20 +1919,19 @@ BOOST_AUTO_TEST_CASE(dispatch_direct_timeout_late_task_keeps_app_alive)
 }
 
 /**
- * T10：CoApp 生命周期对象的共享寿命（run 收束期间并发读取）。
+ * T10：CoApp 生命周期对象的共享寿命（受管任务收束期间并发读取）。
  *
- * m_lifecycle 发布的是 run 局部 HostLifecycle 的地址：run 收束时清空指针并
- * 析构局部对象。若读取者取到指针后与「清空 + 析构」并发，就会进入已析构对象
- * （CondVar destroy vs broadcast：TSan 在 T9 报告过同一对操作）。本用例让
- * 读线程在收束全程持续走完四个读取入口（状态/待收尾/失败清单/请求关闭），
- * 断言收束正常完成、run 结束后各读口仍安全。修复前该窗口是真实 UAF。
+ * 收束窗口内并发读四个公开观察口（State/PendingCleanup/LifecycleFailures/
+ * RequestShutdown）不得触到已析构对象：状态簿记由 Registry/CoApp 成员
+ * 承载（无 run 局部生命周期对象发布点）。本用例让读线程在收束全程持续
+ * 走完四个读取入口，断言收束正常完成、读口在收束后仍安全。
  */
 BOOST_AUTO_TEST_CASE(lifecycle_readers_survive_run_teardown)
 {
     g_probe = std::make_shared<ProbeState>(0);
     auto box =
         StartApp(std::chrono::milliseconds{30000}, std::chrono::milliseconds{2000},
-                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+                 /*routed*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts()); });
 
     std::atomic<bool> stop{false};
     std::atomic<long> reads{0};
@@ -1732,10 +1943,10 @@ BOOST_AUTO_TEST_CASE(lifecycle_readers_survive_run_teardown)
              * 四个读取入口全部走一遍：它们都经 m_lifecycle 取用 run 的局部
              * 生命周期对象，收束窗口内不得触到已析构对象。
              */
-            (void)box.app->shutdown_state();
-            (void)box.app->pending_cleanup();
-            (void)box.app->lifecycle_failures();
-            box.app->request_shutdown();
+            (void)box.App()->State();
+            (void)box.App()->PendingCleanup();
+            (void)box.App()->LifecycleFailures();
+            box.App()->RequestShutdown();
             if (first) {
                 reader_ran.CountDown();
                 first = false;
@@ -1755,7 +1966,7 @@ BOOST_AUTO_TEST_CASE(lifecycle_readers_survive_run_teardown)
     /**
                    * 局部生命周期对象），读线程仍在窗口内活动。
                    */
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
+    BOOST_CHECK(box.run->rc == kExitOk);
     BOOST_CHECK(reads.load(std::memory_order_relaxed) > 0);
 
     stop.store(true, std::memory_order_release);
@@ -1764,9 +1975,9 @@ BOOST_AUTO_TEST_CASE(lifecycle_readers_survive_run_teardown)
     /**
      * run 结束后各读口仍安全：报停驻状态，不再触碰已析构的生命周期对象。
      */
-    BOOST_CHECK(box.app->shutdown_state() == fw::ShutdownState::Closed);
-    BOOST_CHECK(box.app->pending_cleanup().empty());
-    BOOST_CHECK(box.app->lifecycle_failures().empty());
+    BOOST_CHECK(box.App()->State() == fw::AppState::Stopped);
+    BOOST_CHECK(box.App()->PendingCleanup().empty());
+    BOOST_CHECK(box.App()->LifecycleFailures().empty());
 }
 
 /**
@@ -1783,7 +1994,7 @@ BOOST_AUTO_TEST_CASE(callrpc_late_completion_after_timeout)
     g_probe = std::make_shared<ProbeState>(1);
     auto box =
         StartApp(milliseconds{30000}, milliseconds{2000},
-                 /*routed*/ {}, [](fw::CoApp& app) { BOOST_REQUIRE(app.add_service<ProbeSvc>(ConcurrentOpts())); });
+                 /*routed*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<ProbeSvc>(ConcurrentOpts()); });
 
     auto state = std::make_shared<CallState>();
     auto r = CallRpc(box, MakeEnv("probe", "wait_echo", "t11-late", 21),
@@ -1819,104 +2030,7 @@ BOOST_AUTO_TEST_CASE(callrpc_late_completion_after_timeout)
     BOOST_CHECK(rep2.value() == 3);
 
     StopApp(box);
-    BOOST_CHECK(box.run->rc == fw::HostLifecycle::kExitOk);
-}
-
-/**
- * T12：run 的异常退出（发布点之后、清空点之前抛出）也必须撤销发布。
- *
- * 窗口：run() 发布 m_lifecycle 后，其后的任何抛出（Hooks 构造、lifecycle.Run、
- * early_failures 分配等 bad_alloc）都会栈回卷析构 run 的局部 HostLifecycle，而
- * 旧代码的 m_lifecycle 仍指向该已析构栈对象。修复 = 发布前装无分配 scope guard，
- * 任何退出（return/throw）都在局部 lifecycle 析构前、于 m_lifecycle_mtx 内清空。
- *
- * 触发经既有测试缝（MakeCoAppForTest 注入 INetworkHost）：桩的 WaitHandlersDone
- * 主动抛出；该点在 HostLifecycle::_ShutDown 未被 try/catch 包裹，异常越过 Run 与
- * run()。注意 HostLifecycle 的三个 Hook（on_scheduler_started/on_handlers_drained/
- * on_release）的异常在 Run 内被 catch 收口为失败项、**不**越过 Run——它们不能覆盖
- * 本窗口，故本用例不以 Hook 冒充覆盖。
- *
- * 关闭请求在 Start() 回调之后才发出：此时 run 已发布 m_lifecycle，request_shutdown
- * 走「指针非空」分支、不写停驻状态，故 m_parked_state 保持初始 Running——这正是
- * 能判别修复的读数（无 guard 的旧码此处进入悬垂对象，shutdown_state() 读到 Closing）。
- */
-class ThrowingDrainHost final : public fw::INetworkHost {
-public:
-    TestLatch started{1};
-    fw::result<void> Create() override
-    {
-        return fw::result<void>::ok();
-    }
-    fw::result<void> Start() override
-    {
-        started.CountDown();
-        return fw::result<void>::ok();
-    }
-    void StopAccepting() noexcept override
-    {
-    }
-    fw::result<void> WaitHandlersDone(co::Deadline) override
-    {
-        throw std::runtime_error("injected WaitHandlersDone throw");
-    }
-    void Close() noexcept override
-    {
-    }
-};
-
-BOOST_AUTO_TEST_CASE(lifecycle_publish_revoked_on_run_exception)
-{
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
-    g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
-
-    fw::CoAppOptions opts{inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
-                                             /*max_header_bytes*/ 8192, /*max_body_bytes*/ 65536,
-                                             /*incoming_timeout*/ std::chrono::milliseconds{30000}},
-                          inf::ListenAddress{"127.0.0.1", 0},
-                          /*static_routes*/ {},
-                          /*shutdown_step_budget*/ std::chrono::milliseconds{2000},
-                          /*local_identity*/ std::string{"inbound-http-t12"}};
-    auto host = std::make_shared<ThrowingDrainHost>();
-    auto app = fw::MakeCoAppForTest(opts, fw::CoAppSeam{host, {}});
-    BOOST_REQUIRE(app);
-
-    std::atomic<bool> threw{false};
-    std::thread runner([&] {
-        try {
-            (void)app->run();
-        } catch (const std::runtime_error&) {
-            threw.store(true, std::memory_order_release);
-        }
-    });
-
-    auto finish_runner = boost::scope::make_scope_exit([&]() noexcept {
-        app->request_shutdown();
-        if (runner.joinable()) {
-            runner.join();
-        }
-    });
-
-    /**
-     * run 已发布 m_lifecycle 并进入服务（Start 回调）后才请求关闭。
-     */
-    BOOST_REQUIRE(host->started.WaitFor(kWait));
-    app->request_shutdown();
-    runner.join();
-    BOOST_REQUIRE_MESSAGE(threw.load(std::memory_order_acquire), "host WaitHandlersDone throw must reach out of run()");
-
-    /**
-     * run 已返回（栈回卷，局部 HostLifecycle 已析构）。修复后 m_lifecycle 已被
-     * guard 清空，读口走「未发布」分支、返回明确的停驻值，绝不解引用已析构对象
-     * （修复前此处进入悬垂对象：shutdown_state() 会读到 Closing，本断言即失败）。
-     */
-    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Running);
-    BOOST_CHECK(app->pending_cleanup().empty());
-    BOOST_CHECK(app->lifecycle_failures().empty());
-    /**
-     * 指针已空 → 停驻状态 CAS Running→Closing
-     */
-    app->request_shutdown();
-    BOOST_CHECK(app->shutdown_state() == fw::ShutdownState::Closing);
+    BOOST_CHECK(box.run->rc == kExitOk);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

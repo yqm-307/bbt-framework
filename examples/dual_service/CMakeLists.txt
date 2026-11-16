@@ -1,13 +1,15 @@
 # examples/dual_service — 双服务 / 跨进程示例（真实 Redis+Mongo 后端）。
 #
-# 三个独立进程（framework 默认 HTTP 线桥做真实 client/server）：
-#   svc_a  storage（put/get/del/sleep_ms；经 CoApp::add_resource 工厂装配真实
+# 三个独立进程（framework 默认 V2 会话做真实 client/server）：
+#   svc_a  storage（put/get/del/sleep_ms；经 CoApp::CoInstallComponent 装配真实
 #          RedisNetResource "cache"（新 net 入口 bbt::infra::redis::CoRedisCli，
-#          Engine+显式 Connect 收口归资源本体）+ MongoDbResource "docs"
-#          （新 owner/句柄入口 bbt::infra::mongo::CoMongoDb+CoMongoColl，
-#          owner Close 同步物理收口），无 KvStore 替身）
-#   svc_b  gateway（handler 内 this->call 跨进程到 svc_a；static_routes 显式
-#          白名单唯一出口）
+#          OnStart 拉起自有 Engine + 装配 client，服务 OnStart 显式 Connect，
+#          OnStop 同步物理收口）+ MongoDbResource "docs"（新 owner/句柄入口
+#          bbt::infra::mongo::CoMongoDb+CoMongoColl，owner Close 同步物理
+#          收口），服务经 ServiceOptions::BindComponent 声明绑定、handler 经
+#          GetComponent+Borrow 取用，无 KvStore 替身）
+#   svc_b  gateway（handler 内 CoServiceBase::call 跨进程到 svc_a；
+#          static_routes 显式白名单唯一出口）
 #   driver 演示客户端（net::Engine + infra 公开 V2 会话客户端 CoRpcClient：
 #          SessionFrame + u32be + Hello/HelloAck 的唯一实现，不复制 codec，
 #          也不引用 framework internal 头）

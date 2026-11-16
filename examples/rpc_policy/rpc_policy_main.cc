@@ -5,16 +5,18 @@
  * 因此本 fixture 由 caller 进程派生一个互异 identity 的 callee 进程：
  *
  * caller 进程（local_identity=rpc-policy-caller）
- * CoApp 宿主 PolicyCallerService；其 handler 内经受保护的
- * `this->call<Req,Resp>` 出站，出站目标解析成功后、真实 socket 发送之前
- * 调用公开策略 `CoAppOptions::rpc_policy`
+ * 受管 CoApp 宿主 PolicyCallerService；其 handler 内经受保护的
+ * `call<Req,Resp>` 出站，出站目标解析成功后、真实 socket 发送之前
+ * 调用公开策略 `AppOptions::SetRpcPolicy`
  * callee 进程（local_identity=rpc-policy-callee）
- * CoApp 宿主 PolicyCalleeService；入站经真实 V2 会话分发
+ * 受管 CoApp 宿主 PolicyCalleeService；入站经真实 V2 会话分发
  *
- * 只用公开面：`bbt/framework/CoApp.hpp`、`bbt/framework/RpcPolicy.hpp`、
- * `RequestContext.hpp` + getvalue 的 proto/codec。**不** include internal/、
- * **不**用 CoAppSeam/MakeCoAppForTest/DispatchInboundForTest/INetworkHost 桩/
- * 发送注入——编译期即证明「不依赖 internal 测试缝」。
+ * 生命周期口径与 getvalue 样板一致：普通 main 启动 runtime 后把装配/启动/
+ * 等待关闭/收口投递进受管协程（CoApp::Create → CoInstall* → CoStart →
+ * CoWaitShutdownRequest → CoStop），native 侧只做 RequestShutdown 与文件/journal
+ * 观测。**不** include internal/、**不**用 CoAppSeam/MakeCoAppForTest/
+ * DispatchInboundForTest/INetworkHost 桩/发送注入——编译期即证明「不依赖
+ * internal 测试缝」。
  *
  * callee 在自己的 handler 内读公开 `RequestContext::deadline` 并 journal 可见
  * 剩余预算，作为「期限只缩不放」的真实 oracle（不依赖 reply envelope 预算，
@@ -23,7 +25,7 @@
  * argv: rpc_policy <mode> <port_file> <meta_file> <journal_file>
  * mode ∈ allow | reject | tighten | widen | expired | decorator
  * - allow     ：策略允许（只计数）
- * - reject    ：策略拒绝（Cancelled）：`_MakeEgress` 在 Send 之前返回错误
+ * - reject    ：策略拒绝（Cancelled）：出站在 Send 之前返回错误
  * - tighten   ：策略收紧出站期限到 now+300ms（应传播到 callee 可见预算）
  * - widen     ：策略返回「放大」期限 now+3600s（框架必须忽略）
  * - expired   ：策略收紧到 now-1ms（框架须在 I/O 前 TimedOut）
@@ -32,11 +34,11 @@
  * 不对外使用。
  *
  * journal 事件：preflight name=<n> seq=<k> / callee_handler_entered
- * deadline_ms=<n> / listener_probe phase=after_run_before_exit port=<n>
- * result=refused|connected|error errno=<n> / resource_close /
- * shutdown rc=.. state=.. owner_closed=.. / callee_shutdown rc=..
+ * deadline_ms=<n> / resource_close / shutdown rc=.. state=.. owner_closed=.. /
+ * listener_probe phase=after_stop_before_exit port=<n>
+ * result=refused|connected|error errno=<n> / callee_shutdown rc=..
  *
- * 关闭后验收（B1）：`app.run()` 返回、runner 已 join、进程与 `CoApp` 对象均仍
+ * 关闭后验收（B1）：CoStop 已返回、rc 已发布、进程与 `CoApp` 对象均仍
  * 存活时，由本进程对自己的 bound 端口做一次**有界** nonblocking connect 并入
  * journal。只有 ECONNREFUSED 记 result=refused（唯一判绿值）；超时或其它 errno
  * 记 result=error（不算绿）。该探针只证明「存活期 listener 已关」——它不证明
@@ -50,6 +52,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -67,13 +70,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <bbt/coroutine/coroutine.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
 
 #include <bbt/framework/CoApp.hpp>
 #include <bbt/framework/CoRpc.hpp>
 #include <bbt/framework/CoService.hpp>
+#include <bbt/framework/Component.hpp>
 #include <bbt/framework/RequestContext.hpp>
+#include <bbt/framework/Result.hpp>
+#include <bbt/framework/RpcMethods.hpp>
 #include <bbt/framework/RpcPolicy.hpp>
 
 /**
@@ -103,38 +110,26 @@ void Journal(const std::string& line) {
     g_journal.flush();
 }
 
-class CloseJournal final : public inf::ICoCloseable {
-public:
-    void Close() noexcept override {
-        bool first = false;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            first = !m_closed;
-            m_closed = true;
-        }
-        if (first)
-            Journal(std::string("event=resource_close auth_state=") + kAuthState);
-    }
-    bool IsClosed() const noexcept override {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        return m_closed;
-    }
-
-private:
-    mutable std::mutex m_mtx;
-    bool m_closed = false;
-};
-
 /**
  * —— 业务（公开面）：caller 出站 + callee 观测 ——
  *
  * callee：journal handler 进入与**公开可见**的 handler 期限剩余（RequestContext
  * ::deadline - now），作为「期限只缩不放」的真实 oracle。
  */
-class PolicyCalleeService final : public fw::CoService<PolicyCalleeService> {
+class PolicyCalleeService final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "bbt.example.v1.PolicyCallee";
 
+    explicit PolicyCalleeService(fw::detail::ConstructKey key)
+        : fw::CoService<>(key) {}
+
+protected:
+    ~PolicyCalleeService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+
+public:
     fw::CoRpcResp GetValue(fw::CoRpcReq req) {
         long long remaining_ms = -1;
         std::string request_id;
@@ -160,21 +155,31 @@ public:
 };
 
 /**
- * caller：经公开 typed 出站 `this->call<Req,Resp>` 转发到 callee（静态路由）或
- * 未配置路由目标（find_route 门拒绝，策略不被询问）。
+ * caller：经公开 typed 出站 `call<Req,Resp>` 转发到 callee（静态路由）或
+ * 未配置路由目标（路由门拒绝，策略不被询问）。
  */
-class PolicyCallerService final : public fw::CoService<PolicyCallerService> {
+class PolicyCallerService final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "bbt.example.v1.PolicyCaller";
     static constexpr std::string_view kCalleeService = "bbt.example.v1.PolicyCallee";
     static constexpr std::string_view kNoRouteService = "bbt.example.v1.PolicyUnrouted";
 
+    explicit PolicyCallerService(fw::detail::ConstructKey key)
+        : fw::CoService<>(key) {}
+
+protected:
+    ~PolicyCallerService() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+
+public:
     fw::CoRpcResp Forward(fw::CoRpcReq req) {
-        return _Forward(std::move(req), kCalleeService);
+        return bbt_co_await _Forward(std::move(req), kCalleeService);
     }
 
     fw::CoRpcResp ForwardNoRoute(fw::CoRpcReq req) {
-        return _Forward(std::move(req), kNoRouteService);
+        return bbt_co_await _Forward(std::move(req), kNoRouteService);
     }
 
     static constexpr auto kRpcMethods =
@@ -184,11 +189,11 @@ public:
                                        bbt::example::v1::GetValueResponse>("ForwardNoRoute"));
 
 private:
-    fw::CoRpcResp _Forward(fw::CoRpcReq req, std::string_view target) {
+    bbt_co_async(fw::CoRpcResp) _Forward(fw::CoRpcReq req, std::string_view target) {
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
         if (!parsed)
             return fw::CoRpcResp::Error(parsed.error());
-        auto reply = this->call<bbt::example::v1::GetValueRequest, bbt::example::v1::GetValueResponse>(
+        auto reply = bbt_co_await call<bbt::example::v1::GetValueRequest, bbt::example::v1::GetValueResponse>(
             target, "GetValue", parsed.value(), {}, fw::CallOptions{});
         if (!reply)
             return fw::CoRpcResp::Error(reply.error());
@@ -287,14 +292,9 @@ const char* ProbeResultName(ListenerProbeResult r) {
  */
 
 fw::ServiceOptions ConcurrentOpts() {
-    return fw::ServiceOptions{fw::ExecutionPolicy::Concurrent,
-                              /*max_inflight*/ 64,
-                              /*mailbox_capacity*/ 0,
-                              /*max_actors*/ 0,
-                              /*ordered_ingress*/ false,
-                              /*max_ordered_streams*/ 0,
-                              /*max_cached_results*/ 0,
-                              /*max_cached_result_bytes*/ 0};
+    return fw::ServiceOptions{}
+        .SetExecution(fw::ExecutionPolicy::Concurrent)
+        .SetMaxInflight(64);
 }
 
 /**
@@ -384,16 +384,24 @@ std::shared_ptr<fw::RpcPolicy> MakePolicy(const std::string& mode) {
     return nullptr;
 }
 
-std::string BoundEndpointOrEmpty(fw::CoApp& app, int timeout_ms) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::string bound = app.bound_endpoint();
-        if (!bound.empty())
-            return bound;
-        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+const char* AppStateName(fw::AppState state) {
+    switch (state) {
+    case fw::AppState::Created:
+        return "Created";
+    case fw::AppState::Starting:
+        return "Starting";
+    case fw::AppState::Running:
+        return "Running";
+    case fw::AppState::Paused:
+        return "Paused";
+    case fw::AppState::Stopping:
+        return "Stopping";
+    case fw::AppState::StopIncomplete:
+        return "StopIncomplete";
+    case fw::AppState::Stopped:
+        return "Stopped";
     }
-    return {};
+    return "Unknown";
 }
 
 void WriteTextFile(const std::string& path, const std::string& text,
@@ -412,53 +420,140 @@ std::uint16_t PortOf(const std::string& endpoint) {
     return static_cast<std::uint16_t>(std::stoi(endpoint.substr(colon + 1)));
 }
 
-void ServeUntilEof(fw::CoApp& app) {
+void WaitForStdinEof() {
     char buf[8];
     while (::read(STDIN_FILENO, buf, sizeof(buf)) > 0) {
     }
-    app.request_shutdown();
+}
+
+void RequestShutdownLocked(const std::shared_ptr<fw::CoApp>& app_handle,
+                           std::mutex& app_mtx) {
+    std::lock_guard<std::mutex> lk(app_mtx);
+    if (app_handle)
+        app_handle->RequestShutdown();
 }
 
 /**
- * —— callee 进程：由 caller 派生，独立 CoApp（互异 identity） ——
+ * 绑定等待的统一失败收口：native 侧触发关闭请求后退出码 5（对应旧 bind
+ * 未就绪语义）；promise 全部由协程侧单次写入，宿主侧不二次写入。
+ */
+int BindFailure(const std::shared_ptr<fw::CoApp>& app_handle,
+                std::mutex& app_mtx, const char* what) {
+    RequestShutdownLocked(app_handle, app_mtx);
+    std::fprintf(stderr, "rpc_policy: %s did not become ready\n", what);
+    return 5;
+}
+
+/**
+ * 装配两进程共用的网络/预算/身份基座（路由与策略由调用方追加）。
+ */
+fw::AppOptions BaseOptions(const char* identity) {
+    return fw::AppOptions{}
+        .SetLimits(64, 64, 64, 64)
+        .SetNetworkLimits(inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
+                                             /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
+                                             /*incoming_timeout*/ std::chrono::milliseconds{30000}})
+        .Listen("127.0.0.1:0")
+        .SetShutdownBudget(std::chrono::milliseconds{3000})
+        .SetLifecycleBudget(std::chrono::milliseconds{3000})
+        .SetLocalIdentity(identity);
+}
+
+/**
+ * —— callee 进程：由 caller 派生，独立受管 CoApp（互异 identity） ——
  */
 int RunCallee(const std::string& port_file, const std::string& meta_file) {
-    fw::CoAppOptions options;
-    options.network_limits = inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
-                                                /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
-                                                /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    options.listen = inf::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    options.local_identity = kCalleeIdentity;
+    fw::AppOptions options = BaseOptions(kCalleeIdentity);
 
-    fw::CoApp app{std::move(options)};
-    if (auto r = app.add_service<PolicyCalleeService>(ConcurrentOpts()); !r) {
-        std::fprintf(stderr, "callee: add_service failed: %s\n", r.error().message.c_str());
+    g_scheduler->Start();
+
+    /**
+     * 装配结果跨协程/线程交接：endpoint 经 promise 交给宿主线程写端口文件；
+     * App 指针发布后宿主线程只做 RequestShutdown（幂等 noexcept）；退出码经
+     * promise 回传（0=按期优雅收口，2=启动失败，4=收口未竟）。promise 全部
+     * 由协程侧单次写入。
+     */
+    std::promise<std::string> bound_ep;
+    std::promise<int>         rc_slot;
+    std::shared_ptr<fw::CoApp> app_handle;
+    std::mutex                 app_mtx;
+
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [options = std::move(options), &bound_ep, &rc_slot,
+         &app_handle, &app_mtx]() mutable {
+            auto app = fw::CoApp::Create(std::move(options), kCalleeIdentity);
+            if (!app) {
+                std::fprintf(stderr, "callee: CoApp::Create failed\n");
+                bound_ep.set_value("");
+                rc_slot.set_value(4);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(app_mtx);
+                app_handle = app;
+            }
+            auto install = bbt_co_await app->CoInstallService<PolicyCalleeService>(ConcurrentOpts());
+            if (!install) {
+                std::fprintf(stderr, "callee: CoInstallService failed: %s\n",
+                             install.error().message.c_str());
+                bound_ep.set_value("");
+                rc_slot.set_value(2);
+                return;
+            }
+            auto started = bbt_co_await app->CoStart(
+                fw::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+            if (!started) {
+                std::fprintf(stderr, "callee: CoStart failed: %s\n",
+                             started.error().message.c_str());
+                bound_ep.set_value("");
+                rc_slot.set_value(2);
+                return;
+            }
+            bound_ep.set_value(app->BoundEndpoint());
+            const auto waited = bbt_co_await app->CoWaitShutdownRequest();
+            (void)waited;
+            auto stopped = bbt_co_await app->CoStop(
+                fw::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+            if (!stopped)
+                std::fprintf(stderr, "callee: CoStop failed: %s\n",
+                             stopped.error().message.c_str());
+            rc_slot.set_value(stopped && app->State() == fw::AppState::Stopped
+                                  ? 0
+                                  : 4);
+        },
+        submitted);
+    if (!submitted) {
+        std::fprintf(stderr, "callee: coroutine task rejected\n");
         return 4;
     }
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
-    const std::string bound = BoundEndpointOrEmpty(app, 10000);
-    if (bound.empty()) {
-        app.request_shutdown();
-        if (runner.joinable())
-            runner.join();
-        std::fprintf(stderr, "callee: bind did not become ready rc=%d\n", rc);
-        return 5;
-    }
-    WriteTextFile(port_file, std::to_string(PortOf(bound)), "callee port");
+    auto bound = bound_ep.get_future();
+    std::string endpoint;
+    if (bound.wait_for(std::chrono::seconds{10}) == std::future_status::ready)
+        endpoint = bound.get();
+    if (endpoint.empty())
+        return BindFailure(app_handle, app_mtx, "callee");
+
+    const std::uint16_t port = PortOf(endpoint);
+    WriteTextFile(port_file, std::to_string(port), "callee port");
     WriteTextFile(meta_file,
                   "process=callee\ncallee_service=" +
                       std::string(PolicyCallerService::kCalleeService) +
                       "\nlocal_identity=" + kCalleeIdentity +
                       "\nauth_state=" + kAuthState + "\n",
                   "callee meta");
-    std::fprintf(stderr, "rpc_policy callee up endpoint=%s\n", bound.c_str());
+    std::fprintf(stderr, "rpc_policy callee up endpoint=%s\n", endpoint.c_str());
 
-    ServeUntilEof(app);
-    if (runner.joinable())
-        runner.join();
+    WaitForStdinEof();
+    /**
+     * stdin EOF：native 线程发关闭请求（仅置位并唤醒唯一 waiter；主协程
+     * 亲自 CoStop 收口）。
+     */
+    RequestShutdownLocked(app_handle, app_mtx);
+    const int rc = rc_slot.get_future().get();
     Journal(std::string("event=callee_shutdown rc=") + std::to_string(rc) +
             " auth_state=" + kAuthState);
     return rc;
@@ -555,6 +650,33 @@ void ReapCallee(CalleeProcess& callee) {
     callee.pid = -1;
 }
 
+/**
+ * 资源记账组件：CoStop 收口相位 OnStop 恰一次 → journal resource_close；
+ * owner_closed 计数同源，供宿主线程在 rc 发布后读取。
+ */
+std::atomic<unsigned> g_resource_close_count{0};
+
+class CloseJournalComponent final : public fw::CoComponent {
+public:
+    struct Options {};
+
+    explicit CloseJournalComponent(fw::detail::ConstructKey key, Options)
+        : fw::CoComponent(key) {}
+
+protected:
+    ~CloseJournalComponent() noexcept override = default;
+
+private:
+    friend class bbt::framework::detail::Registry;
+
+protected:
+    fw::result<void> OnStop() override {
+        g_resource_close_count.fetch_add(1);
+        Journal(std::string("event=resource_close auth_state=") + kAuthState);
+        return fw::result<void>::ok();
+    }
+};
+
 int RunCaller(const std::string& mode, const std::string& port_file,
               const std::string& meta_file, const std::string& journal_path) {
     const auto slash = port_file.rfind('/');
@@ -573,49 +695,99 @@ int RunCaller(const std::string& mode, const std::string& port_file,
     }
     const std::string callee_endpoint = "127.0.0.1:" + std::to_string(callee_port);
 
-    fw::CoAppOptions options;
-    options.network_limits = inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
-                                                /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
-                                                /*incoming_timeout*/ std::chrono::milliseconds{30000}};
-    options.listen = inf::ListenAddress{"127.0.0.1", 0};
-    options.shutdown_step_budget = std::chrono::milliseconds{3000};
-    /**
-     * V2 会话身份必填；caller/callee/驱动器三方互异。
-     */
-    options.local_identity = kCallerIdentity;
-    options.static_routes = {
-        fw::StaticRoute{std::string(PolicyCallerService::kCalleeService), callee_endpoint}};
+    fw::AppOptions options = BaseOptions(kCallerIdentity);
+    options.AddRoute(std::string(PolicyCallerService::kCalleeService),
+                     callee_endpoint);
     /**
      * 唯一组装点——构造期选择公开策略。
      */
-    options.rpc_policy = MakePolicy(mode);
+    options.SetRpcPolicy(MakePolicy(mode));
 
-    fw::CoApp app{std::move(options)};
-    if (auto r = app.add_service<PolicyCallerService>(ConcurrentOpts()); !r) {
-        std::fprintf(stderr, "fixture: add_service(caller) failed: %s\n", r.error().message.c_str());
+    g_scheduler->Start();
+
+    std::promise<std::string> bound_ep;
+    std::promise<int>         rc_slot;
+    std::shared_ptr<fw::CoApp> app_handle;
+    std::mutex                 app_mtx;
+
+    bool submitted = false;
+    g_scheduler->RegistCoroutineTask(
+        [options = std::move(options), mode, &bound_ep, &rc_slot,
+         &app_handle, &app_mtx]() mutable {
+            auto app = fw::CoApp::Create(std::move(options), kCallerIdentity);
+            if (!app) {
+                std::fprintf(stderr, "fixture: CoApp::Create failed\n");
+                bound_ep.set_value("");
+                rc_slot.set_value(4);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(app_mtx);
+                app_handle = app;
+            }
+            auto resource = bbt_co_await app->CoInstallComponent<CloseJournalComponent>(
+                "close-journal", CloseJournalComponent::Options{});
+            if (!resource) {
+                std::fprintf(stderr, "fixture: CoInstallComponent failed: %s\n",
+                             resource.error().message.c_str());
+                bound_ep.set_value("");
+                rc_slot.set_value(2);
+                return;
+            }
+            auto install = bbt_co_await app->CoInstallService<PolicyCallerService>(ConcurrentOpts());
+            if (!install) {
+                std::fprintf(stderr, "fixture: CoInstallService failed: %s\n",
+                             install.error().message.c_str());
+                bound_ep.set_value("");
+                rc_slot.set_value(2);
+                return;
+            }
+            auto started = bbt_co_await app->CoStart(
+                fw::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+            if (!started) {
+                std::fprintf(stderr, "fixture: CoStart failed: %s\n",
+                             started.error().message.c_str());
+                bound_ep.set_value("");
+                rc_slot.set_value(2);
+                return;
+            }
+            bound_ep.set_value(app->BoundEndpoint());
+            const auto waited = bbt_co_await app->CoWaitShutdownRequest();
+            (void)waited;
+            auto stopped = bbt_co_await app->CoStop(
+                fw::LifecycleOptions{}.SetDeadline(
+                    std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+            if (!stopped)
+                std::fprintf(stderr, "fixture: CoStop failed: %s\n",
+                             stopped.error().message.c_str());
+            const int rc = stopped && app->State() == fw::AppState::Stopped
+                               ? 0
+                               : 4;
+            Journal(std::string("event=shutdown mode=") + mode + " rc=" +
+                    std::to_string(rc) + " state=" + AppStateName(app->State()) +
+                    " owner_closed=" +
+                    std::to_string(g_resource_close_count.load()) +
+                    " auth_state=" + kAuthState);
+            rc_slot.set_value(rc);
+        },
+        submitted);
+    if (!submitted) {
+        std::fprintf(stderr, "fixture: coroutine task rejected\n");
         ReapCallee(callee);
         return 4;
     }
-    auto owner = std::make_shared<CloseJournal>();
-    if (auto r = app.add_resource<CloseJournal>(owner); !r) {
-        std::fprintf(stderr, "fixture: add_resource failed: %s\n", r.error().message.c_str());
-        ReapCallee(callee);
-        return 4;
-    }
 
-    int rc = -1;
-    std::thread runner([&] { rc = app.run(); });
-
-    const std::string bound = BoundEndpointOrEmpty(app, 10000);
-    if (bound.empty()) {
-        app.request_shutdown();
-        if (runner.joinable())
-            runner.join();
+    auto bound = bound_ep.get_future();
+    std::string endpoint;
+    if (bound.wait_for(std::chrono::seconds{10}) == std::future_status::ready)
+        endpoint = bound.get();
+    if (endpoint.empty()) {
+        BindFailure(app_handle, app_mtx, "fixture");
         ReapCallee(callee);
-        std::fprintf(stderr, "fixture: bind did not become ready rc=%d\n", rc);
         return 5;
     }
-    const std::uint16_t port = PortOf(bound);
+    const std::uint16_t port = PortOf(endpoint);
 
     WriteTextFile(port_file, std::to_string(port), "port");
     WriteTextFile(meta_file,
@@ -628,32 +800,32 @@ int RunCaller(const std::string& mode, const std::string& port_file,
                       "\nauth_state=" + kAuthState + "\n",
                   "meta");
     std::fprintf(stderr, "rpc_policy fixture up mode=%s endpoint=%s callee=%s\n",
-                 mode.c_str(), bound.c_str(), callee_endpoint.c_str());
+                 mode.c_str(), endpoint.c_str(), callee_endpoint.c_str());
 
-    ServeUntilEof(app);
-    if (runner.joinable())
-        runner.join();
-
-    const int state = static_cast<int>(app.shutdown_state());
-    Journal(std::string("event=shutdown rc=") + std::to_string(rc) + " state=" + std::to_string(state) + " owner_closed=" + (owner->IsClosed() ? "1" : "0") + " auth_state=" + kAuthState);
+    WaitForStdinEof();
+    /**
+     * stdin EOF：native 线程发关闭请求（仅置位并唤醒唯一 waiter；主协程
+     * 亲自 CoStop 收口）。
+     */
+    RequestShutdownLocked(app_handle, app_mtx);
+    const int rc = rc_slot.get_future().get();
 
     /**
-     * B1：run 已返回、runner 已 join，而本进程与 app 对象仍存活——此刻对 bound
+     * B1：CoStop 已返回、rc 已发布，而本进程与 app 对象仍存活——此刻对 bound
      * 端口做有界探针才可能区分「框架关掉了 listener」与「进程回收后被内核顺带
      * 释放」。端口取自已服务过真实 RPC 的同一个值（driver 核 port 字段一致）。
      */
     int probe_errno = 0;
     const ListenerProbeResult probe = ProbeListenerBoundPort(port, &probe_errno);
-    Journal(std::string("event=listener_probe phase=after_run_before_exit port=") + std::to_string(port) + " result=" + ProbeResultName(probe) + " errno=" + std::to_string(probe_errno) + " auth_state=" + kAuthState);
+    Journal(std::string("event=listener_probe phase=after_stop_before_exit port=") + std::to_string(port) + " result=" + ProbeResultName(probe) + " errno=" + std::to_string(probe_errno) + " auth_state=" + kAuthState);
 
     /**
      * caller 已收束后再关 callee；异常路径也被有界回收。
      */
     ReapCallee(callee);
     std::fprintf(stderr,
-                 "rpc_policy fixture rc=%d state=%d owner_closed=%d "
-                 "listener_probe=%s errno=%d\n",
-                 rc, state, owner->IsClosed() ? 1 : 0, ProbeResultName(probe), probe_errno);
+                 "rpc_policy fixture rc=%d listener_probe=%s errno=%d\n",
+                 rc, ProbeResultName(probe), probe_errno);
     return rc;
 }
 
