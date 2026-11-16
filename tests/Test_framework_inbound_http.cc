@@ -290,6 +290,7 @@ struct CtxSnapshot {
     std::string trace_id;
     co::Deadline    deadline{};
     std::uint64_t   co_id = 0;
+    co::detail::ProcesserId processer_id = BBT_COROUTINE_INVALID_PROCESSER_ID;
     std::thread::id tid{};
 };
 
@@ -392,6 +393,9 @@ CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     s.trace_id       = c.trace_id.value_or("");
     s.deadline       = c.deadline;
     s.co_id          = co::GetLocalCoroutineId();
+    const auto processer = co::detail::Processer::TryGetLocalProcesser();
+    s.processer_id   = processer ? processer->GetId()
+                                 : BBT_COROUTINE_INVALID_PROCESSER_ID;
     s.tid            = std::this_thread::get_id();
     return s;
 }
@@ -745,15 +749,15 @@ struct Spinner {
     std::atomic<std::thread::id> tid{};
 };
 
-std::shared_ptr<Spinner> LaunchSpinner() {
+std::shared_ptr<Spinner> LaunchSpinner(co::detail::ProcesserId target) {
     auto s = std::make_shared<Spinner>();
-    bbtco [s]() {
+    g_scheduler->RegistCoroutineTaskOn(target, [s]() {
         s->tid.store(std::this_thread::get_id(),
                      std::memory_order_release);
         s->spinning.store(true, std::memory_order_release);
         while (!s->release.load(std::memory_order_acquire))
             std::this_thread::yield();
-    };
+    });
     return s;
 }
 
@@ -1329,13 +1333,18 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
      * 选第一个落盘的 rid 作跨 worker 目标：占用它挂起前所在 worker。
      */
     const std::string target = g_probe->before.begin()->first;
-    const auto target_tid = g_probe->before.at(target).tid;
+    const auto target_snapshot = g_probe->before.at(target);
+    const auto target_processer = target_snapshot.processer_id;
+    const auto target_tid = target_snapshot.tid;
+    BOOST_REQUIRE(target_processer != BBT_COROUTINE_INVALID_PROCESSER_ID);
     std::shared_ptr<Spinner> held;
     for (int i = 0; i < 10 && !held; ++i) {
-        auto s = LaunchSpinner();
+        auto s = LaunchSpinner(target_processer);
         /**
-         * 有界等待其开始；被派到已占 worker 时永不启动 → 放行后重试。
+         * 定向首投仍允许调度器窃取；只接受真实在目标 worker 启动的探针。
+         * 未启动的探针也登记清理，避免遗留任务占用后续用例。
          */
+        g_spinners.push_back(s);
         const auto until = Clock::now() + std::chrono::seconds{2};
         while (!s->spinning.load(std::memory_order_acquire)) {
             if (Clock::now() > until) break;
@@ -1351,7 +1360,6 @@ BOOST_AUTO_TEST_CASE(concurrent_context_isolated_cross_worker) {
             s->release.store(true, std::memory_order_release);
     }
     BOOST_REQUIRE(held);
-    g_spinners.push_back(held);
 
     /**
      * 放行所有请求：恢复在被占 worker 上无法发生，目标请求必然
