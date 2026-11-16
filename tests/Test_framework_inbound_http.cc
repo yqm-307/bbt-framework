@@ -1649,6 +1649,11 @@ BOOST_AUTO_TEST_CASE(handler_drain_shutdown_late) {
     box.after_first_stop->CountDown();
     BOOST_REQUIRE(inflight_done.WaitFor(kWait));
     /**
+     * 客户端可能因关闭断链先返回；handler 的恢复与 after 快照是另一个
+     * 协程上的事实。等待真实恢复事件，不能用客户端完成代替服务端完成。
+     */
+    BOOST_REQUIRE(g_probe->WaitEvent("resumed:t6-h", kWait));
+    /**
      * 在途 handler 被放行后真实跑完请求全程：handler 侧 after 快照为证。
      * 注意 infra 同步 Close 契约——owner Close 经 Abort 丢弃未发送响应、
      * 不做 flush，故关闭期间完成的回复不保证送达原客户端（客户端结果可能
