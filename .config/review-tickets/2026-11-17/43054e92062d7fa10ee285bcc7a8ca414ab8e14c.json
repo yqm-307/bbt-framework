@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-17",
+  "commit": "43054e92062d7fa10ee285bcc7a8ca414ab8e14c",
+  "base": "ffb5a6c9e66b11787f2b068bed9b7e83b7afd0ae",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6-astra (deleg_58d6e76b)",
+  "summary": "AGENTS.md「提交与合入」段的 Agent author 固定写法（--author=\"agent <邮箱>\"）与 bbtools-coroutine、bbtools-infra 及 bbtools-pub 的「Author 固定为用户本人 yqm-307，不加 --author」冲突；改为同一措辞，删除 agent 邮箱占位。其余约束未改动。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "独立审查结论“可提交”：与三处规则一致、无残留矛盾、未删弱其他约束、未放宽门禁、新措辞可直接执行。",
+      "evidence": {
+        "reviewer": "gpt-6-astra / openai-api (deleg_58d6e76b, sa-0-2cc5484f, 88s)",
+        "report": "/home/yqm/.hermes/profiles/alice/cache/scratch/framework-author-review.md",
+        "scope": "AGENTS.md 提交与合入段：删除 Agent author 固定写法，新增 Author 固定用户本人条款 (+2/-1)"
+      }
+    },
+    {
+      "id": "diff-check",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "git diff --cached --check 无输出、退出 0。"
+    },
+    {
+      "id": "no-residue",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "仓内 grep 'agent <' 与 '--author=\"agent' 无残留（仅 AGENTS.md 原一处）。"
+    }
+  ]
+}

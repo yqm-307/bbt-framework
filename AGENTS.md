@@ -58,7 +58,8 @@
 
 ### 提交与合入
 
-- 提交标题使用 `<type>(<scope>): <简洁中文说明>`，单次提交不混无关变更；目标测试通过且无新增警告后才允许 commit。交付前检查无意外改动并报告未覆盖项。Agent author 固定写法：`git commit --author="agent <agent@users.noreply.github.com>"`。
+- 提交标题使用 `<type>(<scope>): <简洁中文说明>`，单次提交不混无关变更；目标测试通过且无新增警告后才允许 commit。交付前检查无意外改动并报告未覆盖项。
+- Author 固定为用户本人 `yqm-307`：用本机 git 配置（`user.name=yqm-307`）直接提交，不加 `--author`，不使用 agent 身份。
 - 本地 push 门禁：wrapper 在 `.config/bbt-git-hooks/`（只放 `pre-push`，启用后不会顺带启用 pub 的 `commit-msg`），本仓规则配置在 `.config/bbt-git-hooks.toml`，规则与 review ticket 格式见 `third-party/bbtools-pub/tools/git-hooks/README.md`。启用前先查已有 `core.hooksPath`，不覆盖其他 hook 系统；`--local` 配置在 linked worktree 间共享，启用后所有 worktree 都按各自根的 `.config/bbt-git-hooks/` 找 hook——没有 wrapper 的 worktree 不受影响，本仓启用需先确认该共享影响或改用 worktree 独立 config（`extensions.worktreeConfig`）。代码 commit 审查通过后，ticket 放在紧随其后的单独 commit（只改 `.config/review-tickets/`）。
 - 不直推 `main`、不自行合并或发布；远端写入后回读确认目标对象。CI 失败先读日志定位根因，不靠重跑掩盖；业务代码修复可自主做，CI/CD 配置修改须先获确认。
 
