@@ -16,12 +16,14 @@
 
 先按任务选一条路径，不全量预载。
 
-| 任务 | 公共规范（pub submodule） | 本仓真源 |
+上游公共规范统一从 `third-party/bbtools-pub/README.md` 根路由进入：bbtools 家族特有约定在 pub `docs/cpp/`；设计、编码、Review、用例设计的通用方法由 pub 指向 `third-party/bbt-agent-toolkit/`，本仓不直接固定 toolkit 路径。
+
+| 任务 | 公共规范（pub 根路由） | 本仓真源 |
 |---|---|---|
-| 架构契约、模块边界 | `third-party/bbtools-pub/docs/10-design/README.md` | `docs/architecture/distributed-framework-baseline.md`（基调真源）＋ 同目录验收矩阵与 `framework-contract.md` |
-| 编码/注释/文档细则 | `third-party/bbtools-pub/docs/20-coding/README.md`（C++、注释、文档专项按入口展开） | `docs/conventions.md`；格式以 `.clang-format`、`.editorconfig` 为真源 |
-| 评审 | `third-party/bbtools-pub/docs/30-review/README.md` | 本文「审查门禁」；`.config/review-tickets/` 存审查凭证 |
-| 设计测试、选择运行范围 | `third-party/bbtools-pub/docs/40-testcase/README.md` | `docs/guides/testing.md`、`docs/conventions.md` §6 |
+| 架构契约、模块边界 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | `docs/architecture/distributed-framework-baseline.md`（基调真源）＋ 同目录验收矩阵与 `framework-contract.md` |
+| 编码/注释/文档细则 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」；家族 C++ 约定见 `third-party/bbtools-pub/docs/cpp/` | `docs/conventions.md`；格式以 `.clang-format`、`.editorconfig` 为真源 |
+| 评审 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | 本文「审查门禁」；`.config/review-tickets/` 存审查凭证 |
+| 设计测试、选择运行范围 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | `docs/guides/testing.md`、`docs/conventions.md` §6 |
 | 构建与测试入口 | — | `README.md`（不把未实现的分布式扩展写成现有事实） |
 | 开发流程、验证、发布、push 门禁 | — | `docs/guides/development.md`、`docs/guides/ci.md`（CI 最终落点；收敛前见 `docs/ci/`） |
 | 协议/依赖政策 | — | `bbtools-infra` 仓（按消费版本读其 AGENTS/decisions） |
