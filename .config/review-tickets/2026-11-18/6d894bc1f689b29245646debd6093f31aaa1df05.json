@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "6d894bc1f689b29245646debd6093f31aaa1df05",
+  "base": "f24257cbeeeb54234a0b9810e4e5c63356d795e4",
+  "result": "pass",
+  "reviewer": "独立审查者（gpt-6.2-astra）",
+  "summary": "核对了固定 pub 对命名、头文件布局与角色方法的承接，以及 framework 公开契约、格式检查范围、构建和测试入口。完整差异通过。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "已对照 CMake 测试注册、普通 PR 工作流和固定版本工具实现核查文档，并核验框架错误、借用寿命与模板组织的本仓约束。",
+      "evidence": {
+        "reviewer": "独立审查者（gpt-6.2-astra）",
+        "scope": "f24257cbeeeb54234a0b9810e4e5c63356d795e4..6d894bc1f689b29245646debd6093f31aaa1df05 全部 8 个文件"
+      }
+    }
+  ]
+}

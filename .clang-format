@@ -1,7 +1,4 @@
-# bbt 三仓统一代码风格（hygiene 2026-10-30）。
-# 基准：以 infra/framework 主导风格反推（4 空格、行尾大括号、指针贴左）。
-# coroutine 存量为 Allman 风格，不追平；新行/改动行按本文件执行（D5）。
-# 工具：clang-format 23.1.3（uv tool install clang-format==23.1.3）。
+# framework 的格式配置，使用 clang-format 23.1.3。
 
 Language: Cpp
 Standard: Latest
@@ -10,9 +7,7 @@ AccessModifierOffset: -4
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never
-# 0 = 不自动折行：存量代码人工折行风格多样（~90–120 列），任何有限列宽都会
-# 把手写折行重新拼接，无谓扩大改动面。行长指导由 docs/conventions.md 承担
-# （建议 ≤120），本文件只管空格/缩进/大括号。
+# 保留已有手工折行。新代码人工按约 120 列组织表达式。
 ColumnLimit: 0
 
 # --- 大括号：全部行尾 ---
@@ -174,7 +169,8 @@ AlignTrailingComments:
   OverEmptyLines: 0
 
 # --- 注释 ---
-FixNamespaceComments: true
+# pub 的 comments.md 要求命名空间以裸右括号结束。
+FixNamespaceComments: false
 ReflowComments: Never
 SpacesInLineCommentPrefix:
   Minimum: 1

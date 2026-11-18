@@ -4,33 +4,26 @@
 
 可 fork 的 C++ 正式服务框架与工程脚手架（App/Service 基类、启动/生命周期、配置、注册发现、Stub 等分布式基础能力）。使用者在应用层开发业务，框架上游不硬编码具体产品业务；交付可 fork 后新增业务服务的工程，不以仅跑通示例替代。不承载具体业务接口、schema 或第三方协议适配实现（后者归 `bbtools-infra`）。
 
-<!-- bbtools:common:begin -->
+## 工程边界
+
 - 依赖方向固定为 `bbt-framework → bbtools-infra → bbtools-coroutine`，禁止反向依赖、环依赖和引用兄弟模块内部实现。跨仓公共契约以契约所在仓文档为真源，变更由用户拍板；并行写任务使用独立工作区、索引、build 和依赖目录，保留他人已有改动。
-- 统一以 C++17 为基线；优先标准库与 Boost 1.90，模板适度，namespace 不超过三层（`bbt::{大模块}::{小模块}`）。
-- 设计、编码、Review 与用例设计的共用判断规范固定在本仓 `third-party/bbtools-pub` submodule（已审阅提交，`git submodule update --init --recursive` 后读取；远端源 https://github.com/yqm-307/bbtools-pub 以其 `main` 已合入内容为准，不读取仓外 pub 工作树的未提交改动），从其 `README.md` 只走当前职责的路径，不全量预载；与本仓 AGENTS 或 `docs/` 冲突时以本仓为准，并在交付中报告差异。
-- 新 worktree/clone 不会带入未提交规范；开工先核对实际规范快照与依赖版本。
+- framework 使用 C++17，优先标准库与 Boost 1.90。命名、类型与布局遵循 pub 的 C++ 规范。
 - 顶层目录：`bbt/`（公共头与实现按模块并置，`bbt/framework/` 为框架库源码）、`tests/`、`examples/`、`docs/`、`scripts/`、`.github/`、`.config/`、`docker/`，另有 `third-party/`（只固定公共规范 submodule，不放本仓实现或运行产物）。不新增顶层目录。
-<!-- bbtools:common:end -->
 
 ## 规范与真源入口
 
-先按任务选一条路径，不全量预载。
+新 clone 或 worktree 先执行 `git submodule update --init --recursive`。从本仓固定的 `third-party/bbtools-pub/README.md` 选择当前任务的一条阅读路径。角色提示词由 pub 路由到 toolkit，家族 C++ 规范和公共工具由 pub 提供。开工和测试前按该入口核对分支、基线和依赖。
 
-上游公共规范统一从 `third-party/bbtools-pub/README.md` 根路由进入：bbtools 家族特有约定在 pub `docs/cpp/`；设计、编码、Review、用例设计的通用方法由 pub 指向 `third-party/bbt-agent-toolkit/`，本仓不直接固定 toolkit 路径。
+优先级：用户最新明确指令 > 本文与本仓 `docs/` > pub。冲突在交付时说明；framework 特例留在本仓，需要改变公共约定时提请用户裁决。
 
-| 任务 | 公共规范（pub 根路由） | 本仓真源 |
-|---|---|---|
-| 架构契约、模块边界 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | `docs/architecture/distributed-framework-baseline.md`（基调真源）＋ 同目录验收矩阵与 `framework-contract.md` |
-| 编码/注释/文档细则 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」；家族 C++ 约定见 `third-party/bbtools-pub/docs/cpp/` | `docs/conventions.md`；格式以 `.clang-format`、`.editorconfig` 为真源 |
-| 评审 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | 本文「审查门禁」；`.config/review-tickets/` 存审查凭证 |
-| 设计测试、选择运行范围 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | `docs/guides/testing.md`、`docs/conventions.md` §6 |
-| 构建与测试入口 | — | `README.md`（不把未实现的分布式扩展写成现有事实） |
-| 开发流程、验证、发布、push 门禁 | — | `docs/guides/development.md`、`docs/guides/ci.md`（CI 最终落点；收敛前见 `docs/ci/`） |
-| 协议/依赖政策 | — | `bbtools-infra` 仓（按消费版本读其 AGENTS/decisions） |
-| 任务与验收 | — | GitHub Issue/PR |
-
-- 优先级：用户最新明确指令 > 本文与本仓 `docs/` > pub；冲突时以本仓为准，并在交付中报告差异；pub 未覆盖的本仓特例写在本仓文档，不改 pub 来迁就本仓。
-- pub 指针更新时先核对提交与变更范围，不读取仓外 pub 工作树的未提交改动。
+| pub 阅读路径 / 任务 | framework 补充入口 |
+|---|---|
+| 设计（architect） | `docs/architecture/distributed-framework-baseline.md`、同目录验收矩阵与 `framework-contract.md` |
+| 实现（engineer） | `docs/conventions.md` 说明源码布局、API 与格式的本仓取值。构建入口见 `README.md` |
+| 用例设计与验证（qa） | `docs/guides/testing.md` 说明 Boost.Test、CTest 注册、测试选集与运行边界 |
+| 审查（reviewer） | 本文「审查门禁」决定独立审查范围。辅助工具与推送凭据见 `docs/guides/development.md` |
+| 多角色协作（workflow） | 按本文的并行工作区边界执行。开发和 CI 分见 `docs/guides/development.md`、`docs/guides/ci.md` |
+| 协议与依赖政策 | 按消费版本读 `bbtools-infra` 的 AGENTS 与决策记录 |
 
 ## 本仓特有规则
 
@@ -53,14 +46,14 @@
 ### 本地构建与验证
 
 - 本地构建并发固定为 2；使用共享队列 `flock /tmp/bbt-build.lock`，构建显式 `--parallel 2`，configure 使用 ccache；测试用 `ctest -j1`。
-- 本地验证必须覆盖冒烟、本次功能及直接耦合测试；本地不跑全量，完整测试走 PR CI。交付证据要求非平凡逻辑有可运行验证（干净 fork/隔离副本新增服务，验证构建、测试、启动、真实请求/错误/关闭）；替身不替代承诺的真实集成。
+- 本地验证必须覆盖冒烟、本次功能及直接耦合测试；本地不跑全量，完整回归由 CI 承担。普通 PR 当前执行 smoke 和命中的 focused，要求完整回归时须单列 full 的执行证据或覆盖缺口。交付证据要求非平凡逻辑有可运行验证（干净 fork/隔离副本新增服务，验证构建、测试、启动、真实请求/错误/关闭）；替身不替代承诺的真实集成。
 - 不把本地结果说成远端 CI 结果；缺环境、权限或依赖时报 `BLOCKED`，不以 stub、跳过断言或削弱测试伪装完成。
 
 ### 提交与合入
 
 - 提交标题使用 `<type>(<scope>): <简洁中文说明>`，单次提交不混无关变更；目标测试通过且无新增警告后才允许 commit。交付前检查无意外改动并报告未覆盖项。
 - Author 固定为用户本人 `yqm-307`：用本机 git 配置（`user.name=yqm-307`）直接提交，不加 `--author`，不使用 agent 身份。
-- 本地 push 门禁：wrapper 在 `.config/bbt-git-hooks/`（只放 `pre-push`，启用后不会顺带启用 pub 的 `commit-msg`），本仓规则配置在 `.config/bbt-git-hooks.toml`，规则与 review ticket 格式见 `third-party/bbtools-pub/tools/git-hooks/README.md`。启用前先查已有 `core.hooksPath`，不覆盖其他 hook 系统；`--local` 配置在 linked worktree 间共享，启用后所有 worktree 都按各自根的 `.config/bbt-git-hooks/` 找 hook——没有 wrapper 的 worktree 不受影响，本仓启用需先确认该共享影响或改用 worktree 独立 config（`extensions.worktreeConfig`）。代码 commit 审查通过后，ticket 放在紧随其后的单独 commit（只改 `.config/review-tickets/`）。
+- 代码 commit 审查通过后单独提交 review ticket，再推送。本仓只接入 pre-push；启用方式见 `docs/guides/development.md`「本地 push 门禁」。
 - 不直推 `main`、不自行合并或发布；远端写入后回读确认目标对象。CI 失败先读日志定位根因，不靠重跑掩盖；业务代码修复可自主做，CI/CD 配置修改须先获确认。
 
 ### 审查门禁
