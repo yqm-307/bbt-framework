@@ -4,17 +4,17 @@
 
 ## 规范入口
 
-跨仓共用的设计、编码、Review 与用例设计规范固定从 `third-party/bbtools-pub/README.md` 进入，按任务只展开对应职责路径（任务到入口的映射见根 `AGENTS.md`「真源入口」表）。`AGENTS.md`、本文、`docs/architecture/`、`docs/conventions.md` 补充 framework 的本地契约；发生冲突时以本仓明确约束和实际实现为准，并在交付中报告差异。
+公共规范与本仓契约的入口和优先级见根 [AGENTS.md](../../AGENTS.md)「规范与真源入口」。
 
 干净 clone 后先执行 `git submodule update --init --recursive`，再读取上述入口；submodule 之外的本地 pub 工作树改动不属于本仓规范证据。更新 pub 指针时先核对目标提交已合入其 `main` 并核对变更范围，指针变更单独提交并写明新旧 SHA。
 
 ## 本地 push 门禁
 
-- wrapper 在 `.config/bbt-git-hooks/pre-push`，本仓规则配置在 `.config/bbt-git-hooks.toml`；规则协议、review ticket 格式与跳过语法见 `third-party/bbtools-pub/tools/git-hooks/README.md`，不在本文复制。
+- `.config/bbt-git-hooks/pre-push` 转发到 pub 的 `tools/git-hooks/hooks/pre-push`。本仓沿用 `.config/bbt-git-hooks.toml`（schema 1）；启用哪些规则以此文件为准。规则机制、ticket 生成和核验见 `third-party/bbtools-pub/tools/git-hooks/README.md`。
 - 启用：先查 `git config --get core.hooksPath` 与 `.git/hooks/` 非 sample 文件，无冲突再执行 `git config --local core.hooksPath .config/bbt-git-hooks`。
 - `--local` 配置在 linked worktree 间共享：启用后所有 worktree 按各自根的 `.config/bbt-git-hooks/` 找 hook，没有 wrapper 的 worktree 不受影响；启用前先确认该共享影响，需要隔离时改用 `extensions.worktreeConfig` 的 worktree 独立 config。
 - 目录里只放 `pre-push`：启用本仓 hooksPath 不会顺带启用 pub 自带的 `commit-msg`。
-- review ticket 随仓库提交在 `.config/review-tickets/<YYYY-MM-DD>/<被审查 commit>.json`，放在紧随代码 commit 之后的单独 commit（该 commit 只能改 `.config/review-tickets/`）；ticket 绑定代码 commit 哈希，amend/rebase 后须重新审查、重新生成。
+
 
 ## 依赖版本选择
 

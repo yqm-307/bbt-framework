@@ -2,12 +2,11 @@
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
-pub_root="$repo_root/third-party/bbtools-pub"
-stage="$pub_root/tools/git-hooks/stages/push/main.py"
+hook="$repo_root/third-party/bbtools-pub/tools/git-hooks/hooks/pre-push"
 
-if [ ! -f "$stage" ]; then
-    printf 'bbt-git-hooks: missing pub push stage: %s\n' "$stage" >&2
+if [ ! -x "$hook" ]; then
+    printf 'bbt-git-hooks: missing or non-executable pub hook: %s\n' "$hook" >&2
     exit 2
 fi
 
-exec python3 -I "$stage" "$@"
+exec "$hook" "$@"
