@@ -14,7 +14,7 @@
   `State` / `PendingCleanup` / `LifecycleFailures` 观察面、V2 RPC 入站（`InstallRpcAdmission`）与
   出站（`RpcEgress`）、静态路由（`AppOptions::AddRoute`）与 `DynamicRouteTable`。
 - **未实现**：
-  - 非拥有关系边 `CoBindObject` / `CoUnbindObject` 恒返回 `UnsupportedRoute`（`host/CoApp.cc`）。
+  - 非拥有关系边 `CoBindObject` / `CoUnbindObject` 恒返回 `UnsupportedRoute`（`bbt/framework/host/CoApp.cc`）。
   - Actor 实例创建与销毁（`CoCreateActor` / `CoDestroyActor`）与 Actor 消息分发未接线；
     `CoInstallActor` 只登记类型，不创建实例。
   - `MonitorService`、`HttpComponent`、`AppInspector`、`AppSession`、`Resolver`、`CoJoin` 在源码中不存在；
@@ -84,24 +84,23 @@ bbt_co_await app->CoStop();                  // 显式收口，State() == Stoppe
 
 ## 构建与测试
 
-干净 clone 先执行 `git submodule update --init --recursive`（`third-party/bbtools-pub` 固定共用规范）。
+从仓库根执行 `git submodule update --init --recursive`，检出固定版本的 pub 及其角色提示词。`git submodule status --recursive` 可核对两级提交。
 
-依赖：`bbtools-infra`（其自身再依赖 `bbtools-coroutine`）。本机开发经显式路径覆盖接入：
+以下示例从仓库根运行。将三个相对路径换成已准备好的 infra、coroutine 源码树及 protobuf 3.21.12 前缀。`realpath` 将选定路径传给 CMake。
 
 ```bash
-INFRA=/path/to/bbtools-infra            # 含顶层 CMakeLists.txt 与 include/
-CO=/path/to/bbtools-coroutine           # 含顶层 CMakeLists.txt 与 bbt/
-PB=/path/to/protobuf-3.21.12/prefix     # 绝对路径
+INFRA=../deps/infra-main
+CO=../deps/coroutine-main
+PB=../deps/protobuf-3.21.12
 
 flock /tmp/bbt-build.lock cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DNEED_TEST=ON \
-  -DBBT_INFRA_SOURCE_DIR=$INFRA -DBBT_COROUTINE_SOURCE_DIR=$CO \
+  -DBBT_INFRA_SOURCE_DIR="$(realpath "$INFRA")" -DBBT_COROUTINE_SOURCE_DIR="$(realpath "$CO")" \
   -DBBT_INFRA_CONFIG=ON -DBBT_INFRA_NET=ON -DBBT_INFRA_HTTP_NET=ON \
-  -DBBT_INFRA_RPC_NET=ON -DBBT_PROTOBUF_PREFIX=$PB
+  -DBBT_INFRA_RPC_NET=ON -DBBT_PROTOBUF_PREFIX="$(realpath "$PB")"
 
-# 构建按目标进行，固定 --parallel 2；ctest 不负责构建，需显式列出目标。
-flock /tmp/bbt-build.lock cmake --build build --parallel 2 --target \
-  bbt_framework Test_framework_v2_core Test_framework_coapp_lifecycle
+# smoke 会启动多个测试程序和跨语言驱动。先构建当前配置的默认目标集。
+flock /tmp/bbt-build.lock cmake --build build --parallel 2
 
 # 测试经统一入口 scripts/ci/run_test_profile.sh（内部 ctest -j1）。
 bash scripts/ci/run_test_profile.sh --build-dir build --profile smoke
@@ -114,7 +113,7 @@ bash scripts/ci/run_test_profile.sh --build-dir build --profile smoke
   同样必需（框架默认宿主 `InfraHttpHost` 消费 `bbt::infra_http_net`）。
 - `BBT_INFRA_SOURCE_DIR` / `BBT_COROUTINE_SOURCE_DIR` 默认为空；为空时回退
   `find_package(bbt_infra CONFIG QUIET)`，仍无 `bbt::infra_common` 则 `FATAL_ERROR`。
-- `-DNEED_TEST=ON` 只开启本仓 `tests/`；上游 coroutine/infra 的同名 `NEED_TEST` 与 `BUILD_TESTING`
+- `-DNEED_TEST=ON` 开启本仓 `tests/` 及满足构建条件的示例。上游 coroutine/infra 的同名 `NEED_TEST` 与 `BUILD_TESTING`
   在接入时被局部屏蔽。
 - 构建产物只进已忽略的 `build/`。
 
@@ -141,7 +140,7 @@ bash scripts/ci/run_test_profile.sh --build-dir build --profile smoke
 
 ## 文档地图
 
-- 跨仓公共规范（设计/编码/Review/用例）：`third-party/bbtools-pub`（固定 submodule）。
+- 公共规范、角色提示词与工具从 `third-party/bbtools-pub/README.md` 进入。framework 的源码与 API 约定见[本仓开发细则](docs/conventions.md)，lint、复杂度与推送门禁的用法见[开发指南](docs/guides/development.md)。
 - 架构基调（设计真源）：[distributed-framework-baseline.md](docs/architecture/distributed-framework-baseline.md)。
 - 框架契约（目标设计 + 已实现边界）：[framework-contract.md](docs/architecture/framework-contract.md)。
 - 验收矩阵（测试设计，非实测结果）：[distributed-framework-validation-matrix.md](docs/architecture/distributed-framework-validation-matrix.md)。

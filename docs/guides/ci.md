@@ -1,6 +1,6 @@
 # bbt-framework CI 说明
 
-本文是 bbt-framework 持续集成的唯一落点文档（`docs/ci/` 已收敛至此）。它描述当前
+本文说明 bbt-framework 当前
 `.github/workflows/ci.yml` 与 `.github/workflows/manual.yml` 的组成、门禁清单与固定
 输入；workflow 文件本身是权威定义，本文不复制其步骤，只给门禁索引与语义。
 
@@ -16,7 +16,7 @@
 | `scripts/ci/run_framework_gate.sh` | `build` 子命令承载 build_test 的「构建+门禁+provenance+封包」；`verify-archive` 接收侧子命令仍在仓内（sha256 校验+闭集/穿越/symlink 门禁+安全解包），当前普通 workflow 无跨 runner 传递，不由其调用 |
 | `scripts/ci/check_docs.py` | docs-check：相对链接有效、docs 文件名无过程编号、README 行数上限 |
 | `scripts/ci/check_format_diff.sh` | 只检查本 PR 改动行的 clang-format 违规（changes 内 `continue-on-error`，告警不阻断） |
-| `scripts/ci/run_test_profile.sh` | 统一测试执行入口：按 profile 选集（`smoke`/`focused`/`full`）→ 注册集=实跑集校验 → skipped/Not Run/failure/error 一律失败；build_test 经其跑 `--profile smoke`，`focused_regex` 非空时追加 `--profile focused`，与 bbtools-infra / bbtools-coroutine 同一份脚本（逐字节相同） |
+| `scripts/ci/run_test_profile.sh` | 统一测试执行入口：按 profile 选集（`smoke`/`focused`/`full`）→ 注册集=实跑集校验 → skipped/Not Run/failure/error 一律失败；build_test 经其跑 `--profile smoke`，`focused_regex` 非空时追加 `--profile focused` |
 | `scripts/ci/test_changed_files.py` | 分类规则 + result 契约单测（仅标准库） |
 | `scripts/ci/test_check_docs.py` | check_docs 正反例单测 |
 | `scripts/ci/test_test_profile.py` | run_test_profile.sh 离线契约测试（选集映射、fail-closed、实跑集对账） |
@@ -147,19 +147,9 @@ smoke profile 测试（changes 的 `focused_regex` 非空时同一构建树追�
   退回冷构建；ccache 安装/版本不符显式失败。smoke/focused 选集、`result.py` 判定、
   链接来源与 provenance 判据均不因缓存改动。
 
-## 6. 测试数（当前注册面）
+## 6. 测试注册与选集
 
-注册数以 `tests/CMakeLists.txt`（`framework.*`）与 `examples/*/CMakeLists.txt`（`examples.*`）为准，
-条件注册项（`live`、`examples.ecommerce_cluster`）按第 6 节说明的开关决定是否出现。
-普通 CI 固定跑 **smoke profile**（`-L smoke`）+ **必要 focused**（`focused_regex` 命中的直接耦合用例，可含非 smoke 项）；
-`framework.shutdown`（单用例实测约 30s、全套约 107s）与全部 `examples.*` 只标 `integration`（跨进程真实协作，非冒烟），
-不进普通 smoke。
-`framework.resource_live_{redis,mongo,combined}` 仅在 infra 相应目标在场时
-注册（`live` label，默认配置不产生；源码已迁移到当前公共 API，live 目标可
-构建但未经真实后端运行验证）。
-测试命名、label 语义与条件 target 的完整契约以 `tests/CMakeLists.txt` 与
-`docs/guides/testing.md`（测试规范，落实三仓统一分层）为准；全量/focused
-执行入口见该文档。
+`tests/CMakeLists.txt` 和各示例的 `CMakeLists.txt` 决定当前配置注册哪些用例。CI 使用的 profile、长时测试以及可选后端的覆盖范围见[测试指南](testing.md)。代码 PR 的测试步骤执行 smoke，并在有匹配项时执行 focused。
 
 ## 7. 手动任务（manual.yml，非 required，仅 workflow_dispatch）
 

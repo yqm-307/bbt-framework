@@ -7,23 +7,22 @@
 ## 工程边界
 
 - 依赖方向固定为 `bbt-framework → bbtools-infra → bbtools-coroutine`，禁止反向依赖、环依赖和引用兄弟模块内部实现。跨仓公共契约以契约所在仓文档为真源，变更由用户拍板；并行写任务使用独立工作区、索引、build 和依赖目录，保留他人已有改动。
-- 统一以 C++17 为基线；优先标准库与 Boost 1.90，模板适度，namespace 不超过三层（`bbt::{大模块}::{小模块}`）。
-
+- framework 使用 C++17，优先标准库与 Boost 1.90。命名、类型与布局遵循 pub 的 C++ 规范。
 - 顶层目录：`bbt/`（公共头与实现按模块并置，`bbt/framework/` 为框架库源码）、`tests/`、`examples/`、`docs/`、`scripts/`、`.github/`、`.config/`、`docker/`，另有 `third-party/`（只固定公共规范 submodule，不放本仓实现或运行产物）。不新增顶层目录。
-
 
 ## 规范与真源入口
 
-新 clone 或 worktree 先执行 `git submodule update --init --recursive`。公共工具、角色提示词与规范从固定版本的 `third-party/bbtools-pub/README.md` 进入。按其要求核对开工与测试基线，只读当前任务需要的路径。
+新 clone 或 worktree 先执行 `git submodule update --init --recursive`。从本仓固定的 `third-party/bbtools-pub/README.md` 选择当前任务的一条阅读路径。角色提示词由 pub 路由到 toolkit，家族 C++ 规范和公共工具由 pub 提供。开工和测试前按该入口核对分支、基线和依赖。
 
 优先级：用户最新明确指令 > 本文与本仓 `docs/` > pub。冲突在交付时说明；framework 特例留在本仓，需要改变公共约定时提请用户裁决。
 
-| 任务 | 本仓入口 |
+| pub 阅读路径 / 任务 | framework 补充入口 |
 |---|---|
-| 架构与模块边界 | `docs/architecture/distributed-framework-baseline.md`、同目录验收矩阵与 `framework-contract.md` |
-| 编码与文档 | `docs/conventions.md`；格式以 `.clang-format`、`.editorconfig` 为准 |
-| 构建与测试 | `README.md`（只写已实现能力）、`docs/guides/testing.md` |
-| 开发、push 与 CI | `docs/guides/development.md`、`docs/guides/ci.md`；评审见本文「审查门禁」 |
+| 设计（architect） | `docs/architecture/distributed-framework-baseline.md`、同目录验收矩阵与 `framework-contract.md` |
+| 实现（engineer） | `docs/conventions.md` 说明源码布局、API 与格式的本仓取值。构建入口见 `README.md` |
+| 用例设计与验证（qa） | `docs/guides/testing.md` 说明 Boost.Test、CTest 注册、测试选集与运行边界 |
+| 审查（reviewer） | 本文「审查门禁」决定独立审查范围。辅助工具与推送凭据见 `docs/guides/development.md` |
+| 多角色协作（workflow） | 按本文的并行工作区边界执行。开发和 CI 分见 `docs/guides/development.md`、`docs/guides/ci.md` |
 | 协议与依赖政策 | 按消费版本读 `bbtools-infra` 的 AGENTS 与决策记录 |
 
 ## 本仓特有规则
@@ -47,7 +46,7 @@
 ### 本地构建与验证
 
 - 本地构建并发固定为 2；使用共享队列 `flock /tmp/bbt-build.lock`，构建显式 `--parallel 2`，configure 使用 ccache；测试用 `ctest -j1`。
-- 本地验证必须覆盖冒烟、本次功能及直接耦合测试；本地不跑全量，完整测试走 PR CI。交付证据要求非平凡逻辑有可运行验证（干净 fork/隔离副本新增服务，验证构建、测试、启动、真实请求/错误/关闭）；替身不替代承诺的真实集成。
+- 本地验证必须覆盖冒烟、本次功能及直接耦合测试；本地不跑全量，完整回归由 CI 承担。普通 PR 当前执行 smoke 和命中的 focused，要求完整回归时须单列 full 的执行证据或覆盖缺口。交付证据要求非平凡逻辑有可运行验证（干净 fork/隔离副本新增服务，验证构建、测试、启动、真实请求/错误/关闭）；替身不替代承诺的真实集成。
 - 不把本地结果说成远端 CI 结果；缺环境、权限或依赖时报 `BLOCKED`，不以 stub、跳过断言或削弱测试伪装完成。
 
 ### 提交与合入
