@@ -1,10 +1,6 @@
 #pragma once
 /**
- * framework Actor 基类（契约 §5）。
- *
- * CoActor 与 CoComponent/CoService 共用 internal/ObjectBase.hpp 的身份基。本头只
- * 声明 ActorId/MailBox 身份面、生命周期与绑定 hook，以及 kActorType 声明 trait。
- * 消息分发、邮箱串行执行和动态 CreateActor 不在本切片。
+ * @brief 业务 Actor 的标识、邮箱地址和生命周期回调。
  */
 
 #include <string>
@@ -18,11 +14,7 @@
 
 namespace bbt::framework {
 
-/**
- * 监控写端（后续切片；仅前置声明）
- */
 class MonitorWriter;
-
 
 /**
  * GetComponent 静态断言的基类；实例化点须含 Component.hpp
@@ -30,18 +22,10 @@ class MonitorWriter;
 class CoComponent;
 
 /**
- * @brief 受管 Actor 基类，提供 ActorId 与 MailBox 身份面。
+ * @brief 用类型和 key 标识 Actor，提供邮箱地址和组件绑定回调。
  *
- * @par 职责
- * 暴露 Actor 的稳定 ActorId 与邮箱地址，并承接 CoApp 在 Actor 销毁与绑定变化
- * 时调用的业务 hook。
- *
- * @par 不负责
- * 本切片不执行消息分发、邮箱串行化或动态创建实例。
- *
- * @par 约束
- * 只能经 CoApp::CoInstallActor 登记类型。派生类构造只接受
- * detail::ConstructKey，析构为 protected 或 private。
+ * 通过 CoApp::CoRegisterActorType 登记类型；登记不创建实例。
+ * 派生类用 detail::ConstructKey 构造，析构函数不对外开放。
  */
 class CoActor : public detail::ObjectBase {
 public:
@@ -56,11 +40,11 @@ public:
     /**
      * @brief 返回本 Actor 的非拥有对象句柄。
      */
-    ObjectHandle   Handle() const { return _ObjectHandle(); }
+    ObjectHandle Handle() const { return _ObjectHandle(); }
     /**
      * @brief 返回 Actor 的身份与状态快照，包含 actor_id 与 mailbox。
      */
-    ActorInfo      Info() const;
+    ActorInfo Info() const;
 
 protected:
     /**
@@ -83,41 +67,36 @@ protected:
     result<ComponentHandle<C>> GetComponent(std::string_view name) const;
 
     /**
-     * @brief Actor 实例创建钩子。
-     *
-     * 当前 HEAD 没有调用点：实例创建路径尚未接线，框架不会触发本 hook。
-     *
-     * @return 成功返回 ok；失败返回的错误即创建失败原因。
+     * @brief 按绑定名借用组件。查找或借用失败时返回对应错误；返回的借用对象析构时归还组件。
+     */
+    template <class C>
+    result<ComponentBorrow<C>> BorrowComponent(std::string_view name) const;
+
+    /**
+     * @brief 为实例创建预留的回调；只登记 Actor 类型不会触发它。
+     * @return 成功返回 ok，失败返回创建错误。
      */
     virtual result<void> OnCreate() { return result<void>::ok(); }
     /**
-     * @brief Actor 实例销毁钩子，在实例登记移除前执行。
-     *
-     * 调用点：CoApp 的 Stop 收口。同步执行，抛出的异常被捕获并
-     * 记入 LifecycleFailures，不向外传播。
+     * @brief 停止应用时，在移除 Actor 实例前同步调用。异常记入 LifecycleFailures，不向外抛出。
      */
     virtual void OnDestroy() {}
     /**
-     * @brief 监控采集钩子。
-     *
-     * 当前 HEAD 没有调用点；监控写端由后续切片接入。
+     * @brief 预留的监控回调；框架目前不会自动调用。
      */
     virtual void OnMonitorCollect(MonitorWriter&) {}
     /**
-     * @brief 绑定变化钩子：本 Actor 作为绑定发起方（subject）完成绑定/解绑后调用。
+     * @brief 绑定生效后通知 bound=true；解绑要等所有借用归还后才通知 bound=false。
+     * 回调在注册表锁外同步执行，框架保证当前对象活到回调结束。异常记入 LifecycleFailures，不撤销绑定或解绑。
      *
-     * CoBindComponent 成功以 bound=true 派发；CoUnbindComponent 在 borrow 排空
-     * 完成后以 bound=false 派发。
-     * 在 Registry 锁外同步执行（subject owner 以 callback lease 保活），异常被
-     * 捕获并记入 LifecycleFailures，绑定不回滚。
-     *
-     * @param event 绑定事件值快照。
+     * @param event 本次绑定变化的快照。
      */
     virtual void OnBindingChanged(const BindingEvent&) {}
 
 private:
     void _BindActor(ActorId id, MailBox mailbox) {
-        m_actor_id = std::move(id); m_mailbox = std::move(mailbox);
+        m_actor_id = std::move(id);
+        m_mailbox = std::move(mailbox);
     }
 
     ActorId m_actor_id;
@@ -135,7 +114,7 @@ private:
  */
 template <class A, class = void>
 struct CoActorStaticName {
-    static std::string Get() { return {}; }
+    static std::string Get();
 };
 
 /**
@@ -143,27 +122,9 @@ struct CoActorStaticName {
  */
 template <class A>
 struct CoActorStaticName<A, std::void_t<decltype(A::kActorType)>> {
-    static std::string Get() { return std::string(A::kActorType); }
+    static std::string Get();
 };
 
-/**
- * ---- CoActor 模板定义 ----
- */
-
-template <class C>
-result<ComponentHandle<C>> CoActor::GetComponent(std::string_view name) const {
-    if (!bbt::coroutine::IsInCoroutineContext())
-        return result<ComponentHandle<C>>::err(MakeError(
-            ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
-    static_assert(std::is_base_of_v<CoComponent, C>,
-        "GetComponent: C must derive from CoComponent");
-    BoundComponent b;
-    if (!_FindBoundCopy(typeid(C), name, &b))
-        return result<ComponentHandle<C>>::err(MakeError(
-            ErrorCode::NotFound,
-            "GetComponent: component '" + std::string(name) + "' is not bound"));
-    return result<ComponentHandle<C>>::ok(
-        detail::MakeComponentHandle<C>(b.object, b.binding_generation));
-}
-
 } // namespace bbt::framework
+
+#include <bbt/framework/__TActor.hpp>

@@ -1,18 +1,9 @@
 #pragma once
 /**
- * 受管请求上下文的值类型（业务面）。
- * 入站适配器从 infra::rpc::Request::Context() 接收已换算的 deadline 与已验证的
- * peer_principal，并从 rpc::Request 取得 request_id；本类型是这些已验证字段
- * 在框架层的受管形态，字段不得由业务侧自行伪造。
- *
- * 取消不由本上下文字段表达：协程等待结果按 coroutine 自身契约处理，
- * 业务级取消由业务流程按 CoXxx 协程返回值自行决定（if/return/继续下一调用），
- * 框架不提供单操作业务取消令牌。
- *
- * 绑定语义：随逻辑请求/协程绑定（登记/取出见 RequestScope）。禁止用普通
- * thread_local 跨挂起缓存本类型或其字段——协程恢复可能换 worker，缓存
- * 必须随协程走。Service 可并发处理多个请求，不得把当前请求存成 Service
- * 可变成员。
+ * @brief 当前入站请求的编号、期限和对端身份，由框架从传输层读取。
+ * 不要用业务字段冒充对端身份。上下文跟随请求协程：协程恢复时可能换线程，
+ * 同一服务也可能同时处理多个请求，因此不要把当前上下文存在线程局部变量或服务成员中。
+ * 上下文不提供取消令牌；业务根据调用结果决定是否继续。
  */
 
 #include <memory>
@@ -27,7 +18,7 @@
 namespace bbt::framework {
 
 struct RequestContext {
-    std::string                        request_id;
+    std::string request_id;
     /**
      * Actor key（若有）
      */
@@ -37,7 +28,7 @@ struct RequestContext {
      * Deadline::max() 表示无有限预算；出站适配拒绝生成无有限预算的
      * infra deadline。
      */
-    bbt::coroutine::Deadline           deadline =
+    bbt::coroutine::Deadline deadline =
         bbt::coroutine::Deadline::max();
     /**
      * 权限上下文：已验证对端身份
@@ -50,8 +41,8 @@ struct RequestContext {
 };
 
 /**
- * 取出当前受管请求上下文；无 → err(InvalidContext)。
- * 登记/退出由 internal::RequestScope 完成（入站分发建立）；业务侧只读。
+ * @brief 读取当前请求的只读上下文。
+ * @return 当前协程或线程没有绑定请求时返回 InvalidContext。
  */
 result<std::shared_ptr<const RequestContext>> CurrentRequestContext();
 

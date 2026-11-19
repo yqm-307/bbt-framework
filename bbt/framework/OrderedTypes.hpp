@@ -1,12 +1,6 @@
 #pragma once
 /**
- * 有序入口发送侧共享类型（业务面）。
- * - OrderedGrant：授权流标识 + 授权身份；operator== 是「同一完整
- * grant」的判定基础，用于幂等重开与冲突判定。
- * - OrderedTicket：OrderedSession::prepare 签发的票据状态——已分配但
- * 尚未发送的序号与 request_id，以及首次发送时绑定的请求内容。
- * - ordered_domain_code::* 与 kOrderedErrorDomain：有序错误的
- * domain / domain_code 常量，集中定义。
+ * @brief 有序 RPC 的授权信息、发送票据和错误码。
  */
 
 #include <cstdint>
@@ -57,19 +51,16 @@ inline bool SameOrderedStreamId(const OrderedGrant& a, const OrderedGrant& b) {
 inline constexpr const char* kOrderedErrorDomain = "framework.actor";
 
 namespace ordered_domain_code {
-inline constexpr const char* kSequenceGap          = "SequenceGap";
-inline constexpr const char* kInProgress           = "InProgress";
-inline constexpr const char* kSequenceConflict     = "SequenceConflict";
-inline constexpr const char* kResultExpired        = "ResultExpired";
+inline constexpr const char* kSequenceGap = "SequenceGap";
+inline constexpr const char* kInProgress = "InProgress";
+inline constexpr const char* kSequenceConflict = "SequenceConflict";
+inline constexpr const char* kResultExpired = "ResultExpired";
 inline constexpr const char* kOrderedStampRequired = "OrderedStampRequired";
-inline constexpr const char* kStreamRejected       = "StreamRejected";
+inline constexpr const char* kStreamRejected = "StreamRejected";
 } // namespace ordered_domain_code
 
 /**
- * 票据：承载已准备但尚未发送的序号、request_id 与绑定内容。
- * 由 OrderedSession 签发并共享给 OrderedStamp::State；自同步。
- * 生命周期：已签发未发送（IsSent()==false）→ 首次发送绑定内容后
- * IsSent()==true，之后只允许以同一内容重发。
+ * @brief 一张票对应一个序号和一个请求编号。首次发送时记录请求内容，以后只能用它重试同一请求。
  */
 class OrderedTicket {
 public:
@@ -96,8 +87,7 @@ public:
     const std::string& request_id() const noexcept { return request_id_; }
 
     /**
-     * 「该票据是否已发送」。false 即「已准备但尚未发送」——发送端丢弃
-     * 它会制造序号缺口，必须保留重试或停止整流。
+     * @brief 票据是否已绑定请求。丢弃未绑定的票会留下序号缺口，不会自动补号。
      */
     bool IsSent() const {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -128,17 +118,18 @@ public:
      */
     bool BoundContentOf(BoundContent& out) const {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (!bound_) return false;
+        if (!bound_)
+            return false;
         out = bound_content_;
         return true;
     }
 
 private:
     const std::uint64_t sequence_;
-    const std::string   request_id_;
-    mutable std::mutex  mtx_;
-    BoundContent        bound_content_{};
-    bool                bound_ = false;
+    const std::string request_id_;
+    mutable std::mutex mtx_;
+    BoundContent bound_content_{};
+    bool bound_ = false;
 };
 
 } // namespace bbt::framework

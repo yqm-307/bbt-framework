@@ -1,10 +1,6 @@
 #pragma once
 /**
- * framework 组件基类 CoComponent（契约 §5）。
- *
- * CoComponent 本身就是带默认 hook 的能力基类，不另设 IComponent/ComponentBase
- * 抽象层。本头只声明身份观察面与生命周期/绑定 hook；受管构造、销毁与 borrow
- * 由 Registry、CoApp 和 ComponentHandle 控制。
+ * @brief 业务组件的基类。CoApp 管理组件的生命周期，服务、Actor 和其他组件通过借用使用它。
  */
 
 #include <string>
@@ -18,26 +14,13 @@
 
 namespace bbt::framework {
 
-/**
- * 监控写端（后续切片；仅前置声明）
- */
 class MonitorWriter;
 
-
 /**
- * @brief 能力组件基类，提供组件身份观察面与默认 hook。
+ * @brief 可由 CoApp 安装、启动和停止的组件。
  *
- * @par 职责
- * 暴露组件的非拥有句柄与值快照，并承接 CoApp 在安装、启动与绑定变化时调用的
- * 业务扩展 hook。
- *
- * @par 不负责
- * 不对外交出 shared_ptr 或原始指针。借用组件须经 ComponentHandle::Borrow()
- * 取得 ComponentBorrow，其引用只在该 borrow 生存期内有效。
- *
- * @par 约束
- * 只能经 CoApp::CoInstallComponent 安装。派生类构造只接受
- * detail::ConstructKey，析构为 protected 或 private。
+ * Handle() 不延长组件寿命；访问组件时须保留 Borrow() 返回的借用对象。
+ * 通过 CoApp::CoInstallComponent 安装。派生类用 detail::ConstructKey 构造，析构函数不对外开放。
  */
 class CoComponent : public detail::ObjectBase {
 public:
@@ -48,7 +31,7 @@ public:
     /**
      * @brief 返回本组件当前身份与状态的值快照。
      */
-    ObjectInfo   Info() const;
+    ObjectInfo Info() const;
 
 protected:
     /**
@@ -73,6 +56,12 @@ protected:
     result<ComponentHandle<C>> GetComponent(std::string_view name) const;
 
     /**
+     * @brief 按绑定名借用组件。查找或借用失败时返回对应错误；返回的借用对象析构时归还组件。
+     */
+    template <class C>
+    result<ComponentBorrow<C>> BorrowComponent(std::string_view name) const;
+
+    /**
      * @brief 安装钩子，在组件登记为 Installing 之后、Installed 之前执行。
      *
      * 调用点：CoApp::CoInstallComponent。在调用协程中同步执行，
@@ -95,36 +84,23 @@ protected:
      */
     virtual result<void> OnStart() { return result<void>::ok(); }
     /**
-     * @brief 停止钩子。
-     *
-     * 调用点：CoApp::CoStop 的逆序收口与 CoUninstallComponent。在受管协程
-     * 中执行；失败记入 LifecycleFailures 且保留 owner 待再次收口，不销毁对象。
-     *
-     * @return 成功返回 ok；失败返回的错误即停止失败原因。
+     * @brief 停止应用或卸载组件时，在受管协程中停止该组件。
+     * @return 失败时框架记录 LifecycleFailures 并保留组件，以便重试。
      */
     virtual result<void> OnStop() { return result<void>::ok(); }
     /**
-     * @brief 卸载钩子，在组件登记移除前执行。
-     *
-     * 调用点：组件销毁路径（Stop 收口与 CoUninstallComponent），在 OnStop 之后。
-     * 抛出的异常由框架捕获并记入 LifecycleFailures。
+     * @brief OnStop 之后、移除组件之前调用。抛出的异常记入 LifecycleFailures。
      */
     virtual void OnUninstall() {}
     /**
-     * @brief 监控采集钩子。
-     *
-     * 当前 HEAD 没有调用点；监控写端由后续切片接入。
+     * @brief 预留的监控回调；框架目前不会自动调用。
      */
     virtual void OnMonitorCollect(MonitorWriter&) {}
     /**
-     * @brief 绑定变化钩子：本组件作为绑定发起方（subject）的绑定边变化时调用。
+     * @brief 绑定生效后通知 bound=true；解绑要等所有借用归还后才通知 bound=false。
+     * 回调在注册表锁外同步执行，框架保证当前对象活到回调结束。异常记入 LifecycleFailures，不撤销绑定或解绑。
      *
-     * CoBindComponent 成功后以 bound=true 派发；CoUnbindComponent 在 borrow 排空
-     * 完成后以 bound=false 派发。
-     * 在 Registry 锁外同步执行（subject owner 以 callback lease 保活），异常被
-     * 捕获并记入 LifecycleFailures，绑定不回滚。
-     *
-     * @param event 绑定事件值快照。
+     * @param event 本次绑定变化的快照。
      */
     virtual void OnBindingChanged(const BindingEvent&) {}
 
@@ -133,25 +109,6 @@ private:
     friend class CoApp;
 };
 
-/**
- * ---- CoComponent 模板定义 ----
- */
-
-template <class C>
-result<ComponentHandle<C>> CoComponent::GetComponent(
-    std::string_view name) const {
-    if (!bbt::coroutine::IsInCoroutineContext())
-        return result<ComponentHandle<C>>::err(MakeError(
-            ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
-    static_assert(std::is_base_of_v<CoComponent, C>,
-        "GetComponent: C must derive from CoComponent");
-    BoundComponent b;
-    if (!_FindBoundCopy(typeid(C), name, &b))
-        return result<ComponentHandle<C>>::err(MakeError(
-            ErrorCode::NotFound,
-            "GetComponent: component '" + std::string(name) + "' is not bound"));
-    return result<ComponentHandle<C>>::ok(
-        detail::MakeComponentHandle<C>(b.object, b.binding_generation));
-}
-
 } // namespace bbt::framework
+
+#include <bbt/framework/__TComponent.hpp>

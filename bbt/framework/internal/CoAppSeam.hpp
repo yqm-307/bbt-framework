@@ -11,6 +11,7 @@
  * 普通 public 业务 API 拿不到。
  */
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string_view>
@@ -21,6 +22,7 @@
 #include <bbt/coroutine/syntax/Async.hpp>
 
 #include <bbt/framework/Object.hpp>
+#include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/Result.hpp>
 
 namespace bbt::framework {
@@ -46,7 +48,7 @@ using RpcSendAppFn = std::function<bbt_co_async(result<bbt::infra::rpc::Response
  */
 struct CoAppSeam {
     std::shared_ptr<INetworkHost> host;
-    RpcSendAppFn                rpc_send;
+    RpcSendAppFn rpc_send;
 };
 
 /**
@@ -65,5 +67,14 @@ std::shared_ptr<CoApp> MakeCoAppForTest(AppOptions options,
 result<bbt::infra::rpc::Response> DispatchInboundForTest(
     CoApp& app,
     const bbt::infra::rpc::Request& request);
+
+/// 访问真实 Registry，供测试在其锁内断言簿记不变量。
+std::shared_ptr<detail::Registry> RegistryForTest(const CoApp& app);
+
+/// 指定首个待分配序号，以测试序号空间上界。
+inline result<OrderedSession::SPtr> OpenOrderedSessionForTest(
+    const OrderedGrant& grant, std::uint64_t first_sequence) {
+    return OrderedSession::OpenForTest(grant, first_sequence);
+}
 
 } // namespace bbt::framework

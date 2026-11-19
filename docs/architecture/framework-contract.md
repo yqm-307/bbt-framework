@@ -177,7 +177,7 @@ public:
 
 `ObjectObserver = std::function<void(const ObjectStateEvent&)>`；事件是 owning 值，含 id、generation、state、revision、observed_at、稳定错误 code/phase，以及可选 ActorInfo，不含引用或 payload。Component 依赖也是 BindComponent 的 subject；BindObject 只记录非拥有的关系，不授权直接调用对象、不隐式建立组件启动依赖。Find 只查已存在对象，失败安装对象仍可通过名字找到以清理；Actor Find 不会激活对象。UninstallActor 先拒新建，按预算销毁已建实例，再撤登记；失败保留类型及残留实例记录。
 
-上面安装、卸载、绑定、Observe 是非协程宿主控制面，误上下文返回 InvalidContext；运行期操作同步完成局部 Start/Stop/绑定 hook 后返回。动态创建/销毁 Actor 只能通过下节 Co 入口在受管协程执行，不在 admission reader 内执行。读值快照和 RequestShutdown 可任意线程调用。需要异步停机时用 RequestShutdown，不从本 App handler 调会等待自身的 CoStop/CoPause；这种调用返回 InvalidContext。
+上面未带 `Co` 的安装、卸载、绑定、Observe 签名是宿主控制面的目标设计。已实现的 `CoBindComponent` / `CoUnbindComponent` 在受管协程调用，误上下文返回 `InvalidContext`。动态创建/销毁 Actor 只能通过下节 Co 入口在受管协程执行，不在 admission reader 内执行。读值快照和 RequestShutdown 可任意线程调用。需要异步停机时用 RequestShutdown，不从本 App handler 调会等待自身的 CoStop/CoPause；这种调用返回 InvalidContext。
 
 ### 4.1 Options 的完整装配面
 
@@ -227,7 +227,7 @@ protected:
     virtual void OnActorCreated(const ActorInfo&) {}
     virtual void OnActorDestroyed(const ActorInfo&) {}
     virtual void OnMonitorCollect(MonitorWriter&) {} // 受管协程，默认空
-    virtual void OnBindingChanged(const BindingEvent&) {} // 宿主，无 I/O
+    virtual void OnBindingChanged(const BindingEvent&) {} // 受管协程，事后通知
 };
 
 class Actor : public detail::ObjectBase {
@@ -252,7 +252,7 @@ protected:
     virtual result<void> OnCreate() { return {}; } // 协程，第一条业务消息前
     virtual void OnDestroy() {}                    // 协程，业务排空后
     virtual void OnMonitorCollect(MonitorWriter&) {}
-    virtual void OnBindingChanged(const BindingEvent&) {} // 宿主，无 I/O
+    virtual void OnBindingChanged(const BindingEvent&) {} // 受管协程，事后通知
 };
 
 class Component {
@@ -275,7 +275,7 @@ protected:
 
 `detail::ObjectBase` 为 Service/Actor 复用 ICoObject 信息、请求上下文和消息实现，不是新公共实体。它及 Component 显式删除 copy/move；各基类将对应 Registry 设为友元。Registry 调用入口 private；业务只覆盖 protected hook。ConstructKey 是构造函数私有、仅 `detail::Registry` 为友元的 passkey 值，由 Registryry 独占，禁止泄给业务。新 hook 只能兼容式新增并带空默认实现。
 
-`BindingEvent` 含 subject/target id、generation、绑定状态、revision 和 observed_at。绑定处理先准备但不发布新边，调用 OnBindingChanged 校验/接线成功后才发布 active；失败保留 failed 记录，不恢复其他已完成操作。解绑先封 gate/invalidate，再在 borrow 排空后通知，hook 失败标记清理 incomplete。回调看到的对象身份不授予裸指针访问权。
+`BindingEvent` 含 subject/target id、generation、绑定状态、revision 和 observed_at。`OnBindingChanged` 是事后通知，在受管协程中于 Registry 锁外同步调用。派发 `bound=true` 前绑定已生效，回调可用 `GetComponent` 查到句柄，并按正常借用规则 `Borrow`。解绑先拒绝该绑定的新借用，旧借用排空并移除绑定后才派发 `bound=false`。通知抛异常只记录 `LifecycleFailure`，绑定和解绑的结果保持不变。回调看到的对象身份不授予裸指针访问权。
 
 ### 5.1 唯一地址、消息和调用语义
 
@@ -342,7 +342,7 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 
 公共声明直接包含实际依赖，不靠偶然的传递 include；通过前置声明和单向依赖消除循环引用。附属 Options、枚举、别名按所属主类归档，不机械拆成大量小文件；现有共享值类型的单独文件仅在承担真实共享职责时保留。拆分后的聚合入口可以继续统一导出公共类型，但不能用聚合入口掩盖单头不能独立包含的问题。
 
-**模板声明与实现分离。** 默认采用“头文件上半段是完整类定义、成员只作声明；下半段是类外模板成员定义”。较长实现按 `third-party/bbtools-pub/docs/cpp/class-and-headers.md` 拆至同目录实现头，由主头末尾包含。实现头是本公共头的实现细节，不作为调用者的独立入口。模板定义必须保持对使用点可见，不能直接搬到普通 `.cc` 导致消费者实例化缺失；非模板实现仍进入配对编译单元。类型 trait、常量和 `= default` 等简短声明可随类保留，不为分区增加空壳或重复转发层。
+**模板声明与实现分离。** 主头保留类定义和函数声明；模板函数体放在同目录的 `__TXxx.hpp`，由主头末尾包含。调用者只包含主头，仍能用自己的类型实例化模板。仅在单个 `.cc` 中使用的模板留在该编译单元。类型 trait、别名、编译期常量和 `= default` / `= delete` 成员保留在声明处。
 
 **Doxygen 放在声明处。** 公开类型、函数、模板及受保护的业务扩展 hook 使用 `/** ... */` 块（排版见 `third-party/bbtools-pub/docs/cpp/comments.md`），不能只写无法导出的普通 `//`。类型按职责卡说明 `@brief`、`@par 职责`、`@par 不负责`、`@par 约束`；函数按实际签名补齐 `@brief`、存在的 `@tparam`/`@param` 和有意义的 `@return`。调用上下文、线程/协程限制、借用寿命、错误与关闭行为按需写 `@pre`、`@par` 或正文，不为空参数或 void 返回机械生成空标签，也不编造尚未兑现的保证。实现文件和模板实现区解释 WHY、算法和时序，不复制公共声明的 Doxygen 契约。
 
@@ -640,12 +640,12 @@ return app.Run();
   不执行 hook、不调用 `CoStop`、不等待自身。
 - `CoWaitShutdownRequest(wait)` 使用持久标志，先请求后等待也不丢通知。同一时刻只允许一个活动 waiter，
   第二个返回 `Busy`；超时返回 `TimedOut` 且不清除请求、不销毁 App。
-- 收到请求只证明请求到达：App 仍可能处于 `Running`。收口须由协程显式 `CoStop()`，成功后 `State() == Stopped`。
+- 收到请求只证明请求到达，App 仍可能处于 `Running`。收口须由协程显式调用 `CoStop()`，并通过 `State()` 确认是否已到 `Stopped`。
 
 ### 12.3 收口未竟与重试
 
-- `CoStop` 在有限 deadline 内收口；耗尽时保留 owner、记录 `LifecycleFailure`，App 置 `StopIncomplete`，
-  `PendingCleanup()` 可观察未完成项。
+- `CoStop` 在非受管协程或本 App 的生命周期 hook 内调用时返回 `InvalidContext`。已有生命周期转换时返回 `Overloaded`。这两种入口拒绝均不改变 App 状态。
+- 已停止或本轮收口完成时，`CoStop` 返回 `ok`，App 状态为 `Stopped`。网络排空失败或对象清理未完成时也返回 `ok`，App 状态为 `StopIncomplete`，保留待收口的 owner。`LifecycleFailures()` 提供失败诊断，`PendingCleanup()` 列出待收口的对象。
 - 网络排空超时后，宿主已被同步 `Close`。再次以更晚期限 `CoStop` 时，若宿主已记录关闭原因，则跳过重复排空，
   直接推进对象收口（`host/CoApp.cc::_StopImpl`）。
 - 每次调用的 deadline 独立计算，不续期前一次调用的 deadline。

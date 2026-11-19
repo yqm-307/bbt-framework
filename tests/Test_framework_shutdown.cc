@@ -32,7 +32,7 @@
  * T7/T7c reply_reserve                V2 正式入站的跨层预算：infra local-min
  *                                   后 framework 恰扣一次 20ms 预留；紧预算在
  *                                   handler 前 TimedOut（服务端观测判定）。
- * T9 v2_multihop                      两跳预算不放大：AdaptCallOptions 取
+ * T9 v2_multihop                      两跳预算不放大：ResolveCallDeadline 取
  *                                   min、显式子期限不生效于放大方向。
  * T10 v2_host_small_limits_start      合法小限额 + 2 workers 的纯入站宿主。
  * T11 v2_engine_start_occupied        Run 提前返回（端口占用）Start 及时失败。
@@ -94,8 +94,8 @@
 #include <bbt/framework/internal/NetworkHost.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
 using Clock = std::chrono::steady_clock;
 
@@ -111,7 +111,8 @@ public:
     void CountDown() {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_count <= 0) return;
+            if (m_count <= 0)
+                return;
             if (--m_count > 0)
                 return;
         }
@@ -127,10 +128,11 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    int                     m_count;
+    int m_count;
 };
 
 class TestGate {
@@ -150,10 +152,11 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         m_cv.wait(lk, [this] { return m_open; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    bool                    m_open = false;
+    bool m_open = false;
 };
 
 constexpr std::chrono::milliseconds kWait{15000};
@@ -189,7 +192,8 @@ public:
             m_open = true;
             notify.swap(m_waiters);
         }
-        for (auto& w : notify) w->Notify();
+        for (auto& w : notify)
+            w->Notify();
     }
     co::WaitStatus Wait(co::Deadline deadline) {
         auto waiter = co::sync::CoWaiter::Create();
@@ -202,7 +206,8 @@ public:
              */
             if (m_open)
                 waiter->Notify();
-            else        m_waiters.push_back(waiter);
+            else
+                m_waiters.push_back(waiter);
             return true;
         });
         {
@@ -215,8 +220,8 @@ public:
     }
 
 private:
-    std::mutex                            m_mtx;
-    bool                                  m_open = false;
+    std::mutex m_mtx;
+    bool m_open = false;
     std::vector<co::sync::CoWaiter::SPtr> m_waiters;
 };
 
@@ -226,7 +231,8 @@ private:
 
 fw::result<std::int32_t> IntArg(const fw::CoRpcReq& req) {
     auto args = req.Parse<std::int32_t>();
-    if (!args) return fw::result<std::int32_t>::err(args.error());
+    if (!args)
+        return fw::result<std::int32_t>::err(args.error());
     return fw::result<std::int32_t>::ok(args.value());
 }
 
@@ -237,19 +243,22 @@ fw::result<std::tuple<std::string, std::int32_t>> AcctArgs(
 
 fw::CoRpcReq RequestInt(std::int32_t value) {
     auto req = fw::CoRpcReq::From(value);
-    if (!req) throw std::logic_error("request encode failed");
+    if (!req)
+        throw std::logic_error("request encode failed");
     return std::move(req).value();
 }
 
 fw::CoRpcReq RequestAcct(std::string account, std::int32_t value) {
     auto req = fw::CoRpcReq::From(
         std::tuple{std::move(account), value});
-    if (!req) throw std::logic_error("request encode failed");
+    if (!req)
+        throw std::logic_error("request encode failed");
     return std::move(req).value();
 }
 
 fw::CoRpcResp ReplyInt(const fw::result<std::int32_t>& value) {
-    if (!value) return fw::CoRpcResp::Error(value.error());
+    if (!value)
+        return fw::CoRpcResp::Error(value.error());
     return fw::CoRpcResp::From(value.value());
 }
 
@@ -278,10 +287,11 @@ struct Probe {
             std::lock_guard<std::mutex> lk(mtx);
             g = gate;
         }
-        if (g) g->Open();
+        if (g)
+            g->Open();
     }
 
-    mutable std::mutex      mtx;
+    mutable std::mutex mtx;
     std::shared_ptr<CoGate> gate;
     std::vector<std::string> events;
 
@@ -303,9 +313,11 @@ struct Probe {
             {
                 std::lock_guard<std::mutex> lk(mtx);
                 for (const auto& e : events)
-                    if (e.rfind(prefix, 0) == 0) return true;
+                    if (e.rfind(prefix, 0) == 0)
+                        return true;
             }
-            if (Clock::now() >= until) return false;
+            if (Clock::now() >= until)
+                return false;
             std::this_thread::yield();
         }
     }
@@ -356,7 +368,7 @@ void InstallBudgetProbeHandler(const std::shared_ptr<fw::InfraHttpHost>& host,
                                const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot) {
     host->InstallRpcHandler(
         [app_slot](const inf::rpc::Request& request,
-                  const std::function<void()>& dispatched)
+                   const std::function<void()>& dispatched)
             -> fw::result<inf::rpc::Response> {
             g_inbound_entry_ns.store(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -418,7 +430,8 @@ public:
     }
     fw::CoRpcResp WaitDial(fw::CoRpcReq req) {
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
             return fw::CoRpcResp::Error(fw::MakeError(
@@ -430,16 +443,18 @@ public:
             return fw::CoRpcResp::Error(WaitErr(st, "wait_dial gate"));
         auto response = bbt_co_await call("echo", "ping", req);
         p->Event(std::string("outbound:") +
-                 (response ? "ok" : "code" +
-                  std::to_string(static_cast<int>(response.error().code))));
-        if (!response) return fw::CoRpcResp::Error(response.error());
+                 (response ? "ok" : "code" + std::to_string(static_cast<int>(response.error().code))));
+        if (!response)
+            return fw::CoRpcResp::Error(response.error());
         return response.value();
     }
     fw::CoRpcResp WaitDialLong(fw::CoRpcReq req) {
         auto value = IntArg(req);
-        if (!value) return fw::CoRpcResp::Error(value.error());
+        if (!value)
+            return fw::CoRpcResp::Error(value.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
             return fw::CoRpcResp::Error(fw::MakeError(
@@ -452,16 +467,17 @@ public:
         p->Event("late_handler_resumed");
         auto response = bbt_co_await call("echo", "ping", req);
         p->Event(std::string("late_outbound:") +
-                 (response ? "ok" : "code" +
-                  std::to_string(static_cast<int>(response.error().code))));
+                 (response ? "ok" : "code" + std::to_string(static_cast<int>(response.error().code))));
         return fw::CoRpcResp::From(value.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&RelaySvc::Ping>("ping"),
         fw::Method<&RelaySvc::WaitDial>("wait_dial"),
         fw::Method<&RelaySvc::WaitDialLong>("wait_dial_long"));
+
 protected:
     ~RelaySvc() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -475,9 +491,11 @@ public:
     explicit AcctRelaySvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
     fw::CoRpcResp ParkDial(fw::CoRpcReq req) {
         auto args = AcctArgs(req);
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
         if (!p)
             return fw::CoRpcResp::Error(fw::MakeError(
@@ -490,16 +508,18 @@ public:
         auto response = bbt_co_await call(
             "echo", "ping", RequestInt(std::get<1>(args.value())));
         p->Event(std::string("actor_outbound:") +
-                 (response ? "ok" : "code" +
-                  std::to_string(static_cast<int>(response.error().code))));
-        if (!response) return fw::CoRpcResp::Error(response.error());
+                 (response ? "ok" : "code" + std::to_string(static_cast<int>(response.error().code))));
+        if (!response)
+            return fw::CoRpcResp::Error(response.error());
         return response.value();
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::ActorMethodAt<&AcctRelaySvc::ParkDial, std::string>(
             "park_dial"));
+
 protected:
     ~AcctRelaySvc() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -512,8 +532,7 @@ class BudgetSvc final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "budget";
     explicit BudgetSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
-    fw::CoRpcResp Probe(fw::CoRpcReq req)
-    {
+    fw::CoRpcResp Probe(fw::CoRpcReq req) {
         auto v = IntArg(req);
         if (!v)
             return fw::CoRpcResp::Error(v.error());
@@ -527,8 +546,10 @@ public:
         return ReplyInt(v);
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(fw::Method<&BudgetSvc::Probe>("probe"));
+
 protected:
     ~BudgetSvc() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -565,12 +586,13 @@ fw::AppOptions AppOpts(inf::NetworkLimits limits,
                        std::vector<fw::StaticRoute> routes,
                        std::string identity) {
     auto opts = fw::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
-        .SetShutdownBudget(lifecycle_budget)
-        .SetLifecycleBudget(lifecycle_budget)
-        .SetNetworkLimits(std::move(limits))
-        .SetLocalIdentity(std::move(identity));
-    for (auto& r : routes) opts.AddRoute(r.service_name, r.address);
+                    .SetLimits(64, 64, 64, 64)
+                    .SetShutdownBudget(lifecycle_budget)
+                    .SetLifecycleBudget(lifecycle_budget)
+                    .SetNetworkLimits(std::move(limits))
+                    .SetLocalIdentity(std::move(identity));
+    for (auto& r : routes)
+        opts.AddRoute(r.service_name, r.address);
     return opts;
 }
 
@@ -604,7 +626,7 @@ void InstallAdmissionForTest(
 
 struct RunHandle {
     std::atomic<bool> done{false};
-    int               rc{-1};
+    int rc{-1};
     std::promise<bool> started;
 };
 
@@ -641,7 +663,7 @@ struct EndpointSlot {
         return ep;
     }
     mutable std::mutex mtx;
-    std::string        ep;
+    std::string ep;
 };
 
 struct AppBox {
@@ -670,11 +692,11 @@ struct AppBox {
 
     std::shared_ptr<fw::CoApp> App() const { return *app_slot; }
 
-    AppBox()                         = default;
+    AppBox() = default;
     ~AppBox() { Stop(); }
-    AppBox(AppBox&&)                 = default;
-    AppBox& operator=(AppBox&&)      = default;
-    AppBox(const AppBox&)            = delete;
+    AppBox(AppBox&&) = default;
+    AppBox& operator=(AppBox&&) = default;
+    AppBox(const AppBox&) = delete;
     AppBox& operator=(const AppBox&) = delete;
 
     /**
@@ -689,7 +711,8 @@ struct AppBox {
             egress_rt->Close();
         if (App())
             App()->RequestShutdown();
-        if (run) JoinRun(run);
+        if (run)
+            JoinRun(run);
         if (host)
             host->Close();
     }
@@ -713,16 +736,28 @@ void ServerTaskBody(
         auto app = *app_slot;
         if (register_fn) {
             auto r = register_fn(*app);
-            if (!r) { set_rc(kExitStartFailed); return; }
+            if (!r) {
+                set_rc(kExitStartFailed);
+                return;
+            }
         }
         auto started = bbt_co_await app->CoStart();
-        if (!started) { set_rc(kExitStartFailed); return; }
+        if (!started) {
+            set_rc(kExitStartFailed);
+            return;
+        }
         h->started.set_value(true);
 
         auto waited = bbt_co_await app->CoWaitShutdownRequest();
-        if (!waited) { set_rc(kExitStopIncomplete); return; }
+        if (!waited) {
+            set_rc(kExitStopIncomplete);
+            return;
+        }
 
-        { auto _r = bbt_co_await app->CoStop(); (void)_r; }
+        {
+            auto _r = bbt_co_await app->CoStop();
+            (void)_r;
+        }
         /**
          * 收口未竟（Stopping/StopIncomplete）才等测试放行推进；已 Stopped
          * 不等闩（避免每个用例白等闩窗期）。
@@ -730,13 +765,19 @@ void ServerTaskBody(
         if (app->State() == fw::AppState::StopIncomplete ||
             app->State() == fw::AppState::Stopping) {
             after_first_stop->WaitFor(std::chrono::minutes{2});
-            { auto _r2 = bbt_co_await app->CoStop(); (void)_r2; }
+            {
+                auto _r2 = bbt_co_await app->CoStop();
+                (void)_r2;
+            }
         }
         set_rc(app->State() == fw::AppState::Stopped &&
                        app->LifecycleFailures().empty()
-                   ? kExitOk : kExitStopIncomplete);
+                   ? kExitOk
+                   : kExitStopIncomplete);
     } catch (...) {
-        try { h->started.set_value(false); } catch (...) {}
+        try {
+            h->started.set_value(false);
+        } catch (...) {}
         set_rc(kExitStartFailed);
     }
 }
@@ -761,7 +802,8 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
         limits, inf::ListenAddress{"127.0.0.1", 0}, "shutdown-egress");
     box.egress = std::make_shared<fw::RpcEgress>(box.egress_rt);
     InstallAdmissionForTest(box.host, box.app_slot);
-    if (configure_fn) configure_fn(box);
+    if (configure_fn)
+        configure_fn(box);
 
     auto eps = box.peer_ep;
     auto egress = box.egress;
@@ -808,15 +850,20 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
                 } catch (...) {
                     h->rc = kExitStartFailed;
                     h->done.store(true, std::memory_order_release);
-                    try { h->started.set_value(false); } catch (...) {}
+                    try {
+                        h->started.set_value(false);
+                    } catch (...) {}
                     return;
                 }
                 ServerTaskBody(app_slot, after_first_stop, h, register_fn);
-            }, submitted);
+            },
+            submitted);
         if (!submitted) {
             h->rc = kExitStartFailed;
             h->done.store(true, std::memory_order_release);
-            try { h->started.set_value(false); } catch (...) {}
+            try {
+                h->started.set_value(false);
+            } catch (...) {}
         }
     }
     return box;
@@ -835,7 +882,7 @@ void LaunchApp(AppBox& box) {
     const auto until = Clock::now() + kWait;
     while (box.endpoint.empty()) {
         BOOST_REQUIRE_MESSAGE(!box.run->done.load(),
-            "server task exited before listen, rc=" << box.run->rc);
+                              "server task exited before listen, rc=" << box.run->rc);
         BOOST_REQUIRE(Clock::now() < until);
         box.endpoint = box.host->bound_endpoint();
         std::this_thread::yield();
@@ -1055,18 +1102,17 @@ fw::result<inf::rpc::Response> CallRpc(const TestClient& tc, const std::string& 
 /**
  * 有界状态轮询（显式状态判据，非 sleep）：直到谓词为真或预算耗尽。
  */
-template <class Pred> bool WaitUntil(Pred pred, std::chrono::milliseconds ms)
-{
+template <class Pred> bool WaitUntil(Pred pred, std::chrono::milliseconds ms) {
     const auto until = Clock::now() + ms;
     while (!pred()) {
-        if (Clock::now() > until) return false;
+        if (Clock::now() > until)
+            return false;
         std::this_thread::yield();
     }
     return true;
 }
 
-bool WaitState(const fw::CoApp& app, fw::AppState want, std::chrono::milliseconds ms)
-{
+bool WaitState(const fw::CoApp& app, fw::AppState want, std::chrono::milliseconds ms) {
     return WaitUntil([&app, want] { return app.State() == want; }, ms);
 }
 
@@ -1091,7 +1137,8 @@ public:
     void StopAccepting() noexcept override { _Record("net.stop_accepting"); }
     fw::result<void> WaitHandlersDone(co::Deadline d) override {
         _Record("net.wait_handlers");
-        if (on_wait_handlers) return on_wait_handlers(d);
+        if (on_wait_handlers)
+            return on_wait_handlers(d);
         return fw::result<void>::ok();
     }
     void Close() noexcept override {
@@ -1099,7 +1146,8 @@ public:
         closed.store(true, std::memory_order_release);
     }
     std::optional<bbt::infra::Error> CloseReason() const noexcept override {
-        if (!closed.load(std::memory_order_acquire)) return std::nullopt;
+        if (!closed.load(std::memory_order_acquire))
+            return std::nullopt;
         return fw::MakeError(fw::ErrorCode::Closed, "host closed");
     }
 
@@ -1107,14 +1155,15 @@ public:
         std::lock_guard<std::mutex> lk(m_mtx);
         return m_calls;
     }
+
 private:
     void _Record(const char* name) {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_calls.push_back(name);
     }
-    mutable std::mutex       m_mtx;
+    mutable std::mutex m_mtx;
     std::vector<std::string> m_calls;
-    std::atomic<bool>        closed{false};
+    std::atomic<bool> closed{false};
 };
 
 BOOST_AUTO_TEST_SUITE(framework_f3)
@@ -1126,10 +1175,10 @@ BOOST_AUTO_TEST_CASE(request_shutdown_external_thread_clean_rc0) {
     g_probe = std::make_shared<Probe>(0);
     auto box = StartApp(std::chrono::milliseconds{30000},
                         std::chrono::milliseconds{5000},
-                        /*routes*/{},
+                        /*routes*/ {},
                         [](fw::CoApp& app) {
-        return bbt_co_await app.CoInstallService<RelaySvc>(ConcurrentOpts());
-    });
+                            return bbt_co_await app.CoInstallService<RelaySvc>(ConcurrentOpts());
+                        });
     auto tc = StartClient(Limits(std::chrono::milliseconds{30000}));
 
     /**
@@ -1178,7 +1227,7 @@ BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
      */
     auto inflight_done = std::make_shared<TestLatch>(1);
     auto inflight_res = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
-    bbtco [tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
+    bbtco[tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
         inflight_res->emplace(
             SendRpc(tc_egress, endpoint,
                     MakeEnv("relay", "wait_dial", "t2-h", 9), kWait));
@@ -1228,10 +1277,10 @@ BOOST_AUTO_TEST_CASE(request_shutdown_before_start) {
     g_probe = std::make_shared<Probe>(0);
     auto box = PrepareApp(std::chrono::milliseconds{30000},
                           std::chrono::milliseconds{5000},
-                          /*routes*/{},
+                          /*routes*/ {},
                           [](fw::CoApp& app) {
-        return bbt_co_await app.CoInstallService<RelaySvc>(ConcurrentOpts());
-    });
+                              return bbt_co_await app.CoInstallService<RelaySvc>(ConcurrentOpts());
+                          });
     /**
      * 请求在启动完成前置位：CoWaitShutdownRequest 立即返回，随即进入
      * 关闭序列。
@@ -1276,7 +1325,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
      */
     auto inflight_done = std::make_shared<TestLatch>(1);
     auto inflight_res = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
-    bbtco [tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
+    bbtco[tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
         inflight_res->emplace(
             SendRpc(tc_egress, endpoint,
                     MakeAcctEnv("park_dial", "t4-h", 3), kWait));
@@ -1294,7 +1343,8 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
     BOOST_REQUIRE(!failures.empty());
     bool drain_failed = false;
     for (const auto& f : failures)
-        if (f.phase == "wait_handlers_done") drain_failed = true;
+        if (f.phase == "wait_handlers_done")
+            drain_failed = true;
     BOOST_CHECK(drain_failed);
 
     /**
@@ -1386,7 +1436,7 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
      */
     auto inflight_done = std::make_shared<TestLatch>(1);
     auto inflight_res = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
-    bbtco [tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
+    bbtco[tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
         inflight_res->emplace(
             SendRpc(tc_egress, endpoint,
                     MakeEnv("relay", "wait_dial_long", "t5-h", 5),
@@ -1436,7 +1486,7 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     g_probe->CompleteGate();
     const auto until = Clock::now() + kWait;
     while (!g_probe->HasEvent("late_outbound:code" +
-             std::to_string(static_cast<int>(fw::ErrorCode::TimedOut)))) {
+                              std::to_string(static_cast<int>(fw::ErrorCode::TimedOut)))) {
         if (g_probe->HasEvent("late_outbound:ok"))
             BOOST_FAIL("late outbound unexpectedly succeeded");
         BOOST_REQUIRE(Clock::now() < until);
@@ -1466,19 +1516,19 @@ BOOST_AUTO_TEST_CASE(wait_handlers_budget_exhaustion) {
     auto first_deadline_finite = std::make_shared<std::atomic<bool>>(false);
     host->on_wait_handlers =
         [wait_calls, first_deadline_finite](co::Deadline d) -> fw::result<void> {
-            const auto call = wait_calls->fetch_add(1);
-            if (call == 0) {
-                /**
+        const auto call = wait_calls->fetch_add(1);
+        if (call == 0) {
+            /**
                  * 预算内等待：期限必须是有限步预算（约 step_budget 量级）。
                  */
-                first_deadline_finite->store(
-                    d < Clock::now() + std::chrono::hours{1},
-                    std::memory_order_release);
-                return fw::result<void>::err(fw::MakeError(
-                    fw::ErrorCode::TimedOut, "handlers still running"));
-            }
-            return fw::result<void>::ok();
-        };
+            first_deadline_finite->store(
+                d < Clock::now() + std::chrono::hours{1},
+                std::memory_order_release);
+            return fw::result<void>::err(fw::MakeError(
+                fw::ErrorCode::TimedOut, "handlers still running"));
+        }
+        return fw::result<void>::ok();
+    };
 
     /**
      * 桩宿主无出站需求：测试缝只换 INetworkHost，rpc_send 留空。
@@ -1501,25 +1551,40 @@ BOOST_AUTO_TEST_CASE(wait_handlers_budget_exhaustion) {
                 auto app = fw::MakeCoAppForTest(opts, fw::CoAppSeam{host, {}});
                 auto r = bbt_co_await app->CoInstallService<RelaySvc>(
                     ConcurrentOpts());
-                if (!r) { set_rc(kExitStartFailed); return; }
+                if (!r) {
+                    set_rc(kExitStartFailed);
+                    return;
+                }
                 r = bbt_co_await app->CoStart();
-                if (!r) { set_rc(kExitStartFailed); return; }
+                if (!r) {
+                    set_rc(kExitStartFailed);
+                    return;
+                }
                 app->RequestShutdown();
-                { auto _r = bbt_co_await app->CoStop(); (void)_r; }
+                {
+                    auto _r = bbt_co_await app->CoStop();
+                    (void)_r;
+                }
                 if (app->State() != fw::AppState::StopIncomplete) {
-                    set_rc(kExitStartFailed); return;
+                    set_rc(kExitStartFailed);
+                    return;
                 }
                 /**
                  * 再次推进：宿主已 Close → 不重排空直接收口。
                  */
-                { auto _r = bbt_co_await app->CoStop(); (void)_r; }
+                {
+                    auto _r = bbt_co_await app->CoStop();
+                    (void)_r;
+                }
                 final_state->store(app->State(), std::memory_order_release);
                 set_rc(app->State() == fw::AppState::Stopped
-                           ? kExitStopIncomplete : kExitStartFailed);
+                           ? kExitStopIncomplete
+                           : kExitStartFailed);
             } catch (...) {
                 set_rc(kExitStartFailed);
             }
-        }, submitted);
+        },
+        submitted);
     BOOST_REQUIRE(submitted);
 
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
@@ -1548,8 +1613,7 @@ BOOST_AUTO_TEST_CASE(wait_handlers_budget_exhaustion) {
  * CallRpc 已返回之后把结果写进共享堆状态并通知 latch。全部等待均为有界谓词
  * 等待，不引入固定等待，也不做无界 join。
  */
-BOOST_AUTO_TEST_CASE(callrpc_late_completion_after_wait_timeout)
-{
+BOOST_AUTO_TEST_CASE(callrpc_late_completion_after_wait_timeout) {
     using std::chrono::milliseconds;
     g_probe = std::make_shared<Probe>(1);
     auto box = StartApp(milliseconds{30000}, milliseconds{2000},
@@ -1620,8 +1684,7 @@ BOOST_AUTO_TEST_CASE(v2_inbound_reply_reserve_exact) {
 
     auto box =
         PrepareApp(std::chrono::milliseconds{30000}, std::chrono::milliseconds{5000},
-                   /*routes*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<BudgetSvc>(ConcurrentOpts()); },
-                   [](AppBox& b) { InstallBudgetProbeHandler(b.host, b.app_slot); });
+                   /*routes*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<BudgetSvc>(ConcurrentOpts()); }, [](AppBox& b) { InstallBudgetProbeHandler(b.host, b.app_slot); });
     LaunchApp(box);
     BOOST_REQUIRE(box.host->rpc_server() != nullptr);
     BOOST_CHECK(box.host->bound_address().has_value());
@@ -1704,8 +1767,7 @@ BOOST_AUTO_TEST_CASE(v2_inbound_reply_reserve_boundary) {
 
     auto box =
         PrepareApp(milliseconds{30000}, milliseconds{5000},
-                   /*routes*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<BudgetSvc>(ConcurrentOpts()); },
-                   [](AppBox& b) { InstallBudgetProbeHandler(b.host, b.app_slot); });
+                   /*routes*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<BudgetSvc>(ConcurrentOpts()); }, [](AppBox& b) { InstallBudgetProbeHandler(b.host, b.app_slot); });
     LaunchApp(box);
     BOOST_REQUIRE(box.host->rpc_server() != nullptr);
     auto tc = StartClient(Limits(milliseconds{30000}));
@@ -1806,12 +1868,10 @@ struct HopProbe {
          */
         std::int64_t at_ns{0};
     };
-    static std::int64_t Ns(Clock::time_point t)
-    {
+    static std::int64_t Ns(Clock::time_point t) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
     }
-    void Reset()
-    {
+    void Reset() {
         std::lock_guard<std::mutex> lk(mtx);
         ingress.clear();
         handler_deadline_ns.clear();
@@ -1821,73 +1881,60 @@ struct HopProbe {
         egress_ok = false;
         handler_calls = 0;
     }
-    void RecordIngress(std::string service, std::string method, co::Deadline pre, Clock::time_point at)
-    {
+    void RecordIngress(std::string service, std::string method, co::Deadline pre, Clock::time_point at) {
         std::lock_guard<std::mutex> lk(mtx);
         ingress.push_back(Ingress{std::move(service), std::move(method), Ns(pre), Ns(at)});
     }
-    Ingress At(const std::string& method) const
-    {
+    Ingress At(const std::string& method) const {
         std::lock_guard<std::mutex> lk(mtx);
         for (const auto& i : ingress)
             if (i.method == method)
                 return i;
         return Ingress{};
     }
-    void SetHandlerDeadline(const std::string& role, co::Deadline d)
-    {
+    void SetHandlerDeadline(const std::string& role, co::Deadline d) {
         std::lock_guard<std::mutex> lk(mtx);
         handler_deadline_ns[role] = Ns(d);
         handler_calls += 1;
     }
-    std::int64_t HandlerDeadline(const std::string& role) const
-    {
+    std::int64_t HandlerDeadline(const std::string& role) const {
         std::lock_guard<std::mutex> lk(mtx);
         const auto it = handler_deadline_ns.find(role);
         return it != handler_deadline_ns.end() ? it->second : 0;
     }
-    int HandlerCalls() const
-    {
+    int HandlerCalls() const {
         std::lock_guard<std::mutex> lk(mtx);
         return handler_calls;
     }
-    void SetAdapted(co::Deadline d)
-    {
+    void SetAdapted(co::Deadline d) {
         std::lock_guard<std::mutex> lk(mtx);
         adapted_ns = Ns(d);
     }
-    std::int64_t Adapted() const
-    {
+    std::int64_t Adapted() const {
         std::lock_guard<std::mutex> lk(mtx);
         return adapted_ns;
     }
-    void SetWidenRequested(co::Deadline d)
-    {
+    void SetWidenRequested(co::Deadline d) {
         std::lock_guard<std::mutex> lk(mtx);
         widen_requested_ns = Ns(d);
     }
-    std::int64_t WidenRequested() const
-    {
+    std::int64_t WidenRequested() const {
         std::lock_guard<std::mutex> lk(mtx);
         return widen_requested_ns;
     }
-    void MarkEgressStart(Clock::time_point t)
-    {
+    void MarkEgressStart(Clock::time_point t) {
         std::lock_guard<std::mutex> lk(mtx);
         egress_start_ns = Ns(t);
     }
-    std::int64_t EgressStart() const
-    {
+    std::int64_t EgressStart() const {
         std::lock_guard<std::mutex> lk(mtx);
         return egress_start_ns;
     }
-    void MarkEgressEnd(bool ok)
-    {
+    void MarkEgressEnd(bool ok) {
         std::lock_guard<std::mutex> lk(mtx);
         egress_ok = ok;
     }
-    bool EgressOk() const
-    {
+    bool EgressOk() const {
         std::lock_guard<std::mutex> lk(mtx);
         return egress_ok;
     }
@@ -1904,8 +1951,7 @@ struct HopProbe {
 
 std::shared_ptr<HopProbe> g_hop;
 
-std::int64_t MsNs(std::chrono::milliseconds d)
-{
+std::int64_t MsNs(std::chrono::milliseconds d) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
 }
 
@@ -1919,8 +1965,7 @@ public:
     static constexpr std::string_view kServiceName = "budget_hop";
     explicit HopSvc(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
 
-    fw::CoRpcResp Leaf(fw::CoRpcReq req)
-    {
+    fw::CoRpcResp Leaf(fw::CoRpcReq req) {
         auto v = IntArg(req);
         if (!v)
             return fw::CoRpcResp::Error(v.error());
@@ -1932,12 +1977,10 @@ public:
         return ReplyInt(v);
     }
 
-    fw::CoRpcResp Forward(fw::CoRpcReq req)
-    {
+    fw::CoRpcResp Forward(fw::CoRpcReq req) {
         return _Forward(req, false);
     }
-    fw::CoRpcResp ForwardWiden(fw::CoRpcReq req)
-    {
+    fw::CoRpcResp ForwardWiden(fw::CoRpcReq req) {
         return _Forward(req, true);
     }
 
@@ -1947,9 +1990,9 @@ public:
 
 protected:
     ~HopSvc() noexcept override = default;
+
 private:
-    fw::CoRpcResp _Forward(fw::CoRpcReq req, bool widen)
-    {
+    fw::CoRpcResp _Forward(fw::CoRpcReq req, bool widen) {
         auto v = IntArg(req);
         if (!v)
             return fw::CoRpcResp::Error(v.error());
@@ -1982,11 +2025,10 @@ private:
  * 该时刻（同钟），再走真实 DispatchInboundForTest→InboundDispatcher 分发。
  */
 void InstallHopProbeHandler(const std::shared_ptr<fw::InfraHttpHost>& host,
-                            const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot)
-{
+                            const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot) {
     host->InstallRpcHandler(
         [app_slot](const inf::rpc::Request& request,
-                  const std::function<void()>& dispatched)
+                   const std::function<void()>& dispatched)
             -> fw::result<inf::rpc::Response> {
             if (g_hop)
                 g_hop->RecordIngress(request.Service(), request.Method(),
@@ -1998,14 +2040,14 @@ void InstallHopProbeHandler(const std::shared_ptr<fw::InfraHttpHost>& host,
 
 /**
  * 多 hop 的 seam 发送实现：与 PrepareApp 默认 rpc_send 同形，但在发起 I/O
- * 之前记录生产 AdaptCallOptions 已适配的出站期限（观测点），并记录发起时刻。
+ * 之前记录生产 ResolveCallDeadline 已解析的出站期限（观测点），并记录发起时刻。
  */
 fw::RpcSendAppFn HopSeamSend(std::shared_ptr<EndpointSlot> eps,
-                            std::shared_ptr<fw::RpcEgress> egress) {
+                             std::shared_ptr<fw::RpcEgress> egress) {
     return [eps, egress](std::string_view target,
-                          const inf::rpc::Request& env,
-                          const inf::CallOptions& o)
-        -> bbt_co_async(fw::result<inf::rpc::Response>) {
+                         const inf::rpc::Request& env,
+                         const inf::CallOptions& o)
+               -> bbt_co_async(fw::result<inf::rpc::Response>) {
         if (g_hop)
             g_hop->SetAdapted(o.deadline);
         std::string ep(target);
@@ -2026,8 +2068,7 @@ fw::RpcSendAppFn HopSeamSend(std::shared_ptr<EndpointSlot> eps,
  * 只有「出站实现」与「endpoint 解析」两点，见上方口径声明。
  */
 AppBox PrepareHopApp(std::chrono::milliseconds incoming_timeout, std::chrono::milliseconds step_budget,
-                     std::vector<fw::StaticRoute> routes, std::function<fw::result<void>(fw::CoApp&)> register_fn)
-{
+                     std::vector<fw::StaticRoute> routes, std::function<fw::result<void>(fw::CoApp&)> register_fn) {
     AppBox box;
     const auto limits = Limits(incoming_timeout);
     box.host = std::make_shared<fw::InfraHttpHost>(
@@ -2064,15 +2105,20 @@ AppBox PrepareHopApp(std::chrono::milliseconds incoming_timeout, std::chrono::mi
                 } catch (...) {
                     h->rc = kExitStartFailed;
                     h->done.store(true, std::memory_order_release);
-                    try { h->started.set_value(false); } catch (...) {}
+                    try {
+                        h->started.set_value(false);
+                    } catch (...) {}
                     return;
                 }
                 ServerTaskBody(app_slot, after_first_stop, h, register_fn);
-            }, submitted);
+            },
+            submitted);
         if (!submitted) {
             h->rc = kExitStartFailed;
             h->done.store(true, std::memory_order_release);
-            try { h->started.set_value(false); } catch (...) {}
+            try {
+                h->started.set_value(false);
+            } catch (...) {}
         }
     }
     return box;
@@ -2083,7 +2129,7 @@ AppBox PrepareHopApp(std::chrono::milliseconds incoming_timeout, std::chrono::mi
  * B（本进程 CoApp hop1 入站）→ B 的出站 → B（同一 CoApp hop2 入站）。
  * 断言全部落在同一 steady_clock 的绝对期限上：
  * - 每跳 local-min 之后 framework 恰扣一次 20ms（同钟精确等值）；
- * - 生产 AdaptCallOptions 后的出站期限 == 父 ctx 期限（无显式期限时继承，
+ * - 生产 ResolveCallDeadline 后的出站期限 == 父 ctx 期限（无显式期限时继承，
  *   不延长、不放大）；
  * - 到达 hop2 的预算相对父 ctx 期限只多出**实测**单程时延——出站放大（例如
  *   改用新预算、或去掉 min 让显式子期限生效）会远超该实测上界；
@@ -2134,7 +2180,7 @@ BOOST_AUTO_TEST_CASE(v2_multihop_budget_never_amplified) {
     BOOST_CHECK_NE(d_f, 0);
     BOOST_CHECK(ing_f.pre_ns - d_f == MsNs(milliseconds{20}));
     /**
-     * 生产 AdaptCallOptions 后的出站期限 == 父 ctx 期限（继承，不延长）。
+     * 生产 ResolveCallDeadline 后的出站期限 == 父 ctx 期限（继承，不延长）。
      */
     BOOST_CHECK(g_hop->Adapted() == d_f);
     BOOST_CHECK(g_hop->HandlerCalls() == 2);
@@ -2333,8 +2379,7 @@ BOOST_AUTO_TEST_CASE(v2_egress_body_limit_rejected_remote_untouched) {
      */
     auto box =
         PrepareApp(std::chrono::milliseconds{30000}, std::chrono::milliseconds{5000},
-                   /*routes*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<BudgetSvc>(ConcurrentOpts()); },
-                   [](AppBox& b) { InstallBudgetProbeHandler(b.host, b.app_slot); });
+                   /*routes*/ {}, [](fw::CoApp& app) { return bbt_co_await app.CoInstallService<BudgetSvc>(ConcurrentOpts()); }, [](AppBox& b) { InstallBudgetProbeHandler(b.host, b.app_slot); });
     LaunchApp(box);
     BOOST_REQUIRE(box.host->rpc_server() != nullptr);
 

@@ -1,9 +1,7 @@
 #pragma once
 /**
- * 有序调用票据（OrderedStamp）与调用选项（CallOptions，业务面）。
- * 票据由 OrderedSession 签发，受管服务在调用时读取票据字段写入
- * fw.* 系统元数据；本面不提供票据的创建入口。
- * OrderedStamp::State 持有 OrderedTicket（序号、request_id、发送绑定内容）。
+ * @brief 单次出站调用的期限和可选的有序票据。
+ * 票据由 OrderedSession 签发。副本共享重试内容，最后一份副本销毁时释放。
  */
 
 #include <cstdint>
@@ -27,6 +25,7 @@ public:
     OrderedStamp& operator=(const OrderedStamp&) noexcept = default;
     std::string request_id() const;
     std::uint64_t sequence() const;
+
 private:
     struct State;
     std::shared_ptr<State> state_;
@@ -37,36 +36,34 @@ private:
 
 struct CallOptions {
     std::optional<bbt::coroutine::Deadline> deadline;
-    std::optional<OrderedStamp>             ordered;
+    std::optional<OrderedStamp> ordered;
 };
 
 /**
  * —— 以下为内部实现细节；State 是 OrderedStamp 的私有成员类型，
  * 外部代码无法命名或构造，票据字段不可由业务修改。
- * State 持有 OrderedTicket，sequence、绑定请求内容经
- * OrderedSession/CoServiceBase 友元读写；拷贝 OrderedStamp 共享同一
- * 票据，保证重发语义作用于同一状态。
+ * 拷贝 OrderedStamp 共享同一票据，保证重发校验使用首次绑定的内容。
  */
 struct OrderedStamp::State {
-    std::shared_ptr<OrderedTicket> ticket;
-    /**
-     * 签发会话弱指针：co_rpc_call 经它执行 BindForSend
-     * （首次发送绑定/重放校验/序号水位检查）；会话已销毁的票据
-     * 如实失败，不静默直发。
-     */
-    std::weak_ptr<OrderedSession>  session;
+    State(std::uint64_t sequence, std::string request_id,
+          std::weak_ptr<OrderedSession> issuer)
+        : ticket(sequence, std::move(request_id)), session(std::move(issuer)) {}
+
+    OrderedTicket ticket;
+
+    /* 核对签发关系，同时允许会话析构释放 grant 占位。 */
+    const std::weak_ptr<OrderedSession> session;
 };
 
 inline OrderedStamp::OrderedStamp(std::shared_ptr<State> state) noexcept
     : state_(std::move(state)) {}
 
 inline std::string OrderedStamp::request_id() const {
-    return (state_ && state_->ticket) ? state_->ticket->request_id()
-                                    : std::string{};
+    return state_ ? state_->ticket.request_id() : std::string{};
 }
 
 inline std::uint64_t OrderedStamp::sequence() const {
-    return (state_ && state_->ticket) ? state_->ticket->sequence() : 0;
+    return state_ ? state_->ticket.sequence() : 0;
 }
 
 } // namespace bbt::framework

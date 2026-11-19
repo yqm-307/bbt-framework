@@ -80,8 +80,13 @@ class GetValueService final : public fw::CoService<> {
 公开 `AppOptions` 显式声明会话身份，V2 入站由框架默认装配——
 
 ```cpp
+fw::AppLimits limits;
+limits.max_objects = 64;
+limits.max_bindings = 64;
+limits.max_observers = 64;
+limits.observer_queue_capacity = 64;
 auto options = fw::AppOptions{}
-    .SetLimits(64, 64, 64, 64)
+    .SetAppLimits(limits)
     .SetNetworkLimits(...)
     .Listen("127.0.0.1:0")                          // 动态端口，仅 loopback
     .SetShutdownBudget(3s).SetLifecycleBudget(3s)
@@ -232,7 +237,7 @@ fail 并回收自有进程）。
   基础关闭路径；既有 `framework.inbound_http` 覆盖并发不串扰，非本切片新路径。容量耗尽
   Overloaded、超时后 inflight 强持有、ShutdownIncomplete、独立 supervisor 硬停机
   journal 未新增。
-- **V06–V08 排除**（OrderedIngress/ActorSerial/写幂等）；**V10 留 #38**。
+- **V06–V08 排除**（OrderedIngress/SerialByKey/写幂等）；**V10 留 #38**。
 - 不宣称 any 身份/授权、生产性能或真实后端（无 Redis/Mongo/Compose、无重试/取消）。
 
 ## 7. 给 #5 的固定接口

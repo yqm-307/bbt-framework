@@ -54,19 +54,12 @@ namespace detail {
 /**
  * @brief 一条组件绑定的簿记：谁绑了、代际、是否还接受新借用。
  *
- * `retiring` 是 Unbind 已封口、正在等本 binding 的 borrow 归零；它只等自己，
- * 不等同一组件上别的 subject。
+ * 条目存在且 `retiring` 为 false 时允许新借用通过绑定级校验；为 true 时
+ * 拒绝新借用，保留条目供本绑定的旧借用归还。条目移除后该代绑定失效。
  */
 struct Binding {
-    ObjectId      subject_id;
+    ObjectId subject_id;
     std::uint64_t generation = 0;
-    /**
-     * gate 开（接受新 borrow）
-     */
-    bool active = false;
-    /**
-     * Unbind 已封口、等本 binding borrow 归零
-     */
     bool retiring = false;
     /**
      * 本 binding 的在途借用数（Unbind 只等自身）
@@ -83,9 +76,9 @@ struct Binding {
  * Registry 的 observer 表中，同样由 `m_mtx` 保护。
  */
 struct RegistryEntry {
-    ObjectId     id;
+    ObjectId id;
     std::uint64_t generation = 0;
-    ObjectKind   kind = ObjectKind::Service;
+    ObjectKind kind = ObjectKind::Service;
     /**
      * Service：service name；Actor：actor type；Component：静态类型名
      */
@@ -99,7 +92,7 @@ struct RegistryEntry {
      * Service/Actor scope 组件的宿主 id
      */
     ObjectId owner_id;
-    ObjectState  state = ObjectState::Created;
+    ObjectState state = ObjectState::Created;
     std::optional<ObjectError> last_error;
     /**
      * 状态事件序号
@@ -118,18 +111,18 @@ struct RegistryEntry {
      * binding 的借用进同一计数）。
      */
     std::vector<Binding> bindings;
-    std::size_t   component_borrows = 0;
+    std::size_t component_borrows = 0;
 
     /**
      * Actor 实例在邮箱层的执行租约计数，供收尾状态统计。
      */
-    std::size_t   exec_leases = 0;
+    std::size_t exec_leases = 0;
 
     /**
      * 生命周期 hook 执行簿记：受管协程内仍有 hook 未达真实终态时 >0；
      * 超时返回不预扣——owner 保留至 hook 真实完成，收口前不允许销毁。
      */
-    std::size_t   hooks_in_flight = 0;
+    std::size_t hooks_in_flight = 0;
     /**
      * 协程侧的「在途 hook 归零」等待位：宿主路径等 m_cv，Co* 入口不能
      * 在 worker 上 std::cv 阻塞，改在本 waiter 上挂起；任务体结束经
@@ -160,19 +153,19 @@ struct RegistryEntry {
  * 但其中的闭包副本可能保留到对应事件批次释放。
  */
 struct ObserverRecord {
-    std::uint64_t   id = 0;
-    ObjectId        observer_id;
-    std::uint64_t   observer_generation = 0;
-    ObjectId        target_id;
-    std::uint64_t   target_generation = 0;
-    ObjectObserver  callback;
-    bool            active = true;
+    std::uint64_t id = 0;
+    ObjectId observer_id;
+    std::uint64_t observer_generation = 0;
+    ObjectId target_id;
+    std::uint64_t target_generation = 0;
+    ObjectObserver callback;
+    bool active = true;
     /**
      * 在途 callback lease：DispatchEvents 在锁内 ++、回调归还后 --。
      * 「查 active + ++in_flight」与 Revoke 的「标 inactive + 等归零 +
      * 抹除」同受 m_mtx 串行化，无锁外窗口；回调执行期记录不可抹除。
      */
-    std::size_t     in_flight = 0;
+    std::size_t in_flight = 0;
 };
 
 /**
@@ -188,8 +181,8 @@ struct BindingLease {
      * borrow 持有实际对象版本，不保活 Registry。
      */
     std::shared_ptr<void> owner;
-    ObjectId     component_id;
-    ObjectId     subject_id;
+    ObjectId component_id;
+    ObjectId subject_id;
     std::uint64_t binding_generation = 0;
     ~BindingLease();
 };
@@ -229,7 +222,8 @@ public:
     }
     bbt::coroutine::Deadline ResolveDeadline(
         const LifecycleOptions& life) const {
-        if (auto d = life.RawDeadline()) return *d;
+        if (auto d = life.RawDeadline())
+            return *d;
         return DefaultDeadline();
     }
     /**
@@ -240,7 +234,8 @@ public:
      */
     bbt::coroutine::Deadline ResolveShutdownDeadline(
         const LifecycleOptions& life) const {
-        if (auto d = life.RawDeadline()) return *d;
+        if (auto d = life.RawDeadline())
+            return *d;
         return std::chrono::steady_clock::now() + m_limits.shutdown_budget;
     }
     bbt::coroutine::Deadline DeadlineFromNow() const {
@@ -291,9 +286,9 @@ public:
      * (scope, owner_id, type, name) 查。
      */
     RegistryEntry* FindComponentLocked(ComponentScope scope,
-                                     const ObjectId& owner_id,
-                                     const std::type_info& type,
-                                     std::string_view name);
+                                       const ObjectId& owner_id,
+                                       const std::type_info& type,
+                                       std::string_view name);
     RegistryEntry* FindActorLocked(const std::string& type,
                                    const std::string& key);
 
@@ -302,14 +297,14 @@ public:
      * 快照；返回待派发事件列表（锁外由 DispatchEvents 执行）。
      */
     std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
-        SetStateLocked(RegistryEntry& e, ObjectState s,
-                       std::optional<ObjectError> err = std::nullopt);
+    SetStateLocked(RegistryEntry& e, ObjectState s,
+                   std::optional<ObjectError> err = std::nullopt);
     /**
      * 等价便捷形：按 id 查条目并 SetStateLocked；未找到时返回空。
      */
     std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
-        SetStateAndGetEvents(const ObjectId& id, ObjectState s,
-                             std::optional<ObjectError> err = std::nullopt);
+    SetStateAndGetEvents(const ObjectId& id, ObjectState s,
+                         std::optional<ObjectError> err = std::nullopt);
     void DispatchEvents(
         std::vector<std::pair<ObserverRecord, ObjectStateEvent>> events);
 
@@ -372,7 +367,7 @@ public:
                             const ObjectId& subject_id,
                             std::uint64_t* out_generation);
     /**
-     * 封该 binding 新 borrow；旧 handle 因 active=false/retiring 而失效，
+     * 进入 retiring 后拒绝新借用，
      * generation 保持不变以便在途 BindingLease 仍按原代归还计数。
      * 若该 binding 无在途 borrow → 立即移除边，返回 ok。仍有 borrow →
      * 标记 retiring，等本 binding borrow 归零后完成（waiter 驱动）。
@@ -388,18 +383,6 @@ public:
     void ReleaseBorrow(const ObjectId& component_id,
                        const ObjectId& subject_id,
                        std::uint64_t binding_generation) noexcept;
-
-    /**
-     * 新 borrow：同一临界区校验「对象存在 + generation + 状态 Running 或
-     * Installing-hook 借用 + binding active + gate 未封」，成功后
-     * component_borrows 与 binding.borrows 各 +1 并返回 BindingLease
-     * （由 ComponentBorrow 持有）。
-     * allow_installing_borrow：显式装配窗口借用；此外 subject 条目处于
-     * Installing（OnInstall 执行中）时自动允许借 Installed 依赖做纯内存装配。
-     */
-    result<std::shared_ptr<BindingLease>> AcquireBorrowLocked(
-        RegistryEntry& component_entry, const ObjectId& subject_id,
-        std::uint64_t binding_generation, bool allow_installing_borrow);
 
     /**
      * 等组件全部 borrow 归零（deadline 有限；供 Uninstall/销毁收口）。
@@ -445,7 +428,7 @@ public:
      * 宿主路径仍走 m_cv（MutexCvWait），两等待域共享同一 hooks_in_flight。
      */
     std::shared_ptr<bbt::coroutine::sync::CoWaiter>
-        HookSettledWaiterLocked(RegistryEntry& e) {
+    HookSettledWaiterLocked(RegistryEntry& e) {
         if (!e.hook_settled_waiter)
             e.hook_settled_waiter = bbt::coroutine::sync::CoWaiter::Create();
         return e.hook_settled_waiter;
@@ -483,7 +466,7 @@ public:
      */
     std::pair<std::shared_ptr<void>,
               std::vector<std::pair<ObserverRecord, ObjectStateEvent>>>
-        FinishDestroyLocked(RegistryEntry& e);
+    FinishDestroyLocked(RegistryEntry& e);
 
     /**
      * ---- 诊断 ----
@@ -517,15 +500,29 @@ public:
      * 对象与业务类型如何布局无关（不经过 void* 反向 static_cast）。
      */
     template <class T>
-    static T* NewManaged(ConstructKey k) { return new T(k); }
+    static T* NewManaged(ConstructKey k);
     template <class T, class Opt>
     static T* NewManaged(ConstructKey k, Opt&& options);
     template <class T>
-    static void DeleteManaged(T* p) noexcept { delete p; }
+    static void DeleteManaged(T* p) noexcept;
 
 private:
+    class WaitList {
+    public:
+        bbt::coroutine::WaitStatus WaitUntilReady(std::mutex& mutex,
+                                                  const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter,
+                                                  const std::function<bool()>& ready,
+                                                  const bbt::coroutine::WaitOptions& options);
+
+        // 接收修改谓词状态的同一把锁，保证摘除与状态更新之间没有登记插入。
+        void NotifyAll(std::unique_lock<std::mutex> lock, std::condition_variable& cv);
+
+    private:
+        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> m_waiters;
+    };
+
     result<void> _WaitBorrows(const std::function<bool()>& ready,
-                               bbt::coroutine::Deadline deadline);
+                              bbt::coroutine::Deadline deadline);
     /**
      * observer lease 排空等待（双域）：协程内挂起在 m_observer_waiters
      * 上的 CoWaiter，native 线程走 m_cv；谓词每次均在 m_mtx 内复查。
@@ -533,53 +530,44 @@ private:
      * 等待通道异常时降级为让出后轮询，不吞责任也不死等断言。
      */
     void _WaitObserversDone(const std::function<bool()>& done) noexcept;
-    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> m_borrow_waiters;
-    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> m_observer_waiters;
+    WaitList m_borrow_waiters;
+    WaitList m_observer_waiters;
     ObjectId NextIdLocked(ObjectKind kind);
     static const char* KindPrefix(ObjectKind kind) noexcept;
 
-    Limits                      m_limits;
-    mutable std::mutex          m_mtx;
+    Limits m_limits;
+    mutable std::mutex m_mtx;
     /**
      * borrow/lease 归零唤醒
      */
     std::condition_variable m_cv;
-    std::deque<RegistryEntry>   m_entries;
+    std::deque<RegistryEntry> m_entries;
     /**
      * id → deque 下标
      */
     std::unordered_map<std::string, std::size_t> m_index;
     std::map<std::uint64_t, ObserverRecord> m_observers;
-    std::uint64_t               m_next_observer_id = 1;
-    std::uint64_t               m_next_generation = 1;
-    std::uint64_t               m_next_id_seq = 0;
+    std::uint64_t m_next_observer_id = 1;
+    std::uint64_t m_next_generation = 1;
+    std::uint64_t m_next_id_seq = 0;
     /**
      * bounded ring
      */
     std::deque<LifecycleFailure> m_failures;
-    std::size_t                 m_failures_dropped = 0;
+    std::size_t m_failures_dropped = 0;
 
     friend struct BindingLease;
 };
-
-template <class Pred>
-bool Registry::MutexCvWait(std::unique_lock<std::mutex>& lk,
-                           bbt::coroutine::Deadline deadline, Pred&& pred) {
-    return m_cv.wait_until(lk, deadline, std::forward<Pred>(pred));
-}
-
-template <class T, class Opt>
-T* Registry::NewManaged(ConstructKey k, Opt&& options) {
-    return new T(k, std::forward<Opt>(options));
-}
 
 /**
  * 契约命名面：三个 Registry 是同一注册表的类型化视图别名（业务
  * `friend class fw::detail::ServiceRegistry` 即 friend 本 Registry）。
  */
-using ServiceRegistry   = Registry;
-using ActorRegistry     = Registry;
+using ServiceRegistry = Registry;
+using ActorRegistry = Registry;
 using ComponentRegistry = Registry;
 
 } // namespace detail
 } // namespace bbt::framework
+
+#include <bbt/framework/internal/__TRegistry.hpp>

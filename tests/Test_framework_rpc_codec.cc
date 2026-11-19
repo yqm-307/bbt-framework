@@ -39,7 +39,7 @@ namespace {
  */
 struct FakeProto {
     std::int32_t id = 0;
-    std::string  tag;
+    std::string tag;
 };
 
 } // namespace
@@ -92,18 +92,18 @@ namespace {
  * bbt::infra::Error。
  */
 static_assert(std::is_same_v<
-    decltype(std::declval<const fw::CoRpcReq&>().Parse<std::int32_t>()),
-    fw::result<std::int32_t>>);
+              decltype(std::declval<const fw::CoRpcReq&>().Parse<std::int32_t>()),
+              fw::result<std::int32_t>>);
 static_assert(std::is_same_v<
-    decltype(std::declval<const fw::CoRpcReq&>()
-                 .Parse<std::int32_t, std::string>()),
-    fw::result<std::tuple<std::int32_t, std::string>>>);
+              decltype(std::declval<const fw::CoRpcReq&>()
+                           .Parse<std::int32_t, std::string>()),
+              fw::result<std::tuple<std::int32_t, std::string>>>);
 static_assert(std::is_same_v<
-    decltype(std::declval<const fw::CoRpcReq&>().Parse<FakeProto>()),
-    fw::result<FakeProto>>);
+              decltype(std::declval<const fw::CoRpcReq&>().Parse<FakeProto>()),
+              fw::result<FakeProto>>);
 static_assert(std::is_same_v<
-    decltype(std::declval<const fw::CoRpcReq&>().ParseProto<FakeProto>()),
-    fw::result<FakeProto>>);
+              decltype(std::declval<const fw::CoRpcReq&>().ParseProto<FakeProto>()),
+              fw::result<FakeProto>>);
 static_assert(
     std::is_same_v<fw::CoRpcResp::ErrorType, bbt::infra::Error>);
 
@@ -111,17 +111,17 @@ static_assert(
  * 请求编码工厂返回类型（编译期钉死）：编码失败经 result 而非异常透出。
  */
 static_assert(std::is_same_v<
-    decltype(fw::CoRpcReq::From(
-        std::declval<const std::int32_t&>())),
-    fw::result<fw::CoRpcReq>>);
+              decltype(fw::CoRpcReq::From(
+                  std::declval<const std::int32_t&>())),
+              fw::result<fw::CoRpcReq>>);
 static_assert(std::is_same_v<
-    decltype(fw::CoRpcReq::From(
-        std::declval<const std::tuple<std::int32_t, std::string>&>())),
-    fw::result<fw::CoRpcReq>>);
+              decltype(fw::CoRpcReq::From(
+                  std::declval<const std::tuple<std::int32_t, std::string>&>())),
+              fw::result<fw::CoRpcReq>>);
 static_assert(std::is_same_v<
-    decltype(fw::CoRpcReq::FromProto(
-        std::declval<const FakeProto&>())),
-    fw::result<fw::CoRpcReq>>);
+              decltype(fw::CoRpcReq::FromProto(
+                  std::declval<const FakeProto&>())),
+              fw::result<fw::CoRpcReq>>);
 
 class Calculator final : public fw::CoService<> {
 public:
@@ -131,7 +131,8 @@ public:
 
     fw::CoRpcResp Add(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t, std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         const auto& [n, name] = args.value();
         return fw::CoRpcResp::From(std::tuple{n + 1, name + "!"});
     }
@@ -146,7 +147,8 @@ public:
      */
     fw::CoRpcResp ProtoEcho(fw::CoRpcReq req) {
         auto msg = req.Parse<FakeProto>();
-        if (!msg) return fw::CoRpcResp::Error(msg.error());
+        if (!msg)
+            return fw::CoRpcResp::Error(msg.error());
         return fw::CoRpcResp::FromProto(msg.value());
     }
 
@@ -171,12 +173,14 @@ public:
 
     fw::CoRpcResp Lookup(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t, std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         return fw::CoRpcResp::From(std::get<1>(args.value()));
     }
     fw::CoRpcResp ById(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         return fw::CoRpcResp::From(args.value() + 1);
     }
 
@@ -224,11 +228,12 @@ std::shared_ptr<fw::CoApp> MakeApp() {
  */
 template <class S>
 S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
-    const auto reg = app.RegistryForTest();
+    const auto reg = fw::RegistryForTest(app);
     std::lock_guard<std::mutex> lk(reg->Mutex());
     auto* e = reg->FindByTypeNameLocked(
         fw::ObjectKind::Service, S::kServiceName);
-    if (!e) return nullptr;
+    if (!e)
+        return nullptr;
     owner = e->object;
     return static_cast<S*>(e->object.get());
 }
@@ -240,8 +245,11 @@ S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     /**
      * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
      */
@@ -250,22 +258,26 @@ bool RunInManagedCoroutine(F&& fn,
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     /**
@@ -273,13 +285,16 @@ bool RunInManagedCoroutine(F&& fn,
      */
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
-#define CO_TEST_CASE(name) \
-    static void name##_body(); \
-    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+#define CO_TEST_CASE(name)                                 \
+    static void name##_body();                             \
+    BOOST_AUTO_TEST_CASE(name) {                           \
+        BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); \
+    }                                                      \
     static void name##_body()
 
 } // namespace
@@ -298,7 +313,7 @@ CO_TEST_CASE(positional_roundtrip_and_method_table) {
                std::string(fw::kCoRpcPositionalSchema));
 
     auto out = table.find("add")->invoke(*service,
-        Request(41, "answer").payload());
+                                         Request(41, "answer").payload());
     BOOST_REQUIRE(out);
     fw::CoRpcReq response(std::move(out.value()));
     auto values = response.Parse<std::int32_t, std::string>();
@@ -380,7 +395,7 @@ CO_TEST_CASE(proto_codec_seam) {
     /**
      * From(proto)/FromProto 均走 ProtoCodec::Encode，不经位置 codec。
      */
-    auto via_from  = fw::CoRpcResp::From(msg);
+    auto via_from = fw::CoRpcResp::From(msg);
     auto via_named = fw::CoRpcResp::FromProto(msg);
     BOOST_REQUIRE(via_from.ok());
     BOOST_REQUIRE(via_named.ok());
@@ -391,7 +406,7 @@ CO_TEST_CASE(proto_codec_seam) {
      * 请求侧对称工厂：CoRpcReq::From(proto)/FromProto 共用同一 Encode，
      * 产出的 payload 与响应侧逐字节一致。
      */
-    auto req_from  = fw::CoRpcReq::From(msg);
+    auto req_from = fw::CoRpcReq::From(msg);
     auto req_named = fw::CoRpcReq::FromProto(msg);
     BOOST_REQUIRE(req_from);
     BOOST_REQUIRE(req_named);
@@ -457,7 +472,6 @@ CO_TEST_CASE(actor_method_at_positional_key) {
     const auto table = fw::BuildMethodTable<Directory>();
     const fw::RpcMethod* lookup = table.find("lookup");
     BOOST_REQUIRE(lookup != nullptr);
-    BOOST_TEST(lookup->actor_keyed);
     BOOST_TEST(lookup->request_schema ==
                std::string(fw::kCoRpcPositionalSchema));
     BOOST_REQUIRE(lookup->extract_key != nullptr);

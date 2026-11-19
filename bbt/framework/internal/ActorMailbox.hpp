@@ -1,27 +1,10 @@
 #pragma once
 /**
- * Actor 邮箱（机器面，internal/）：单 Actor 的串行执行资格 + 有界等待队列。
- *
- * 语义（串行执行承诺）：
- * - 接纳顺序：TryEnqueue 成功的项按接纳先后排队；容量仅计等待中项，
- * 不含执行中项；满则拒绝并返回 Overloaded——不排队等待、不淘汰已接纳项。
- * - 非重入：同一邮箱同一时刻至多一个 handler 在执行；前一条 handler
- * 正常或异常退出后才取下一条。
- * - handler 在邮箱的 drain 协程内联执行：handler 挂起等待远端/被依赖项时
- * 让出 worker，但 drain 协程仍持有本邮箱的业务执行资格，下一条不会被取出。
- * - 不绑定原生线程；不同邮箱的 drain 协程相互独立，可并发推进。
- *
- * 复用与自兜边界（不从组件名推断保证）：
- * - g_scheduler->RegistCoroutineTask：仅提供「把 drain 闭包交给某个 worker
- * 协程执行」，不承诺同一闭包不被并发执行。唯一消费者由本类自保证：
- * m_draining 占位标志与队列共用 m_mtx，空转→活跃边沿至多注册一个 drain。
- * - 销毁竞争：drain 闭包按值捕获邮箱、方法描述与 actor 实例，协程存活
- * 期间这些执行所需对象不悬空；邮箱析构不发生在 drain 运行中途。运行时
- * 无 Stop/restart；进程结束前不销毁挂起协程，故这里不依赖停机时的栈展开。
- * - 队列与容量用 std::deque + std::mutex 自建：coroutine 的 Chan<T,Max>
- * 容量是模板常量，放不下运行期 mailbox_capacity；且其读端挂起语义
- * （m_is_reading 单读者）虽同形，本类需要在持锁临界区内完成「满则拒绝
- * + 边沿注册」的原子判定，故不套接。
+ * @brief 按入队顺序逐个执行同一邮箱的任务。
+ * 任务在锁外执行；即使它挂起，同一邮箱也不会开始下一项，其他邮箱仍可继续。
+ * 容量只计算等待项，不含正在执行的任务。满时返回 Overloaded，不等待也不挤掉旧任务。
+ * Close 后不再接收新任务，已入队的继续执行。队列和 m_draining 共用一把锁，
+ * 保证最多只有一个协程取任务；该协程持有邮箱直到队列清空。
  */
 
 #include <cstddef>
@@ -88,10 +71,10 @@ private:
 
     mutable std::mutex m_mtx;
     std::deque<Task> m_queue;
-    bool             m_draining = false;
-    bool             m_closed   = false;
+    bool m_draining = false;
+    bool m_closed = false;
     const std::size_t m_capacity;
-    ErrorHook        m_on_abnormal;
+    ErrorHook m_on_abnormal;
 };
 
 } // namespace bbt::framework

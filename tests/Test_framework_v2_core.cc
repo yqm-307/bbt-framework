@@ -36,10 +36,11 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/framework/Framework.hpp>
+#include <bbt/framework/internal/CoAppSeam.hpp>
 
 namespace fw = bbt::framework;
-using bbt::framework::result;
 using bbt::framework::ErrorCode;
+using bbt::framework::result;
 
 namespace {
 
@@ -48,12 +49,14 @@ namespace {
  */
 class CounterComponent final : public fw::CoComponent {
 public:
-    struct Options { int initial = 0; };
+    struct Options {
+        int initial = 0;
+    };
 
     explicit CounterComponent(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), m_count(o.initial) {}
 
-    int  Get() const noexcept { return m_count; }
+    int Get() const noexcept { return m_count; }
     void Inc() noexcept { ++m_count; }
 
 protected:
@@ -72,6 +75,7 @@ public:
     struct Options {};
     explicit AnotherComponent(fw::detail::ConstructKey k, Options)
         : fw::CoComponent(k) {}
+
 protected:
     ~AnotherComponent() noexcept override = default;
     friend class fw::detail::Registry;
@@ -106,13 +110,16 @@ protected:
     ~EchoService() noexcept override = default;
 
     result<void> OnInstall() override {
-        ++install_count; return result<void>::ok();
+        ++install_count;
+        return result<void>::ok();
     }
     result<void> OnStart() override {
-        ++start_count; return result<void>::ok();
+        ++start_count;
+        return result<void>::ok();
     }
     result<void> OnStop() override {
-        ++stop_count; return result<void>::ok();
+        ++stop_count;
+        return result<void>::ok();
     }
     void OnUninstall() override { ++uninstall_count; }
     void OnBindingChanged(const fw::BindingEvent&) override {
@@ -124,7 +131,8 @@ protected:
         if (h) {
             ++s_gc_ok;
             auto b = h.value().Borrow();
-            if (b) ++s_gc_borrow_ok;
+            if (b)
+                ++s_gc_borrow_ok;
         }
         auto bad = GetComponent<AnotherComponent>("counter");
         if (!bad && bad.error().code == ErrorCode::InvalidArgument)
@@ -142,11 +150,12 @@ class FailInstallService final : public fw::CoService<> {
 public:
     static constexpr std::string_view kServiceName = "fail_install";
     explicit FailInstallService(fw::detail::ConstructKey k) : fw::CoService<>(k) {}
+
 protected:
     ~FailInstallService() noexcept override = default;
     result<void> OnInstall() override {
         return result<void>::err(fw::MakeError(ErrorCode::InternalError,
-            "OnInstall 显式失败"));
+                                               "OnInstall 显式失败"));
     }
     friend class fw::detail::Registry;
 };
@@ -160,6 +169,7 @@ public:
     static constexpr std::string_view kServiceName = "echo2";
     explicit Echo2Service(fw::detail::ConstructKey k)
         : fw::CoService<CounterComponent>(k) {}
+
 protected:
     ~Echo2Service() noexcept override = default;
     friend class fw::detail::Registry;
@@ -214,7 +224,8 @@ protected:
         return result<void>::ok();
     }
     result<void> OnStart() override {
-        if (bbt::coroutine::GetLocalCoroutineId() != 0) ++s_onstart_co;
+        if (bbt::coroutine::GetLocalCoroutineId() != 0)
+            ++s_onstart_co;
         /**
          * hook 内同协程再调宿主控制面 → InvalidContext（自等待）。
          */
@@ -232,11 +243,13 @@ protected:
         return result<void>::ok();
     }
     result<void> OnStop() override {
-        if (bbt::coroutine::GetLocalCoroutineId() != 0) ++s_onstop_co;
+        if (bbt::coroutine::GetLocalCoroutineId() != 0)
+            ++s_onstop_co;
         return result<void>::ok();
     }
     void OnBindingChanged(const fw::BindingEvent& ev) override {
-        if (!ev.bound) ++s_unbind_events;
+        if (!ev.bound)
+            ++s_unbind_events;
     }
     friend class fw::detail::Registry;
 };
@@ -255,11 +268,13 @@ fw::CoApp* ProbeService::s_app = nullptr;
  */
 class DepComponent final : public fw::CoComponent {
 public:
-    struct Options { int tag = 0; };
+    struct Options {
+        int tag = 0;
+    };
     explicit DepComponent(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), m_tag(o.tag) {}
 
-    static std::mutex              s_order_mtx;
+    static std::mutex s_order_mtx;
     /**
      * "start:N"/"stop:N" 事件序
      */
@@ -268,8 +283,8 @@ public:
      * OnStop 挂起毫秒（0=不挂起）
      */
     static std::atomic<int> s_suspend_ms;
-    static std::atomic<int>        s_start_co;
-    static std::atomic<int>        s_stop_co;
+    static std::atomic<int> s_start_co;
+    static std::atomic<int> s_stop_co;
 
     int Tag() const noexcept { return m_tag; }
 
@@ -277,13 +292,15 @@ protected:
     ~DepComponent() noexcept override = default;
 
     result<void> OnStart() override {
-        if (bbt::coroutine::GetLocalCoroutineId() != 0) ++s_start_co;
+        if (bbt::coroutine::GetLocalCoroutineId() != 0)
+            ++s_start_co;
         std::lock_guard<std::mutex> lk(s_order_mtx);
         s_order.push_back("start:" + std::to_string(m_tag));
         return result<void>::ok();
     }
     result<void> OnStop() override {
-        if (bbt::coroutine::GetLocalCoroutineId() != 0) ++s_stop_co;
+        if (bbt::coroutine::GetLocalCoroutineId() != 0)
+            ++s_stop_co;
         const int ms = s_suspend_ms.load();
         /**
          * 真实挂起：不阻塞 worker
@@ -300,11 +317,11 @@ private:
     friend class fw::detail::Registry;
 };
 
-std::mutex               DepComponent::s_order_mtx;
+std::mutex DepComponent::s_order_mtx;
 std::vector<std::string> DepComponent::s_order;
-std::atomic<int>         DepComponent::s_suspend_ms{0};
-std::atomic<int>         DepComponent::s_start_co{0};
-std::atomic<int>         DepComponent::s_stop_co{0};
+std::atomic<int> DepComponent::s_suspend_ms{0};
+std::atomic<int> DepComponent::s_start_co{0};
+std::atomic<int> DepComponent::s_stop_co{0};
 
 /**
  * 依赖组件：subject 侧，绑定 DepComponent 并在 OnBindingChanged 经
@@ -334,12 +351,16 @@ protected:
         return result<void>::ok();
     }
     void OnBindingChanged(const fw::BindingEvent& ev) override {
-        if (!ev.bound) { ++s_unbind_events; return; }
+        if (!ev.bound) {
+            ++s_unbind_events;
+            return;
+        }
         auto h = GetComponent<DepComponent>("dep");
         if (h) {
             ++s_get_ok;
             auto b = h.value().Borrow();
-            if (b) ++s_borrow_ok;
+            if (b)
+                ++s_borrow_ok;
         }
     }
     friend class fw::detail::Registry;
@@ -358,10 +379,12 @@ public:
     explicit WorkerActor(fw::detail::ConstructKey k) : fw::CoActor(k) {}
     int create_count = 0;
     int destroy_count = 0;
+
 protected:
     ~WorkerActor() noexcept override = default;
     result<void> OnCreate() override {
-        ++create_count; return result<void>::ok();
+        ++create_count;
+        return result<void>::ok();
     }
     void OnDestroy() override { ++destroy_count; }
     friend class fw::detail::Registry;
@@ -478,29 +501,37 @@ static_assert(!std::is_destructible_v<WorkerActor>);
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     /**
      * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
      */
-    if (!g_scheduler->IsInitialized()) g_scheduler->Start();
+    if (!g_scheduler->IsInitialized())
+        g_scheduler->Start();
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     /**
@@ -508,13 +539,16 @@ bool RunInManagedCoroutine(F&& fn,
      */
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
-#define CO_TEST_CASE(name) \
-    static void name##_body(); \
-    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+#define CO_TEST_CASE(name)                                 \
+    static void name##_body();                             \
+    BOOST_AUTO_TEST_CASE(name) {                           \
+        BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); \
+    }                                                      \
     static void name##_body()
 
 BOOST_AUTO_TEST_SUITE(v2_core)
@@ -545,7 +579,8 @@ CO_TEST_CASE(coapp_construct_handle) {
 
 CO_TEST_CASE(component_install_find_lifecycle) {
     auto app = fw::CoApp::Create(MakeAppOptions());
-    CounterComponent::Options opts; opts.initial = 41;
+    CounterComponent::Options opts;
+    opts.initial = 41;
 
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>("counter", opts));
     auto dup = bbt_co_await app->CoInstallComponent<CounterComponent>("counter", opts);
@@ -577,7 +612,7 @@ CO_TEST_CASE(component_install_while_running) {
     auto h = app->FindComponent<CounterComponent>("c");
     BOOST_REQUIRE(h);
     BOOST_CHECK(h.value().Info().value().state ==
-                      fw::ObjectState::Running);
+                fw::ObjectState::Running);
 }
 
 CO_TEST_CASE(service_lifecycle_hooks) {
@@ -588,16 +623,16 @@ CO_TEST_CASE(service_lifecycle_hooks) {
     auto h = app->FindService("echo");
     BOOST_REQUIRE(h);
     BOOST_CHECK(h.value().Info().value().state ==
-                      fw::ObjectState::Installed);
+                fw::ObjectState::Installed);
 
     BOOST_REQUIRE(bbt_co_await app->CoStart());
     BOOST_CHECK(h.value().Info().value().state ==
-                      fw::ObjectState::Running);
+                fw::ObjectState::Running);
 
     auto mb = h.value().GetMailBox();
     BOOST_REQUIRE(mb);
     BOOST_CHECK(mb.value().Address().ObjectKind() ==
-                      fw::AppObjectAddress::Kind::Service);
+                fw::AppObjectAddress::Kind::Service);
     BOOST_CHECK(mb.value().Address().Type() == "echo");
 
     BOOST_REQUIRE(bbt_co_await app->CoUninstallService<EchoService>());
@@ -607,11 +642,11 @@ CO_TEST_CASE(service_lifecycle_hooks) {
         auto reinstall = bbt_co_await app->CoInstallService<EchoService>(
             fw::ServiceOptions{}.SetMaxInflight(1));
         BOOST_REQUIRE_MESSAGE(reinstall,
-            "卸载后重装失败: code="
-                << (reinstall ? -1
-                              : static_cast<int>(reinstall.error().code))
-                << " msg="
-                << (reinstall ? std::string{} : reinstall.error().message));
+                              "卸载后重装失败: code="
+                                  << (reinstall ? -1
+                                                : static_cast<int>(reinstall.error().code))
+                                  << " msg="
+                                  << (reinstall ? std::string{} : reinstall.error().message));
     }
     auto h2 = app->FindService("echo");
     BOOST_REQUIRE(h2);
@@ -627,7 +662,7 @@ CO_TEST_CASE(service_install_failed) {
     auto h = app->FindService("fail_install");
     BOOST_REQUIRE(h);
     BOOST_CHECK(h.value().Info().value().state ==
-                      fw::ObjectState::InstallFailed);
+                fw::ObjectState::InstallFailed);
     BOOST_CHECK(h.value().Info().value().last_error.has_value());
     BOOST_CHECK(h.value().Info().value().last_error->phase == "install");
     BOOST_REQUIRE(bbt_co_await app->CoUninstallService<FailInstallService>());
@@ -666,7 +701,8 @@ CO_TEST_CASE(actor_type_registration) {
 
 CO_TEST_CASE(bind_component_and_borrow) {
     auto app = fw::CoApp::Create(MakeAppOptions());
-    CounterComponent::Options opts; opts.initial = 7;
+    CounterComponent::Options opts;
+    opts.initial = 7;
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>("counter", opts));
     BOOST_REQUIRE(bbt_co_await app->CoInstallService<EchoService>(
         fw::ServiceOptions{}.SetMaxInflight(4)));
@@ -704,7 +740,7 @@ CO_TEST_CASE(bind_component_and_borrow) {
     }
 
     BOOST_REQUIRE(bbt_co_await app->CoUnbindComponent<CounterComponent>(svc_h.value(),
-                                                        "counter"));
+                                                                        "counter"));
     auto b3 = bind.value().Borrow();
     BOOST_CHECK(!b3 && b3.error().code == ErrorCode::Closed);
 }
@@ -737,9 +773,9 @@ CO_TEST_CASE(observe_state_events) {
      * 观察者用 App 自身 handle（observer 与 target 不同对象）。
      */
     auto token = bbt_co_await app->CoObserve(app->Handle(), svc_h.value(),
-        [&seen](const fw::ObjectStateEvent& ev) {
-            seen.push_back(ev.state);
-        });
+                                             [&seen](const fw::ObjectStateEvent& ev) {
+                                                 seen.push_back(ev.state);
+                                             });
     BOOST_REQUIRE(token);
     BOOST_CHECK(token.value().IsActive());
 
@@ -802,7 +838,8 @@ CO_TEST_CASE(component_placement_validation) {
  */
 CO_TEST_CASE(assembly_borrow_during_oninstall) {
     auto app = fw::CoApp::Create(MakeAppOptions());
-    CounterComponent::Options opts; opts.initial = 33;
+    CounterComponent::Options opts;
+    opts.initial = 33;
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>("counter", opts));
 
     /**
@@ -819,8 +856,7 @@ CO_TEST_CASE(assembly_borrow_during_oninstall) {
     ProbeService::s_install_borrow_ok = 0;
     ProbeService::s_install_borrow_value = 0;
     BOOST_REQUIRE(bbt_co_await app->CoInstallService<ProbeService>(
-        fw::ServiceOptions{}.SetMaxInflight(1)
-            .BindComponent<CounterComponent>("counter")));
+        fw::ServiceOptions{}.SetMaxInflight(1).BindComponent<CounterComponent>("counter")));
     /**
      * OnInstall 装配窗口内借到 Installed 组件并完成纯内存读取。
      */
@@ -895,9 +931,9 @@ CO_TEST_CASE(two_subjects_independent_unbind) {
 CO_TEST_CASE(component_dep_getcomponent_and_cycle) {
     auto app = fw::CoApp::Create(MakeAppOptions());
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<DepComponent>("dep",
-                                                     DepComponent::Options{7}));
+                                                                     DepComponent::Options{7}));
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<UserComponent>("user",
-                                                      UserComponent::Options{}));
+                                                                      UserComponent::Options{}));
     BOOST_REQUIRE(bbt_co_await app->CoStart());
 
     auto dep_h = app->FindComponent<DepComponent>("dep");
@@ -941,8 +977,7 @@ CO_TEST_CASE(hooks_run_in_managed_coroutine) {
     CounterComponent::Options opts;
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>("counter", opts));
     BOOST_REQUIRE(bbt_co_await app->CoInstallService<ProbeService>(
-        fw::ServiceOptions{}.SetMaxInflight(1)
-            .BindComponent<CounterComponent>("counter")));
+        fw::ServiceOptions{}.SetMaxInflight(1).BindComponent<CounterComponent>("counter")));
     BOOST_REQUIRE(bbt_co_await app->CoStart());
     BOOST_CHECK(ProbeService::s_onstart_co.load() >= 1);
     BOOST_CHECK(ProbeService::s_invalid_ctx.load() >= 1);
@@ -963,9 +998,9 @@ CO_TEST_CASE(dependency_topo_start_and_reverse_stop) {
     }
     DepComponent::s_suspend_ms = 0;
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<DepComponent>("dep",
-                                                     DepComponent::Options{1}));
+                                                                     DepComponent::Options{1}));
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<UserComponent>("user",
-                                                      UserComponent::Options{}));
+                                                                      UserComponent::Options{}));
     auto user_h = app->FindComponent<UserComponent>("user");
     auto dep_h = app->FindComponent<DepComponent>("dep");
     BOOST_REQUIRE(user_h && dep_h);
@@ -979,7 +1014,8 @@ CO_TEST_CASE(dependency_topo_start_and_reverse_stop) {
     }
     auto find_idx = [&](const std::string& k) {
         for (std::size_t i = 0; i < order.size(); ++i)
-            if (order[i] == k) return static_cast<int>(i);
+            if (order[i] == k)
+                return static_cast<int>(i);
         return -1;
     };
     /**
@@ -1000,7 +1036,7 @@ CO_TEST_CASE(dependency_topo_start_and_reverse_stop) {
 CO_TEST_CASE(deadline_timeout_retains_then_settles) {
     auto app = fw::CoApp::Create(MakeAppOptions());
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<DepComponent>("dep",
-                                                     DepComponent::Options{2}));
+                                                                     DepComponent::Options{2}));
     BOOST_REQUIRE(bbt_co_await app->CoStart());
     auto dep_h = app->FindComponent<DepComponent>("dep");
     BOOST_REQUIRE(dep_h);
@@ -1064,7 +1100,7 @@ CO_TEST_CASE(request_shutdown_is_not_stop) {
  * on_registered 复查关闭「先放行后挂起」竞态。
  */
 struct CoGate {
-    std::atomic<bool>                   open{false};
+    std::atomic<bool> open{false};
     bbt::coroutine::sync::CoWaiter::SPtr waiter =
         bbt::coroutine::sync::CoWaiter::Create();
 
@@ -1076,13 +1112,15 @@ struct CoGate {
      * 在受管协程内调用：gate 未开则挂起至 Open。
      */
     void Wait() {
-        if (open.load(std::memory_order_acquire)) return;
+        if (open.load(std::memory_order_acquire))
+            return;
         /**
          * 无期限：终态由 Open 放行
          */
         bbt::coroutine::WaitOptions wo;
         waiter->WaitWithCallback(wo, [this] {
-            if (open.load(std::memory_order_acquire)) waiter->Notify();
+            if (open.load(std::memory_order_acquire))
+                waiter->Notify();
             return true;
         });
     }
@@ -1116,7 +1154,8 @@ protected:
     ~GateService() noexcept override = default;
 
     result<void> OnStart() override {
-        if (s_start_gate) s_start_gate->Wait();
+        if (s_start_gate)
+            s_start_gate->Wait();
         return result<void>::ok();
     }
     result<void> OnStop() override {
@@ -1134,8 +1173,8 @@ protected:
     friend class fw::detail::Registry;
 };
 
-std::atomic<int>  GateService::s_onstop_entered{0};
-std::atomic<int>  GateService::s_onstop_returned{0};
+std::atomic<int> GateService::s_onstop_entered{0};
+std::atomic<int> GateService::s_onstop_returned{0};
 std::atomic<bool> GateService::s_onstop_co{false};
 std::shared_ptr<CoGate> GateService::s_gate;
 std::shared_ptr<CoGate> GateService::s_start_gate;
@@ -1220,9 +1259,10 @@ CO_TEST_CASE(co_stop_deadline_returns_before_hook_settles) {
     {
         bool saw_timeout = false;
         for (const auto& f : app->LifecycleFailures())
-            if (f.code == ErrorCode::TimedOut) saw_timeout = true;
+            if (f.code == ErrorCode::TimedOut)
+                saw_timeout = true;
         BOOST_CHECK_MESSAGE(saw_timeout,
-            "短 deadline 的 CoStop 未留下 TimedOut 诊断");
+                            "短 deadline 的 CoStop 未留下 TimedOut 诊断");
     }
     /**
      * 责任保留：App 未完成收口、对象未被销毁。
@@ -1284,7 +1324,8 @@ CO_TEST_CASE(co_component_hook_deadline_retains_then_settles) {
     {
         bool saw_timeout = false;
         for (const auto& f : app->LifecycleFailures())
-            if (f.code == ErrorCode::TimedOut) saw_timeout = true;
+            if (f.code == ErrorCode::TimedOut)
+                saw_timeout = true;
         BOOST_CHECK(saw_timeout);
     }
     BOOST_CHECK(app->State() == fw::AppState::StopIncomplete);
@@ -1443,7 +1484,6 @@ CO_TEST_CASE(co_pause_consumes_lifecycle_budget_not_shutdown) {
     GateService::s_gate.reset();
 }
 
-
 namespace {
 } // namespace
 
@@ -1459,7 +1499,7 @@ BOOST_AUTO_TEST_CASE(non_co_rejected_before_registry_or_hook_side_effects) {
     const auto service = app->FindService("echo").value();
     const auto component = app->FindComponent<CounterComponent>("counter").value();
     const auto before = bbt::coroutine::GetCoObjectStats("framework.CoService");
-    const auto reg = app->RegistryForTest();
+    const auto reg = fw::RegistryForTest(*app);
     std::size_t objects;
     {
         std::lock_guard<std::mutex> lock(reg->Mutex());
@@ -1488,12 +1528,32 @@ BOOST_AUTO_TEST_CASE(non_co_rejected_before_registry_or_hook_side_effects) {
     (void)app->CoBindObject(service, component);
     (void)app->CoUnbindObject(service, component);
     (void)app->CoObserve(service, component,
-        [&](const fw::ObjectStateEvent&) { ++events; });
+                         [&](const fw::ObjectStateEvent&) { ++events; });
     (void)app->CoStart();
     (void)app->CoPause();
     (void)app->CoResume();
     (void)app->CoStop();
     (void)app->CoWaitShutdownRequest();
+    /**
+     * 返回域：函数体已在 native 域真实执行，结果由 AsyncReturn 携带；
+     * 在受管协程里解包只过 AwaitHelper 的环境检查、不重跑产品函数，
+     * 因此可直接断言入口给出 InvalidContext，而非默默成功或换错误码。
+     * 三类代表路径（登记、生命周期、订阅）共用同一 _CheckCoContext。
+     */
+    auto install_pending = app->CoInstallService<FailInstallService>();
+    auto start_pending = app->CoStart();
+    auto observe_pending = app->CoObserve(
+        service, component, [](const fw::ObjectStateEvent&) {});
+    BOOST_REQUIRE(RunInManagedCoroutine([&] {
+        auto installed = bbt_co_await std::move(install_pending);
+        auto started = bbt_co_await std::move(start_pending);
+        auto observed = bbt_co_await std::move(observe_pending);
+        BOOST_CHECK(!installed &&
+                    installed.error().code == ErrorCode::InvalidContext);
+        BOOST_CHECK(!started && started.error().code == ErrorCode::InvalidContext);
+        BOOST_CHECK(!observed &&
+                    observed.error().code == ErrorCode::InvalidContext);
+    }));
     BOOST_CHECK(app->State() == fw::AppState::Created);
     BOOST_CHECK_EQUAL(events, 0);
     BOOST_CHECK(!app->FindComponent<CounterComponent>("other"));
@@ -1575,13 +1635,17 @@ namespace {
  * static_cast 会错位；Borrow 经 CoComponent* 调整必须返回正确地址
  * （成员断言读到真实字段而不是 Marker 子对象）。
  */
-struct MarkerBase { virtual ~MarkerBase() = default; std::uint64_t tag = 0xDEAD; };
+struct MarkerBase {
+    virtual ~MarkerBase() = default;
+    std::uint64_t tag = 0xDEAD;
+};
 class MiComponent final : public MarkerBase, public fw::CoComponent {
 public:
     struct Options {};
     explicit MiComponent(fw::detail::ConstructKey k, Options)
         : fw::CoComponent(k) {}
     int value = 77;
+
 protected:
     ~MiComponent() noexcept override = default;
     friend class fw::detail::Registry;
@@ -1597,7 +1661,7 @@ public:
     explicit StopCtlComponent(fw::detail::ConstructKey k, Options)
         : fw::CoComponent(k) {}
 
-    static std::mutex              s_mtx;
+    static std::mutex s_mtx;
     /**
      * "stop"/"release" 次序
      */
@@ -1606,7 +1670,7 @@ public:
      * OnStop 返回错误
      */
     static std::atomic<bool> s_fail;
-    static std::atomic<int>        s_stop_calls;
+    static std::atomic<int> s_stop_calls;
 
 protected:
     ~StopCtlComponent() noexcept override = default;
@@ -1624,10 +1688,10 @@ protected:
     friend class fw::detail::Registry;
 };
 
-std::mutex               StopCtlComponent::s_mtx;
+std::mutex StopCtlComponent::s_mtx;
 std::vector<std::string> StopCtlComponent::s_seq;
-std::atomic<bool>        StopCtlComponent::s_fail{false};
-std::atomic<int>         StopCtlComponent::s_stop_calls{0};
+std::atomic<bool> StopCtlComponent::s_fail{false};
+std::atomic<int> StopCtlComponent::s_stop_calls{0};
 
 /**
  * 受控 borrow 持有者：OnStop 排空顺序探针在测试协程外持 lease。
@@ -1686,7 +1750,8 @@ CO_TEST_CASE(stop_waits_borrow_release_before_onstop) {
                 std::chrono::seconds(3)));
         BOOST_CHECK(r);
         stop_done.store(true);
-    }, sub);
+    },
+                                     sub);
     BOOST_REQUIRE(sub);
 
     /**
@@ -1703,7 +1768,8 @@ CO_TEST_CASE(stop_waits_borrow_release_before_onstop) {
      */
     borrow_opt.reset();
 
-    for (int i = 0; i < 300 && !stop_done.load(); ++i) bbtco_sleep(10);
+    for (int i = 0; i < 300 && !stop_done.load(); ++i)
+        bbtco_sleep(10);
     BOOST_CHECK(stop_done.load());
     BOOST_CHECK(app->State() == fw::AppState::Stopped);
     {
@@ -1744,7 +1810,8 @@ CO_TEST_CASE(onstop_failure_retains_owner_then_settles) {
     BOOST_CHECK(h.value().IsValid());
     bool saw_onstop_fail = false;
     for (const auto& f : app->LifecycleFailures())
-        if (f.phase == "onstop") saw_onstop_fail = true;
+        if (f.phase == "onstop")
+            saw_onstop_fail = true;
     BOOST_CHECK(saw_onstop_fail);
 
     /**
@@ -1832,8 +1899,7 @@ CO_TEST_CASE(cross_app_subject_handle_rejected) {
     auto bad = bbt_co_await app_a->CoInstallComponent<CounterComponent>(
         "scoped", opts, placement);
     BOOST_CHECK(!bad && bad.error().code == ErrorCode::InvalidArgument);
-    BOOST_CHECK(app_a->FindComponent<CounterComponent>("scoped").error()
-                    .code == ErrorCode::NotFound);
+    BOOST_CHECK(app_a->FindComponent<CounterComponent>("scoped").error().code == ErrorCode::NotFound);
 }
 
 /**
@@ -2014,7 +2080,7 @@ CO_TEST_CASE(observer_auto_revoke_with_inflight_callback) {
     auto uninstall = std::async(std::launch::async, [&] {
         return RunInManagedCoroutine([&] {
             auto r = bbt_co_await
-                app->CoUninstallComponent<CounterComponent>("observer_obj");
+                         app->CoUninstallComponent<CounterComponent>("observer_obj");
             (void)r;
         });
     });
@@ -2053,9 +2119,9 @@ CO_TEST_CASE(service_stop_not_blocked_by_other_subject_borrow) {
     auto svc_b = app->FindService("echo2");
     BOOST_REQUIRE(svc_a && svc_b);
     auto h_a = bbt_co_await
-        app->CoBindComponent<CounterComponent>(svc_a.value(), "shared");
+                   app->CoBindComponent<CounterComponent>(svc_a.value(), "shared");
     auto h_b = bbt_co_await
-        app->CoBindComponent<CounterComponent>(svc_b.value(), "shared");
+                   app->CoBindComponent<CounterComponent>(svc_b.value(), "shared");
     BOOST_REQUIRE(h_a && h_b);
 
     /**
@@ -2100,7 +2166,8 @@ public:
 protected:
     ~DrainRetryService() noexcept override { ++s_destroyed; }
     result<void> OnStop() override {
-        ++s_onstop; return result<void>::ok();
+        ++s_onstop;
+        return result<void>::ok();
     }
     void OnUninstall() override { ++s_onuninstall; }
     friend class fw::detail::Registry;
@@ -2152,7 +2219,7 @@ CO_TEST_CASE(service_uninstall_retry_keeps_waiting_own_borrow) {
      * 首次：本 subject 的 borrow 未归还 → TimedOut，hook 不推进。
      */
     const auto first = bbt_co_await
-        app->CoUninstallService<DrainRetryService>(short_life());
+                           app->CoUninstallService<DrainRetryService>(short_life());
     BOOST_CHECK(!first);
     BOOST_CHECK(first.error().code == ErrorCode::TimedOut);
     BOOST_CHECK(DrainRetryService::s_onstop.load() == 0);
@@ -2167,7 +2234,7 @@ CO_TEST_CASE(service_uninstall_retry_keeps_waiting_own_borrow) {
      * 重试（borrow 仍持有）：必须续等既有 retiring 边并再次 TimedOut。
      */
     const auto second = bbt_co_await
-        app->CoUninstallService<DrainRetryService>(short_life());
+                            app->CoUninstallService<DrainRetryService>(short_life());
     BOOST_CHECK(!second);
     BOOST_CHECK(second.error().code == ErrorCode::TimedOut);
     BOOST_CHECK(DrainRetryService::s_onstop.load() == 0);
@@ -2188,15 +2255,17 @@ CO_TEST_CASE(service_uninstall_retry_keeps_waiting_own_borrow) {
     BOOST_CHECK(app->FindService("drain_retry").error().code ==
                 ErrorCode::NotFound);
     {
-        auto reg = app->RegistryForTest();
+        auto reg = fw::RegistryForTest(*app);
         std::lock_guard<std::mutex> lk(reg->Mutex());
         std::size_t residual = 0;
         for (const auto& cid :
              reg->ListIdsByKindLocked(fw::ObjectKind::Component)) {
             const auto* x = reg->FindEntryLocked(cid);
-            if (!x) continue;
+            if (!x)
+                continue;
             for (const auto& b : x->bindings)
-                if (b.subject_id == id_a && b.retiring) ++residual;
+                if (b.subject_id == id_a && b.retiring)
+                    ++residual;
         }
         BOOST_CHECK_EQUAL(residual, 0u);
     }
@@ -2216,11 +2285,13 @@ public:
         : fw::CoService<CounterComponent>(k) {}
     static std::shared_ptr<CoGate> s_gate;
     static std::atomic<int> s_onstop_entered;
+
 protected:
     ~ClosingService() noexcept override = default;
     result<void> OnStop() override {
         ++s_onstop_entered;
-        if (s_gate) s_gate->Wait();
+        if (s_gate)
+            s_gate->Wait();
         return result<void>::ok();
     }
     friend class fw::detail::Registry;
@@ -2248,7 +2319,7 @@ CO_TEST_CASE(bind_rejected_when_subject_closing) {
     auto uninstall = std::async(std::launch::async, [&] {
         return RunInManagedCoroutine([&] {
             auto r = bbt_co_await
-                app->CoUninstallService<ClosingService>();
+                         app->CoUninstallService<ClosingService>();
             (void)r;
         });
     });
@@ -2261,7 +2332,7 @@ CO_TEST_CASE(bind_rejected_when_subject_closing) {
     }
     BOOST_REQUIRE(ClosingService::s_onstop_entered.load() >= 1);
     const auto during = bbt_co_await
-        app->CoBindComponent<CounterComponent>(svc.value(), "c");
+                            app->CoBindComponent<CounterComponent>(svc.value(), "c");
     BOOST_CHECK(!during && during.error().code == ErrorCode::Closed);
     ClosingService::s_gate->Open();
     BOOST_REQUIRE(uninstall.wait_for(std::chrono::seconds(4)) ==
@@ -2270,15 +2341,17 @@ CO_TEST_CASE(bind_rejected_when_subject_closing) {
     /**
      * subject 已移除：组件上不应残留指向已销毁 service 的 active 边。
      */
-    auto reg = app->RegistryForTest();
+    auto reg = fw::RegistryForTest(*app);
     std::lock_guard<std::mutex> lk(reg->Mutex());
     bool dangling = false;
     for (const auto& cid :
          reg->ListIdsByKindLocked(fw::ObjectKind::Component)) {
         const auto* x = reg->FindEntryLocked(cid);
-        if (!x) continue;
+        if (!x)
+            continue;
         for (const auto& b : x->bindings)
-            if (b.subject_id == svc.value().Id() && b.active) dangling = true;
+            if (b.subject_id == svc.value().Id() && !b.retiring)
+                dangling = true;
     }
     BOOST_CHECK(!dangling);
     ClosingService::s_gate.reset();
@@ -2292,8 +2365,7 @@ CO_TEST_CASE(bind_rejected_when_subject_closing) {
 CO_TEST_CASE(costop_removes_actor_type_entry) {
     auto app = fw::CoApp::Create(MakeAppOptions());
     BOOST_REQUIRE(bbt_co_await app->CoInstallActor<WorkerActor>(
-        fw::ActorOptions{}.SetMaxActors(4).SetMailboxCapacity(8)
-            .SetAggregateQueueCapacity(64)));
+        fw::ActorOptions{}.SetMaxActors(4).SetMailboxCapacity(8).SetAggregateQueueCapacity(64)));
     auto actor_h = app->FindActor(fw::ActorId{"worker", ""});
     BOOST_REQUIRE(actor_h);
 
@@ -2310,14 +2382,15 @@ CO_TEST_CASE(costop_removes_actor_type_entry) {
     /**
      * type entry 已收口：Registry 中不再保留该 actor 登记条目。
      */
-    auto reg = app->RegistryForTest();
+    auto reg = fw::RegistryForTest(*app);
     {
         std::lock_guard<std::mutex> lk(reg->Mutex());
         bool found = false;
         for (const auto& id :
              reg->ListIdsByKindLocked(fw::ObjectKind::Actor)) {
             const auto* e = reg->FindEntryLocked(id);
-            if (e && e->type_name == "worker") found = true;
+            if (e && e->type_name == "worker")
+                found = true;
         }
         BOOST_CHECK(!found);
     }
@@ -2329,13 +2402,208 @@ CO_TEST_CASE(costop_removes_actor_type_entry) {
 }
 
 /**
+ * P1（契约锁定）：OnBindingChanged 抛错不改变绑定结果——通知抛错仍可
+ * 借，绑定保持 active，异常只记 LifecycleFailure（binding_changed_hook），
+ * 不回滚、不外泄。
+ */
+class BindingThrowService final : public fw::CoService<CounterComponent> {
+public:
+    static constexpr std::string_view kServiceName = "binding_throw";
+    explicit BindingThrowService(fw::detail::ConstructKey k)
+        : fw::CoService<CounterComponent>(k) {}
+
+    static std::atomic<int> s_bind_hooks;
+    static std::atomic<int> s_unbind_hooks;
+
+protected:
+    ~BindingThrowService() noexcept override = default;
+    void OnBindingChanged(const fw::BindingEvent& ev) override {
+        if (ev.bound) {
+            ++s_bind_hooks;
+            throw std::runtime_error("binding hook probe");
+        }
+        ++s_unbind_hooks;
+    }
+    friend class fw::detail::Registry;
+};
+std::atomic<int> BindingThrowService::s_bind_hooks{0};
+std::atomic<int> BindingThrowService::s_unbind_hooks{0};
+
+CO_TEST_CASE(bind_hook_throw_records_failure_and_still_borrowable) {
+    BindingThrowService::s_bind_hooks = 0;
+    BindingThrowService::s_unbind_hooks = 0;
+    auto app = fw::CoApp::Create(MakeAppOptions());
+    CounterComponent::Options opts;
+    opts.initial = 3;
+    BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>(
+        "counter", opts));
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<BindingThrowService>(
+        fw::ServiceOptions{}.SetMaxInflight(4)));
+    BOOST_REQUIRE(bbt_co_await app->CoStart());
+    auto svc = app->FindService("binding_throw");
+    BOOST_REQUIRE(svc);
+
+    const auto bind = bbt_co_await
+                          app->CoBindComponent<CounterComponent>(svc.value(), "counter");
+    /**
+     * hook 确已执行且异常未外泄：bind 正常返回成功。
+     */
+    BOOST_REQUIRE(bind);
+    BOOST_CHECK_EQUAL(BindingThrowService::s_bind_hooks.load(), 1);
+    /**
+     * 绑定仍可借：借用手感与未抛错一致。
+     */
+    {
+        auto borrow = bind.value().Borrow();
+        BOOST_REQUIRE(borrow);
+        borrow.value().Get().Inc();
+        BOOST_CHECK(borrow.value().Get().Get() == 4);
+    }
+    /**
+     * 抛错只记诊断：operation=bind、phase=binding_changed_hook。
+     */
+    const auto failures = app->LifecycleFailures();
+    BOOST_REQUIRE_EQUAL(failures.size(), 1u);
+    BOOST_CHECK_EQUAL(failures.front().operation, "bind");
+    BOOST_CHECK_EQUAL(failures.front().phase, "binding_changed_hook");
+    BOOST_CHECK(failures.front().code == ErrorCode::InternalError);
+}
+
+/**
+ * P1（契约锁定）：解绑通知在存量借用归还后送达——borrow 未归还时解绑
+ * 超时且 bound=false 通知不得提前送达；归还后重试收口并恰好通知一次。
+ */
+CO_TEST_CASE(unbind_notification_after_borrow_drain) {
+    ProbeService::s_unbind_events = 0;
+    auto app = fw::CoApp::Create(MakeAppOptions());
+    BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>(
+        "counter", CounterComponent::Options{}));
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<ProbeService>(
+        fw::ServiceOptions{}.SetMaxInflight(4)));
+    BOOST_REQUIRE(bbt_co_await app->CoStart());
+    auto svc = app->FindService("probe");
+    BOOST_REQUIRE(svc);
+    const auto bind = bbt_co_await
+                          app->CoBindComponent<CounterComponent>(svc.value(), "counter");
+    BOOST_REQUIRE(bind);
+
+    std::optional<fw::ComponentBorrow<CounterComponent>> held;
+    {
+        auto b = bind.value().Borrow();
+        BOOST_REQUIRE(b);
+        held.emplace(std::move(b.value()));
+    }
+
+    const auto short_life = [] {
+        return fw::LifecycleOptions{}.SetDeadline(
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(300));
+    };
+    /**
+     * 存量借用未归还：解绑 TimedOut，通知不得先于排空送达。
+     */
+    const auto first = bbt_co_await
+                           app->CoUnbindComponent<CounterComponent>(svc.value(), "counter", {},
+                                                                    short_life());
+    BOOST_REQUIRE(!first);
+    BOOST_CHECK(first.error().code == ErrorCode::TimedOut);
+    BOOST_CHECK_EQUAL(ProbeService::s_unbind_events.load(), 0);
+    /**
+     * 超时留痕：borrow_drain 相位记 LifecycleFailure，retiring 边保留。
+     */
+    {
+        const auto failures = app->LifecycleFailures();
+        BOOST_REQUIRE_EQUAL(failures.size(), 1u);
+        BOOST_CHECK_EQUAL(failures.front().operation, "unbind");
+        BOOST_CHECK_EQUAL(failures.front().phase, "borrow_drain");
+        BOOST_CHECK(failures.front().code == ErrorCode::TimedOut);
+    }
+    /**
+     * 归还后重试：排空完成才送达，且恰好一次。
+     */
+    held.reset();
+    const auto second = bbt_co_await
+                            app->CoUnbindComponent<CounterComponent>(svc.value(), "counter", {},
+                                                                     fw::LifecycleOptions{}.SetDeadline(
+                                                                         std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    BOOST_REQUIRE(second);
+    BOOST_CHECK_EQUAL(ProbeService::s_unbind_events.load(), 1);
+}
+
+/**
+ * 借用与订阅的最后持有者换成普通线程：受管任务取出 lease/令牌后移交
+ * native 线程析构，Registry 的归还（ReleaseBorrow）与撤销（RevokeObserver）
+ * 路径不要求 Co 域——借用计数归零后解绑不再等排空，撤销同时抹除订阅记录
+ * 并释放回调闭包。
+ */
+CO_TEST_CASE(borrow_and_observer_release_on_native_thread) {
+    auto app = fw::CoApp::Create(MakeAppOptions());
+    BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<CounterComponent>(
+        "counter", CounterComponent::Options{}));
+    BOOST_REQUIRE(bbt_co_await app->CoInstallService<EchoService>(
+        fw::ServiceOptions{}.SetMaxInflight(1)));
+    BOOST_REQUIRE(bbt_co_await app->CoStart());
+    auto svc_h = app->FindService("echo");
+    BOOST_REQUIRE(svc_h);
+    const auto bind = bbt_co_await
+                          app->CoBindComponent<CounterComponent>(svc_h.value(), "counter");
+    BOOST_REQUIRE(bind);
+    /**
+     * 兼容窗口：旧成员入口仍返回同一 Registry，未随测试迁移失效。
+     */
+    BOOST_CHECK(app->RegistryForTest() == fw::RegistryForTest(*app));
+
+    auto probe = std::make_shared<int>(7);
+    std::weak_ptr<int> weak_probe = probe;
+    auto borrow = bind.value().Borrow();
+    BOOST_REQUIRE(borrow);
+    auto token = bbt_co_await app->CoObserve(
+        app->Handle(), svc_h.value(),
+        [probe](const fw::ObjectStateEvent&) { (void)*probe; });
+    BOOST_REQUIRE(token);
+
+    /**
+     * 移交：线程内读取组件、确认订阅生效，随后在 native 线程显式析构两个
+     * RAII 值——释放发生的执行域就是本用例要锁定的边界。
+     */
+    std::optional<fw::ComponentBorrow<CounterComponent>> cross_borrow{
+        std::move(borrow.value())};
+    std::optional<fw::ObserverToken> cross_token{std::move(token.value())};
+    std::atomic<int> seen{-1};
+    std::atomic<bool> active{false};
+    std::thread native(
+        [b = std::move(cross_borrow), t = std::move(cross_token), &seen, &active]() mutable {
+            seen.store(b->Get().Get(), std::memory_order_release);
+            active.store(t->IsActive(), std::memory_order_release);
+            b.reset();
+            t.reset();
+        });
+    native.join();
+    BOOST_CHECK_EQUAL(seen.load(), 0);
+    BOOST_CHECK(active.load());
+
+    /**
+     * 归还已记账：解绑立即收口（若 native 释放未计入，解绑会超时）；
+     * 撤销已抹除记录，回调闭包随记录释放。
+     */
+    probe.reset();
+    BOOST_CHECK(weak_probe.expired());
+    BOOST_REQUIRE(bbt_co_await app->CoUnbindComponent<CounterComponent>(
+        svc_h.value(), "counter"));
+    auto closed = bind.value().Borrow();
+    BOOST_CHECK(!closed && closed.error().code == ErrorCode::Closed);
+    BOOST_REQUIRE(bbt_co_await app->CoStop());
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
+}
+
+/**
  * ---- 编译期负向断言（ConstructKey 不可聚合构造）----
  * C++17 下 `ConstructKey() = default` 首声明会使空类保持 aggregate；
  * user-provided `ConstructKey() {}` 关闭该绕过——静态断言钉死性质。
  */
 static_assert(!std::is_aggregate_v<fw::detail::ConstructKey>,
-    "ConstructKey 必须不是 aggregate（业务不得 ConstructKey{} 绕过）");
+              "ConstructKey 必须不是 aggregate（业务不得 ConstructKey{} 绕过）");
 static_assert(!std::is_default_constructible_v<fw::detail::ConstructKey>,
-    "ConstructKey 默认构造私有，业务不可直接构造");
+              "ConstructKey 默认构造私有，业务不可直接构造");
 
 BOOST_AUTO_TEST_SUITE_END()

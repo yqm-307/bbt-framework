@@ -17,33 +17,33 @@ namespace bbt::framework {
 result<void> ServiceOptions::Validate() const {
     if (m_max_inflight == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ServiceOptions: max_inflight must be a finite positive value"));
-    if (m_execution == ExecutionPolicy::ActorSerial) {
+                                           "ServiceOptions: max_inflight must be a finite positive value"));
+    if (m_execution == ExecutionPolicy::SerialByKey) {
         if (m_max_serial_keys == 0)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ServiceOptions: ActorSerial requires max_serial_keys > 0"));
+                                               "ServiceOptions: ActorSerial requires max_serial_keys > 0"));
         if (m_serial_queue_capacity == 0)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ServiceOptions: ActorSerial requires serial_queue_capacity > 0"));
+                                               "ServiceOptions: ActorSerial requires serial_queue_capacity > 0"));
     } else {
         if (m_max_serial_keys != 0 || m_serial_queue_capacity != 0)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ServiceOptions: Concurrent must not create serial queues"));
+                                               "ServiceOptions: Concurrent must not create serial queues"));
     }
     if (m_ordered_ingress.enabled) {
-        if (m_execution != ExecutionPolicy::ActorSerial)
+        if (m_execution != ExecutionPolicy::SerialByKey)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ServiceOptions: ordered_ingress only allowed with ActorSerial"));
+                                               "ServiceOptions: ordered_ingress only allowed with ActorSerial"));
         if (m_ordered_ingress.max_ordered_streams == 0 ||
             m_ordered_ingress.max_cached_results == 0 ||
             m_ordered_ingress.max_cached_result_bytes == 0)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "ServiceOptions: ordered_ingress limits must be finite positive values"));
+                                               "ServiceOptions: ordered_ingress limits must be finite positive values"));
     } else if (m_ordered_ingress.max_ordered_streams != 0 ||
                m_ordered_ingress.max_cached_results != 0 ||
                m_ordered_ingress.max_cached_result_bytes != 0) {
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ServiceOptions: disabled ordered_ingress requires all three limits to be 0"));
+                                           "ServiceOptions: disabled ordered_ingress requires all three limits to be 0"));
     }
     return result<void>::ok();
 }
@@ -51,27 +51,13 @@ result<void> ServiceOptions::Validate() const {
 result<void> ActorOptions::Validate() const {
     if (m_max_actors == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorOptions: max_actors must be a finite positive value"));
+                                           "ActorOptions: max_actors must be a finite positive value"));
     if (m_mailbox_capacity == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorOptions: mailbox_capacity must be a finite positive value"));
+                                           "ActorOptions: mailbox_capacity must be a finite positive value"));
     if (m_aggregate_queue_capacity == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "ActorOptions: aggregate_queue_capacity must be a finite positive value"));
-    return result<void>::ok();
-}
-
-result<void> AppOptions::Validate() const {
-    if (m_max_objects == 0 || m_max_bindings == 0 || m_max_observers == 0 ||
-        m_observer_queue_capacity == 0)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "AppOptions: SetLimits requires all four limits to be positive"));
-    if (m_shutdown_budget.count() <= 0)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "AppOptions: SetShutdownBudget must be a finite positive value"));
-    if (m_lifecycle_budget.count() <= 0)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "AppOptions: SetLifecycleBudget must be a finite positive value"));
+                                           "ActorOptions: aggregate_queue_capacity must be a finite positive value"));
     return result<void>::ok();
 }
 
@@ -81,7 +67,8 @@ result<void> AppOptions::Validate() const {
 
 bool ObjectHandle::IsValid() const noexcept {
     auto reg = m_reg.lock();
-    if (!reg) return false;
+    if (!reg)
+        return false;
     return reg->HandleValid(*this);
 }
 
@@ -89,7 +76,7 @@ result<ObjectInfo> ObjectHandle::Info() const {
     auto reg = m_reg.lock();
     if (!reg)
         return result<ObjectInfo>::err(MakeError(ErrorCode::Closed,
-            "ObjectHandle: registry closed"));
+                                                 "ObjectHandle: registry closed"));
     return reg->Info(*this);
 }
 
@@ -97,7 +84,7 @@ result<MailBox> ObjectHandle::GetMailBox() const {
     auto reg = m_reg.lock();
     if (!reg)
         return result<MailBox>::err(MakeError(ErrorCode::Closed,
-            "ObjectHandle: registry closed"));
+                                              "ObjectHandle: registry closed"));
     return reg->MailBoxOf(*this);
 }
 
@@ -106,17 +93,21 @@ result<MailBox> ObjectHandle::GetMailBox() const {
  */
 
 void ObserverToken::Revoke() noexcept {
-    if (m_id == 0) return;
+    if (m_id == 0)
+        return;
     auto reg = m_reg.lock();
     const std::uint64_t id = m_id;
     m_id = 0;
-    if (reg) reg->RevokeObserver(id);
+    if (reg)
+        reg->RevokeObserver(id);
 }
 
 bool ObserverToken::IsActive() const noexcept {
-    if (m_id == 0) return false;
+    if (m_id == 0)
+        return false;
     auto reg = m_reg.lock();
-    if (!reg) return false;
+    if (!reg)
+        return false;
     return reg->ObserverActive(m_id);
 }
 
@@ -144,12 +135,12 @@ result<void> AppObjectAddress::Validate() const {
     case Kind::Service:
         if (m_type.empty())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "AppObjectAddress: service name empty"));
+                                               "AppObjectAddress: service name empty"));
         break;
     case Kind::Actor:
         if (m_type.empty() || m_key.empty())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "AppObjectAddress: actor type/key empty"));
+                                               "AppObjectAddress: actor type/key empty"));
         break;
     }
     return result<void>::ok();

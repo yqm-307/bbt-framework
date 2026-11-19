@@ -7,9 +7,11 @@ add_library(bbt_framework STATIC
     actor/ActorMailbox.cc
     actor/OrderedSession.cc
     actor/OrderedIngress.cc
+    host/AppOptions.cc
     host/AppRuntimeState.cc
     host/CallOptionsAdapter.cc
     host/CoApp.cc
+    host/CoAppNetwork.cc
     host/CoServiceCall.cc
     host/DynamicRouteTable.cc
     host/InboundDispatcher.cc

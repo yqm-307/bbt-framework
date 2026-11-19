@@ -1,13 +1,8 @@
 #pragma once
 /**
- * RPC 方法表（机器面，internal/）。
- * 业务用 fw::Method / fw::ActorMethodAt / fw::RpcMethods 声明方法清单
- * （声明糖见公共头 RpcMethods.hpp，业务在 CoService<...>::kRpcMethods
- * 上书写），本头把声明展开为类型擦除的分发闭包：handler 签名统一
- * CoRpcResp(CoRpcReq)，负载经位置参数 codec（CoRpc.hpp）；actor key
- * 取自位置参数下标（ActorMethodAt），不再有手写提取 lambda。
- * 非法签名走模板推导失败的编译错误；重复/空方法名在方法表构建期抛
- * std::invalid_argument，不等首个请求才失败。
+ * @brief 把服务声明的 RPC 方法注册为可调用的处理函数。
+ * ActorMethodAt 从指定位置参数取 key。签名不受支持会编译失败；
+ * 方法名为空或重复会在构建方法表时抛 std::invalid_argument。
  */
 
 #include <cstdint>
@@ -33,33 +28,7 @@
 namespace bbt::framework {
 
 /**
- * ---- 成员函数指针 traits：提取 request/reply 类型与编解码绑定 ----
- * 主模板只声明不实现；不受支持的签名实例化即编译错误。
- */
-
-template <class MemberPtr>
-struct rpc_traits;
-
-template <class Service>
-struct rpc_traits<CoRpcResp (Service::*)(CoRpcReq)> {
-    using service_type = Service;
-    using request_type = CoRpcReq;
-    using reply_type = CoRpcResp;
-    static constexpr bool kCoRpc = true;
-};
-
-template <class Service>
-struct rpc_traits<CoRpcResp (Service::*)(const CoRpcReq&)> {
-    using service_type = Service;
-    using request_type = CoRpcReq;
-    using reply_type = CoRpcResp;
-    static constexpr bool kCoRpc = true;
-};
-
-/**
- * ---- 单方法描述：类型擦除后的分发与 key 提取闭包 ----
- * invoke：解码负载 → 在传入的真实 Service 实例上调用成员指针 → 编码回复。
- * extract_key：仅 ActorMethod 安装，从解码后的 Request 声明字段取 key。
+ * invoke 调用实际服务对象的方法；需要按 key 派发时，extract_key 从请求中取 key。
  */
 
 struct RpcMethod {
@@ -68,11 +37,10 @@ struct RpcMethod {
     using KeyExtractor = std::function<result<std::string>(
         const std::vector<std::uint8_t>&)>;
 
-    std::string  name;
-    std::string  request_schema;
-    std::string  response_schema;
-    bool         actor_keyed = false;
-    Invoker      invoke;
+    std::string name;
+    std::string request_schema;
+    std::string response_schema;
+    Invoker invoke;
     KeyExtractor extract_key;
 };
 
@@ -81,201 +49,25 @@ struct RpcMethod {
  */
 class RpcMethodTable {
 public:
-    const RpcMethod* find(std::string_view name) const noexcept {
-        for (const auto& m : m_methods)
-            if (m.name == name)
-                return &m;
-        return nullptr;
-    }
+    const RpcMethod* find(std::string_view name) const noexcept;
     const std::vector<RpcMethod>& methods() const noexcept { return m_methods; }
     std::size_t size() const noexcept { return m_methods.size(); }
 
     /**
      * 构建期追加：空名/重名 → std::invalid_argument（启动期暴露）。
      */
-    void Add(RpcMethod m) {
-        if (m.name.empty())
-            throw std::invalid_argument("method table: empty method name");
-        if (find(m.name) != nullptr)
-            throw std::invalid_argument(
-                "method table: duplicate method '" + m.name + "'");
-        m_methods.push_back(std::move(m));
-    }
+    void Add(RpcMethod m);
+
 private:
     std::vector<RpcMethod> m_methods;
 };
 
-namespace detail {
-
-/**
- * 声明条目类型（MethodDecl/PositionalActorMethodDecl/MethodList）在公共头
- * RpcMethods.hpp 定义——业务经 fw::Method/fw::ActorMethodAt/fw::RpcMethods
- * 构造，本头只消费已声明的清单。
- */
-
-/**
- * ---- key 字段值 → 字符串（声明式 key 的换算规则） ----
- */
-
-template <class K>
-result<std::string> ActorKeyToString(const K& key) {
-    using D = std::decay_t<K>;
-    std::string s;
-    if constexpr (std::is_same_v<D, std::string>) {
-        s = key;
-    } else if constexpr (std::is_convertible_v<const K&,
-                                             std::string_view>) {
-        s = std::string(std::string_view(key));
-    } else if constexpr (std::is_integral_v<D> &&
-                         !std::is_same_v<D, bool>) {
-        s = std::to_string(key);
-    } else {
-        static_assert(sizeof(D) == 0,
-            "ActorMethod: key field type must be std::string, string_view, or an integer type");
-    }
-    if (s.empty())
-        return result<std::string>::err(MakeError(
-            ErrorCode::InvalidArgument, "actor key field is empty"));
-    return result<std::string>::ok(std::move(s));
-}
-
-/**
- * ---- 分发闭包构造 ----
- */
-
-template <class MemberPtr>
-RpcMethod::Invoker MakeCoRpcInvoker(MemberPtr handler) {
-    using Traits = rpc_traits<MemberPtr>;
-    using Service = typename Traits::service_type;
-    static_assert(std::is_base_of_v<CoServiceBase, Service>,
-                  "RpcMethods: Service must derive from CoService<...>");
-    return [handler](CoServiceBase& base,
-                     const std::vector<std::uint8_t>& payload)
-        -> result<std::vector<std::uint8_t>> {
-        try {
-            CoRpcResp resp = (static_cast<Service&>(base).*handler)(
-                CoRpcReq{payload});
-            if (!resp.ok())
-                return result<std::vector<std::uint8_t>>::err(resp.error());
-            return result<std::vector<std::uint8_t>>::ok(resp.payload());
-        } catch (...) {
-            return result<std::vector<std::uint8_t>>::err(MakeError(
-                ErrorCode::InternalError, "rpc handler threw"));
-        }
-    };
-}
-
-template <class MemberPtr>
-RpcMethod::Invoker SelectInvoker(MemberPtr handler) {
-    using Traits = rpc_traits<MemberPtr>;
-    static_assert(Traits::kCoRpc,
-        "RpcMethods: handler signature must be CoRpcResp(CoRpcReq)");
-    return MakeCoRpcInvoker(handler);
-}
-
-template <class Key, std::size_t Index>
-RpcMethod::KeyExtractor MakePositionalKeyExtractor() {
-    return [](const std::vector<std::uint8_t>& payload)
-        -> result<std::string> {
-        auto decoded = bbt::infra::rpc::DecodeAt<Key>(payload, Index);
-        if (!decoded)
-            return result<std::string>::err(std::move(decoded.error()));
-        try {
-            return ActorKeyToString(decoded.value());
-        } catch (...) {
-            return result<std::string>::err(MakeError(
-                ErrorCode::InternalError, "actor key extraction threw"));
-        }
-    };
-}
-
-/**
- * ---- 声明条目 → RpcMethod 展开 ----
- */
-
-template <class Decl>
-struct MethodDeclBuilder;
-
-template <auto Ptr>
-struct MethodDeclBuilder<MethodDecl<Ptr>> {
-    static RpcMethod Build(const MethodDecl<Ptr>& d) {
-        using Traits = rpc_traits<decltype(Ptr)>;
-        RpcMethod m;
-        m.name = d.name;
-        static_assert(Traits::kCoRpc,
-            "RpcMethods: handler signature must be CoRpcResp(CoRpcReq)");
-        m.request_schema = std::string(kCoRpcPositionalSchema);
-        m.response_schema = std::string(kCoRpcPositionalSchema);
-        m.actor_keyed = false;
-        m.invoke          = SelectInvoker(Ptr);
-        return m;
-    }
-};
-
-template <auto Ptr, class Key, std::size_t Index>
-struct MethodDeclBuilder<PositionalActorMethodDecl<Ptr, Key, Index>> {
-    static RpcMethod Build(
-        const PositionalActorMethodDecl<Ptr, Key, Index>& d) {
-        using Traits = rpc_traits<decltype(Ptr)>;
-        static_assert(Traits::kCoRpc,
-                      "ActorMethodAt requires a CoRpcReq/CoRpcResp handler");
-        RpcMethod m;
-        m.name            = d.name;
-        m.request_schema  = std::string(kCoRpcPositionalSchema);
-        m.response_schema = std::string(kCoRpcPositionalSchema);
-        m.actor_keyed     = true;
-        m.invoke          = SelectInvoker(Ptr);
-        m.extract_key     = MakePositionalKeyExtractor<Key, Index>();
-        return m;
-    }
-};
-
-/**
- * proto schema 方法。request/response_schema 从生成 message 的
- * descriptor full_name 推导——.proto 是唯一真源，杜绝手写漂移。本特化只在
- * 业务以真实 protobuf 类型实例化 ProtoMethod 时展开，框架库本体不依赖
- * protobuf 头。
- */
-template <auto Ptr, class Req, class Resp>
-struct MethodDeclBuilder<ProtoMethodDecl<Ptr, Req, Resp>> {
-    static RpcMethod Build(const ProtoMethodDecl<Ptr, Req, Resp>& d) {
-        using Traits = rpc_traits<decltype(Ptr)>;
-        static_assert(Traits::kCoRpc,
-                      "ProtoMethod requires a CoRpcReq/CoRpcResp handler");
-        RpcMethod m;
-        m.name            = d.name;
-        m.request_schema  = Req::descriptor()->full_name();
-        m.response_schema = Resp::descriptor()->full_name();
-        m.actor_keyed     = false;
-        m.invoke          = SelectInvoker(Ptr);
-        return m;
-    }
-};
-
-} // namespace detail
-
-/**
- * 声明清单 → 方法表；重名/空名在构建期抛 std::invalid_argument。
- */
+/// 展开声明清单。空名和重名在构建期抛 std::invalid_argument。
 template <class... D>
-RpcMethodTable BuildMethodTable(const detail::MethodList<D...>& list) {
-    RpcMethodTable table;
-    std::apply(
-        [&](const auto&... d) {
-            (table.Add(detail::MethodDeclBuilder<
-                     std::decay_t<decltype(d)>>::Build(d)), ...);
-        },
-        list.methods);
-    return table;
-}
+RpcMethodTable BuildMethodTable(const detail::MethodList<D...>& list);
 
 template <class T>
-RpcMethodTable BuildMethodTable() {
-    if constexpr (has_rpc_methods_v<T>)
-        return BuildMethodTable(T::kRpcMethods);
-    else
-        return RpcMethodTable{};
-}
+RpcMethodTable BuildMethodTable();
 
 /**
  * 启动期校验——ActorSerial 服务的每个方法都必须经 ActorMethod 安装
@@ -286,3 +78,5 @@ result<void> ValidateActorKeying(const RpcMethodTable& table,
                                  ExecutionPolicy execution);
 
 } // namespace bbt::framework
+
+#include <bbt/framework/internal/__TMethodTable.hpp>

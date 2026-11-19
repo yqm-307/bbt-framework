@@ -15,38 +15,72 @@
 namespace bbt::framework {
 namespace detail {
 
-/**
- * ---- BindingLease ----
- */
-
 BindingLease::~BindingLease() {
     auto reg = reg_w.lock();
-    if (!reg) return;
+    if (!reg)
+        return;
     reg->ReleaseBorrow(component_id, subject_id, binding_generation);
 }
 
-/**
- * ---- 工具 ----
- */
-
 const char* Registry::KindPrefix(ObjectKind kind) noexcept {
     switch (kind) {
-    case ObjectKind::App:       return "app";
-    case ObjectKind::Service:   return "service";
-    case ObjectKind::Actor:     return "actor";
-    case ObjectKind::Component: return "component";
+    case ObjectKind::App:
+        return "app";
+    case ObjectKind::Service:
+        return "service";
+    case ObjectKind::Actor:
+        return "actor";
+    case ObjectKind::Component:
+        return "component";
     }
     return "object";
 }
 
 ObjectId Registry::NextIdLocked(ObjectKind kind) {
     return std::string(KindPrefix(kind)) + ":" +
-        std::to_string(m_next_id_seq++);
+           std::to_string(m_next_id_seq++);
 }
 
-/**
- * ---- 条目生命周期 ----
- */
+bbt::coroutine::WaitStatus Registry::WaitList::WaitUntilReady(std::mutex& mutex,
+                                                              const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter,
+                                                              const std::function<bool()>& ready, const bbt::coroutine::WaitOptions& options) {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (ready())
+                return bbt::coroutine::WaitStatus::Completed;
+        }
+        const auto status = waiter->WaitWithCallback(options, [&] {
+            bool done;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                m_waiters.push_back(waiter);
+                // 状态可能在协程登记前已变化，登记后须在同一临界区复查。
+                done = ready();
+            }
+            if (done)
+                waiter->Notify();
+            return true;
+        });
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            m_waiters.erase(std::remove(m_waiters.begin(), m_waiters.end(), waiter),
+                            m_waiters.end());
+        }
+        if (status != bbt::coroutine::WaitStatus::Completed)
+            return status;
+    }
+}
+
+void Registry::WaitList::NotifyAll(std::unique_lock<std::mutex> lock,
+                                   std::condition_variable& cv) {
+    decltype(m_waiters) waiters;
+    waiters.swap(m_waiters);
+    lock.unlock();
+    for (const auto& waiter : waiters)
+        waiter->Notify();
+    cv.notify_all();
+}
 
 result<RegistryEntry*> Registry::CreateEntryLocked(
     ObjectKind kind, std::string type_name, std::string name,
@@ -54,18 +88,18 @@ result<RegistryEntry*> Registry::CreateEntryLocked(
     const std::type_info& object_type, const std::shared_ptr<void>& object) {
     if (CountObjectsLocked() >= m_limits.max_objects)
         return result<RegistryEntry*>::err(MakeError(ErrorCode::Overloaded,
-            "registry: object limit reached"));
+                                                     "registry: object limit reached"));
 
     RegistryEntry e;
-    e.id         = NextIdLocked(kind);
+    e.id = NextIdLocked(kind);
     e.generation = m_next_generation++;
-    e.kind       = kind;
-    e.type_name  = std::move(type_name);
-    e.name       = std::move(name);
-    e.scope      = scope;
-    e.owner_id   = std::move(owner_id);
-    e.state      = ObjectState::Created;
-    e.object     = object;
+    e.kind = kind;
+    e.type_name = std::move(type_name);
+    e.name = std::move(name);
+    e.scope = scope;
+    e.owner_id = std::move(owner_id);
+    e.state = ObjectState::Created;
+    e.object = object;
     e.object_type = &object_type;
 
     m_entries.push_back(std::move(e));
@@ -84,13 +118,15 @@ result<RegistryEntry*> Registry::CreateEntryLocked(
 
 RegistryEntry* Registry::FindEntryLocked(std::string_view id) {
     auto it = m_index.find(std::string(id));
-    if (it == m_index.end()) return nullptr;
+    if (it == m_index.end())
+        return nullptr;
     return &m_entries[it->second];
 }
 
 const RegistryEntry* Registry::FindEntryLocked(std::string_view id) const {
     auto it = m_index.find(std::string(id));
-    if (it == m_index.end()) return nullptr;
+    if (it == m_index.end())
+        return nullptr;
     return &m_entries[it->second];
 }
 
@@ -98,11 +134,16 @@ RegistryEntry* Registry::FindComponentLocked(
     ComponentScope scope, const ObjectId& owner_id,
     const std::type_info& type, std::string_view name) {
     for (auto& e : m_entries) {
-        if (e.kind != ObjectKind::Component) continue;
-        if (e.scope != scope) continue;
-        if (e.scope != ComponentScope::App && e.owner_id != owner_id) continue;
-        if (*e.object_type != type) continue;
-        if (e.name != name) continue;
+        if (e.kind != ObjectKind::Component)
+            continue;
+        if (e.scope != scope)
+            continue;
+        if (e.scope != ComponentScope::App && e.owner_id != owner_id)
+            continue;
+        if (*e.object_type != type)
+            continue;
+        if (e.name != name)
+            continue;
         return &e;
     }
     return nullptr;
@@ -111,8 +152,10 @@ RegistryEntry* Registry::FindComponentLocked(
 RegistryEntry* Registry::FindActorLocked(const std::string& type,
                                          const std::string& key) {
     for (auto& e : m_entries) {
-        if (e.kind != ObjectKind::Actor) continue;
-        if (e.type_name == type && e.name == key) return &e;
+        if (e.kind != ObjectKind::Actor)
+            continue;
+        if (e.type_name == type && e.name == key)
+            return &e;
     }
     return nullptr;
 }
@@ -120,15 +163,18 @@ RegistryEntry* Registry::FindActorLocked(const std::string& type,
 RegistryEntry* Registry::FindByTypeNameLocked(ObjectKind kind,
                                               std::string_view type_name) {
     for (auto& e : m_entries) {
-        if (e.kind != kind) continue;
-        if (e.type_name == type_name) return &e;
+        if (e.kind != kind)
+            continue;
+        if (e.type_name == type_name)
+            return &e;
     }
     return nullptr;
 }
 
 std::size_t Registry::CountBindingsLocked() const {
     std::size_t n = 0;
-    for (const auto& e : m_entries) n += e.bindings.size();
+    for (const auto& e : m_entries)
+        n += e.bindings.size();
     return n;
 }
 
@@ -136,14 +182,11 @@ ObjectHandle Registry::MakeHandleLocked(const RegistryEntry& e) {
     return ObjectHandle(weak_from_this(), e.id, e.generation, e.kind);
 }
 
-/**
- * ---- 稳定 id 快照 ----
- */
-
 std::vector<ObjectId> Registry::ListIdsLocked() const {
     std::vector<ObjectId> out;
     out.reserve(m_entries.size());
-    for (const auto& e : m_entries) out.push_back(e.id);
+    for (const auto& e : m_entries)
+        out.push_back(e.id);
     return out;
 }
 
@@ -151,14 +194,16 @@ std::vector<ObjectId> Registry::ListIdsLocked(ObjectKind kind,
                                               ObjectState state) const {
     std::vector<ObjectId> out;
     for (const auto& e : m_entries)
-        if (e.kind == kind && e.state == state) out.push_back(e.id);
+        if (e.kind == kind && e.state == state)
+            out.push_back(e.id);
     return out;
 }
 
 std::vector<ObjectId> Registry::ListIdsByKindLocked(ObjectKind kind) const {
     std::vector<ObjectId> out;
     for (const auto& e : m_entries)
-        if (e.kind == kind) out.push_back(e.id);
+        if (e.kind == kind)
+            out.push_back(e.id);
     return out;
 }
 
@@ -175,7 +220,8 @@ std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
 Registry::SetStateLocked(RegistryEntry& e, ObjectState s,
                          std::optional<ObjectError> err) {
     e.state = s;
-    if (err) e.last_error = std::move(err);
+    if (err)
+        e.last_error = std::move(err);
     ++e.revision;
 
     ObjectStateEvent ev;
@@ -192,13 +238,15 @@ Registry::SetStateLocked(RegistryEntry& e, ObjectState s,
             e.owner_id, e.state, e.last_error, ev.observed_at};
         ai.actor_id = ActorId{e.type_name, e.name};
         auto addr = AddressOf(e);
-        if (addr) ai.mailbox = MailBox(addr.value());
+        if (addr)
+            ai.mailbox = MailBox(addr.value());
         ev.actor = std::move(ai);
     }
 
     std::vector<std::pair<ObserverRecord, ObjectStateEvent>> out;
     for (const auto& [tid, rec] : m_observers) {
-        if (!rec.active) continue;
+        if (!rec.active)
+            continue;
         if (rec.target_id != e.id || rec.target_generation != e.generation)
             continue;
         out.emplace_back(rec, ev);
@@ -226,7 +274,6 @@ void Registry::DispatchEvents(
      * 事件向量本身携带 callback 副本（rec 拷贝）——回调结束即释放该
      * 副本，不让已撤销/已派发闭包多活一轮。
      */
-    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> waiters;
     for (auto& item : events) {
         auto& ev = item.second;
         ObjectObserver callback;
@@ -252,15 +299,11 @@ void Registry::DispatchEvents(
          * 立即归还闭包副本
          */
         callback = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            auto it = m_observers.find(item.first.id);
-            if (it != m_observers.end() && it->second.in_flight > 0)
-                --it->second.in_flight;
-            waiters.swap(m_observer_waiters);
-        }
-        for (const auto& w : waiters) w->Notify();
-        m_cv.notify_all();
+        std::unique_lock<std::mutex> lk(m_mtx);
+        auto it = m_observers.find(item.first.id);
+        if (it != m_observers.end() && it->second.in_flight > 0)
+            --it->second.in_flight;
+        m_observer_waiters.NotifyAll(std::move(lk), m_cv);
     }
 }
 
@@ -270,18 +313,16 @@ void Registry::SetStateAndDispatch(const ObjectId& id, ObjectState s,
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto* e = FindEntryLocked(id);
-        if (!e) return;
+        if (!e)
+            return;
         events = SetStateLocked(*e, s, std::move(err));
     }
     DispatchEvents(std::move(events));
 }
 
-/**
- * ---- 控制面互斥 ----
- */
-
 bool Registry::BeginOpLocked(RegistryEntry& e) {
-    if (e.op_in_progress) return false;
+    if (e.op_in_progress)
+        return false;
     e.op_in_progress = true;
     return true;
 }
@@ -304,11 +345,11 @@ result<ObserverToken> Registry::Observe(const ObjectHandle& observer,
                                         ObjectObserver callback) {
     if (!callback)
         return result<ObserverToken>::err(MakeError(ErrorCode::InvalidArgument,
-            "Observe: null callback"));
+                                                    "Observe: null callback"));
     if (observer.m_reg.lock().get() != this ||
         target.m_reg.lock().get() != this)
         return result<ObserverToken>::err(MakeError(ErrorCode::InvalidArgument,
-            "Observe: handle belongs to another registry"));
+                                                    "Observe: handle belongs to another registry"));
 
     std::lock_guard<std::mutex> lk(m_mtx);
     /**
@@ -316,18 +357,19 @@ result<ObserverToken> Registry::Observe(const ObjectHandle& observer,
      */
     std::size_t active_count = 0;
     for (const auto& [tid, rec] : m_observers)
-        if (rec.active) ++active_count;
+        if (rec.active)
+            ++active_count;
     if (active_count >= m_limits.max_observers)
         return result<ObserverToken>::err(MakeError(ErrorCode::Overloaded,
-            "Observe: observer limit reached"));
+                                                    "Observe: observer limit reached"));
     const RegistryEntry* obs = FindEntryLocked(observer.m_id);
     const RegistryEntry* tgt = FindEntryLocked(target.m_id);
     if (!obs || obs->generation != observer.m_generation)
         return result<ObserverToken>::err(MakeError(ErrorCode::NotFound,
-            "Observe: observer not found or generation stale"));
+                                                    "Observe: observer not found or generation stale"));
     if (!tgt || tgt->generation != target.m_generation)
         return result<ObserverToken>::err(MakeError(ErrorCode::NotFound,
-            "Observe: target not found or generation stale"));
+                                                    "Observe: target not found or generation stale"));
 
     const std::uint64_t tid = m_next_observer_id++;
     ObserverRecord rec;
@@ -350,7 +392,8 @@ void Registry::RevokeObserver(std::uint64_t token_id) noexcept {
     {
         std::unique_lock<std::mutex> lk(m_mtx);
         auto it = m_observers.find(token_id);
-        if (it == m_observers.end()) return;
+        if (it == m_observers.end())
+            return;
         it->second.active = false;
     }
     _WaitObserversDone([this, token_id] {
@@ -370,36 +413,8 @@ void Registry::_WaitObserversDone(
          * 让出后轮询——撤销语义必须到达，不能把错误透成 noexcept 失败。
          */
         auto waiter = bbt::coroutine::sync::CoWaiter::Create();
-        for (;;) {
-            {
-                std::lock_guard<std::mutex> lk(m_mtx);
-                if (done()) return;
-            }
-            /**
-             * 无期限：lease 归零是唯一终态
-             */
-            bbt::coroutine::WaitOptions wait;
-            const auto status = waiter->WaitWithCallback(wait, [&] {
-                bool ready;
-                {
-                    std::lock_guard<std::mutex> lk(m_mtx);
-                    m_observer_waiters.push_back(waiter);
-                    ready = done();
-                }
-                if (ready) waiter->Notify();
-                return true;
-            });
-            {
-                std::lock_guard<std::mutex> lk(m_mtx);
-                m_observer_waiters.erase(
-                    std::remove(m_observer_waiters.begin(),
-                        m_observer_waiters.end(), waiter),
-                    m_observer_waiters.end());
-            }
-            if (status == bbt::coroutine::WaitStatus::Completed) continue;
-            /**
-             * 异常等待通道：让出当前协程并复查，不静默退出。
-             */
+        while (m_observer_waiters.WaitUntilReady(m_mtx, waiter, done, {}) !=
+               bbt::coroutine::WaitStatus::Completed) {
             bbtco_sleep(1);
         }
     } else {
@@ -427,7 +442,8 @@ void Registry::RevokeObserversOf(std::string_view observer_id) {
 
 void Registry::RevokeObserversOfLocked(std::string_view observer_id) {
     for (auto& [tid, rec] : m_observers)
-        if (rec.observer_id == observer_id) rec.active = false;
+        if (rec.observer_id == observer_id)
+            rec.active = false;
 }
 
 void Registry::DrainInactiveObservers() noexcept {
@@ -464,10 +480,6 @@ void Registry::DrainInactiveObservers() noexcept {
     }
 }
 
-/**
- * ---- handle 观察面 ----
- */
-
 bool Registry::OwnsHandle(const ObjectHandle& h) const noexcept {
     return h.m_reg.lock().get() == this;
 }
@@ -477,10 +489,10 @@ result<ObjectInfo> Registry::Info(const ObjectHandle& h) const {
     const RegistryEntry* e = FindEntryLocked(h.m_id);
     if (!e)
         return result<ObjectInfo>::err(MakeError(ErrorCode::NotFound,
-            "ObjectHandle: object destroyed"));
+                                                 "ObjectHandle: object destroyed"));
     if (e->generation != h.m_generation)
         return result<ObjectInfo>::err(MakeError(ErrorCode::InvalidArgument,
-            "ObjectHandle: generation stale"));
+                                                 "ObjectHandle: generation stale"));
     return result<ObjectInfo>::ok(ObjectInfo{
         e->id, e->generation, e->kind, e->type_name, e->name, e->scope,
         e->owner_id, e->state, e->last_error,
@@ -491,8 +503,8 @@ bool Registry::HandleValid(const ObjectHandle& h) const noexcept {
     std::lock_guard<std::mutex> lk(m_mtx);
     const RegistryEntry* e = FindEntryLocked(h.m_id);
     return e != nullptr && e->generation == h.m_generation &&
-        e->state != ObjectState::Destroyed &&
-        e->state != ObjectState::Invalidated;
+           e->state != ObjectState::Destroyed &&
+           e->state != ObjectState::Invalidated;
 }
 
 result<AppObjectAddress> Registry::AddressOf(const RegistryEntry& e) {
@@ -515,18 +527,15 @@ result<MailBox> Registry::MailBoxOf(const ObjectHandle& h) const {
     const RegistryEntry* e = FindEntryLocked(h.m_id);
     if (!e)
         return result<MailBox>::err(MakeError(ErrorCode::NotFound,
-            "GetMailBox: object destroyed"));
+                                              "GetMailBox: object destroyed"));
     if (e->generation != h.m_generation)
         return result<MailBox>::err(MakeError(ErrorCode::InvalidArgument,
-            "GetMailBox: generation stale"));
+                                              "GetMailBox: generation stale"));
     auto addr = AddressOf(*e);
-    if (!addr) return result<MailBox>::err(std::move(addr.error()));
+    if (!addr)
+        return result<MailBox>::err(std::move(addr.error()));
     return result<MailBox>::ok(MailBox(addr.value()));
 }
-
-/**
- * ---- binding / borrow ----
- */
 
 result<void> Registry::BindLocked(RegistryEntry& component_entry,
                                   const RegistryEntry& subject_entry,
@@ -534,10 +543,10 @@ result<void> Registry::BindLocked(RegistryEntry& component_entry,
                                   std::uint64_t* out_generation) {
     if (component_entry.kind != ObjectKind::Component)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "BindComponent: target is not a component"));
+                                           "BindComponent: target is not a component"));
     if (component_entry.gate_closed)
         return result<void>::err(MakeError(ErrorCode::Closed,
-            "BindComponent: component gate closed"));
+                                           "BindComponent: component gate closed"));
     /**
      * subject 同临界区 gate：销毁/收口路径先封 subject（gate_closed /
      * op_in_progress / 关闭语义状态）再擦除其 retiring 边——此后新增的
@@ -552,58 +561,57 @@ result<void> Registry::BindLocked(RegistryEntry& component_entry,
         subject_entry.state == ObjectState::StopIncomplete ||
         subject_entry.state == ObjectState::UninstallIncomplete)
         return result<void>::err(MakeError(ErrorCode::Closed,
-            "BindComponent: subject is closing"));
+                                           "BindComponent: subject is closing"));
     if (CountBindingsLocked() >= m_limits.max_bindings)
         return result<void>::err(MakeError(ErrorCode::Overloaded,
-            "BindComponent: binding limit reached"));
+                                           "BindComponent: binding limit reached"));
     /**
      * 同 (subject, component) 已有 active binding → InvalidArgument。
      */
     for (const auto& b : component_entry.bindings)
         if (b.subject_id == subject_id && !b.retiring)
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                "BindComponent: duplicate binding"));
+                                               "BindComponent: duplicate binding"));
 
     Binding b;
     b.subject_id = subject_id;
     b.generation = m_next_generation++;
-    b.active = true;
     component_entry.bindings.push_back(std::move(b));
     *out_generation = component_entry.bindings.back().generation;
     return result<void>::ok();
 }
 
 result<void> Registry::BeginUnbindLocked(RegistryEntry& component_entry,
-                                       const ObjectId& subject_id,
-                                       std::uint64_t* out_generation) {
+                                         const ObjectId& subject_id,
+                                         std::uint64_t* out_generation) {
     for (auto it = component_entry.bindings.begin();
          it != component_entry.bindings.end(); ++it) {
-        if (it->subject_id != subject_id || it->retiring) continue;
-        it->active = false;
+        if (it->subject_id != subject_id || it->retiring)
+            continue;
         it->retiring = true;
         /**
-         * generation 不推进：retiring 自身即让旧 handle 失效（Borrow 先看
-         * !active||retiring → Closed）；保持原代让在途 BindingLease 的
-         * ReleaseBorrow 仍能按 (subject, gen) 归还计数。
+         * 保持原代让在途 BindingLease 仍能按 (subject, gen) 归还计数。
          */
-        if (out_generation) *out_generation = it->generation;
+        if (out_generation)
+            *out_generation = it->generation;
         /**
          * 边保留至 Unbind 等待方确认排空后 EraseBindingLocked 收口。
          */
         return result<void>::ok();
     }
     return result<void>::err(MakeError(ErrorCode::NotFound,
-        "UnbindComponent: binding not found"));
+                                       "UnbindComponent: binding not found"));
 }
 
 void Registry::ReleaseBorrow(const ObjectId& component_id,
                              const ObjectId& subject_id,
                              std::uint64_t binding_generation) noexcept {
-    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> waiters;
     std::unique_lock<std::mutex> lk(m_mtx);
     RegistryEntry* e = FindEntryLocked(component_id);
-    if (!e) return;
-    if (e->component_borrows > 0) --e->component_borrows;
+    if (!e)
+        return;
+    if (e->component_borrows > 0)
+        --e->component_borrows;
 
     /**
      * 本 binding 计数归还。retiring 边在归零后不自动抹除——「已排空的
@@ -613,124 +621,31 @@ void Registry::ReleaseBorrow(const ObjectId& component_id,
     for (auto& b : e->bindings) {
         if (b.subject_id == subject_id &&
             b.generation == binding_generation) {
-            if (b.borrows > 0) --b.borrows;
+            if (b.borrows > 0)
+                --b.borrows;
             break;
         }
     }
-    waiters.swap(m_borrow_waiters);
-    lk.unlock();
-    for (const auto& waiter : waiters) waiter->Notify();
-    m_cv.notify_all();
-}
-
-result<std::shared_ptr<BindingLease>> Registry::AcquireBorrowLocked(
-    RegistryEntry& component_entry, const ObjectId& subject_id,
-    std::uint64_t binding_generation, bool allow_installing_borrow) {
-    if (component_entry.gate_closed)
-        return result<std::shared_ptr<BindingLease>>::err(MakeError(
-            ErrorCode::Closed, "Borrow: component gate closed"));
-
-    /**
-     * 装配窗口：subject（绑定发起方）正处于 Installing（OnInstall 执行中）
-     * 时允许借 Installed 依赖做纯内存装配——窗口由 subject 状态推导，
-     * 不靠调用方传 flag 保证（显式 allow_installing_borrow 等价放行）。
-     */
-    bool installing_borrow = allow_installing_borrow;
-    if (!installing_borrow) {
-        const RegistryEntry* subj = FindEntryLocked(subject_id);
-        installing_borrow =
-            (subj != nullptr && subj->state == ObjectState::Installing);
-    }
-
-    /**
-     * 对象状态门：Running 可借；OnInstall 装配窗口内 Installed 可借。
-     */
-    const ObjectState s = component_entry.state;
-    const bool state_ok =
-        (s == ObjectState::Running) ||
-        (installing_borrow && s == ObjectState::Installed);
-    if (!state_ok) {
-        ErrorCode code = ErrorCode::Closed;
-        if (s == ObjectState::Installing || s == ObjectState::Starting ||
-            s == ObjectState::Paused)
-            code = ErrorCode::Overloaded;
-        else if (s == ObjectState::Destroyed || s == ObjectState::Invalidated)
-            code = ErrorCode::Closed;
-        else if (s == ObjectState::InstallFailed || s == ObjectState::Failed)
-            code = ErrorCode::Closed;
-        else if (s == ObjectState::Created || s == ObjectState::Installed)
-            /**
-             * 未 Running 且非装配窗口
-             */
-            code = ErrorCode::Overloaded;
-        return result<std::shared_ptr<BindingLease>>::err(MakeError(code,
-            "Borrow: component not borrowable in current state"));
-    }
-
-    /**
-     * binding 边：按 (subject, generation) 唯一匹配。retiring/inactive 或
-     * 代失配的旧 handle → Closed；同 subject 的新边不影响。
-     */
-    Binding* edge = nullptr;
-    for (auto& b : component_entry.bindings) {
-        if (b.subject_id == subject_id &&
-            b.generation == binding_generation) {
-            edge = &b;
-            break;
-        }
-    }
-    if (edge == nullptr)
-        return result<std::shared_ptr<BindingLease>>::err(MakeError(
-            ErrorCode::Closed, "Borrow: binding invalidated"));
-    if (!edge->active || edge->retiring)
-        return result<std::shared_ptr<BindingLease>>::err(MakeError(
-            ErrorCode::Closed, "Borrow: binding invalidated"));
-
-    auto lease = std::make_shared<BindingLease>();
-    lease->reg_w = weak_from_this();
-    lease->owner = component_entry.object;
-    lease->component_id = component_entry.id;
-    lease->subject_id = subject_id;
-    lease->binding_generation = binding_generation;
-    ++component_entry.component_borrows;
-    ++edge->borrows;
-    return result<std::shared_ptr<BindingLease>>::ok(std::move(lease));
+    m_borrow_waiters.NotifyAll(std::move(lk), m_cv);
 }
 
 result<void> Registry::_WaitBorrows(
     const std::function<bool()>& ready, bbt::coroutine::Deadline deadline) {
     if (!bbt::coroutine::IsInCoroutineContext())
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
-            "borrow wait requires coroutine context"));
-    auto waiter = bbt::coroutine::sync::CoWaiter::Create();
-    for (;;) {
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            if (ready()) return result<void>::ok();
-        }
-        bbt::coroutine::WaitOptions wait;
-        wait.deadline = deadline;
-        const auto status = waiter->WaitWithCallback(wait, [&] {
-            bool done;
-            {
-                std::lock_guard<std::mutex> lk(m_mtx);
-                m_borrow_waiters.push_back(waiter);
-                done = ready();
-            }
-            if (done) waiter->Notify();
-            return true;
-        });
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_borrow_waiters.erase(std::remove(m_borrow_waiters.begin(),
-                m_borrow_waiters.end(), waiter), m_borrow_waiters.end());
-        }
-        if (status == bbt::coroutine::WaitStatus::Completed) continue;
-        const auto code = status == bbt::coroutine::WaitStatus::TimedOut
-            ? ErrorCode::TimedOut : status == bbt::coroutine::WaitStatus::Cancelled
-            ? ErrorCode::Cancelled : ErrorCode::RuntimeUnavailable;
-        return result<void>::err(MakeError(code, "borrow wait did not complete"));
-    }
+                                           "borrow wait requires coroutine context"));
+    bbt::coroutine::WaitOptions wait;
+    wait.deadline = deadline;
+    const auto waiter = bbt::coroutine::sync::CoWaiter::Create();
+    const auto status = m_borrow_waiters.WaitUntilReady(m_mtx, waiter, ready, wait);
+    if (status == bbt::coroutine::WaitStatus::Completed)
+        return result<void>::ok();
+    const auto code = status == bbt::coroutine::WaitStatus::TimedOut
+                          ? ErrorCode::TimedOut
+                      : status == bbt::coroutine::WaitStatus::Cancelled
+                          ? ErrorCode::Cancelled
+                          : ErrorCode::RuntimeUnavailable;
+    return result<void>::err(MakeError(code, "borrow wait did not complete"));
 }
 
 result<void> Registry::WaitBorrowsDrained(
@@ -738,7 +653,8 @@ result<void> Registry::WaitBorrowsDrained(
     return _WaitBorrows([&] {
         const auto* e = FindEntryLocked(component_id);
         return !e || e->component_borrows == 0;
-    }, deadline);
+    },
+                        deadline);
 }
 
 result<void> Registry::WaitBindingDrained(
@@ -746,13 +662,15 @@ result<void> Registry::WaitBindingDrained(
     std::uint64_t binding_generation, bbt::coroutine::Deadline deadline) {
     return _WaitBorrows([&] {
         const auto* e = FindEntryLocked(component_id);
-        if (!e) return true;
+        if (!e)
+            return true;
         for (const auto& b : e->bindings) {
             if (b.subject_id == subject_id && b.generation == binding_generation)
                 return b.borrows == 0;
         }
         return true;
-    }, deadline);
+    },
+                        deadline);
 }
 
 bool Registry::FindRetiringBindingLocked(
@@ -760,7 +678,8 @@ bool Registry::FindRetiringBindingLocked(
     std::uint64_t* out_generation) const {
     for (const auto& b : component_entry.bindings) {
         if (b.subject_id == subject_id && b.retiring) {
-            if (out_generation) *out_generation = b.generation;
+            if (out_generation)
+                *out_generation = b.generation;
             return true;
         }
     }
@@ -784,8 +703,9 @@ void Registry::EraseSubjectBindingsLocked(RegistryEntry& component_entry,
                                           const ObjectId& subject_id) {
     auto& bs = component_entry.bindings;
     bs.erase(std::remove_if(bs.begin(), bs.end(), [&](const Binding& b) {
-        return b.subject_id == subject_id && b.retiring;
-    }), bs.end());
+                 return b.subject_id == subject_id && b.retiring;
+             }),
+             bs.end());
 }
 
 void Registry::NoteHookSettled(const ObjectId& id) noexcept {
@@ -793,28 +713,28 @@ void Registry::NoteHookSettled(const ObjectId& id) noexcept {
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto* e = FindEntryLocked(id);
-        if (e && e->hooks_in_flight > 0) --e->hooks_in_flight;
-        if (e && e->hooks_in_flight == 0) w = e->hook_settled_waiter;
+        if (e && e->hooks_in_flight > 0)
+            --e->hooks_in_flight;
+        if (e && e->hooks_in_flight == 0)
+            w = e->hook_settled_waiter;
     }
     /**
      * Notify 在锁外：Notify 链路会触发协程唤醒/驱动回调，不阻塞 Registry
      * 临界区；m_cv 唤醒宿主等待者同样不持锁（m_cv 谓词在锁内复查）。
      */
     m_cv.notify_all();
-    if (w) w->Notify();
+    if (w)
+        w->Notify();
 }
 
 bool Registry::AcquireDispatchLease(const ObjectId& id) {
     std::lock_guard<std::mutex> lk(m_mtx);
     auto* e = FindEntryLocked(id);
-    if (!e || e->gate_closed) return false;
+    if (!e || e->gate_closed)
+        return false;
     ++e->hooks_in_flight;
     return true;
 }
-
-/**
- * ---- 组件依赖拓扑 ----
- */
 
 std::vector<ObjectId> Registry::ComponentStartOrderLocked(
     bool* had_cycle) const {
@@ -824,12 +744,15 @@ std::vector<ObjectId> Registry::ComponentStartOrderLocked(
      */
     std::unordered_map<ObjectId, std::vector<ObjectId>> deps;
     for (const auto& e : m_entries) {
-        if (e.kind != ObjectKind::Component) continue;
+        if (e.kind != ObjectKind::Component)
+            continue;
         auto& out = deps[e.id];
         for (const auto& ce : m_entries) {
-            if (ce.kind != ObjectKind::Component) continue;
+            if (ce.kind != ObjectKind::Component)
+                continue;
             for (const auto& b : ce.bindings) {
-                if (b.subject_id == e.id) out.push_back(ce.id);
+                if (b.subject_id == e.id)
+                    out.push_back(ce.id);
             }
         }
     }
@@ -844,8 +767,12 @@ std::vector<ObjectId> Registry::ComponentStartOrderLocked(
         mark[id] = 1;
         for (const auto& d : deps[id]) {
             const auto it = mark.find(d);
-            if (it != mark.end() && it->second == 2) continue;
-            if (it != mark.end() && it->second == 1) { cycle = true; continue; }
+            if (it != mark.end() && it->second == 2)
+                continue;
+            if (it != mark.end() && it->second == 1) {
+                cycle = true;
+                continue;
+            }
             /**
              * 目标非组件（防御）
              */
@@ -857,22 +784,21 @@ std::vector<ObjectId> Registry::ComponentStartOrderLocked(
         order.push_back(id);
     };
     for (const auto& e : m_entries) {
-        if (e.kind != ObjectKind::Component) continue;
-        if (mark.count(e.id) == 0) dfs(e.id);
+        if (e.kind != ObjectKind::Component)
+            continue;
+        if (mark.count(e.id) == 0)
+            dfs(e.id);
     }
-    if (had_cycle) *had_cycle = cycle;
+    if (had_cycle)
+        *had_cycle = cycle;
     return order;
 }
-
-/**
- * ---- Uninstall ----
- */
 
 result<RegistryEntry*> Registry::BeginDestroyLocked(std::string_view id) {
     RegistryEntry* e = FindEntryLocked(id);
     if (!e)
         return result<RegistryEntry*>::err(MakeError(ErrorCode::NotFound,
-            "BeginDestroy: object not found"));
+                                                     "BeginDestroy: object not found"));
 
     /**
      * 组件：仍有 binding 边 → Busy（不自动解绑使用者）。retiring 且
@@ -880,10 +806,10 @@ result<RegistryEntry*> Registry::BeginDestroyLocked(std::string_view id) {
      */
     if (e->kind == ObjectKind::Component && !e->bindings.empty())
         return result<RegistryEntry*>::err(MakeError(ErrorCode::Overloaded,
-            "UninstallComponent: active bindings remain"));
+                                                     "UninstallComponent: active bindings remain"));
     if (e->op_in_progress)
         return result<RegistryEntry*>::err(MakeError(ErrorCode::Overloaded,
-            "BeginDestroy: operation in progress"));
+                                                     "BeginDestroy: operation in progress"));
 
     e->gate_closed = true;
     e->op_in_progress = true;
@@ -897,7 +823,8 @@ Registry::FinishDestroyLocked(RegistryEntry& e) {
     m_index.erase(e.id);
     auto it = m_entries.begin();
     for (; it != m_entries.end(); ++it) {
-        if (it->id == e.id) break;
+        if (it->id == e.id)
+            break;
     }
     std::shared_ptr<void> obj;
     if (it != m_entries.end()) {
@@ -913,20 +840,17 @@ Registry::FinishDestroyLocked(RegistryEntry& e) {
     return {std::move(obj), std::move(events)};
 }
 
-/**
- * ---- 诊断 ----
- */
-
 std::vector<CleanupInfo> Registry::PendingCleanup() const {
     std::lock_guard<std::mutex> lk(m_mtx);
     std::vector<CleanupInfo> out;
     for (const auto& e : m_entries) {
         const bool pending = e.component_borrows > 0 || e.exec_leases > 0 ||
-            e.hooks_in_flight > 0 ||
-            !e.destroy_phase.empty() ||
-            e.state == ObjectState::StopIncomplete ||
-            e.state == ObjectState::UninstallIncomplete;
-        if (!pending) continue;
+                             e.hooks_in_flight > 0 ||
+                             !e.destroy_phase.empty() ||
+                             e.state == ObjectState::StopIncomplete ||
+                             e.state == ObjectState::UninstallIncomplete;
+        if (!pending)
+            continue;
         CleanupInfo ci;
         ci.object_id = e.id;
         ci.generation = e.generation;
@@ -964,45 +888,84 @@ std::vector<LifecycleFailure> Registry::Failures() const {
  */
 
 result<std::pair<std::shared_ptr<void>, CoComponent*>> BorrowImpl(
-    const ObjectHandle& object, std::uint64_t binding_generation,
-    bool allow_installing_borrow) {
+    const ObjectHandle& object, std::uint64_t binding_generation) {
+    using BorrowResult = result<std::pair<std::shared_ptr<void>, CoComponent*>>;
     auto reg = object.m_reg.lock();
     if (!reg)
-        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
+        return BorrowResult::err(
             MakeError(ErrorCode::Closed, "Borrow: registry closed"));
     std::lock_guard<std::mutex> lk(reg->Mutex());
     RegistryEntry* e = reg->FindEntryLocked(object.m_id);
     if (!e)
-        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
+        return BorrowResult::err(
             MakeError(ErrorCode::Closed, "Borrow: object destroyed"));
     if (e->generation != object.m_generation)
-        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
+        return BorrowResult::err(
             MakeError(ErrorCode::Closed, "Borrow: generation stale"));
     /**
-     * subject_id 由调用方（service handle）给出——ComponentHandle 经
-     * BindComponent 发放时 subject 已记录在该 binding 内；这里用
-     * 「binding_generation 匹配」反查 subject，保证 handle 不可伪造
-     * 其他 subject 的借用。
+     * subject 取自命中的边，确保借用计数归属于句柄对应的那一代绑定。
      */
-    ObjectId subject;
-    bool found = false;
-    for (const auto& b : e->bindings) {
+    Binding* edge = nullptr;
+    for (auto& b : e->bindings) {
         if (b.generation == binding_generation) {
-            subject = b.subject_id;
-            found = true;
+            edge = &b;
             break;
         }
     }
-    if (!found)
-        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
+    if (edge == nullptr)
+        return BorrowResult::err(
             MakeError(ErrorCode::Closed, "Borrow: binding invalidated"));
-    auto lease = reg->AcquireBorrowLocked(*e, subject, binding_generation,
-                                          allow_installing_borrow);
-    if (!lease)
-        return result<std::pair<std::shared_ptr<void>, CoComponent*>>::err(
-            std::move(lease.error()));
-    return result<std::pair<std::shared_ptr<void>, CoComponent*>>::ok(
-        std::make_pair(std::shared_ptr<void>(std::move(lease.value())),
+
+    if (e->gate_closed)
+        return BorrowResult::err(
+            MakeError(ErrorCode::Closed, "Borrow: component gate closed"));
+
+    /**
+     * 装配窗口由 subject 状态推导：subject 正处于 Installing（OnInstall
+     * 执行中）时允许借 Installed 依赖做纯内存装配。
+     */
+    const RegistryEntry* subj = reg->FindEntryLocked(edge->subject_id);
+    const bool installing_borrow =
+        subj != nullptr && subj->state == ObjectState::Installing;
+
+    /**
+     * 对象状态门：Running 可借；OnInstall 装配窗口内 Installed 可借。
+     */
+    const ObjectState s = e->state;
+    const bool state_ok =
+        (s == ObjectState::Running) ||
+        (installing_borrow && s == ObjectState::Installed);
+    if (!state_ok) {
+        ErrorCode code = ErrorCode::Closed;
+        if (s == ObjectState::Installing || s == ObjectState::Starting ||
+            s == ObjectState::Paused)
+            code = ErrorCode::Overloaded;
+        else if (s == ObjectState::Destroyed || s == ObjectState::Invalidated)
+            code = ErrorCode::Closed;
+        else if (s == ObjectState::InstallFailed || s == ObjectState::Failed)
+            code = ErrorCode::Closed;
+        else if (s == ObjectState::Created || s == ObjectState::Installed)
+            /**
+             * 未 Running 且非装配窗口
+             */
+            code = ErrorCode::Overloaded;
+        return BorrowResult::err(MakeError(code,
+                                           "Borrow: component not borrowable in current state"));
+    }
+    if (edge->retiring)
+        return BorrowResult::err(
+            MakeError(ErrorCode::Closed, "Borrow: binding invalidated"));
+
+    auto lease = std::make_shared<BindingLease>();
+    lease->reg_w = reg->weak_from_this();
+    lease->owner = e->object;
+    lease->component_id = e->id;
+    lease->subject_id = edge->subject_id;
+    lease->binding_generation = binding_generation;
+    ++e->component_borrows;
+    ++edge->borrows;
+    return BorrowResult::ok(
+        std::make_pair(std::shared_ptr<void>(std::move(lease)),
                        static_cast<CoComponent*>(e->object.get())));
 }
 

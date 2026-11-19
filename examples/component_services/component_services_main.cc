@@ -54,10 +54,10 @@ namespace {
 
 using shop::Emit;
 
-std::mutex    g_journal_mtx;
+std::mutex g_journal_mtx;
 std::ofstream g_journal;
-int           g_checks   = 0;
-int           g_failures = 0;
+int g_checks = 0;
+int g_failures = 0;
 
 void Journal(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_journal_mtx);
@@ -72,14 +72,17 @@ void Journal(const std::string& line) {
  */
 void Check(bool ok, const std::string& name, const std::string& detail) {
     ++g_checks;
-    if (!ok) ++g_failures;
+    if (!ok)
+        ++g_failures;
     Journal("event=check name=" + name + " ok=" + (ok ? "1" : "0") +
             " detail=" + (detail.empty() ? "none" : detail));
     std::printf("%s %-38s %s\n", ok ? "PASS" : "FAIL", name.c_str(),
                 detail.c_str());
 }
 
-std::string Int(long long v) { return std::to_string(v); }
+std::string Int(long long v) {
+    return std::to_string(v);
+}
 
 /**
  * 稳定错误码的短名不逐个枚举：示例只关心比较 code，名字用于人读细节。
@@ -88,11 +91,18 @@ std::string Err(const fw::Error& e) {
     return "code_" + Int(int(e.code));
 }
 
-std::string Pid() { return Int(::getpid()); }
+std::string Pid() {
+    return Int(::getpid());
+}
 
 fw::AppOptions MakeAppOptions() {
+    fw::AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     return fw::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
+        .SetAppLimits(limits)
         .SetShutdownBudget(std::chrono::milliseconds{2000})
         .SetLifecycleBudget(std::chrono::milliseconds{2000});
 }
@@ -133,9 +143,10 @@ void RunSharedScenario() {
     auto comp = app->FindComponent<shop::PriceBook>(
         std::string(shop::kPricingSlot));
     Check(bool(comp), "find_pricing", comp ? "ok" : Err(comp.error()));
-    if (!comp) return;
-    const fw::ObjectId    old_id  = comp.value().Id();
-    const std::uint64_t   old_gen = comp.value().Generation();
+    if (!comp)
+        return;
+    const fw::ObjectId old_id = comp.value().Id();
+    const std::uint64_t old_gen = comp.value().Generation();
 
     std::vector<fw::ObjectState> observed;
     auto token = bbt_co_await app->CoObserve(
@@ -170,7 +181,7 @@ void RunSharedScenario() {
               " start=" + Int(shop::PriceBook::s_start.load()));
 
     auto catalog_h = app->FindService("catalog");
-    auto cart_h    = app->FindService("cart");
+    auto cart_h = app->FindService("cart");
     Check(bool(catalog_h) && bool(cart_h), "find_services",
           bool(catalog_h) && bool(cart_h) ? "ok" : "missing");
 
@@ -247,7 +258,8 @@ void RunSharedScenario() {
     /**
      * token 的生命周期由观察者持有：显式 Revoke 后 IsActive 为 false。
      */
-    if (token) token.value().Revoke();
+    if (token)
+        token.value().Revoke();
     Check(token ? !token.value().IsActive() : false,
           "observer_token_revoke", token ? "ok" : "no_token");
 
@@ -325,7 +337,8 @@ void RunSharedScenario() {
         [&svc_events](const fw::ObjectStateEvent&) { ++svc_events; });
     Check(bool(cart_token), "observer_service_token",
           cart_token ? "ok" : Err(cart_token.error()));
-    if (cart_token) cart_token.value().Revoke();
+    if (cart_token)
+        cart_token.value().Revoke();
     Check(cart_token ? !cart_token.value().IsActive() : false,
           "observer_token_explicit_revoke", cart_token ? "ok" : "no_token");
     const int before_stop_events = svc_events;
@@ -467,14 +480,14 @@ void RunNodeScenario(int price_cents) {
     Check(bool(binding), "node_bind_cart",
           binding ? "ok" : Err(binding.error()));
     int total = -1;
-    int seq   = -1;
+    int seq = -1;
     int items = -1;
     if (binding) {
         auto borrow = binding.value().Borrow();
         if (borrow) {
             shop::PriceBook& book = borrow.value().Get();
             total = book.CartTotalCents();
-            seq   = book.InstanceSeq();
+            seq = book.InstanceSeq();
             items = book.CatalogSize();
         }
     }
@@ -502,9 +515,9 @@ void RunNodeScenario(int price_cents) {
 bool RunInManagedCoroutine(const std::function<void()>& fn,
                            std::chrono::milliseconds budget) {
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
+        bool done = false;
     };
     auto slot = std::make_shared<Slot>();
     bool submitted = false;
@@ -524,7 +537,8 @@ bool RunInManagedCoroutine(const std::function<void()>& fn,
             slot->cv.notify_all();
         },
         submitted);
-    if (!submitted) return false;
+    if (!submitted)
+        return false;
     std::unique_lock<std::mutex> lk(slot->mtx);
     return slot->cv.wait_for(lk, budget, [&] { return slot->done; });
 }
@@ -532,11 +546,12 @@ bool RunInManagedCoroutine(const std::function<void()>& fn,
 struct Args {
     std::string mode = "shared";
     std::string journal;
-    int         price = 0;
+    int price = 0;
 };
 
 bool ParseArgs(int argc, char* argv[], Args* out) {
-    if (argc < 2) return false;
+    if (argc < 2)
+        return false;
     out->mode = argv[1];
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -556,7 +571,8 @@ bool ParseArgs(int argc, char* argv[], Args* out) {
             return false;
         }
     }
-    if (out->journal.empty()) return false;
+    if (out->journal.empty())
+        return false;
     return out->mode == "shared" || out->mode == "node";
 }
 
@@ -587,7 +603,7 @@ int main(int argc, char* argv[]) {
      * hook 内含字符串/容器操作，默认 12KB 栈偏紧，显式放大。
      */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
-    g_bbt_coroutine_config->m_cfg_stack_size        = 256 * 1024;
+    g_bbt_coroutine_config->m_cfg_stack_size = 256 * 1024;
     g_scheduler->Start();
 
     bool finished = false;

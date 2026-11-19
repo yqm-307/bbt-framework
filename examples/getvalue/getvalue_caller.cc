@@ -77,8 +77,13 @@ protected:
  * caller 与 badroute 共用的基础装配（除静态路由外完全一致）。
  */
 bbt::framework::AppOptions BaseOptions() {
+    bbt::framework::AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     return bbt::framework::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
+        .SetAppLimits(limits)
         .SetNetworkLimits(bbt::infra::NetworkLimits{
             64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}})
         .Listen("127.0.0.1:0")
@@ -119,12 +124,24 @@ std::string JsonEscape(const std::string& s) {
     out.reserve(s.size());
     for (const char c : s) {
         switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            out += c;
+            break;
         }
     }
     return out;
@@ -266,7 +283,7 @@ int main(int argc, char* argv[]) {
         return 90;
     const std::string port_file = argv[2];
     const std::string callee_ep = argv[3];
-    const std::string black_ep  = argv[4];
+    const std::string black_ep = argv[4];
     const std::string meta_file = argv[5];
 
     /**
@@ -293,9 +310,9 @@ int main(int argc, char* argv[]) {
     g_scheduler->Start();
 
     std::promise<std::string> bound_ep;
-    std::promise<int>         rc_slot;
+    std::promise<int> rc_slot;
     std::shared_ptr<bbt::framework::CoApp> app_handle;
-    std::mutex                  app_mtx;
+    std::mutex app_mtx;
 
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
@@ -351,7 +368,8 @@ int main(int argc, char* argv[]) {
     if (bound.wait_for(std::chrono::seconds{10}) != std::future_status::ready) {
         {
             std::lock_guard<std::mutex> lk(app_mtx);
-            if (app_handle) app_handle->RequestShutdown();
+            if (app_handle)
+                app_handle->RequestShutdown();
         }
         std::fprintf(stderr, "caller did not bind\n");
         return 5;
@@ -389,7 +407,8 @@ int main(int argc, char* argv[]) {
      */
     {
         std::lock_guard<std::mutex> lk(app_mtx);
-        if (app_handle) app_handle->RequestShutdown();
+        if (app_handle)
+            app_handle->RequestShutdown();
     }
     const int rc = rc_slot.get_future().get();
     std::fprintf(stderr, "getvalue caller rc=%d\n", rc);

@@ -38,12 +38,11 @@ bbt_co_async(result<bbt::infra::rpc::Response>) AppRuntimeState::Send(
      */
     bbt::infra::CallOptions opt = options;
     if (rpc_policy) {
-        RpcPolicyDecision decision;
         auto d = rpc_policy->Preflight(
             RpcCallView{target, env, opt.deadline});
         if (!d)
             return result<bbt::infra::rpc::Response>::err(d.error());
-        decision = d.value();
+        const auto& decision = d.value();
 
         if (decision.kind == RpcPolicyDecision::Kind::Reject)
             return result<bbt::infra::rpc::Response>::err(decision.reject_error);
@@ -57,7 +56,7 @@ bbt_co_async(result<bbt::infra::rpc::Response>) AppRuntimeState::Send(
 
         /**
          * 收紧到已过期（或不晚于 now）→ 发起任何 I/O 之前按 TimedOut 拒绝，
-         * 与 AdaptCallOptions 的过期门同语义。
+         * 此处复查的是策略生效后的期限。
          */
         if (opt.deadline <= std::chrono::steady_clock::now())
             return result<bbt::infra::rpc::Response>::err(
@@ -95,7 +94,8 @@ void AppRuntimeState::RemoveDispatch(const std::string& service) noexcept {
         std::lock_guard<std::mutex> lock(mtx);
         dispatcher = this->dispatcher;
     }
-    if (dispatcher) dispatcher->RemoveService(service);
+    if (dispatcher)
+        dispatcher->RemoveService(service);
 }
 
 result<bbt::infra::rpc::Response> AppRuntimeState::Dispatch(

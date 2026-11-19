@@ -15,11 +15,8 @@ namespace bbt::framework {
 
 namespace {
 
-std::string RouteKey(std::string_view service) { return std::string(service); }
-
-bool SameEndpoint(const std::string& a,
-                  const std::string& b) {
-    return a == b;
+std::string RouteKey(std::string_view service) {
+    return std::string(service);
 }
 
 } // namespace
@@ -47,26 +44,19 @@ result<void> DynamicRouteTable::Replace(
     std::vector<std::string> unique;
     unique.reserve(endpoints.size());
     for (auto& ep : endpoints) {
-        const bool seen = std::any_of(
-            unique.begin(), unique.end(),
-            [&ep](const std::string& known) {
-                return SameEndpoint(known, ep);
-            });
-        if (!seen)
+        if (std::find(unique.begin(), unique.end(), ep) == unique.end())
             unique.push_back(std::move(ep));
     }
 
     Entry fresh;
-    fresh.snapshot.revision    = revision;
+    fresh.snapshot.revision = revision;
     fresh.snapshot.observed_at = std::chrono::steady_clock::now();
-    fresh.snapshot.endpoints   = std::move(unique);
+    fresh.snapshot.endpoints = std::move(unique);
 
     std::lock_guard<std::mutex> lk(m_mtx);
     auto& entry = m_entries[std::move(service)];
-    const bool same_view = entry.snapshot.endpoints.size() == fresh.snapshot.endpoints.size() &&
-        std::equal(entry.snapshot.endpoints.begin(), entry.snapshot.endpoints.end(),
-                   fresh.snapshot.endpoints.begin(), SameEndpoint);
-    entry.snapshot    = std::move(fresh.snapshot);
+    const bool same_view = entry.snapshot.endpoints == fresh.snapshot.endpoints;
+    entry.snapshot = std::move(fresh.snapshot);
     if (!same_view)
         entry.next = 0;
     entry.unavailable = false;

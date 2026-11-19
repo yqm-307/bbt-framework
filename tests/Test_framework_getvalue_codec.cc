@@ -82,11 +82,12 @@ std::shared_ptr<fw::CoApp> MakeApp() {
  */
 template <class S>
 S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
-    const auto reg = app.RegistryForTest();
+    const auto reg = fw::RegistryForTest(app);
     std::lock_guard<std::mutex> lk(reg->Mutex());
     auto* e = reg->FindByTypeNameLocked(
         fw::ObjectKind::Service, S::kServiceName);
-    if (!e) return nullptr;
+    if (!e)
+        return nullptr;
     owner = e->object;
     return static_cast<S*>(e->object.get());
 }
@@ -98,8 +99,11 @@ S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     /**
      * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
      */
@@ -108,22 +112,26 @@ bool RunInManagedCoroutine(F&& fn,
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     /**
@@ -131,7 +139,8 @@ bool RunInManagedCoroutine(F&& fn,
      */
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
@@ -171,7 +180,7 @@ BOOST_AUTO_TEST_CASE(method_table_schema_derived_from_descriptor) {
     BOOST_REQUIRE(m != nullptr);
     BOOST_CHECK_EQUAL(m->request_schema, "bbt.example.v1.GetValueRequest");
     BOOST_CHECK_EQUAL(m->response_schema, "bbt.example.v1.GetValueResponse");
-    BOOST_CHECK(!m->actor_keyed);
+    BOOST_CHECK(m->extract_key == nullptr);
 }
 
 BOOST_AUTO_TEST_CASE(proto_codec_golden_vectors_roundtrip) {

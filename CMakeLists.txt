@@ -81,6 +81,7 @@ add_subdirectory(bbt/framework)
 set(BBT_FRAMEWORK_PUBLIC_HEADERS
     Result.hpp
     Address.hpp
+    AppOptions.hpp
     Object.hpp
     Component.hpp
     Actor.hpp
@@ -97,40 +98,32 @@ set(BBT_FRAMEWORK_PUBLIC_HEADERS
     CoRpc.hpp
     DynamicRouteTable.hpp
     Framework.hpp)
-# RedisNetResource.hpp 依赖新 net Redis 入口公开头（bbt::infra_redis_net
-# 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
-# bbt::infra_redis_net 的公开 include 面可见，不引入 hiredis）。
-if(TARGET bbt::infra_redis_net)
-    set(_redis_net_hdr_tu
-        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/RedisNetResource.cc")
-    file(WRITE "${_redis_net_hdr_tu}"
-        "#include <bbt/framework/RedisNetResource.hpp>\n")
-    add_library(bbt_framework_redis_net_header_selfcheck STATIC
-        "${_redis_net_hdr_tu}")
-    target_link_libraries(bbt_framework_redis_net_header_selfcheck PRIVATE
-        bbt::framework bbt::infra_redis_net)
-    target_compile_options(bbt_framework_redis_net_header_selfcheck PRIVATE
-        -Wall -Wextra)
-    set_target_properties(bbt_framework_redis_net_header_selfcheck PROPERTIES
-        LINKER_LANGUAGE CXX)
-endif()
-# MongoDbResource.hpp 依赖新 mongo owner/句柄入口公开头（bbt::infra_mongo
-# 注册时才存在其上游头/链接目标）：在场时单独自给自检（其公开面只经
-# bbt::infra_mongo 的公开 include 面可见，不引入 mongocxx/bsoncxx）。
-if(TARGET bbt::infra_mongo)
-    set(_mongo_hdr_tu
-        "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/MongoDbResource.cc")
-    file(WRITE "${_mongo_hdr_tu}"
-        "#include <bbt/framework/MongoDbResource.hpp>\n")
-    add_library(bbt_framework_mongo_header_selfcheck STATIC
-        "${_mongo_hdr_tu}")
-    target_link_libraries(bbt_framework_mongo_header_selfcheck PRIVATE
-        bbt::framework bbt::infra_mongo)
-    target_compile_options(bbt_framework_mongo_header_selfcheck PRIVATE
-        -Wall -Wextra)
-    set_target_properties(bbt_framework_mongo_header_selfcheck PROPERTIES
-        LINKER_LANGUAGE CXX)
-endif()
+# Fold each adapter into the original static archive. Only callers that use the
+# adapter link its existing infra backend, including installed consumers.
+function(bbt_framework_resource name backend resource)
+    if(TARGET ${backend})
+        add_library(bbt_framework_${name} OBJECT
+            bbt/framework/${resource}.cc)
+        target_include_directories(bbt_framework_${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(bbt_framework_${name} PRIVATE bbt::infra_common ${backend})
+        target_compile_features(bbt_framework_${name} PRIVATE cxx_std_17)
+        target_compile_options(bbt_framework_${name} PRIVATE -Wall -Wextra)
+        target_sources(bbt_framework PRIVATE $<TARGET_OBJECTS:bbt_framework_${name}>)
+
+        set(_tu "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/${resource}.cc")
+        file(WRITE "${_tu}" "#include <bbt/framework/${resource}.hpp>\n")
+        add_library(bbt_framework_${name}_header_selfcheck STATIC "${_tu}")
+        target_link_libraries(bbt_framework_${name}_header_selfcheck PRIVATE bbt::framework ${backend})
+        target_compile_options(bbt_framework_${name}_header_selfcheck PRIVATE -Wall -Wextra)
+        set_property(GLOBAL APPEND PROPERTY BBT_FRAMEWORK_BUILT_RESOURCE_HEADERS "${resource}.hpp")
+    endif()
+endfunction()
+bbt_framework_resource(redis_net bbt::infra_redis_net RedisNetResource)
+bbt_framework_resource(mongo bbt::infra_mongo MongoDbResource)
+get_property(_resource_headers GLOBAL PROPERTY BBT_FRAMEWORK_BUILT_RESOURCE_HEADERS)
+string(REPLACE ";" "\n" _resource_headers "${_resource_headers}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/framework-resource-headers.txt" "${_resource_headers}\n")
+
 # internal/ 机器面头文件同样做自给自检（Framework.hpp 不传递包含它们，
 # 但仍要求独立可编译）。CoApp.hpp 因 add_service 展开方法表而包含
 # MethodTable.hpp，属宿主头而非本汇总头。

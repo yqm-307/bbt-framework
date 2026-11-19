@@ -34,7 +34,9 @@ namespace fw = bbt::framework;
 
 namespace {
 
-struct PlayerRouteArg { std::string player_id; };
+struct PlayerRouteArg {
+    std::string player_id;
+};
 
 } // namespace
 
@@ -65,12 +67,16 @@ fw::CoRpcReq Request(Ts&&... values) {
  */
 class DummyComponent final : public fw::CoComponent {
 public:
-    struct Options { int n = 0; };
+    struct Options {
+        int n = 0;
+    };
     explicit DummyComponent(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), n_(o.n) {}
     int Value() const noexcept { return n_; }
+
 protected:
     ~DummyComponent() noexcept override = default;
+
 private:
     int n_;
     friend class fw::detail::Registry;
@@ -85,17 +91,29 @@ public:
 
     fw::CoRpcResp Echo(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         return fw::CoRpcResp::From("echo:" + args.value());
+    }
+    /**
+     * const 引用请求签名与按值 Echo 走同一 invoke 闭包，返回值区分两路。
+     */
+    fw::CoRpcResp EchoConstRef(const fw::CoRpcReq& req) {
+        auto args = req.Parse<std::string>();
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
+        return fw::CoRpcResp::From("const-echo:" + args.value());
     }
     fw::CoRpcResp Reset(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         return fw::CoRpcResp::From(std::tuple<>{});
     }
     fw::CoRpcResp Notify(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         m_last_notify = args.value();
         return fw::CoRpcResp::From(std::tuple<>{});
     }
@@ -108,7 +126,8 @@ public:
     }
     fw::CoRpcResp WhoAmI(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         return fw::CoRpcResp::From("player:" + args.value());
     }
 
@@ -128,13 +147,15 @@ public:
     template <class R>
     fw::result<fw::ComponentBorrow<R>> Bound(std::string_view name) {
         auto h = GetComponent<R>(name);
-        if (!h) return fw::result<fw::ComponentBorrow<R>>::err(
-            std::move(h.error()));
+        if (!h)
+            return fw::result<fw::ComponentBorrow<R>>::err(
+                std::move(h.error()));
         return h.value().Borrow();
     }
 
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EchoService::Echo>("echo"),
+        fw::Method<&EchoService::EchoConstRef>("echo-const"),
         fw::Method<&EchoService::Reset>("reset"),
         fw::Method<&EchoService::Notify>("notify"),
         fw::Method<&EchoService::Fail>("fail"),
@@ -162,6 +183,7 @@ public:
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&DupService::A>("same"),
         fw::Method<&DupService::B>("same"));
+
 protected:
     ~DupService() noexcept override = default;
     friend class fw::detail::Registry;
@@ -177,6 +199,7 @@ public:
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
         fw::Method<&EmptyNameService::A>(""));
+
 protected:
     ~EmptyNameService() noexcept override = default;
     friend class fw::detail::Registry;
@@ -230,11 +253,12 @@ std::shared_ptr<fw::CoApp> MakeApp(fw::AppOptions options = AppOpts()) {
  */
 template <class S>
 S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
-    const auto reg = app.RegistryForTest();
+    const auto reg = fw::RegistryForTest(app);
     std::lock_guard<std::mutex> lk(reg->Mutex());
     auto* e = reg->FindByTypeNameLocked(
         fw::ObjectKind::Service, S::kServiceName);
-    if (!e) return nullptr;
+    if (!e)
+        return nullptr;
     owner = e->object;
     return static_cast<S*>(e->object.get());
 }
@@ -246,8 +270,11 @@ S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{5000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     /**
      * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
      */
@@ -256,22 +283,26 @@ bool RunInManagedCoroutine(F&& fn,
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     /**
@@ -279,33 +310,38 @@ bool RunInManagedCoroutine(F&& fn,
      */
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
-#define CO_TEST_CASE(name) \
-    static void name##_body(); \
-    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+#define CO_TEST_CASE(name)                                 \
+    static void name##_body();                             \
+    BOOST_AUTO_TEST_CASE(name) {                           \
+        BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); \
+    }                                                      \
     static void name##_body()
 
 BOOST_AUTO_TEST_SUITE(framework_f0)
 
 BOOST_AUTO_TEST_CASE(method_table_binding) {
     const auto table = fw::BuildMethodTable<EchoService>();
-    BOOST_TEST(table.size() == 6);
+    BOOST_TEST(table.size() == 7);
 
     const fw::RpcMethod* echo = table.find("echo");
     BOOST_REQUIRE(echo != nullptr);
     BOOST_TEST(echo->request_schema == std::string(fw::kCoRpcPositionalSchema));
     BOOST_TEST(echo->response_schema == std::string(fw::kCoRpcPositionalSchema));
-    BOOST_TEST(!echo->actor_keyed);
     BOOST_CHECK(echo->extract_key == nullptr);
 
     const fw::RpcMethod* who = table.find("who-am-i");
     BOOST_REQUIRE(who != nullptr);
-    BOOST_TEST(who->actor_keyed);
     BOOST_CHECK(who->extract_key != nullptr);
     BOOST_TEST(who->request_schema == std::string(fw::kCoRpcPositionalSchema));
+
+    const fw::RpcMethod* echo_ref = table.find("echo-const");
+    BOOST_REQUIRE(echo_ref != nullptr);
+    BOOST_CHECK(echo_ref->extract_key == nullptr);
     BOOST_TEST(table.find("no-such-method") == nullptr);
 }
 
@@ -324,6 +360,17 @@ CO_TEST_CASE(dispatch_roundtrip) {
     auto reply = fw::CoRpcReq(std::move(out.value())).Parse<std::string>();
     BOOST_REQUIRE(reply);
     BOOST_TEST(reply.value() == "echo:hi");
+
+    /**
+     * const 引用签名经同一 invoke 闭包在真实受管实例上调用并返回。
+     */
+    auto ref_out =
+        table.find("echo-const")->invoke(*svc, Request(std::string{"hi"}).payload());
+    BOOST_REQUIRE(ref_out);
+    auto ref_reply =
+        fw::CoRpcReq(std::move(ref_out.value())).Parse<std::string>();
+    BOOST_REQUIRE(ref_reply);
+    BOOST_TEST(ref_reply.value() == "const-echo:hi");
 }
 
 CO_TEST_CASE(empty_success_and_side_effect) {
@@ -488,9 +535,7 @@ BOOST_AUTO_TEST_CASE(positional_roundtrip_all_scalar_types) {
         std::string{"位置参数"}, bytes});
     BOOST_REQUIRE(request);
 
-    auto decoded = request.value().Parse<
-        bool, std::int8_t, std::int32_t, std::uint64_t,
-        double, std::string, std::vector<std::uint8_t>>();
+    auto decoded = request.value().Parse<bool, std::int8_t, std::int32_t, std::uint64_t, double, std::string, std::vector<std::uint8_t>>();
     BOOST_REQUIRE(decoded);
     const auto& [flag, tiny, n, big, ratio, name, blob] = decoded.value();
     BOOST_TEST(flag);

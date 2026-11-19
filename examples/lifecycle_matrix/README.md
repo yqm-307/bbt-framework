@@ -97,7 +97,7 @@ transport（loopback 无认证 → 空串），不被 metadata 升级。
   的迟到路径另有编排：不再次 `CoStop`，经逐对象 `CoUninstall*` 完成收口，故
   App 状态停留在 `StopIncomplete`（journal `state=5`），`pending=0` 与组件
   OnStop 是收口完成的判定依据。
-- **ActorSerial / mailbox 容量维度未覆盖**：本示例只用 Concurrent，故
+- **SerialByKey / mailbox 容量维度未覆盖**：本示例只用 Concurrent，故
   `mailbox_capacity` 耗尽路径不在此切片（服务容量维度以 Concurrent 的
   `max_inflight` 覆盖）。
 - **出站 / 跨 hop 预算未在本切片重验**：本 fixture 无静态路由（未配置即
