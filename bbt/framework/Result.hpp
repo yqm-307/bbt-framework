@@ -1,7 +1,6 @@
 #pragma once
 /**
- * result<T> 是 bbt::infra::result<T> 的 using 引用，
- * 不另造错误体系；Error/ErrorCode/MakeError 一并按别名透出供业务使用。
+ * @brief 框架与 infra 共用 result、Error 和 ErrorCode，错误无需转换。
  */
 
 #include <bbt/infra/Result.hpp>

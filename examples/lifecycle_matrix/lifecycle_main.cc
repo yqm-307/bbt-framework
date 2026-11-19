@@ -55,14 +55,14 @@
  */
 #include "lifecycle_service.hpp"
 
-namespace fw  = bbt::framework;
+namespace fw = bbt::framework;
 namespace inf = bbt::infra;
 
 namespace {
 
 using lifecycle::kAuthState;
 
-std::mutex    g_journal_mtx;
+std::mutex g_journal_mtx;
 std::ofstream g_journal;
 
 void Journal(const std::string& line) {
@@ -113,11 +113,12 @@ protected:
  */
 std::uint16_t PickLoopbackPort() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
+    if (fd < 0)
+        return 0;
     sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
+    addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = 0;
+    addr.sin_port = 0;
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         ::close(fd);
         return 0;
@@ -134,7 +135,8 @@ std::uint16_t PickLoopbackPort() {
 
 std::string Trim(const std::string& s) {
     const auto b = s.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return {};
+    if (b == std::string::npos)
+        return {};
     const auto e = s.find_last_not_of(" \t\r\n");
     return s.substr(b, e - b + 1);
 }
@@ -152,12 +154,14 @@ int SettleIncompleteStop(const std::shared_ptr<fw::CoApp>& app) {
     if (app->State() == fw::AppState::Stopped &&
         app->PendingCleanup().empty())
         return 0;
-    if (app->State() != fw::AppState::StopIncomplete) return 4;
+    if (app->State() != fw::AppState::StopIncomplete)
+        return 4;
 
     const auto settle_deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds{15000};
+                                 std::chrono::milliseconds{15000};
     while (!app->PendingCleanup().empty()) {
-        if (std::chrono::steady_clock::now() >= settle_deadline) return 4;
+        if (std::chrono::steady_clock::now() >= settle_deadline)
+            return 4;
         bbtco_sleep(10);
     }
     auto un_svc = bbt_co_await app->CoUninstallService<
@@ -189,11 +193,11 @@ int main(int argc, char* argv[]) {
          * EX_USAGE
          */
         return 90;
-    const std::string port_file     = argv[2];
-    const std::string meta_file     = argv[3];
-    const std::string journal_path  = argv[4];
-    const std::size_t max_inflight  = std::strtoul(argv[5], nullptr, 10);
-    const long        step_budget   = std::strtol(argv[6], nullptr, 10);
+    const std::string port_file = argv[2];
+    const std::string meta_file = argv[3];
+    const std::string journal_path = argv[4];
+    const std::size_t max_inflight = std::strtoul(argv[5], nullptr, 10);
+    const long step_budget = std::strtol(argv[6], nullptr, 10);
 
     g_journal.open(journal_path, std::ios::out | std::ios::trunc);
     if (!g_journal) {
@@ -210,7 +214,7 @@ int main(int argc, char* argv[]) {
      * g_scheduler->Start() 前设置（同 getvalue 切片口径）。
      */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
-    g_bbt_coroutine_config->m_cfg_stack_size        = 512 * 1024;
+    g_bbt_coroutine_config->m_cfg_stack_size = 512 * 1024;
 
     const std::uint16_t port = PickLoopbackPort();
     if (port == 0) {
@@ -219,37 +223,42 @@ int main(int argc, char* argv[]) {
     }
     const std::string endpoint = "127.0.0.1:" + std::to_string(port);
 
+    fw::AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     auto options = fw::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
-        .SetNetworkLimits(inf::NetworkLimits{
-            /*max_connections*/ 64, /*max_inflight*/ 64,
-            /*max_header_bytes*/ 16 * 1024,
-            /**
+                       .SetAppLimits(limits)
+                       .SetNetworkLimits(inf::NetworkLimits{
+                           /*max_connections*/ 64, /*max_inflight*/ 64,
+                           /*max_header_bytes*/ 16 * 1024,
+                           /**
              * R4「字节上限」维度（功能检查非压测）
              */
-            /*max_body_bytes*/ 4096,
-            /*incoming_timeout*/ std::chrono::milliseconds{30000}})
-        /**
+                           /*max_body_bytes*/ 4096,
+                           /*incoming_timeout*/ std::chrono::milliseconds{30000}})
+                       /**
          * 内核已分配动态端口，listen 到它；CoStart 后经 BoundEndpoint 回读。
          */
-        .Listen("127.0.0.1:" + std::to_string(port))
-        /**
+                       .Listen("127.0.0.1:" + std::to_string(port))
+                       /**
          * V2 会话身份必填。
          */
-        .SetLocalIdentity("lifecycle-fixture")
-        .SetShutdownBudget(std::chrono::milliseconds{
-            step_budget > 0 ? step_budget : 1})
-        .SetLifecycleBudget(std::chrono::milliseconds{3000});
+                       .SetLocalIdentity("lifecycle-fixture")
+                       .SetShutdownBudget(std::chrono::milliseconds{
+                           step_budget > 0 ? step_budget : 1})
+                       .SetLifecycleBudget(std::chrono::milliseconds{3000});
 
     /**
      * 装配结果跨协程/线程交接（与 getvalue/two_service 同口径）：endpoint 经
      * promise 交给宿主线程写端口文件；App 指针发布后宿主线程只做
      * RequestShutdown（幂等 noexcept）；退出码经 promise 回传（单次写入）。
      */
-    std::promise<std::string>  bound_ep;
-    std::promise<int>          rc_slot;
+    std::promise<std::string> bound_ep;
+    std::promise<int> rc_slot;
     std::shared_ptr<fw::CoApp> app_handle;
-    std::mutex                 app_mtx;
+    std::mutex app_mtx;
 
     g_scheduler->Start();
 
@@ -331,7 +340,8 @@ int main(int argc, char* argv[]) {
         std::future_status::ready) {
         {
             std::lock_guard<std::mutex> lk(app_mtx);
-            if (app_handle) app_handle->RequestShutdown();
+            if (app_handle)
+                app_handle->RequestShutdown();
         }
         std::fprintf(stderr, "fixture: bind timeout\n");
         return 5;
@@ -340,7 +350,8 @@ int main(int argc, char* argv[]) {
     if (bound != endpoint) {
         {
             std::lock_guard<std::mutex> lk(app_mtx);
-            if (app_handle) app_handle->RequestShutdown();
+            if (app_handle)
+                app_handle->RequestShutdown();
         }
         std::fprintf(stderr,
                      "fixture: bind mismatch: picked=%s bound='%s'\n",
@@ -414,7 +425,8 @@ int main(int argc, char* argv[]) {
             Journal(std::string("event=shutdown_requested auth_state=") +
                     kAuthState);
             std::lock_guard<std::mutex> lk(app_mtx);
-            if (app_handle) app_handle->RequestShutdown();
+            if (app_handle)
+                app_handle->RequestShutdown();
         } else if (cmd == "open") {
             Journal(std::string("event=gate_opened auth_state=") + kAuthState);
             lifecycle::Gate().Open();
@@ -428,12 +440,14 @@ int main(int argc, char* argv[]) {
      */
     {
         std::lock_guard<std::mutex> lk(app_mtx);
-        if (app_handle) app_handle->RequestShutdown();
+        if (app_handle)
+            app_handle->RequestShutdown();
     }
 
     const int rc = rc_slot.get_future().get();
     run_done.store(true, std::memory_order_release);
-    if (observer.joinable()) observer.join();
+    if (observer.joinable())
+        observer.join();
 
     const int state = static_cast<int>(app_handle->State());
     Journal(std::string("event=shutdown rc=") + std::to_string(rc) +

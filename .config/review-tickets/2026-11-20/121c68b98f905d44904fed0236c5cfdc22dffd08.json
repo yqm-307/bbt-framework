@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-20",
+  "commit": "121c68b98f905d44904fed0236c5cfdc22dffd08",
+  "base": "df6673b50ada2563d0061bb9a7fd3620894766e6",
+  "result": "pass",
+  "reviewer": "独立审查者 builtin:reviewer (deleg_b02fb3c7)",
+  "summary": "核对实际代码提交、分层审查范围和验证记录，未发现阻塞推送的问题。此结论不代表远端 CI 通过。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "复用整合版及模板拆分版的独审，抽查关闭、借用与序号耗尽的注释对实现的描述。60 个文件的格式化输出与提交逐字节相符。复核本地构建 94/94、专项 13/13、冒烟 18/18，无失败或跳过。未复测 #79 压力条件。",
+      "evidence": {
+        "reviewer": "builtin:reviewer / deleg_b02fb3c7",
+        "scope": "df6673b50ada2563d0061bb9a7fd3620894766e6..121c68b98f905d44904fed0236c5cfdc22dffd08，86 个文件，目标树 37e3c25da16a259cd868bcba4f680fa3826b21ce。"
+      }
+    }
+  ]
+}

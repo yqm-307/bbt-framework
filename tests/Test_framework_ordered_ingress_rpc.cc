@@ -88,6 +88,7 @@ public:
 
 protected:
     ~OrderedSvc() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -97,11 +98,12 @@ private:
  */
 template <class S>
 S* ManagedService(fw::CoApp& app, std::shared_ptr<void>& owner) {
-    const auto reg = app.RegistryForTest();
+    const auto reg = fw::RegistryForTest(app);
     std::lock_guard<std::mutex> lk(reg->Mutex());
     auto* e = reg->FindByTypeNameLocked(
         fw::ObjectKind::Service, S::kServiceName);
-    if (!e) return nullptr;
+    if (!e)
+        return nullptr;
     owner = e->object;
     return static_cast<S*>(e->object.get());
 }
@@ -181,11 +183,11 @@ struct CallState {
 struct ServerState {
     std::shared_ptr<std::shared_ptr<fw::CoApp>> app_slot =
         std::make_shared<std::shared_ptr<fw::CoApp>>();
-    std::promise<bool>                       started;
-    std::atomic<bool>                        done{false};
-    int                                      rc{-1};
-    fw::ErrorCode                            invalid_code{};
-    bool                                     invalid_rejected{false};
+    std::promise<bool> started;
+    std::atomic<bool> done{false};
+    int rc{-1};
+    fw::ErrorCode invalid_code{};
+    bool invalid_rejected{false};
 };
 
 struct Fixture {
@@ -243,8 +245,8 @@ struct Fixture {
                                 .SetOrderedIngress(fw::OrderedIngressOptions{
                                     /*enabled*/ true, 8, 64, 65536});
                         const auto invalid_registration = bbt_co_await
-                            app->CoInstallService<OrderedSvc>(
-                                invalid_concurrent);
+                                                              app->CoInstallService<OrderedSvc>(
+                                                                  invalid_concurrent);
                         st->invalid_rejected = !invalid_registration;
                         if (invalid_registration)
                             st->invalid_code =
@@ -259,8 +261,11 @@ struct Fixture {
                                 .SetOrderedIngress(fw::OrderedIngressOptions{
                                     /*enabled*/ true, 8, 64, 65536});
                         auto r = bbt_co_await
-                            app->CoInstallService<OrderedSvc>(service_options);
-                        if (!r) { set_rc(2); return; }
+                                     app->CoInstallService<OrderedSvc>(service_options);
+                        if (!r) {
+                            set_rc(2);
+                            return;
+                        }
 
                         fw::OrderedGrant grant;
                         grant.service = "ordered";
@@ -274,20 +279,33 @@ struct Fixture {
                          */
                         grant.peer_principal.clear();
                         if (auto g = app->grant_ordered_stream(std::move(grant));
-                            !g) { set_rc(2); return; }
+                            !g) {
+                            set_rc(2);
+                            return;
+                        }
 
                         if (auto s = bbt_co_await app->CoStart(); !s) {
-                            set_rc(2); return;
+                            set_rc(2);
+                            return;
                         }
                         st->started.set_value(true);
-                        { auto _r = bbt_co_await app->CoWaitShutdownRequest(); (void)_r; }
-                        { auto _r = bbt_co_await app->CoStop(); (void)_r; }
+                        {
+                            auto _r = bbt_co_await app->CoWaitShutdownRequest();
+                            (void)_r;
+                        }
+                        {
+                            auto _r = bbt_co_await app->CoStop();
+                            (void)_r;
+                        }
                         set_rc(app->State() == fw::AppState::Stopped ? 0 : 4);
                     } catch (...) {
-                        try { st->started.set_value(false); } catch (...) {}
+                        try {
+                            st->started.set_value(false);
+                        } catch (...) {}
                         set_rc(2);
                     }
-                }, submitted);
+                },
+                submitted);
             if (!submitted) {
                 server->rc = 2;
                 server->done.store(true, std::memory_order_release);
@@ -297,7 +315,7 @@ struct Fixture {
         auto started = server->started.get_future();
         BOOST_REQUIRE_MESSAGE(
             started.wait_for(std::chrono::seconds{15}) ==
-                std::future_status::ready &&
+                    std::future_status::ready &&
                 started.get(),
             "server task did not start");
 

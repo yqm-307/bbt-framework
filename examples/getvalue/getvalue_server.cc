@@ -37,7 +37,7 @@
 
 namespace {
 
-std::mutex  g_journal_mtx;
+std::mutex g_journal_mtx;
 std::string g_journal_path;
 
 /**
@@ -60,9 +60,9 @@ void AppendHandlerEntry(const std::string& request_id,
 int main(int argc, char* argv[]) {
     if (argc < 5 || std::strcmp(argv[1], "server") != 0)
         return 90;
-    const std::string port_file    = argv[2];
-    const std::string meta_file    = argv[3];
-    g_journal_path                 = argv[4];
+    const std::string port_file = argv[2];
+    const std::string meta_file = argv[3];
+    g_journal_path = argv[4];
 
     /**
      * 入站 handler 在传输层协程内运行：本示例在 handler 内做 protobuf 业务
@@ -89,17 +89,22 @@ int main(int argc, char* argv[]) {
      */
     g_scheduler->Start();
 
+    bbt::framework::AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     auto options = bbt::framework::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
-        .SetNetworkLimits(bbt::infra::NetworkLimits{
-            64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}})
-        .Listen("127.0.0.1:0")
-        .SetShutdownBudget(std::chrono::milliseconds{3000})
-        .SetLifecycleBudget(std::chrono::milliseconds{3000})
-        /**
+                       .SetAppLimits(limits)
+                       .SetNetworkLimits(bbt::infra::NetworkLimits{
+                           64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}})
+                       .Listen("127.0.0.1:0")
+                       .SetShutdownBudget(std::chrono::milliseconds{3000})
+                       .SetLifecycleBudget(std::chrono::milliseconds{3000})
+                       /**
          * V2 会话身份必填；进程内每个会话 owner 使用明确身份。
          */
-        .SetLocalIdentity("getvalue-server");
+                       .SetLocalIdentity("getvalue-server");
 
     /**
      * 装配结果跨协程/线程交接：endpoint 经 promise 交给宿主线程写端口
@@ -107,9 +112,9 @@ int main(int argc, char* argv[]) {
      * 退出码经 promise 回传（0=按期优雅收口，2=启动失败，4=收口未竟）。
      */
     std::promise<std::string> bound_ep;
-    std::promise<int>         rc_slot;
+    std::promise<int> rc_slot;
     std::shared_ptr<bbt::framework::CoApp> app_handle;
-    std::mutex                  app_mtx;
+    std::mutex app_mtx;
 
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
@@ -177,7 +182,8 @@ int main(int argc, char* argv[]) {
          */
         {
             std::lock_guard<std::mutex> lk(app_mtx);
-            if (app_handle) app_handle->RequestShutdown();
+            if (app_handle)
+                app_handle->RequestShutdown();
         }
         std::fprintf(stderr, "server did not bind\n");
         return 5;
@@ -215,7 +221,8 @@ int main(int argc, char* argv[]) {
      */
     {
         std::lock_guard<std::mutex> lk(app_mtx);
-        if (app_handle) app_handle->RequestShutdown();
+        if (app_handle)
+            app_handle->RequestShutdown();
     }
     const int rc = rc_slot.get_future().get();
     std::fprintf(stderr, "getvalue server rc=%d\n", rc);

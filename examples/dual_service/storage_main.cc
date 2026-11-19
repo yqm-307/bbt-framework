@@ -59,8 +59,8 @@
 #include <bbt/framework/MongoDbResource.hpp>
 #include <bbt/framework/RedisNetResource.hpp>
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
 
 namespace {
@@ -89,7 +89,8 @@ void BsonPutI32(std::vector<std::uint8_t>& b, std::int32_t v) {
     b.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFF));
 }
 void BsonPutCStr(std::vector<std::uint8_t>& b, std::string_view s) {
-    for (char c : s) b.push_back(static_cast<std::uint8_t>(c));
+    for (char c : s)
+        b.push_back(static_cast<std::uint8_t>(c));
     b.push_back(0x00);
 }
 void BsonElemString(std::vector<std::uint8_t>& b,
@@ -168,9 +169,11 @@ public:
      */
     fw::result<void> OnStart() override {
         auto h = GetComponent<fw::RedisNetResource>("cache");
-        if (!h) return fw::result<void>::err(std::move(h.error()));
+        if (!h)
+            return fw::result<void>::err(std::move(h.error()));
         auto b = h.value().Borrow();
-        if (!b) return fw::result<void>::err(std::move(b.error()));
+        if (!b)
+            return fw::result<void>::err(std::move(b.error()));
         const inf::CallOptions o{
             std::chrono::steady_clock::now() + kRedisConnectBudget};
         auto connected = bbt_co_await b.value().Get().Connect(o);
@@ -192,19 +195,26 @@ public:
 
     fw::CoRpcResp Put(fw::CoRpcReq req) {
         auto args = req.Parse<std::string, std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto& [key, value] = args.value();
-        if (key.empty()) return ArgErr("storage.put: empty key");
+        if (key.empty())
+            return ArgErr("storage.put: empty key");
         auto cache = GetComponent<fw::RedisNetResource>("cache");
-        if (!cache) return ResErr(cache.error());
+        if (!cache)
+            return ResErr(cache.error());
         auto cache_b = cache.value().Borrow();
-        if (!cache_b) return ResErr(cache_b.error());
+        if (!cache_b)
+            return ResErr(cache_b.error());
         auto docs = GetComponent<fw::MongoDbResource>("docs");
-        if (!docs) return ResErr(docs.error());
+        if (!docs)
+            return ResErr(docs.error());
         auto docs_b = docs.value().Borrow();
-        if (!docs_b) return ResErr(docs_b.error());
+        if (!docs_b)
+            return ResErr(docs_b.error());
         auto budget = ResourceBudget();
-        if (!budget) return fw::CoRpcResp::Error(budget.error());
+        if (!budget)
+            return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
         /**
          * 真实双写：Redis SET 与 Mongo upsert 都成功才回写好的值。
@@ -212,7 +222,8 @@ public:
         if (auto r = bbt_co_await cache_b.value().Get().Set(key, value, o); !r)
             return fw::CoRpcResp::Error(r.error());
         if (auto r = bbt_co_await docs_b.value().Get().UpdateOne(
-                DocKey(key), DocSet(value), o); !r)
+                DocKey(key), DocSet(value), o);
+            !r)
             return fw::CoRpcResp::Error(r.error());
         std::printf("[svc_a] put key=%s (redis+mongo)\n", key.c_str());
         return fw::CoRpcResp::From(value);
@@ -220,29 +231,38 @@ public:
 
     fw::CoRpcResp Get(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
-        if (args.value().empty()) return ArgErr("storage.get: empty key");
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
+        if (args.value().empty())
+            return ArgErr("storage.get: empty key");
         auto cache = GetComponent<fw::RedisNetResource>("cache");
-        if (!cache) return ResErr(cache.error());
+        if (!cache)
+            return ResErr(cache.error());
         auto cache_b = cache.value().Borrow();
-        if (!cache_b) return ResErr(cache_b.error());
+        if (!cache_b)
+            return ResErr(cache_b.error());
         auto docs = GetComponent<fw::MongoDbResource>("docs");
-        if (!docs) return ResErr(docs.error());
+        if (!docs)
+            return ResErr(docs.error());
         auto docs_b = docs.value().Borrow();
-        if (!docs_b) return ResErr(docs_b.error());
+        if (!docs_b)
+            return ResErr(docs_b.error());
         auto budget = ResourceBudget();
-        if (!budget) return fw::CoRpcResp::Error(budget.error());
+        if (!budget)
+            return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
         /**
          * 真实读路径：Redis GET 命中即回；miss 回退 Mongo FindOne。
          */
         auto hit = bbt_co_await cache_b.value().Get().Get(args.value(), o);
-        if (!hit) return fw::CoRpcResp::Error(hit.error());
+        if (!hit)
+            return fw::CoRpcResp::Error(hit.error());
         if (hit.value().has_value())
             return fw::CoRpcResp::From(hit.value().value());
         auto doc = bbt_co_await docs_b.value().Get().FindOne(
             DocKey(args.value()), o);
-        if (!doc) return fw::CoRpcResp::Error(doc.error());
+        if (!doc)
+            return fw::CoRpcResp::Error(doc.error());
         if (doc.value().has_value()) {
             /**
              * 命中 Mongo 即算命中（值本体在文档字节里，示例只证真实往返）。
@@ -260,33 +280,44 @@ public:
 
     fw::CoRpcResp Del(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto cache = GetComponent<fw::RedisNetResource>("cache");
-        if (!cache) return ResErr(cache.error());
+        if (!cache)
+            return ResErr(cache.error());
         auto cache_b = cache.value().Borrow();
-        if (!cache_b) return ResErr(cache_b.error());
+        if (!cache_b)
+            return ResErr(cache_b.error());
         auto docs = GetComponent<fw::MongoDbResource>("docs");
-        if (!docs) return ResErr(docs.error());
+        if (!docs)
+            return ResErr(docs.error());
         auto docs_b = docs.value().Borrow();
-        if (!docs_b) return ResErr(docs_b.error());
+        if (!docs_b)
+            return ResErr(docs_b.error());
         auto budget = ResourceBudget();
-        if (!budget) return fw::CoRpcResp::Error(budget.error());
+        if (!budget)
+            return fw::CoRpcResp::Error(budget.error());
         const inf::CallOptions& o = budget.value();
         auto rn = bbt_co_await cache_b.value().Get().Delete({args.value()}, o);
-        if (!rn) return fw::CoRpcResp::Error(rn.error());
+        if (!rn)
+            return fw::CoRpcResp::Error(rn.error());
         auto mn = bbt_co_await docs_b.value().Get().DeleteOne(
             DocKey(args.value()), o);
-        if (!mn) return fw::CoRpcResp::Error(mn.error());
+        if (!mn)
+            return fw::CoRpcResp::Error(mn.error());
         const bool removed = (rn.value() + mn.value()) > 0;
         return fw::CoRpcResp::From(static_cast<std::int32_t>(removed ? 1 : 0));
     }
 
     fw::CoRpcResp SleepMs(fw::CoRpcReq req) {
         auto args = req.Parse<std::int32_t>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
-        if (args.value() < 0) return ArgErr("storage.sleep_ms: negative ms");
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
+        if (args.value() < 0)
+            return ArgErr("storage.sleep_ms: negative ms");
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         /**
          * 在永不通知的 CoWaiter 上带预算等待：等价于协作式 sleep，入站
          * deadline 到期以 TimedOut 如实返回，协程级 RequestCancel 到达则
@@ -299,7 +330,8 @@ public:
         if (st != co::WaitStatus::Completed)
             return fw::CoRpcResp::Error(fw::MakeError(
                 st == co::WaitStatus::TimedOut
-                    ? fw::ErrorCode::TimedOut : fw::ErrorCode::Cancelled,
+                    ? fw::ErrorCode::TimedOut
+                    : fw::ErrorCode::Cancelled,
                 "storage.sleep_ms: interrupted"));
         return fw::CoRpcResp::From(args.value());
     }
@@ -325,7 +357,7 @@ private:
 std::atomic_bool g_stop{false};
 
 void InstallSignals() {
-    std::signal(SIGINT,  [](int) { g_stop.store(true); });
+    std::signal(SIGINT, [](int) { g_stop.store(true); });
     std::signal(SIGTERM, [](int) { g_stop.store(true); });
 }
 
@@ -334,14 +366,18 @@ void InstallSignals() {
  * 会让进程 terminate，而非法端口是普通用法错误，应给诊断后正常退出。
  */
 bool ParsePort(const char* text, std::uint16_t* out) {
-    if (text == nullptr || *text == '\0') return false;
+    if (text == nullptr || *text == '\0')
+        return false;
     unsigned long value = 0;
     for (const char* p = text; *p != '\0'; ++p) {
-        if (*p < '0' || *p > '9') return false;
+        if (*p < '0' || *p > '9')
+            return false;
         value = value * 10 + static_cast<unsigned long>(*p - '0');
-        if (value > 65535) return false;
+        if (value > 65535)
+            return false;
     }
-    if (value == 0) return false;
+    if (value == 0)
+        return false;
     *out = static_cast<std::uint16_t>(value);
     return true;
 }
@@ -353,7 +389,8 @@ bool ParsePort(const char* text, std::uint16_t* out) {
  */
 std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     const auto pos = addr.rfind(':');
-    if (pos == std::string::npos) return {addr, 0};
+    if (pos == std::string::npos)
+        return {addr, 0};
     std::uint16_t port = 0;
     if (!ParsePort(addr.c_str() + pos + 1, &port))
         return {addr.substr(0, pos), 0};
@@ -368,7 +405,7 @@ int main(int argc, char** argv) {
      */
     if (argc != 4) {
         std::fprintf(stderr,
-            "usage: svc_a <listen_port> <redis_addr host:port> <mongo_uri>\n");
+                     "usage: svc_a <listen_port> <redis_addr host:port> <mongo_uri>\n");
         /**
          * EX_USAGE
          */
@@ -377,8 +414,8 @@ int main(int argc, char** argv) {
     std::uint16_t port = 0;
     if (!ParsePort(argv[1], &port)) {
         std::fprintf(stderr,
-            "[svc_a] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
-            argv[1]);
+                     "[svc_a] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
+                     argv[1]);
         /**
          * EX_USAGE
          */
@@ -387,8 +424,8 @@ int main(int argc, char** argv) {
     const auto [rhost, rport] = SplitAddr(argv[2]);
     if (rhost.empty() || rport == 0) {
         std::fprintf(stderr,
-            "[svc_a] FATAL: 非法 redis_addr \"%s\"（需要 host:port，端口 1..65535）\n",
-            argv[2]);
+                     "[svc_a] FATAL: 非法 redis_addr \"%s\"（需要 host:port，端口 1..65535）\n",
+                     argv[2]);
         /**
          * EX_USAGE
          */
@@ -415,9 +452,9 @@ int main(int argc, char** argv) {
     auto redis_address = inf::net::Address::Ip(rhost, rport, raddr_ec);
     if (raddr_ec || !redis_address.Valid()) {
         std::fprintf(stderr,
-            "[svc_a] FATAL: 非法 redis_addr \"%s\"（新入口只接受数值 "
-            "IPv4/IPv6: %s）\n",
-            argv[2], raddr_ec.message().c_str());
+                     "[svc_a] FATAL: 非法 redis_addr \"%s\"（新入口只接受数值 "
+                     "IPv4/IPv6: %s）\n",
+                     argv[2], raddr_ec.message().c_str());
         /**
          * EX_USAGE
          */
@@ -431,33 +468,38 @@ int main(int argc, char** argv) {
      * 绑定一次完成；owner Close 是同步物理收口）。
      */
     inf::mongo::MongoRuntimeConfig mcfg;
-    mcfg.uri                      = mongo_uri;
-    mcfg.worker_threads           = 2;
-    mcfg.max_queue                = 256;
+    mcfg.uri = mongo_uri;
+    mcfg.worker_threads = 2;
+    mcfg.max_queue = 256;
     mcfg.server_selection_timeout = std::chrono::milliseconds{5000};
-    mcfg.connect_timeout          = std::chrono::milliseconds{5000};
-    mcfg.socket_timeout           = std::chrono::milliseconds{5000};
-    mcfg.wait_queue_timeout       = std::chrono::milliseconds{5000};
+    mcfg.connect_timeout = std::chrono::milliseconds{5000};
+    mcfg.socket_timeout = std::chrono::milliseconds{5000};
+    mcfg.wait_queue_timeout = std::chrono::milliseconds{5000};
     const inf::mongo::MongoTarget mtarget{"bbt_dual_service", "kv"};
 
     InstallSignals();
     g_scheduler->Start();
 
+    fw::AppLimits limits;
+    limits.max_objects = 128;
+    limits.max_bindings = 128;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     auto options = fw::AppOptions{}
-        .SetLimits(128, 128, 64, 64)
-        .SetNetworkLimits(inf::NetworkLimits{
-            /*max_connections*/ 128,
-            /*max_inflight*/    64,
-            /*max_header_bytes*/16384,
-            /*max_body_bytes*/  65536,
-            /*incoming_timeout*/std::chrono::milliseconds{30000}})
-        .Listen("127.0.0.1:" + std::to_string(port))
-        .SetLocalIdentity("dual-storage")
-        /**
+                       .SetAppLimits(limits)
+                       .SetNetworkLimits(inf::NetworkLimits{
+                           /*max_connections*/ 128,
+                           /*max_inflight*/ 64,
+                           /*max_header_bytes*/ 16384,
+                           /*max_body_bytes*/ 65536,
+                           /*incoming_timeout*/ std::chrono::milliseconds{30000}})
+                       .Listen("127.0.0.1:" + std::to_string(port))
+                       .SetLocalIdentity("dual-storage")
+                       /**
          * 纯被调方：无出站 RPC 路由
          */
-        .SetShutdownBudget(std::chrono::milliseconds{2000})
-        .SetLifecycleBudget(std::chrono::milliseconds{30000});
+                       .SetShutdownBudget(std::chrono::milliseconds{2000})
+                       .SetLifecycleBudget(std::chrono::milliseconds{30000});
 
     /**
      * 装配/启动/等待关闭/收口全部在受管协程内（Co* 入口的 CoRuntimeOnly
@@ -466,11 +508,11 @@ int main(int argc, char** argv) {
      * 4 = 收口未竟）。app_done 让 watcher 在「主协程未发布 app 就结束」
      * 时也能退出。
      */
-    std::promise<int>                rc_slot;
-    std::shared_ptr<fw::CoApp>       app_handle;
-    std::mutex                       app_mtx;
-    std::atomic_bool                 app_done{false};
-    const std::string                redis_desc =
+    std::promise<int> rc_slot;
+    std::shared_ptr<fw::CoApp> app_handle;
+    std::mutex app_mtx;
+    std::atomic_bool app_done{false};
+    const std::string redis_desc =
         rhost + ":" + std::to_string(rport);
 
     bool submitted = false;
@@ -505,7 +547,8 @@ int main(int argc, char** argv) {
             auto docs_install =
                 bbt_co_await app->CoInstallComponent<fw::MongoDbResource>(
                     "docs", fw::MongoDbResource::Options{}
-                                .SetConfig(mcfg).SetTarget(mtarget));
+                                .SetConfig(mcfg)
+                                .SetTarget(mtarget));
             if (!docs_install) {
                 std::fprintf(stderr,
                              "[svc_a] CoInstallComponent(docs) failed: %s\n",

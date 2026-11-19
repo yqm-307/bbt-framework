@@ -448,8 +448,13 @@ int BindFailure(const std::shared_ptr<fw::CoApp>& app_handle,
  * 装配两进程共用的网络/预算/身份基座（路由与策略由调用方追加）。
  */
 fw::AppOptions BaseOptions(const char* identity) {
+    fw::AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     return fw::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
+        .SetAppLimits(limits)
         .SetNetworkLimits(inf::NetworkLimits{/*max_connections*/ 64, /*max_inflight*/ 64,
                                              /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
                                              /*incoming_timeout*/ std::chrono::milliseconds{30000}})
@@ -474,9 +479,9 @@ int RunCallee(const std::string& port_file, const std::string& meta_file) {
      * 由协程侧单次写入。
      */
     std::promise<std::string> bound_ep;
-    std::promise<int>         rc_slot;
+    std::promise<int> rc_slot;
     std::shared_ptr<fw::CoApp> app_handle;
-    std::mutex                 app_mtx;
+    std::mutex app_mtx;
 
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
@@ -706,9 +711,9 @@ int RunCaller(const std::string& mode, const std::string& port_file,
     g_scheduler->Start();
 
     std::promise<std::string> bound_ep;
-    std::promise<int>         rc_slot;
+    std::promise<int> rc_slot;
     std::shared_ptr<fw::CoApp> app_handle;
-    std::mutex                 app_mtx;
+    std::mutex app_mtx;
 
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(

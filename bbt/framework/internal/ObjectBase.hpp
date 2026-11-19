@@ -66,9 +66,9 @@ protected:
      */
     struct BoundComponent {
         const std::type_info* type;
-        std::string           name;
-        ObjectHandle          object;
-        std::uint64_t         binding_generation = 0;
+        std::string name;
+        ObjectHandle object;
+        std::uint64_t binding_generation = 0;
     };
     /**
      * 按 (type, name) 取绑定表项副本；未绑定返回 false。返回副本而非指针：
@@ -76,6 +76,9 @@ protected:
      */
     bool _FindBoundCopy(const std::type_info& type, std::string_view name,
                         BoundComponent* out) const;
+    static result<void> _CheckGetComponentContext();
+    result<BoundComponent> _GetComponentLookup(
+        const std::type_info& type, std::string_view name) const;
     void _BindComponentEntry(const std::type_info& type, std::string name,
                              ObjectHandle object, std::uint64_t gen);
     void _UnbindComponentEntry(const std::type_info& type,
@@ -89,8 +92,8 @@ private:
      * 绑定表短临界区保护：OnBindingChanged/hook 可在受管协程内读表，
      * 绑定/解绑在 Co 控制入口写表；锁内只读写表项，不调用业务代码。
      */
-    mutable std::mutex            m_bound_mtx;
-    std::vector<BoundComponent>   m_bound_components;
+    mutable std::mutex m_bound_mtx;
+    std::vector<BoundComponent> m_bound_components;
 
     friend class ::bbt::framework::CoApp;
     friend class detail::Registry;

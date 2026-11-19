@@ -1,17 +1,16 @@
 #pragma once
 /**
- * 服务执行策略（业务面）。
- * Concurrent：派发协程内联执行，服务级 max_inflight 接纳计数封顶。
- * ActorSerial：按方法声明的 key 提取器取 actor key，每个 key 一条
- * 串行邮箱队列（容量 ServiceOptions::SerialQueueCapacity），同一 key
- * 至多一条 handler 在执行；key 数受 ServiceOptions::MaxSerialKeys 封顶。
- *
- * 「容量耗尽返回 Overloaded」属运行期行为，装配期不在此检查；
- * 装配期规则由 ServiceOptions::Validate 落实。
+ * @brief Concurrent 允许多个请求同时执行；SerialByKey 按方法取出的 key 分队列。
+ * 同一 key 每次只执行一个请求，不同 key 可并行。SerialQueueCapacity 限制每个队列等待的请求数，
+ * MaxSerialKeys 限制 key 的数量；运行时超出容量返回 Overloaded。Concurrent 的并发数受 max_inflight 限制。
  */
 
 namespace bbt::framework {
 
-enum class ExecutionPolicy { Concurrent, ActorSerial };
+enum class ExecutionPolicy {
+    Concurrent,
+    SerialByKey,
+    ActorSerial = SerialByKey, ///< 兼容旧拼写。
+};
 
 } // namespace bbt::framework

@@ -133,13 +133,20 @@ protected:
 
 const char* AppStateName(fw::AppState s) {
     switch (s) {
-        case fw::AppState::Created:        return "Created";
-        case fw::AppState::Starting:       return "Starting";
-        case fw::AppState::Running:        return "Running";
-        case fw::AppState::Paused:         return "Paused";
-        case fw::AppState::Stopping:       return "Stopping";
-        case fw::AppState::StopIncomplete: return "StopIncomplete";
-        case fw::AppState::Stopped:        return "Stopped";
+    case fw::AppState::Created:
+        return "Created";
+    case fw::AppState::Starting:
+        return "Starting";
+    case fw::AppState::Running:
+        return "Running";
+    case fw::AppState::Paused:
+        return "Paused";
+    case fw::AppState::Stopping:
+        return "Stopping";
+    case fw::AppState::StopIncomplete:
+        return "StopIncomplete";
+    case fw::AppState::Stopped:
+        return "Stopped";
     }
     return "Unknown";
 }
@@ -151,8 +158,13 @@ fw::ServiceOptions ServiceOpts() {
 }
 
 fw::AppOptions BaseOptions(std::string identity) {
+    fw::AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     return fw::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
+        .SetAppLimits(limits)
         .SetNetworkLimits(inf::NetworkLimits{
             /*max_connections*/ 64, /*max_inflight*/ 64,
             /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
@@ -207,10 +219,10 @@ std::string SchemaMeta(const std::string& local_identity) {
  * 4=Create 失败或收口未竟，5=宿主侧绑定超时。
  */
 struct HostSlots {
-    std::promise<std::string>  bound_ep;
-    std::promise<int>          rc_slot;
+    std::promise<std::string> bound_ep;
+    std::promise<int> rc_slot;
     std::shared_ptr<fw::CoApp> app_handle;
-    std::mutex                 app_mtx;
+    std::mutex app_mtx;
 };
 
 /**
@@ -226,7 +238,8 @@ bool WaitBoundAndServe(HostSlots& slots, const std::string& port_file,
         std::future_status::ready) {
         {
             std::lock_guard<std::mutex> lk(slots.app_mtx);
-            if (slots.app_handle) slots.app_handle->RequestShutdown();
+            if (slots.app_handle)
+                slots.app_handle->RequestShutdown();
         }
         std::fprintf(stderr, "two_service %s did not bind\n", who);
         return false;
@@ -246,7 +259,8 @@ bool WaitBoundAndServe(HostSlots& slots, const std::string& port_file,
      */
     {
         std::lock_guard<std::mutex> lk(slots.app_mtx);
-        if (slots.app_handle) slots.app_handle->RequestShutdown();
+        if (slots.app_handle)
+            slots.app_handle->RequestShutdown();
     }
     return true;
 }

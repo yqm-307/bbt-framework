@@ -38,7 +38,8 @@ Error OrderedDomainErrorWithDetails(const char* domain_code,
     Error e = OrderedDomainError(domain_code, std::move(message));
     e.details = std::move(details);
     auto v = ValidateErrorAtBoundary(e);
-    if (!v) return v.error();
+    if (!v)
+        return v.error();
     return e;
 }
 
@@ -134,51 +135,37 @@ result<OrderedStamp> OrderedSession::prepare() {
     } else {
         ++next_sequence_;
     }
-    auto ticket = std::make_shared<OrderedTicket>(seq, MakeRequestId(seq));
-    tickets_.emplace(ticket->request_id(), ticket);
-    auto state = std::make_shared<OrderedStamp::State>();
-    state->ticket  = std::move(ticket);
-    /**
-     * 票据回指签发会话：co_rpc_call 经它执行 BindForSend；
-     * 弱指针不影响会话生命周期语义（析构即释放 grant 占位）。
-     */
-    state->session = shared_from_this();
+    auto state = std::make_shared<OrderedStamp::State>(seq, MakeRequestId(seq), weak_from_this());
     return result<OrderedStamp>::ok(OrderedStamp(std::move(state)));
-}
-
-std::shared_ptr<OrderedTicket> OrderedSession::TicketOf(
-    const OrderedStamp& stamp) {
-    if (!stamp.state_ || !stamp.state_->ticket) return nullptr;
-    return stamp.state_->ticket;
 }
 
 result<void> OrderedSession::BindForSend(
     const OrderedStamp& stamp, const OrderedTicket::BoundContent& content) {
-    auto ticket = TicketOf(stamp);
-    if (!ticket) {
+    if (!stamp.state_) {
         return result<void>::err(MakeError(
             ErrorCode::InvalidArgument, "empty ordered stamp"));
     }
-    std::lock_guard<std::mutex> lk(mtx_);
-    auto it = tickets_.find(ticket->request_id());
-    if (it == tickets_.end() || it->second.get() != ticket.get()) {
+    if (stamp.state_->session.lock().get() != this) {
         return result<void>::err(MakeError(
             ErrorCode::InvalidArgument,
             "ordered stamp not issued by this session"));
     }
-    if (ticket->IsSent()) {
+    auto& ticket = stamp.state_->ticket;
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (ticket.IsSent()) {
         /**
          * 复用票据只能重发同一请求；内容不一致本地拒绝，不发出。
          */
-        if (ticket->BindOrCheck(content)) return result<void>::ok();
+        if (ticket.BindOrCheck(content))
+            return result<void>::ok();
         return result<void>::err(OrderedDomainError(
             ordered_domain_code::kSequenceConflict,
             "ordered ticket already bound to a different request"));
     }
     /**
-     * 首次发送不得越过仍未发送的更小序号票据。
+     * 水位记录缺号，即使缺号所对应的票据已被丢弃。
      */
-    if (ticket->sequence() != bind_watermark_ + 1) {
+    if (ticket.sequence() != bind_watermark_ + 1) {
         return result<void>::err(OrderedDomainErrorWithDetails(
             ordered_domain_code::kSequenceGap,
             "first send would skip an unsent ticket",
@@ -188,18 +175,16 @@ result<void> OrderedSession::BindForSend(
     /**
      * 未绑定，必然成功
      */
-    ticket->BindOrCheck(content);
+    ticket.BindOrCheck(content);
     ++bind_watermark_;
     return result<void>::ok();
 }
 
 bool OrderedSession::IsTicketSent(const OrderedStamp& stamp) const {
-    auto ticket = TicketOf(stamp);
-    if (!ticket) return false;
+    if (!stamp.state_ || stamp.state_->session.lock().get() != this)
+        return false;
     std::lock_guard<std::mutex> lk(mtx_);
-    auto it = tickets_.find(ticket->request_id());
-    if (it == tickets_.end() || it->second.get() != ticket.get()) return false;
-    return ticket->IsSent();
+    return stamp.state_->ticket.IsSent();
 }
 
 } // namespace bbt::framework

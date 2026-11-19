@@ -29,6 +29,13 @@ cmake_args=(
     -DNEED_TEST=OFF -DNEED_EXAMPLE=OFF
     -DBUILD_TESTING=OFF
 )
+# 可选资源按实际存在的 infra 链接目标决定是否装入框架静态库。
+for option in BBT_INFRA_REDIS_NET BBT_HIREDIS_PREFIX BBT_INFRA_MONGO BBT_MONGOC_PREFIX BBT_MONGOCXX_PREFIX; do
+    if [ -n "${!option:-}" ]; then
+        cmake_args+=("-D${option}=${!option}")
+    fi
+done
+
 # 固定 protobuf 前缀时才显式传递；不传则沿用 infra 的默认发现逻辑。
 if [ -n "${BBT_PROTOBUF_PREFIX:-}" ]; then
     cmake_args+=("-DBBT_PROTOBUF_PREFIX=${BBT_PROTOBUF_PREFIX}")
@@ -42,6 +49,13 @@ install -d "${prefix}/include" "${prefix}/lib"
 # 公共头与实现已收拢到 bbt/framework/（内部头在 internal/ 子目录），
 # 安装布局保持 include/bbt/framework/... 不变。
 while IFS= read -r -d '' file; do
+    case "${file##*/}" in
+        RedisNetResource.hpp|MongoDbResource.hpp)
+            if ! grep -Fxq "${file##*/}" "${build_dir}/framework-resource-headers.txt"; then
+                continue
+            fi
+            ;;
+    esac
     target="${prefix}/include/${file#"${repo_root}/"}"
     install -D -m 0644 "${file}" "${target}"
 done < <(find "${repo_root}/bbt" -type f \( -name '*.h' -o -name '*.hh' -o -name '*.hpp' \) -print0)

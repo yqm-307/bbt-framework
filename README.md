@@ -8,15 +8,16 @@
 - **公共面唯一**：业务只使用 `bbt::framework`。聚合头 `bbt/framework/Framework.hpp`，宿主头
   `bbt/framework/CoApp.hpp`。机器面头在 `bbt/framework/internal/`，业务不直接包含。
 - **已实现**：受管对象装配与卸载（`CoInstallService`、`CoInstallComponent`、`CoUninstallService`、
-  `CoUninstallComponent`）、Actor 类型登记（`CoInstallActor`）、声明式与运行期绑定
-  （`ServiceOptions::BindComponent`、`CoBindComponent`、`CoUnbindComponent`）、`GetComponent` + `Borrow`、
+  `CoUninstallComponent`）、Actor 类型登记（`CoRegisterActorType`）、声明式与运行期绑定
+  （`ServiceOptions::BindComponent`、`CoBindComponent`、`CoUnbindComponent`）、主体内的 `BorrowComponent`、
   `CoObserve` 事件、`CoStart` / `CoStop`、`RequestShutdown` / `CoWaitShutdownRequest`、
   `State` / `PendingCleanup` / `LifecycleFailures` 观察面、V2 RPC 入站（`InstallRpcAdmission`）与
   出站（`RpcEgress`）、静态路由（`AppOptions::AddRoute`）与 `DynamicRouteTable`。
 - **未实现**：
   - 非拥有关系边 `CoBindObject` / `CoUnbindObject` 恒返回 `UnsupportedRoute`（`bbt/framework/host/CoApp.cc`）。
   - Actor 实例创建与销毁（`CoCreateActor` / `CoDestroyActor`）与 Actor 消息分发未接线；
-    `CoInstallActor` 只登记类型，不创建实例。
+    `CoRegisterActorType` 只登记类型。服务用 `ExecutionPolicy::SerialByKey` 按 key 串行执行 RPC。
+    `CoInstallActor` 和 `ExecutionPolicy::ActorSerial` 保留兼容。
   - `MonitorService`、`HttpComponent`、`AppInspector`、`AppSession`、`Resolver`、`CoJoin` 在源码中不存在；
     框架契约中出现的这些名字是目标设计，不是现有 API。
 - 目标设计与当前实现的差异见 [框架契约](docs/architecture/framework-contract.md) §1 与 §12。
@@ -47,12 +48,17 @@ private:
 };
 ```
 
-装配（须在受管协程内）：
+装配（在返回 `result<void>` 的受管协程入口中）：
 
 ```cpp
+bbt::framework::AppLimits limits;
+limits.max_objects = 64;
+limits.max_bindings = 64;
+limits.max_observers = 64;
+limits.observer_queue_capacity = 64;
 auto app = bbt::framework::CoApp::Create(
     bbt::framework::AppOptions{}
-        .SetLimits(64, 64, 64, 64)
+        .SetAppLimits(limits)
         .SetNetworkLimits(bbt::infra::NetworkLimits{
             /*max_connections*/ 64, /*max_inflight*/ 64,
             /*max_header_bytes*/ 16 * 1024, /*max_body_bytes*/ 64 * 1024,
@@ -63,14 +69,19 @@ auto app = bbt::framework::CoApp::Create(
         .SetLocalIdentity("echo-server"),
     "echo-server");
 
-bbt_co_await app->CoInstallService<EchoService>(
+auto installed = bbt_co_await app->CoInstallService<EchoService>(
     bbt::framework::ServiceOptions{}.SetMaxInflight(64));
-bbt_co_await app->CoStart();
-bbt_co_await app->CoWaitShutdownRequest();   // 外部线程 RequestShutdown() 唤醒
-bbt_co_await app->CoStop();                  // 显式收口，State() == Stopped 才是完整收口
+if (!installed) return installed;
+auto started = bbt_co_await app->CoStart();
+if (!started) return started;
+auto waited = bbt_co_await app->CoWaitShutdownRequest();  // 外部线程 RequestShutdown() 唤醒
+auto stopped = bbt_co_await app->CoStop();
+// 若 State() == StopIncomplete，用 PendingCleanup() 定位并带新期限继续收口。
+return stopped ? waited : stopped;
 ```
 
 - 对象只能经 `CoApp::CoInstall*` 创建。业务不能栈构造、`new` 或 `make_shared`。
+- `AppLimits::observer_queue_capacity` 当前只参与启动的正值校验，观察派发不据此限制队列。
 - 配置监听时必须给非零 `SetNetworkLimits`：`bbt::infra::NetworkLimits` 默认全零，
   会被 `CoStart` 的网络配置校验以 `max_connections out of range` 拒绝。
 - `Co` 前缀方法必须在受管协程内调用，宿主/非协程上下文返回 `InvalidContext`。
@@ -79,8 +90,10 @@ bbt_co_await app->CoStop();                  // 显式收口，State() == Stoppe
   重载）以 `bbt_co_async(result<...>)` 声明，只能在受管协程内经 `bbt_co_await`
   消费；非协程环境下 `bbt_co_await` 先抛 `std::logic_error`（实参与函数体不执行），
   通过后沿当前协程同步执行、期间可挂起，没有 Future/并行调度。
-- 完整可运行的装配序列（普通 `main` + 受管协程 + 跨线程交接）见
-  [`examples/getvalue`](examples/getvalue/README.md) 与 [`examples/component_services`](examples/component_services/README.md)。
+- **新增服务**：参照上面的 `kRpcMethods` 和 `CoInstallService` 注册，完整宿主见 [`getvalue`](examples/getvalue/README.md)。
+- **借组件**：先声明 `ServiceOptions::BindComponent`，再在服务内使用 `BorrowComponent` 获取租约，见 [`component_services`](examples/component_services/README.md)。
+- **跨进程调用**：用 `AppOptions::AddRoute` 指向远端，在调用方 Service 内调用 `call`，见 [`two_service`](examples/two_service/README.md)。
+- 可选的 Redis / Mongo 组件随对应 infra 目标构建和安装，使用方同时链接对应 infra 库。装配见 [`dual_service`](examples/dual_service/README.md)。
 
 ## 构建与测试
 

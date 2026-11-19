@@ -33,6 +33,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/rpc/Request.hpp>
@@ -51,40 +52,40 @@ class OrderedIngress;
 
 class InboundDispatcher {
 public:
-    /**
-     * 每个已注册服务的分发表项：两条执行策略共用同一个 Registry 受管
-     * 服务对象（裸指针非拥有；对象寿命由 CoApp 收口序保证——排空先于
-     * 对象销毁，Release 之后表项不可再达）。表项强持有方法表与有序入口，
-     * 在途分发自持这些共享对象，不依赖宿主对象继续存活。
-     */
-    struct ServiceEntry {
-        ServiceOptions          options;
+    // 安装簿与各次发布共享。有序入口随安装存活，保留流授权与序号状态。
+    struct ServiceDescription {
+        /**
+         * 安装期一次写入：options/table 来自 CoInstallService，
+         * ordered_ingress 由首次网络装配在 m_net_mtx 下挂上，此后只读。
+         */
+        ServiceOptions options;
         std::shared_ptr<const RpcMethodTable> table;
-        /**
-         * Registry 受管服务对象（非拥有；收口序保证在途分发期间存活）
-         */
-        CoServiceBase*          instance = nullptr;
-        /**
-         * 仅 ordered ActorSerial
-         */
         std::shared_ptr<OrderedIngress> ordered_ingress;
-        /**
-         * 执行租约（类型擦除，CoApp 供给）：进入 handler 前取 Registry
-         * 分发租约，gate 已封返回 false（Closed 拒绝）；执行结束归还。
-         * 空 close 时不设，直接执行（无网络簿记的测试构造）。
-         */
-        std::function<bool()>   lease_acquire;
-        std::function<void()>   lease_release;
     };
+
+    // 租约保护非拥有的 Registry 实例。测试直接构造时可省略租约。
+    struct ServiceTarget {
+        CoServiceBase* instance = nullptr;
+        std::function<bool()> lease_acquire;
+        std::function<void()> lease_release;
+    };
+
+    struct ServiceBinding {
+        std::shared_ptr<const ServiceDescription> description;
+        ServiceTarget target;
+    };
+
+    // 兼容直接构造分发表的测试。
+    struct ServiceEntry : ServiceDescription, ServiceTarget {};
 
     explicit InboundDispatcher(
         std::map<std::string, ServiceEntry> services);
+    explicit InboundDispatcher(
+        std::map<std::string, ServiceBinding> services);
 
     /**
-     * 运行期移除服务分发表项（CoUninstallService/收口路径）：新分发
-     * NotFound，已有邮箱 Close（已接纳等待项仍由 drain 消费完）；在途
-     * 执行经服务对象上的执行租约（Registry hooks_in_flight）由对象
-     * 收口路径等待，本组件不等待业务终态。
+     * 移除服务后，新查找返回 NotFound。关闭邮箱不丢弃已入队任务；
+     * 已经进入处理函数的请求由服务卸载流程等待，此处不等待。
      */
     void RemoveService(const std::string& service);
 
@@ -103,13 +104,23 @@ public:
         const std::function<void()>& on_dispatched = {});
 
 private:
+    /**
+     * 在途运行记录。请求在表锁内取得 shared_ptr，跨锁持有本次发布的
+     * 绑定与运行状态，因此重新发布或摘表都不会提前销毁它们。
+     */
     struct PerService {
-        ServiceEntry        entry;
-        std::atomic_size_t  inflight{0};
-        std::mutex          mb_mtx;
+        explicit PerService(ServiceBinding service) : binding(std::move(service)) {}
+
+        const ServiceBinding binding;
+        std::atomic_size_t inflight{0};
+        /**
+         * 摘除后拒绝新建邮箱（mb_mtx 保护）：保证摘除后不存在「新建
+         * 可接纳任务的邮箱」的窗口。已建邮箱由 RemoveService 统一 Close。
+         */
+        bool closed{false};
+        std::mutex mb_mtx;
         std::unordered_map<std::string, ActorMailbox::SPtr> mailboxes;
     };
-
 
     /**
      * 服务级 max_inflight 接纳计数（RAII 递减）。
@@ -120,16 +131,16 @@ private:
         std::atomic_size_t& c_;
     };
 
-    ActorMailbox::SPtr _MailboxFor(PerService& svc,
-                                   const std::string& actor_key);
+    result<ActorMailbox::SPtr> _MailboxFor(PerService& svc,
+                                           const std::string& actor_key);
 
     /**
-     * 分发表在构建后主要只读；RemoveService 运行期插入写。shared_mutex：
-     * Dispatch 取共享锁，RemoveService 取独占锁（锁内只查表/摘表项，
-     * 分发与邮箱操作在锁外）。
+     * 分发表在构建后主要只读；RemoveService 运行期抽表项。shared_mutex：
+     * Dispatch 取共享锁（锁内复制在途记录 shared_ptr，锁外持记录使用），
+     * RemoveService 取独占锁抽出记录（分发与邮箱操作在锁外）。
      */
     mutable std::shared_mutex m_services_mtx;
-    std::map<std::string, std::unique_ptr<PerService>> m_services;
+    std::map<std::string, std::shared_ptr<PerService>> m_services;
 };
 
 } // namespace bbt::framework

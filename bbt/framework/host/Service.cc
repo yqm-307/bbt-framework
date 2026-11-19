@@ -12,13 +12,10 @@
 
 namespace bbt::framework {
 
-/**
- * ---- detail::ObjectBase ----
- */
-
 ObjectInfo detail::ObjectBase::_ObjectInfo() const {
     auto r = m_handle.Info();
-    if (r) return r.value();
+    if (r)
+        return r.value();
     /**
      * 对象已销毁/失效：返回带原 id/generation 的最小快照。
      */
@@ -76,21 +73,31 @@ bool detail::ObjectBase::_FindBoundCopy(const std::type_info& type,
     return false;
 }
 
-/**
- * ---- CoComponent::Info ----
- */
+result<void> detail::ObjectBase::_CheckGetComponentContext() {
+    if (!bbt::coroutine::IsInCoroutineContext())
+        return result<void>::err(MakeError(
+            ErrorCode::InvalidContext, "GetComponent requires coroutine context"));
+    return result<void>::ok();
+}
 
-ObjectInfo CoComponent::Info() const { return _ObjectInfo(); }
+result<detail::ObjectBase::BoundComponent>
+detail::ObjectBase::_GetComponentLookup(const std::type_info& type,
+                                        std::string_view name) const {
+    BoundComponent b;
+    if (!_FindBoundCopy(type, name, &b))
+        return result<BoundComponent>::err(MakeError(
+            ErrorCode::NotFound,
+            "GetComponent: component '" + std::string(name) + "' is not bound"));
+    return result<BoundComponent>::ok(std::move(b));
+}
 
-/**
- * ---- CoServiceBase ----
- */
+ObjectInfo CoComponent::Info() const {
+    return _ObjectInfo();
+}
 
-ObjectInfo CoServiceBase::Info() const { return _ObjectInfo(); }
-
-/**
- * ---- CoActor::Info ----
- */
+ObjectInfo CoServiceBase::Info() const {
+    return _ObjectInfo();
+}
 
 ActorInfo CoActor::Info() const {
     ActorInfo out;

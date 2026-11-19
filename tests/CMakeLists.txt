@@ -94,7 +94,7 @@ set_tests_properties(framework.v1_absent PROPERTIES
     TIMEOUT 30 LABELS "smoke;unit")
 
 # deadline 继承与受管请求上下文（RequestContext/RequestScope/
-# CallOptionsAdapter）；真实协程调度器 + 注入点断言。
+# ResolveCallDeadline）；真实协程调度器 + 注入点断言。
 add_executable(Test_framework_request_context Test_framework_request_context.cc)
 target_link_libraries(Test_framework_request_context PRIVATE bbt::framework)
 target_compile_options(Test_framework_request_context PRIVATE -Wall -Wextra)

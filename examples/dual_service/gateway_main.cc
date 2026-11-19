@@ -62,13 +62,15 @@ public:
          * 远端业务错误（NotFound）原样透传给本进程调用方。
          */
         auto resp = bbt_co_await call("storage", "get", req);
-        if (!resp) return fw::CoRpcResp::Error(resp.error());
+        if (!resp)
+            return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
 
     fw::CoRpcResp Store(fw::CoRpcReq req) {
         auto resp = bbt_co_await call("storage", "put", req);
-        if (!resp) return fw::CoRpcResp::Error(resp.error());
+        if (!resp)
+            return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
 
@@ -77,7 +79,8 @@ public:
          * 清理本轮 key 用：透传 storage.del（Redis DEL + Mongo DeleteOne）。
          */
         auto resp = bbt_co_await call("storage", "del", req);
-        if (!resp) return fw::CoRpcResp::Error(resp.error());
+        if (!resp)
+            return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
 
@@ -91,15 +94,16 @@ public:
     fw::CoRpcResp SlowCall(fw::CoRpcReq req) {
         /**
          * 显式给 storage 一个 600ms 子预算（CallOptions.deadline 经
-         * AdaptCallOptions 与父预算取 min，不会延长父预算）。预算随
+         * ResolveCallDeadline 与父预算取 min，不会延长父预算）。预算随
          * V2 Call 的 remaining_budget_ms 到达 storage，服务端继承后
          * 在其 deadline 到期时如实 TimedOut；本进程再把该错误透传给 driver。
          */
         fw::CallOptions o;
         o.deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds{kSlowCallSubBudgetMs};
+                     std::chrono::milliseconds{kSlowCallSubBudgetMs};
         auto resp = bbt_co_await call("storage", "sleep_ms", req, {}, o);
-        if (!resp) return fw::CoRpcResp::Error(resp.error());
+        if (!resp)
+            return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
 
@@ -109,7 +113,8 @@ public:
          * find_route NotFound，不发起任何网络 I/O。
          */
         auto resp = bbt_co_await call("no.such.service", "ping", req);
-        if (!resp) return fw::CoRpcResp::Error(resp.error());
+        if (!resp)
+            return fw::CoRpcResp::Error(resp.error());
         return resp.value();
     }
 
@@ -131,7 +136,7 @@ private:
 std::atomic_bool g_stop{false};
 
 void InstallSignals() {
-    std::signal(SIGINT,  [](int) { g_stop.store(true); });
+    std::signal(SIGINT, [](int) { g_stop.store(true); });
     std::signal(SIGTERM, [](int) { g_stop.store(true); });
 }
 
@@ -139,14 +144,18 @@ void InstallSignals() {
  * 十进制端口解析（同 svc_a）：非法值给诊断后正常退出，不走 std::stoi 抛异常。
  */
 bool ParsePort(const char* text, std::uint16_t* out) {
-    if (text == nullptr || *text == '\0') return false;
+    if (text == nullptr || *text == '\0')
+        return false;
     unsigned long value = 0;
     for (const char* p = text; *p != '\0'; ++p) {
-        if (*p < '0' || *p > '9') return false;
+        if (*p < '0' || *p > '9')
+            return false;
         value = value * 10 + static_cast<unsigned long>(*p - '0');
-        if (value > 65535) return false;
+        if (value > 65535)
+            return false;
     }
-    if (value == 0) return false;
+    if (value == 0)
+        return false;
     *out = static_cast<std::uint16_t>(value);
     return true;
 }
@@ -159,14 +168,14 @@ int main(int argc, char** argv) {
      */
     if (argc != 3) {
         std::fprintf(stderr,
-            "usage: svc_b <listen_port> <storage_endpoint host:port>\n");
+                     "usage: svc_b <listen_port> <storage_endpoint host:port>\n");
         return 64;
     }
     std::uint16_t port = 0;
     if (!ParsePort(argv[1], &port)) {
         std::fprintf(stderr,
-            "[svc_b] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
-            argv[1]);
+                     "[svc_b] FATAL: 非法 listen_port \"%s\"（需要 1..65535 的十进制端口）\n",
+                     argv[1]);
         /**
          * EX_USAGE
          */
@@ -184,26 +193,31 @@ int main(int argc, char** argv) {
     InstallSignals();
     g_scheduler->Start();
 
+    fw::AppLimits limits;
+    limits.max_objects = 128;
+    limits.max_bindings = 128;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     auto options = fw::AppOptions{}
-        .SetLimits(128, 128, 64, 64)
-        .SetNetworkLimits(bbt::infra::NetworkLimits{
-            /*max_connections*/ 128,
-            /*max_inflight*/    64,
-            /*max_header_bytes*/16384,
-            /*max_body_bytes*/  65536,
-            /*incoming_timeout*/std::chrono::milliseconds{30000}})
-        .Listen("127.0.0.1:" + std::to_string(port))
-        /**
+                       .SetAppLimits(limits)
+                       .SetNetworkLimits(bbt::infra::NetworkLimits{
+                           /*max_connections*/ 128,
+                           /*max_inflight*/ 64,
+                           /*max_header_bytes*/ 16384,
+                           /*max_body_bytes*/ 65536,
+                           /*incoming_timeout*/ std::chrono::milliseconds{30000}})
+                       .Listen("127.0.0.1:" + std::to_string(port))
+                       /**
          * V2 会话身份必填；gateway 与 storage 进程使用互异身份。
          */
-        .SetLocalIdentity("dual-gateway")
-        /**
+                       .SetLocalIdentity("dual-gateway")
+                       /**
          * 出站白名单：仅允许名为 "storage" 的逻辑目标，endpoint 为真实
          * host:port——没有自动发现，也未配置的目标一律 NotFound。
          */
-        .AddRoute("storage", storage_ep)
-        .SetShutdownBudget(std::chrono::milliseconds{2000})
-        .SetLifecycleBudget(std::chrono::milliseconds{30000});
+                       .AddRoute("storage", storage_ep)
+                       .SetShutdownBudget(std::chrono::milliseconds{2000})
+                       .SetLifecycleBudget(std::chrono::milliseconds{30000});
 
     /**
      * 装配/启动/等待关闭/收口全部在受管协程内（Co* 入口的 CoRuntimeOnly
@@ -211,10 +225,10 @@ int main(int argc, char** argv) {
      * promise 回传（0 = CoStop 成功且 Stopped，2 = 安装/启动失败，
      * 4 = 收口未竟）。
      */
-    std::promise<int>                rc_slot;
-    std::shared_ptr<fw::CoApp>       app_handle;
-    std::mutex                       app_mtx;
-    std::atomic_bool                 app_done{false};
+    std::promise<int> rc_slot;
+    std::shared_ptr<fw::CoApp> app_handle;
+    std::mutex app_mtx;
+    std::atomic_bool app_done{false};
 
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(

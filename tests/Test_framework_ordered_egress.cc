@@ -19,6 +19,7 @@
 
 #include <bbt/framework/OrderedSession.hpp>
 #include <bbt/framework/OrderedTypes.hpp>
+#include <bbt/framework/internal/CoAppSeam.hpp>
 #include <bbt/framework/internal/ErrorDomainRule.hpp>
 
 namespace fw = bbt::framework;
@@ -28,9 +29,9 @@ namespace {
 
 fw::OrderedGrant MakeGrant(const std::string& tag) {
     fw::OrderedGrant g;
-    g.service        = "svc." + tag;
-    g.actor_key      = "actor." + tag;
-    g.producer_id    = "producer." + tag;
+    g.service = "svc." + tag;
+    g.actor_key = "actor." + tag;
+    g.producer_id = "producer." + tag;
     g.producer_epoch = "pepoch." + tag;
     g.receiver_epoch = "repoch." + tag;
     g.peer_principal = "peer." + tag;
@@ -39,11 +40,11 @@ fw::OrderedGrant MakeGrant(const std::string& tag) {
 
 fw::OrderedTicket::BoundContent MakeContent(const std::string& tag) {
     fw::OrderedTicket::BoundContent c;
-    c.service        = "svc";
-    c.method         = "method." + tag;
-    c.actor_key      = "actor";
-    c.custom         = "custom." + tag;
-    c.request_bytes  = "bytes." + tag;
+    c.service = "svc";
+    c.method = "method." + tag;
+    c.actor_key = "actor";
+    c.custom = "custom." + tag;
+    c.request_bytes = "bytes." + tag;
     return c;
 }
 
@@ -62,6 +63,7 @@ public:
             cv_.wait(lk, [this] { return arrived_ == total_; });
         }
     }
+
 private:
     const std::size_t total_;
     std::size_t arrived_ = 0;
@@ -71,7 +73,8 @@ private:
 
 const std::string* DetailValue(const fw::Error& e, const std::string& key) {
     for (const auto& kv : e.details) {
-        if (kv.first == key) return &kv.second;
+        if (kv.first == key)
+            return &kv.second;
     }
     return nullptr;
 }
@@ -122,12 +125,16 @@ BOOST_AUTO_TEST_CASE(prepare_concurrent_unique_and_dense) {
             barrier.ArriveAndWait();
             for (int k = 0; k < kPerThread; ++k) {
                 auto r = s->prepare();
-                if (!r) { ++failures; continue; }
+                if (!r) {
+                    ++failures;
+                    continue;
+                }
                 out[t].push_back(r.value());
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads)
+        th.join();
 
     BOOST_CHECK_EQUAL(failures.load(), 0);
     std::vector<std::uint64_t> seqs;
@@ -180,13 +187,17 @@ BOOST_AUTO_TEST_CASE(ticket_resend_same_request_conflict_rejected) {
     /**
      * 任一边界字段不同均属不同请求
      */
-    auto m = content; m.method = "m2";
+    auto m = content;
+    m.method = "m2";
     BOOST_CHECK(!s->BindForSend(stamp, m));
-    auto a = content; a.actor_key = "actor2";
+    auto a = content;
+    a.actor_key = "actor2";
     BOOST_CHECK(!s->BindForSend(stamp, a));
-    auto cu = content; cu.custom = "custom2";
+    auto cu = content;
+    cu.custom = "custom2";
     BOOST_CHECK(!s->BindForSend(stamp, cu));
-    auto sv = content; sv.service = "svc2";
+    auto sv = content;
+    sv.service = "svc2";
     BOOST_CHECK(!s->BindForSend(stamp, sv));
 }
 
@@ -196,7 +207,7 @@ BOOST_AUTO_TEST_CASE(ticket_resend_same_request_conflict_rejected) {
  */
 BOOST_AUTO_TEST_CASE(sequence_never_wraps) {
     const std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
-    auto s = fw::OrderedSession::OpenForTest(MakeGrant("t4"), kMax - 1);
+    auto s = fw::OpenOrderedSessionForTest(MakeGrant("t4"), kMax - 1);
     BOOST_REQUIRE(s);
     auto p1 = s.value()->prepare();
     BOOST_REQUIRE(p1);
@@ -219,7 +230,7 @@ BOOST_AUTO_TEST_CASE(sequence_never_wraps) {
     /**
      * 起始序号 0 属非法注入
      */
-    BOOST_CHECK(!fw::OrderedSession::OpenForTest(MakeGrant("t4b"), 0));
+    BOOST_CHECK(!fw::OpenOrderedSessionForTest(MakeGrant("t4b"), 0));
 }
 
 /**
@@ -506,6 +517,135 @@ BOOST_AUTO_TEST_CASE(reply_boundary_downgrades_invalid_error) {
         BOOST_REQUIRE_EQUAL(e.details.size(), 1u);
         BOOST_CHECK_EQUAL(e.details[0].second, "42");
     }
+}
+
+/**
+ * 用例 10：票据副本寿命——副本共享同一票据，放掉一份不影响同内容重试，
+ * 换内容仍 SequenceConflict（绑定内容未被副本释放带走）；放掉最后一份后
+ * 票据连同其重试内容随共享 State 消亡，会话不持有票据、水位不失，
+ * 同会话下一张仍按序签发并绑定。绑定存储的分配器层回收观察不在公开面内，
+ * 由仓外独立最小探针承担，共用测试不塞全局分配钩子。
+ */
+BOOST_AUTO_TEST_CASE(bound_stamp_copy_release_allows_next_bind) {
+    auto s = fw::OrderedSession::Open(MakeGrant("t10")).value();
+    const auto content = MakeContent("life");
+    std::optional<fw::OrderedStamp> stamp;
+    {
+        auto first = s->prepare().value();
+        BOOST_CHECK_EQUAL(first.sequence(), 1u);
+        BOOST_CHECK(s->BindForSend(first, content));
+        /**
+         * 复制已绑定 stamp；first 在作用域末消亡（放掉一份副本）
+         */
+        stamp = first;
+    }
+    /**
+     * 少了一份副本：同内容重试仍命中同一票据的既有绑定
+     */
+    {
+        auto copy = *stamp;
+        BOOST_CHECK(s->BindForSend(*stamp, content));
+        auto other = content;
+        other.request_bytes = "other-request-after-copy-release";
+        auto bad = s->BindForSend(copy, other);
+        BOOST_REQUIRE(!bad);
+        BOOST_CHECK_EQUAL(bad.error().domain_code, "SequenceConflict");
+    }
+    /**
+     * 放掉最后一份：会话存活、水位不失——下一张仍按 2 签发并绑定
+     */
+    stamp.reset();
+    auto next = s->prepare().value();
+    BOOST_CHECK_EQUAL(next.sequence(), 2u);
+    BOOST_CHECK(s->BindForSend(next, content));
+    BOOST_CHECK(s->IsTicketSent(next));
+}
+
+/**
+ * 用例 11：另一活会话拒绝非本会话签发的票据——InvalidArgument（本地
+ * 参数错误，非 actor 域远端错误）；IsTicketSent 对外会话始终 false
+ * （含签发方已绑定之后）；拒绝不推进外会话自己的首次绑定水位。
+ */
+BOOST_AUTO_TEST_CASE(foreign_session_rejects_stamp_without_watermark_move) {
+    auto issuer = fw::OrderedSession::Open(MakeGrant("t11a")).value();
+    auto foreign = fw::OrderedSession::Open(MakeGrant("t11b")).value();
+    auto stamp = issuer->prepare().value();
+    auto own1 = foreign->prepare().value();
+    auto own2 = foreign->prepare().value();
+    const auto content = MakeContent("foreign");
+
+    BOOST_CHECK(!foreign->IsTicketSent(stamp));
+    auto rej = foreign->BindForSend(stamp, content);
+    BOOST_REQUIRE(!rej);
+    BOOST_CHECK(rej.error().code == fw::ErrorCode::InvalidArgument);
+    BOOST_CHECK(rej.error().domain != std::string(fw::kOrderedErrorDomain));
+    /**
+     * 拒绝未在签发方或外会话侧产生任何绑定
+     */
+    BOOST_CHECK(!issuer->IsTicketSent(stamp));
+    BOOST_CHECK(!foreign->IsTicketSent(stamp));
+
+    /**
+     * 拒绝未推进外会话水位：own2 越序首发仍报 SequenceGap，expected 仍为 1
+     */
+    auto gap = foreign->BindForSend(own2, content);
+    BOOST_REQUIRE(!gap);
+    BOOST_CHECK_EQUAL(gap.error().domain_code, "SequenceGap");
+    const auto* expected = DetailValue(gap.error(), "expected_sequence");
+    BOOST_REQUIRE(expected != nullptr);
+    BOOST_CHECK_EQUAL(*expected, "1");
+
+    /**
+     * 外会话自身按序首发正常；签发方绑定后，外会话视角仍恒 false
+     */
+    BOOST_CHECK(foreign->BindForSend(own1, content));
+    BOOST_CHECK(foreign->IsTicketSent(own1));
+    BOOST_CHECK(issuer->BindForSend(stamp, content));
+    BOOST_CHECK(issuer->IsTicketSent(stamp));
+    BOOST_CHECK(!foreign->IsTicketSent(stamp));
+}
+
+/**
+ * 用例 12：序号 1 的未绑定票据副本全部丢弃后首发 2——弃票不补缺号、
+ * 水位不动：SequenceGap、expected_sequence 仍为 1、票据未绑定；
+ * 拒绝本身也不推进水位（重试仍报同一缺口）。
+ */
+BOOST_AUTO_TEST_CASE(discarded_unbound_ticket_leaves_gap_at_one) {
+    auto s = fw::OrderedSession::Open(MakeGrant("t12")).value();
+    const auto content = MakeContent("gap");
+    std::optional<fw::OrderedStamp> t2;
+    {
+        auto t1 = s->prepare().value();
+        BOOST_CHECK_EQUAL(t1.sequence(), 1u);
+        /**
+         * 一份副本先消亡；作用域结束时 t1 最后一份消亡——该票从未绑定
+         */
+        {
+            auto t1_copy = t1;
+            BOOST_CHECK_EQUAL(t1_copy.sequence(), 1u);
+        }
+        t2 = s->prepare().value();
+    }
+    BOOST_CHECK_EQUAL(t2->sequence(), 2u);
+
+    auto gap = s->BindForSend(*t2, content);
+    BOOST_REQUIRE(!gap);
+    BOOST_CHECK_EQUAL(gap.error().domain_code, "SequenceGap");
+    const auto* expected = DetailValue(gap.error(), "expected_sequence");
+    BOOST_REQUIRE(expected != nullptr);
+    BOOST_CHECK_EQUAL(*expected, "1");
+    BOOST_CHECK(!s->IsTicketSent(*t2));
+
+    /**
+     * 拒绝不推进水位：同一票据重试仍报 expected 1 且未绑定
+     */
+    auto again = s->BindForSend(*t2, content);
+    BOOST_REQUIRE(!again);
+    BOOST_CHECK_EQUAL(again.error().domain_code, "SequenceGap");
+    const auto* expected_again = DetailValue(again.error(), "expected_sequence");
+    BOOST_REQUIRE(expected_again != nullptr);
+    BOOST_CHECK_EQUAL(*expected_again, "1");
+    BOOST_CHECK(!s->IsTicketSent(*t2));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

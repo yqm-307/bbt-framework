@@ -1,30 +1,15 @@
 #pragma once
 /**
- * OrderedSession——同一授权流的唯一发送序号所有者（业务面）。
- * 只覆盖发送侧：prepare 发号与票据首次发送绑定/重放校验。
- *
- * 语义要点：
- * - 序号由本类分配：从 1 开始、线程安全、不回绕（空间耗尽明确失败），
- * 不依赖墙钟、不依赖客户端自增。
- * - 同一授权流（service/actor/producer/epoch/receiver_epoch 五字段流
- * 标识）在进程内至多一个存活发送实例：同一完整 grant 再次 Open 返回
- * 同一个共享会话；流标识相同但完整 grant 冲突 → StreamRejected。
- * 跨进程 fencing 不承诺，唯一部署由启动装配者保证。
- * - 票据首次发送绑定 service/method、actor-key、custom 与编码请求
- * 字节；已绑定票据只能重发同一请求，内容不一致 → 本地拒绝
- * SequenceConflict，不发出。
- * - 发送端不得跳过未发送票据制造序号缺口：首次发送
- * 必须按序号顺序进行；越序首次发送 → 本地拒绝 SequenceGap，并在
- * Error.details 的 expected_sequence 给出应先发送的序号。已绑定
- * 票据的重发不受水位限制。契约未规定 prepare 是否应因未结算票据
- * 阻塞——本实现选择不阻塞 prepare、在发送侧强制顺序，属实现策略。
+ * @brief 为同一条有序请求流分配序号和重试票据。
+ * 每个进程内同一条流只能有一个存活会话；跨进程的唯一性由部署方保证。
+ * 可以预先领多张票，但首次使用必须按序号。丢弃尚未绑定的票会留下缺号，后面的票不能跳过它。
  */
 
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
+
 #include <vector>
 
 #include <bbt/framework/CallOptions.hpp>
@@ -49,31 +34,28 @@ public:
     static result<SPtr> Open(const OrderedGrant& grant);
 
     /**
-     * 测试注入点：显式指定首个待分配序号（须 >= 1），用于验证序号
-     * 空间上界行为；其余语义与 Open 相同。
+     * 兼容既有测试。新测试通过 internal/CoAppSeam.hpp 指定首个序号。
      */
     static result<SPtr> OpenForTest(const OrderedGrant& grant,
                                     std::uint64_t first_sequence);
 
     /**
-     * 线程安全分配从 1 开始的 uint64 序号与唯一 request_id；不回绕：
-     * 序号空间耗尽返回明确错误（err(InternalError)），绝不静默回到小序号。
+     * @brief 线程安全地分配序号和唯一请求编号。Open 创建的会话从 1 开始发号。
+     * @return 序号用尽时返回 InternalError，不会从头发号。
      */
     result<OrderedStamp> prepare();
 
     /**
-     * 发送路径入口（由 co_rpc_call 调用）。
-     * - 未发送票据：须恰为最小未发送序号，绑定 content 并标记已发送；
-     * 越序 → err(domain_code=SequenceGap, expected_sequence=\<应先发的\>)。
-     * - 已发送票据：content 一致 → ok（重发同一请求）；不一致 →
-     * err(domain_code=SequenceConflict)。
-     * - 票据非本会话签发 → err(InvalidArgument)。
+     * @brief 首次发送时，把票据与服务、方法、Actor key、路由字段及请求字节绑定。
+     * 同一张票可重试同一请求。
+     * @return 跳号返回 SequenceGap，expected_sequence 给出下一张应使用的票号；
+     * 重试时内容不同返回 SequenceConflict；不是此会话签发的票返回 InvalidArgument。
      */
     result<void> BindForSend(const OrderedStamp& stamp,
                              const OrderedTicket::BoundContent& content);
 
     /**
-     * 观测：该票据是否已发送；非本会话票据返回 false。
+     * @brief 检查本会话的票是否已经绑定请求；返回 true 不表示对端已收到。其他会话的票返回 false。
      */
     bool IsTicketSent(const OrderedStamp& stamp) const;
 
@@ -84,7 +66,7 @@ private:
 
     static result<SPtr> OpenImpl(const OrderedGrant& grant,
                                  std::uint64_t first_sequence);
-    static std::shared_ptr<OrderedTicket> TicketOf(const OrderedStamp& stamp);
+
     std::string MakeRequestId(std::uint64_t sequence) const;
 
     struct RegistryEntry {
@@ -111,14 +93,8 @@ private:
      * 已分配到 UINT64_MAX，禁止回绕
      */
     bool exhausted_ = false;
-    /**
-     * 已连续完成首次发送的最大序号
-     */
+    /* 已连续完成首次绑定的最大序号。 */
     std::uint64_t bind_watermark_ = 0;
-    /**
-     * 本会话签发的全部票据（按 request_id 索引），兼作归属判定。
-     */
-    std::unordered_map<std::string, std::shared_ptr<OrderedTicket>> tickets_;
 };
 
 } // namespace bbt::framework

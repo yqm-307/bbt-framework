@@ -76,7 +76,8 @@ struct Args {
 };
 
 bool ParseArgs(int argc, char* argv[], Args* out) {
-    if (argc < 2) return false;
+    if (argc < 2)
+        return false;
     out->mode = argv[1];
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -98,7 +99,8 @@ bool ParseArgs(int argc, char* argv[], Args* out) {
             return false;
         }
     }
-    if (out->consul.empty()) return false;
+    if (out->consul.empty())
+        return false;
     return out->mode == "gateway" || out->mode == "order" ||
            out->mode == "catalog" || (out->mode == "settlement" && out->storage);
 }
@@ -120,14 +122,18 @@ ServiceOptions ConcurrentOptions() {
  */
 std::uint16_t ParseEndpointPort(const std::string& endpoint) {
     const auto colon = endpoint.rfind(':');
-    if (colon == std::string::npos) return 0;
+    if (colon == std::string::npos)
+        return 0;
     const std::string port_text = endpoint.substr(colon + 1);
-    if (port_text.empty()) return 0;
+    if (port_text.empty())
+        return 0;
     unsigned long value = 0;
     for (const char c : port_text) {
-        if (c < '0' || c > '9') return 0;
+        if (c < '0' || c > '9')
+            return 0;
         value = value * 10 + static_cast<unsigned long>(c - '0');
-        if (value > 65535) return 0;
+        if (value > 65535)
+            return 0;
     }
     return static_cast<std::uint16_t>(value);
 }
@@ -208,10 +214,10 @@ int main(int argc, char* argv[]) {
      * 调用（调度器仍能推进在途操作时）。
      */
     ConsulDiscoveryComponent::Options discovery_options;
-    discovery_options.agent_url       = args.consul;
-    discovery_options.watch_services  = watches;
+    discovery_options.agent_url = args.consul;
+    discovery_options.watch_services = watches;
     discovery_options.request_timeout = std::chrono::milliseconds{3000};
-    discovery_options.query_wait      = std::chrono::milliseconds{2000};
+    discovery_options.query_wait = std::chrono::milliseconds{2000};
     std::shared_ptr<ConsulDiscoveryComponent> discovery;
     {
         auto created = ConsulDiscoveryComponent::Create(discovery_options, table);
@@ -256,19 +262,19 @@ int main(int argc, char* argv[]) {
         redis_address = std::move(address);
     }
     bbt::infra::mongo::MongoRuntimeConfig mongo_config;
-    bbt::infra::mongo::MongoTarget    mongo_target;
-    std::string                       mongo_collection;
+    bbt::infra::mongo::MongoTarget mongo_target;
+    std::string mongo_collection;
     if (args.storage && (args.mode == "order" || args.mode == "settlement")) {
-        mongo_collection        = args.mode == "order" ? "orders" : "bills";
-        mongo_config.uri        = args.mongo;
+        mongo_collection = args.mode == "order" ? "orders" : "bills";
+        mongo_config.uri = args.mongo;
         mongo_config.worker_threads = 2;
-        mongo_config.max_queue  = 64;
+        mongo_config.max_queue = 64;
         mongo_config.server_selection_timeout = std::chrono::milliseconds{2000};
         mongo_config.connect_timeout = std::chrono::milliseconds{2000};
-        mongo_config.socket_timeout  = std::chrono::milliseconds{2000};
+        mongo_config.socket_timeout = std::chrono::milliseconds{2000};
         mongo_config.wait_queue_timeout = std::chrono::milliseconds{2000};
-        mongo_target.database    = args.database;
-        mongo_target.collection  = mongo_collection;
+        mongo_target.database = args.database;
+        mongo_target.collection = mongo_collection;
     }
 #endif
 
@@ -279,25 +285,30 @@ int main(int argc, char* argv[]) {
      * 失败，4=收口未竟；promise 各只写一次）。
      */
     std::promise<std::string> bound_ep;
-    std::promise<int>         rc_slot;
-    std::shared_ptr<CoApp>    app_handle;
-    std::mutex                app_mtx;
-    std::atomic<int>          register_failed{0};
+    std::promise<int> rc_slot;
+    std::shared_ptr<CoApp> app_handle;
+    std::mutex app_mtx;
+    std::atomic<int> register_failed{0};
 
+    AppLimits limits;
+    limits.max_objects = 64;
+    limits.max_bindings = 64;
+    limits.max_observers = 64;
+    limits.observer_queue_capacity = 64;
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [options = AppOptions{}
-                        .SetLimits(64, 64, 64, 64)
-                        .SetNetworkLimits(bbt::infra::NetworkLimits{
-                            64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}})
-                        .Listen("127.0.0.1:0")
-                        .SetShutdownBudget(std::chrono::milliseconds{8000})
-                        .SetLifecycleBudget(std::chrono::milliseconds{30000})
-                        /**
+                       .SetAppLimits(limits)
+                       .SetNetworkLimits(bbt::infra::NetworkLimits{
+                           64, 64, 16 * 1024, 64 * 1024, std::chrono::milliseconds{30000}})
+                       .Listen("127.0.0.1:0")
+                       .SetShutdownBudget(std::chrono::milliseconds{8000})
+                       .SetLifecycleBudget(std::chrono::milliseconds{30000})
+                       /**
                          * V2 会话身份必填；每个进程角色使用自己的身份。
                          */
-                        .SetLocalIdentity(std::string("ecommerce-") + args.mode)
-                        .SetDynamicRoutes(table),
+                       .SetLocalIdentity(std::string("ecommerce-") + args.mode)
+                       .SetDynamicRoutes(table),
          discovery, mode = args.mode, service, register_as, pid,
 #ifdef EC_STORAGE_AVAILABLE
          redis_address, mongo_config, mongo_target, mongo_collection,
@@ -446,7 +457,8 @@ int main(int argc, char* argv[]) {
          */
         {
             std::lock_guard<std::mutex> lk(app_mtx);
-            if (app_handle) app_handle->RequestShutdown();
+            if (app_handle)
+                app_handle->RequestShutdown();
         }
         const int rc = rc_slot.get_future().get();
         std::fprintf(stderr, "ecommerce_cluster: did not bind (rc=%d)\n", rc);
@@ -473,7 +485,8 @@ int main(int argc, char* argv[]) {
     }
     {
         std::lock_guard<std::mutex> lk(app_mtx);
-        if (app_handle) app_handle->RequestShutdown();
+        if (app_handle)
+            app_handle->RequestShutdown();
     }
 
     const int rc = rc_slot.get_future().get();

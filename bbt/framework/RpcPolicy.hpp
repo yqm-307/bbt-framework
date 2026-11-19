@@ -1,24 +1,5 @@
 #pragma once
-/**
- * 公开出站 RPC 策略（受控虚拟点）。
- *
- * 只暴露「只读调用事实 + Allow/Reject + 只收紧期限」这一可被框架验证的窄面：
- * 不交出发送实现、可变 envelope、codec、路由目标选择或 infra 内部类型。策略
- * 因此既不能自组 wire/HTTP，也不能绕过 owner/限额/关联/Close 契约。若要把
- * 「任意 next 包装 / 替换发送」做成公开入口，属超出本头既定口径的范围
- * 变更——本头不提供该面。
- *
- * 调用契约（不可放宽）：
- * - 位置：每次受管出站调用在静态路由授权（CoApp::find_route）之后、发送之前
- * 被调用一次；未命中静态路由的目标不会询问策略。
- * - 线程：在调用发起协程内执行；Concurrent 服务可并发出站，故同一策略实例
- * 会被并发调用，实现必须线程安全。
- * - 禁止：不得阻塞、不得发起 I/O、不得回调 CoApp/服务（避免重入）。
- * - 只读：target/request 为本次调用的只读引用，生命周期仅限本次调用，不得保存。
- * - 期限：只能收紧（框架取 min），不得放大；收紧到已过期 → 框架在发起任何 I/O
- * 之前按 TimedOut 拒绝。
- * - 失败：返回 err → 按框架既有错误边界上报，与今天的 egress 失败同形。
- */
+/** @brief 对经过路由解析的受管出站调用做只读策略判断。 */
 
 #include <optional>
 #include <string>
@@ -44,7 +25,10 @@ struct RpcCallView {
  * 策略结论：Allow（放行，可选收紧期限）或 Reject（拒绝，零 I/O）。
  */
 struct RpcPolicyDecision {
-    enum class Kind { Allow, Reject };
+    enum class Kind {
+        Allow,
+        Reject
+    };
 
     Kind kind = Kind::Allow;
 
@@ -68,7 +52,10 @@ public:
     virtual ~RpcPolicy() = default;
 
     /**
-     * 每次受管出站调用调用一次（契约见文件头）。
+     * 静态或动态路由解析成功后、发送前调用一次。解析失败不进入策略。
+     * 在发起调用的协程内执行，同一实例可被并发调用。实现须线程安全，
+     * 不得阻塞、执行 I/O 或重入 CoApp/服务。视图中的引用仅此次调用有效。
+     * 策略错误或拒绝直接返回调用方。允许时只能缩短期限，过期返回 TimedOut。
      */
     virtual result<RpcPolicyDecision> Preflight(const RpcCallView& call) = 0;
 };

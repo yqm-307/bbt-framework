@@ -32,10 +32,10 @@ namespace shop {
  * 业务语义。不做全局 using namespace，消费者不受影响。
  */
 namespace fw = bbt::framework;
-using bbt::framework::result;
+using bbt::framework::BindingEvent;
 using bbt::framework::ErrorCode;
 using bbt::framework::MakeError;
-using bbt::framework::BindingEvent;
+using bbt::framework::result;
 using bbt::framework::detail::ConstructKey;
 
 /**
@@ -75,7 +75,8 @@ inline void Emit(const std::string& line) {
         std::lock_guard<std::mutex> lk(JournalMutex());
         sink = JournalSink();
     }
-    if (sink) sink(line);
+    if (sink)
+        sink(line);
 }
 
 /**
@@ -87,10 +88,10 @@ public:
      * @brief 装配参数：版本、目录单价、停止时挂起毫秒、是否让 OnStart 失败。
      */
     struct Options {
-        int  version          = 1;
-        int  unit_price_cents = 0;
-        int  halt_ms          = 0;
-        bool fail_start       = false;
+        int version = 1;
+        int unit_price_cents = 0;
+        int halt_ms = 0;
+        bool fail_start = false;
     };
 
     explicit PriceBook(ConstructKey key, Options o)
@@ -105,9 +106,13 @@ public:
     }
 
     int Version() const noexcept { return m_version; }
-    int UnitPriceCents() const { return Locked([this] { return m_unit_price; }); }
+    int UnitPriceCents() const {
+        return Locked([this] { return m_unit_price; });
+    }
     int InstanceSeq() const noexcept { return m_instance_seq; }
-    int CatalogSize() const { return Locked([this] { return int(m_catalog.size()); }); }
+    int CatalogSize() const {
+        return Locked([this] { return int(m_catalog.size()); });
+    }
 
     /**
      * @brief 写入一条目录价；由 CatalogService 在启动时调用。
@@ -130,7 +135,9 @@ public:
             return it == m_cart_qty.end() ? 0 : it->second;
         });
     }
-    int CartTotalCents() const { return Locked([this] { return m_cart_total_cents; }); }
+    int CartTotalCents() const {
+        return Locked([this] { return m_cart_total_cents; });
+    }
 
     /**
      * 跨实例的阶段计数：用于断言"只创建一次/只存活一个"，不参与业务。
@@ -181,7 +188,8 @@ protected:
         /**
          * 真实挂起：证明 hook 在受管协程中执行，有限 deadline 覆盖它。
          */
-        if (m_halt_ms > 0) bbtco_sleep(m_halt_ms);
+        if (m_halt_ms > 0)
+            bbtco_sleep(m_halt_ms);
         Emit("event=component_hook name=" + std::string(kPricingSlot) +
              " phase=stop version=" + std::to_string(m_version) +
              " instance_seq=" + std::to_string(m_instance_seq));
@@ -207,16 +215,16 @@ private:
         f();
     }
 
-    const int  m_version;
-    const int  m_unit_price;
-    const int  m_halt_ms;
+    const int m_version;
+    const int m_unit_price;
+    const int m_halt_ms;
     const bool m_fail_start;
-    const int  m_instance_seq;
+    const int m_instance_seq;
 
-    mutable std::mutex     m_mtx;
+    mutable std::mutex m_mtx;
     std::map<std::string, int> m_catalog;
     std::map<std::string, int> m_cart_qty;
-    int                    m_cart_total_cents = 0;
+    int m_cart_total_cents = 0;
 
     inline static std::atomic<int> s_instance_seq{0};
     friend class bbt::framework::detail::Registry;
@@ -246,13 +254,7 @@ protected:
         /**
          * 声明式绑定在安装时建立；此时组件已 Running，可借用并写共享状态。
          */
-        auto h = GetComponent<PriceBook>(kPricingSlot);
-        if (!h) {
-            Emit("event=catalog_start error=get_component code=" +
-                 std::to_string(int(h.error().code)));
-            return result<void>::err(std::move(h.error()));
-        }
-        auto b = h.value().Borrow();
+        auto b = BorrowComponent<PriceBook>(kPricingSlot);
         if (!b) {
             Emit("event=catalog_start error=borrow code=" +
                  std::to_string(int(b.error().code)));

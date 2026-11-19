@@ -2,22 +2,10 @@
 
 /**
  * @file DynamicRouteTable.hpp
- * @brief 出站目标的动态路由表：由发现提供方发布权威快照，数据面只读解析。
+ * @brief 在内存中发布完整服务路由快照，由出站调用轮转解析。
  *
- * 职责边界：
- *   - 只保存「逻辑服务名 → 一组 endpoint + 观测时间 + revision」，不联网、
- *     不重试、不感知具体注册中心后端；provider（如 Consul 阻塞查询循环）在
- *     应用侧组装，通过 Replace 发布完整权威快照。
- *   - 数据面（Resolve）只读内存，绝不在调用路径发起注册中心请求。
- *
- * 语义（与 docs/architecture/distributed-framework-baseline.md §5.2 一致）：
- *   - 每次 Replace 以不可变值整体替换该服务的视图，不合并增量；
- *   - 同一服务的 endpoint 集合按 round-robin 解析；空集合 → NotFound；
- *   - 成功查询即使视图未变也必须 Replace（刷新 observed_at），否则健康的稳定
- *     服务会在 stale_limit 后被误判陈旧；
- *   - revision 回退时照装调用方给出的完整快照：revision 只在同一 provider 的
- *     epoch 内可比，比较与重置由 provider 负责；
- *   - 超过 stale_limit 未刷新 → RuntimeUnavailable，禁止返回陈旧 endpoint。
+ * 发现提供方负责联网和比较 revision。成功查询应刷新快照，即使目标没变。
+ * 查询失败保留旧快照的原观测时间，到期后解析失败。
  */
 
 #include <chrono>
@@ -27,7 +15,6 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
-
 
 #include <bbt/framework/Result.hpp>
 
@@ -48,7 +35,7 @@ struct DynamicRouteSnapshot {
 /**
  * @brief 线程安全的动态路由表。
  *
- * 可在任意线程 Replace（provider）与 Resolve（业务出站），两者互不阻塞网络。
+ * 可在任意线程 Replace（provider）与 Resolve（业务出站），两个入口都不执行网络 I/O。
  */
 class DynamicRouteTable {
 public:
@@ -68,8 +55,8 @@ public:
      *
      * @param service   逻辑服务名，非空。
      * @param revision  本次查询的注册中心 revision（0 表示未知）。
-     * @param endpoints 完整 endpoint 集合；重复项按首次出现去重。
-     * @return 空服务名/空 transport/空 endpoint → InvalidArgument。
+     * @param endpoints 完整 endpoint 集合；按首次出现去重。端点序列未变时保留轮转游标。
+     * @return 空服务名或空 endpoint → InvalidArgument。
      */
     result<void> Replace(std::string service,
                          std::uint64_t revision,
@@ -96,12 +83,12 @@ public:
 private:
     struct Entry {
         DynamicRouteSnapshot snapshot;
-        std::size_t          next{0};
-        bool                 unavailable{false};
+        std::size_t next{0};
+        bool unavailable{false};
     };
 
     const std::chrono::milliseconds m_stale_limit;
-    mutable std::mutex              m_mtx;
+    mutable std::mutex m_mtx;
     /**
      * round-robin 游标随解析推进，故 const Resolve 仍需可变表。
      */
