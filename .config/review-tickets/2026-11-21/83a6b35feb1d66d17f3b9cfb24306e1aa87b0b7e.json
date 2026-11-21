@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-21",
+  "commit": "83a6b35feb1d66d17f3b9cfb24306e1aa87b0b7e",
+  "base": "bee9978b755c24dd5e8e922471eb40578616783d",
+  "result": "pass",
+  "reviewer": "独立审查者 builtin:reviewer（收敛复审 deleg_3f151fa0 verdict=ship；首轮 deleg_41492afb、二轮 deleg_17dc68e8、三轮 deleg_15fe9f04）",
+  "summary": "组件动态绑定生命周期与资源收口简化、Infra 统一关闭 API 迁移及停机/卸载/回退收口加固。首轮 3 个 P1（回退绑定门与 StopIncomplete、Service observer 撤销排空、失败组件依赖保留）与二轮 R2-1（两阶段 Service 收口异常退出守卫）均已修复并逐条对照源码核实；三轮 R3 极端 OOM 场景经核实以 HEAD 既有 FinishDestroyLocked/FindEntryLocked 机制为前提（本候选 0 改动行），新增守卫已设 noexcept 消除栈展开期 terminate 风险。收敛复审 verdict=ship、findings 为空。受审语义快照 sha256 1c10e6566d96ec629fd5aca114b88bee4c24c296272be14ad2cc7b2fac27891f；本 commit 相对该快照仅在 7 个文件追加整文件 clang-format（push 门禁要求整文件干净），派发者逐文件验证 clang-format(受审版)==本版 逐字节相同，纯格式化、零语义变化。此结论不代表远端 CI 通过。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "收敛复审只读核对工作树真实 diff 与受审快照哈希一致，判定本候选新增代码无独立阻塞缺陷（ship）。本地证据：冒烟 19/19、专项 17/17（含三条新增定向回归）、真实 Redis/Mongo/联合 live 3/3 均零跳过；编译零错误无新警告；check_format_diff.sh --staged 与 check_docs.py 通过；7 个整文件格式化文件经 clang-format(旧)==新 逐字节验证为纯格式化。bad_alloc 异常路径无注入缝，未做故障注入（如实披露）；既有 FinishDestroyLocked OOM 行为超出本候选范围。",
+      "evidence": {
+        "reviewer": "builtin:reviewer / deleg_3f151fa0",
+        "scope": "bee9978b755c24dd5e8e922471eb40578616783d..83a6b35feb1d66d17f3b9cfb24306e1aa87b0b7e，43 个文件；受审语义快照 sha256 1c10e6566d96ec629fd5aca114b88bee4c24c296272be14ad2cc7b2fac27891f，含整文件格式化快照 sha256 6770d70599d207596cf7ccdb5f7c87d1e3eaa690f702622fef93c59292f8488b。"
+      }
+    }
+  ]
+}
