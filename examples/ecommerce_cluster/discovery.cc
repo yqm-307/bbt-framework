@@ -53,7 +53,9 @@ ConsulDiscoveryComponent::ConsulDiscoveryComponent(
         m_watches[i].service = m_options.watch_services[i];
 }
 
-ConsulDiscoveryComponent::~ConsulDiscoveryComponent() noexcept { Close(); }
+ConsulDiscoveryComponent::~ConsulDiscoveryComponent() noexcept {
+    Close();
+}
 
 result<std::shared_ptr<ConsulDiscoveryComponent>> ConsulDiscoveryComponent::Create(
     Options options, std::shared_ptr<bbt::framework::DynamicRouteTable> table) {
@@ -104,8 +106,10 @@ result<void> ConsulDiscoveryComponent::_StartEngine() {
         m_engine_returned.store(true, std::memory_order_release);
     });
     for (int i = 0; i < 500; ++i) {
-        if (m_engine->Phase() == bbt::infra::net::EnginePhase::Running) break;
-        if (m_engine_returned.load(std::memory_order_acquire)) break;
+        if (m_engine->Phase() == bbt::infra::net::EnginePhase::Running)
+            break;
+        if (m_engine_returned.load(std::memory_order_acquire))
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
     if (m_engine->Phase() != bbt::infra::net::EnginePhase::Running)
@@ -119,18 +123,16 @@ result<void> ConsulDiscoveryComponent::_StartEngine() {
     bbt::infra::http::ClientOptions http_options;
     http_options.limits.max_connections = 8;
     http_options.limits.max_keepalive_connections = 4;
-    http_options.timeout = bbt::infra::http::Timeout::Uniform(
-        bbt::infra::http::PhaseTimeout::Milliseconds(
-            std::chrono::milliseconds{5000}));
+    http_options.SetTimeout(std::chrono::milliseconds{5000});
     auto http = bbt::infra::http::Client::Create(m_engine, http_options);
     if (!http)
         return result<void>::err(std::move(http.error()));
     m_http = std::move(http).value();
 
     bbt::infra::consul::Options consul_options;
-    consul_options.agent_url         = m_options.agent_url;
-    consul_options.request_timeout   = m_options.request_timeout;
-    consul_options.query_wait        = m_options.query_wait;
+    consul_options.agent_url = m_options.agent_url;
+    consul_options.request_timeout = m_options.request_timeout;
+    consul_options.query_wait = m_options.query_wait;
     auto consul = bbt::infra::consul::Client::Create(m_http, consul_options);
     if (!consul)
         return result<void>::err(std::move(consul.error()));
@@ -145,7 +147,8 @@ result<void> ConsulDiscoveryComponent::Start() {
     if (m_started.exchange(true))
         return result<void>::err(MakeError(
             ErrorCode::InvalidArgument, "consul discovery: Start called twice"));
-    if (m_watches.empty()) return result<void>::ok();
+    if (m_watches.empty())
+        return result<void>::ok();
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -212,16 +215,17 @@ bbt_co_async(void) ConsulDiscoveryComponent::_WatchLoop(std::size_t index) {
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 if (!watch.first_done) {
-                    watch.first_done   = true;
-                    watch.first_ok     = false;
-                    watch.first_error  = snapshot.error().message;
+                    watch.first_done = true;
+                    watch.first_ok = false;
+                    watch.first_error = snapshot.error().message;
                 }
             }
             m_cv.notify_all();
             _SleepWhileActive(std::chrono::milliseconds{200});
             continue;
         }
-        if (m_stop.load(std::memory_order_acquire)) break;
+        if (m_stop.load(std::memory_order_acquire))
+            break;
 
         std::vector<std::string> endpoints;
         std::vector<std::string> endpoint_names;
@@ -246,23 +250,26 @@ bbt_co_async(void) ConsulDiscoveryComponent::_WatchLoop(std::size_t index) {
          * 下一轮 index：epoch 回退退回 0 重取完整快照；0 用 1 避免 busy loop。
          */
         std::uint64_t next_index = snapshot.value().index;
-        if (snapshot.value().index < last_index) next_index = 0;
-        else if (snapshot.value().index == 0) next_index = 1;
+        if (snapshot.value().index < last_index)
+            next_index = 0;
+        else if (snapshot.value().index == 0)
+            next_index = 1;
         last_index = snapshot.value().index;
 
         bool changed = false;
         std::size_t endpoint_count = 0;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            changed            = endpoint_names != watch.endpoints;
-            endpoint_count     = endpoint_names.size();
-            watch.endpoints    = std::move(endpoint_names);
-            watch.revision     = snapshot.value().index;
-            watch.index        = next_index;
+            changed = endpoint_names != watch.endpoints;
+            endpoint_count = endpoint_names.size();
+            watch.endpoints = std::move(endpoint_names);
+            watch.revision = snapshot.value().index;
+            watch.index = next_index;
             if (!watch.first_done) {
                 watch.first_done = true;
-                watch.first_ok   = bool(replaced);
-                if (!replaced) watch.first_error = replaced.error().message;
+                watch.first_ok = bool(replaced);
+                if (!replaced)
+                    watch.first_error = replaced.error().message;
             }
         }
         m_cv.notify_all();
@@ -275,7 +282,8 @@ bbt_co_async(void) ConsulDiscoveryComponent::_WatchLoop(std::size_t index) {
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_watchers_active > 0) --m_watchers_active;
+        if (m_watchers_active > 0)
+            --m_watchers_active;
     }
     m_cv.notify_all();
     return {};
@@ -293,11 +301,11 @@ bbt_co_async(bbt::infra::result<void>) ConsulDiscoveryComponent::RegisterSelf(
             "consul discovery: register requires service/instance/address/port"));
 
     bbt::infra::consul::ServiceRegistration registration;
-    registration.id      = std::move(instance_id);
-    registration.name    = std::move(service);
+    registration.id = std::move(instance_id);
+    registration.name = std::move(service);
     registration.address = std::move(address);
-    registration.port    = port;
-    registration.tags    = {"ecommerce-cluster", "issue70"};
+    registration.port = port;
+    registration.tags = {"ecommerce-cluster", "issue70"};
     const std::string logged_id = registration.id;
     const std::string logged_service = registration.name;
 
@@ -309,7 +317,7 @@ bbt_co_async(bbt::infra::result<void>) ConsulDiscoveryComponent::RegisterSelf(
     }
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        m_registered_id      = logged_id;
+        m_registered_id = logged_id;
         m_registered_service = logged_service;
     }
     Journal("event=registered service=" + logged_service + " instance=" +
@@ -323,7 +331,8 @@ bbt_co_async(bbt::infra::result<void>) ConsulDiscoveryComponent::DeregisterSelf(
         std::lock_guard<std::mutex> lk(m_mtx);
         id = m_registered_id;
     }
-    if (id.empty()) return result<void>::ok();
+    if (id.empty())
+        return result<void>::ok();
     if (m_closed.load())
         return result<void>::err(
             MakeError(ErrorCode::Closed, "consul discovery: component closed"));
@@ -343,13 +352,15 @@ bbt_co_async(bbt::infra::result<void>) ConsulDiscoveryComponent::DeregisterSelf(
 }
 
 void ConsulDiscoveryComponent::Close() noexcept {
-    if (m_closed.exchange(true)) return;
+    if (m_closed.exchange(true))
+        return;
     m_stop.store(true, std::memory_order_release);
 
     /**
      * 视图不再由本进程维护：立即标记不可用，残留 gateway 不会继续打到旧地址。
      */
-    for (const auto& watch : m_watches) m_table->MarkUnavailable(watch.service);
+    for (const auto& watch : m_watches)
+        m_table->MarkUnavailable(watch.service);
     m_cv.notify_all();
 
     {
@@ -358,22 +369,27 @@ void ConsulDiscoveryComponent::Close() noexcept {
                       m_options.request_timeout + std::chrono::milliseconds{1000},
                       [this] { return m_watchers_active == 0; });
     }
-    if (m_consul) m_consul->Close();
+    if (m_consul)
+        m_consul->Close();
     if (m_engine) {
-        m_engine->RequestClose();
-        if (m_engine_thread.joinable()) m_engine_thread.join();
+        m_engine->Close();
+        if (m_engine_thread.joinable())
+            m_engine_thread.join();
     }
     m_consul.reset();
     m_http.reset();
 }
 
-bool ConsulDiscoveryComponent::IsClosed() const noexcept { return m_closed.load(); }
+bool ConsulDiscoveryComponent::IsClosed() const noexcept {
+    return m_closed.load();
+}
 
 std::uint64_t ConsulDiscoveryComponent::Revision(
     std::string_view service) const {
     std::lock_guard<std::mutex> lk(m_mtx);
     for (const auto& watch : m_watches) {
-        if (watch.service == service) return watch.revision;
+        if (watch.service == service)
+            return watch.revision;
     }
     return 0;
 }

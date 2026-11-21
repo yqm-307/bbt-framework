@@ -222,12 +222,22 @@ def scenario_shared(binary, tmpdir):
     check(totals == ["2000", "3000"], "shared.cart_totals_per_version",
           f"totals={totals}")
 
-    rebinding = [
+    catalog_bound = [
         e for e in binding_events
-        if e.get("service") == "catalog" and e.get("borrow") == "1"
+        if e.get("service") == "catalog" and e.get("bound") == "1"
     ]
-    check(bool(rebinding), "shared.catalog_rebind_borrows_new_instance",
-          f"events={len(rebinding)}")
+    bound_seqs = [e.get("instance_seq") for e in catalog_bound]
+    check(bound_seqs == ["1", "2"],
+          "shared.catalog_rebind_reads_v1_then_v2",
+          f"instance_seqs={bound_seqs}")
+
+    catalog_unbound = [
+        e for e in binding_events
+        if e.get("service") == "catalog" and e.get("bound") == "0"
+    ]
+    check(len(catalog_unbound) == 1,
+          "shared.catalog_unbind_observed_once",
+          f"unbound={len(catalog_unbound)}")
 
     fail_events = [e for e in entries if e.get("event") == "hook_failure_recorded"]
     check(len(fail_events) == 1, "shared.hook_failure_event",

@@ -9,7 +9,7 @@
   `bbt/framework/CoApp.hpp`。机器面头在 `bbt/framework/internal/`，业务不直接包含。
 - **已实现**：受管对象装配与卸载（`CoInstallService`、`CoInstallComponent`、`CoUninstallService`、
   `CoUninstallComponent`）、Actor 类型登记（`CoRegisterActorType`）、声明式与运行期绑定
-  （`ServiceOptions::BindComponent`、`CoBindComponent`、`CoUnbindComponent`）、主体内的 `BorrowComponent`、
+  （`ServiceOptions::BindComponent`、`CoBindComponent`、`CoUnbindComponent`）、主体内的 `GetComponent`、
   `CoObserve` 事件、`CoStart` / `CoStop`、`RequestShutdown` / `CoWaitShutdownRequest`、
   `State` / `PendingCleanup` / `LifecycleFailures` 观察面、V2 RPC 入站（`InstallRpcAdmission`）与
   出站（`RpcEgress`）、静态路由（`AppOptions::AddRoute`）与 `DynamicRouteTable`。
@@ -91,7 +91,7 @@ return stopped ? waited : stopped;
   消费；非协程环境下 `bbt_co_await` 先抛 `std::logic_error`（实参与函数体不执行），
   通过后沿当前协程同步执行、期间可挂起，没有 Future/并行调度。
 - **新增服务**：参照上面的 `kRpcMethods` 和 `CoInstallService` 注册，完整宿主见 [`getvalue`](examples/getvalue/README.md)。
-- **借组件**：先声明 `ServiceOptions::BindComponent`，再在服务内使用 `BorrowComponent` 获取租约，见 [`component_services`](examples/component_services/README.md)。
+- **使用共享组件**：声明 `ServiceOptions::BindComponent`，在服务内用 `GetComponent` 查当前绑定，用句柄的 `lock()` 持有该实例，见 [`component_services`](examples/component_services/README.md)。
 - **跨进程调用**：用 `AppOptions::AddRoute` 指向远端，在调用方 Service 内调用 `call`，见 [`two_service`](examples/two_service/README.md)。
 - 可选的 Redis / Mongo 组件随对应 infra 目标构建和安装，使用方同时链接对应 infra 库。装配见 [`dual_service`](examples/dual_service/README.md)。
 

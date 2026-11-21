@@ -134,11 +134,38 @@ bbt_co_async(result<ComponentHandle<C>>) CoApp::CoBindComponent(
         return result<ComponentHandle<C>>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoComponent, C>,
                   "CoBindComponent: C must derive from CoComponent");
-    auto r = _BindComponentImpl(typeid(C), subject, name, placement, life);
+    (void)life;
+    auto r = _BindComponentImpl(typeid(C), subject, name, name, placement, false);
     if (!r)
         return result<ComponentHandle<C>>::err(std::move(r.error()));
     return result<ComponentHandle<C>>::ok(
-        detail::MakeComponentHandle<C>(r.value().first, r.value().second));
+        detail::MakeComponentHandle<C>(std::move(r.value())));
+}
+
+template <class C>
+bbt_co_async(result<ComponentHandle<C>>) CoApp::CoRebindComponent(
+    const ObjectHandle& subject, std::string_view slot, std::string_view target_name,
+    const ComponentOptions& placement) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<ComponentHandle<C>>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoComponent, C>,
+                  "CoRebindComponent: C must derive from CoComponent");
+    auto r = _BindComponentImpl(typeid(C), subject, slot, target_name, placement, true);
+    if (!r)
+        return result<ComponentHandle<C>>::err(std::move(r.error()));
+    return result<ComponentHandle<C>>::ok(
+        detail::MakeComponentHandle<C>(std::move(r.value())));
+}
+
+template <class C>
+bbt_co_async(result<void>) CoApp::CoUnbindComponent(
+    const ObjectHandle& subject, std::string_view slot,
+    const ComponentOptions& placement) {
+    if (auto ctx = _CheckCoContext(); !ctx)
+        return result<void>::err(std::move(ctx.error()));
+    static_assert(std::is_base_of_v<CoComponent, C>,
+                  "CoUnbindComponent: C must derive from CoComponent");
+    return _UnbindComponentImpl(typeid(C), subject, slot, placement, nullptr);
 }
 
 template <class C>
@@ -149,7 +176,7 @@ bbt_co_async(result<void>) CoApp::CoUnbindComponent(
         return result<void>::err(std::move(ctx.error()));
     static_assert(std::is_base_of_v<CoComponent, C>,
                   "CoUnbindComponent: C must derive from CoComponent");
-    return _UnbindComponentImpl(typeid(C), subject, name, placement, life);
+    return _UnbindComponentImpl(typeid(C), subject, name, placement, &life);
 }
 
 } // namespace bbt::framework

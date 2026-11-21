@@ -48,6 +48,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 
+#include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/rpc/CoRpcClient.hpp>
 #include <bbt/infra/rpc/Options.hpp>
@@ -78,7 +79,7 @@ std::string Key(std::string_view bare) {
 }
 
 struct Reply {
-    bool         ok = false;
+    bool ok = false;
     /**
      * ok=false 时有效
      */
@@ -95,22 +96,38 @@ struct Reply {
 
 const char* CodeName(fw::ErrorCode c) {
     switch (c) {
-    case fw::ErrorCode::InvalidArgument:    return "InvalidArgument";
-    case fw::ErrorCode::InvalidContext:     return "InvalidContext";
-    case fw::ErrorCode::RuntimeUnavailable: return "RuntimeUnavailable";
-    case fw::ErrorCode::Closed:             return "Closed";
-    case fw::ErrorCode::Cancelled:          return "Cancelled";
-    case fw::ErrorCode::TimedOut:           return "TimedOut";
-    case fw::ErrorCode::Overloaded:         return "Overloaded";
-    case fw::ErrorCode::Unavailable:        return "Unavailable";
-    case fw::ErrorCode::TransportError:     return "TransportError";
-    case fw::ErrorCode::ProtocolError:      return "ProtocolError";
-    case fw::ErrorCode::NotFound:           return "NotFound";
-    case fw::ErrorCode::TypeMismatch:       return "TypeMismatch";
-    case fw::ErrorCode::UnsupportedRoute:   return "UnsupportedRoute";
-    case fw::ErrorCode::OutcomeUnknown:     return "OutcomeUnknown";
-    case fw::ErrorCode::RemoteError:        return "RemoteError";
-    case fw::ErrorCode::InternalError:      return "InternalError";
+    case fw::ErrorCode::InvalidArgument:
+        return "InvalidArgument";
+    case fw::ErrorCode::InvalidContext:
+        return "InvalidContext";
+    case fw::ErrorCode::RuntimeUnavailable:
+        return "RuntimeUnavailable";
+    case fw::ErrorCode::Closed:
+        return "Closed";
+    case fw::ErrorCode::Cancelled:
+        return "Cancelled";
+    case fw::ErrorCode::TimedOut:
+        return "TimedOut";
+    case fw::ErrorCode::Overloaded:
+        return "Overloaded";
+    case fw::ErrorCode::Unavailable:
+        return "Unavailable";
+    case fw::ErrorCode::TransportError:
+        return "TransportError";
+    case fw::ErrorCode::ProtocolError:
+        return "ProtocolError";
+    case fw::ErrorCode::NotFound:
+        return "NotFound";
+    case fw::ErrorCode::TypeMismatch:
+        return "TypeMismatch";
+    case fw::ErrorCode::UnsupportedRoute:
+        return "UnsupportedRoute";
+    case fw::ErrorCode::OutcomeUnknown:
+        return "OutcomeUnknown";
+    case fw::ErrorCode::RemoteError:
+        return "RemoteError";
+    case fw::ErrorCode::InternalError:
+        return "InternalError";
     }
     return "?";
 }
@@ -162,7 +179,7 @@ bool StartRuntime() {
         }
         if (Clock::now() >= until) {
             std::fprintf(stderr, "[driver] engine startup timed out\n");
-            rt->engine->RequestClose();
+            rt->engine->Close();
             rt->runner.join();
             return false;
         }
@@ -178,7 +195,7 @@ bool StartRuntime() {
     if (!client) {
         std::fprintf(stderr, "[driver] rpc client create failed: %s\n",
                      client.error().message.c_str());
-        rt->engine->RequestClose();
+        rt->engine->Close();
         rt->runner.join();
         return false;
     }
@@ -191,13 +208,13 @@ void StopRuntime() {
     if (!g_runtime)
         return;
     /**
-     * 控制线程不在协程域：统一关闭入口的协程 Close 不可直接消费，用同步
-     * Shutdown 立即封口；连接物理回收由 Engine RequestClose 后 Run 返回收口。
+     * 控制线程不在协程域：统一 Close 的 Immediate 任意域可调用，立即封口；
+     * 连接物理回收由 Engine Close 后 Run 返回收口。
      */
     if (g_runtime->client)
-        g_runtime->client->Shutdown();
+        (void)g_runtime->client->Close(bbt::infra::CloseOptions::Immediate());
     if (g_runtime->engine)
-        g_runtime->engine->RequestClose();
+        g_runtime->engine->Close();
     if (g_runtime->runner.joinable())
         g_runtime->runner.join();
     g_runtime->client.reset();
@@ -229,10 +246,10 @@ Reply Send(const std::string& service, const std::string& method,
      * Client::Call 只在协程内合法；控制线程这边用 latch（mutex+CV）收协程结果。
      */
     struct Slot {
-        std::mutex              m;
+        std::mutex m;
         std::condition_variable cv;
-        bool                    done = false;
-        Reply                   reply;
+        bool done = false;
+        Reply reply;
     };
     auto slot = std::make_shared<Slot>();
     bbtco[request, slot, budget, want_request_id]() mutable {
@@ -242,7 +259,7 @@ Reply Send(const std::string& service, const std::string& method,
             "tcp://" + g_endpoint, std::move(request), o);
         Reply r;
         if (!res) {
-            r.ok    = false;
+            r.ok = false;
             r.error = std::move(res.error());
         } else if (res.value().RequestId() != want_request_id) {
             r.error = fw::MakeError(fw::ErrorCode::ProtocolError,
@@ -253,7 +270,7 @@ Reply Send(const std::string& service, const std::string& method,
         }
         std::lock_guard<std::mutex> lk(slot->m);
         slot->reply = std::move(r);
-        slot->done  = true;
+        slot->done = true;
         slot->cv.notify_all();
     };
     std::unique_lock<std::mutex> lk(slot->m);
@@ -274,9 +291,11 @@ Reply Send(const std::string& service, const std::string& method,
 
 template <class T>
 std::optional<T> Decode(const Reply& r) {
-    if (!r.ok) return std::nullopt;
+    if (!r.ok)
+        return std::nullopt;
     auto v = fw::CoRpcReq(std::vector<std::uint8_t>(r.payload)).Parse<T>();
-    if (!v) return std::nullopt;
+    if (!v)
+        return std::nullopt;
     return v.value();
 }
 
@@ -294,8 +313,8 @@ void Check(bool cond, const std::string& name, const std::string& detail) {
 
 std::string ErrDetail(const Reply& r) {
     return "err=" + std::string(CodeName(r.error.code)) + " \"" +
-        r.error.message + "\" elapsed=" + std::to_string(r.elapsed.count()) +
-        "ms";
+           r.error.message + "\" elapsed=" + std::to_string(r.elapsed.count()) +
+           "ms";
 }
 
 } // namespace
@@ -303,8 +322,8 @@ std::string ErrDetail(const Reply& r) {
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 3) {
         std::fprintf(stderr,
-            "usage: driver <gateway_endpoint host:port> "
-            "[--expect-storage-down]\n");
+                     "usage: driver <gateway_endpoint host:port> "
+                     "[--expect-storage-down]\n");
         return 64;
     }
     g_endpoint = argv[1];
@@ -414,8 +433,7 @@ int main(int argc, char** argv) {
             Check(dr.ok && dv && *dv == 1 && !fr.ok &&
                       fr.error.code == fw::ErrorCode::NotFound,
                   "cleanup: del 本轮 key -> 复核 NotFound",
-                  "del=" + (dr.ok ? std::to_string(dv ? *dv : -1)
-                                  : ErrDetail(dr)) +
+                  "del=" + (dr.ok ? std::to_string(dv ? *dv : -1) : ErrDetail(dr)) +
                       " fetch=" + ErrDetail(fr));
         }
     } else {
@@ -444,7 +462,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     /**
-     * 收口：Client Shutdown 后 Engine RequestClose，Run 返回才表示本代网络资源
+     * 收口：Client Close(Immediate) 后 Engine Close，Run 返回才表示本代网络资源
      * 收口；显式 reset 后于 Close 即可（coroutine Scheduler 无 Stop）。
      */
     StopRuntime();

@@ -50,7 +50,9 @@
 #ifdef EC_STORAGE_AVAILABLE
 #include <bbt/framework/RedisNetResource.hpp>
 #include <bbt/framework/MongoDbResource.hpp>
-#include <bbt/infra/mongo/Client.hpp>
+#include <bbt/infra/mongo/CoMongoColl.hpp>
+#include <bbt/infra/mongo/CoMongoDb.hpp>
+#include <bbt/infra/mongo/MongoTypes.hpp>
 #include <bbt/infra/net/Address.hpp>
 #endif
 

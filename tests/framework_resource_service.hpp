@@ -29,7 +29,9 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/sync/WaitTypes.hpp>
 
-#include <bbt/infra/mongo/Client.hpp>
+#include <bbt/infra/mongo/CoMongoColl.hpp>
+#include <bbt/infra/mongo/CoMongoDb.hpp>
+#include <bbt/infra/mongo/MongoTypes.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 
 /**
@@ -48,8 +50,8 @@
 
 namespace fw8test {
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
 
 /**
@@ -99,7 +101,7 @@ public:
      *   操作，操作结果（true=成功）经此回调报告给独立持有的观察者，而不经
      *   Service 实例本身——避免测试持 Service 指针与关闭释放竞争。
      */
-    static inline std::function<void()>     s_hold_gate;
+    static inline std::function<void()> s_hold_gate;
     static inline std::function<void(bool)> s_hold_op_report;
 
     fw::CoRpcResp Get(fw::CoRpcReq req);

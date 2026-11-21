@@ -11,9 +11,8 @@ result<ComponentHandle<C>> CoActor::GetComponent(std::string_view name) const {
     auto b = _GetComponentLookup(typeid(C), name);
     if (!b)
         return result<ComponentHandle<C>>::err(std::move(b.error()));
-    const auto& bound = b.value();
     return result<ComponentHandle<C>>::ok(
-        detail::MakeComponentHandle<C>(bound.object, bound.binding_generation));
+        detail::MakeComponentHandle<C>(std::move(b.value())));
 }
 
 template <class C>

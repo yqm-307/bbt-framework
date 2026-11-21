@@ -6,7 +6,7 @@
 
 - 框架库在 `bbt/framework/`。业务通过 `<bbt/framework/...>` 和 `bbt::framework` 消费公开接口，宿主实现和 `internal/` 类型留在框架内。上游依赖走 infra 的公开构建目标，`bbtools-core` 已冻结。应用、扩展与核心的依赖方向见 [AGENTS.md](../AGENTS.md)。
 - 可失败的公开操作沿用模块已有契约。`bbt/framework/Result.hpp` 直接导出 infra 的 `result<T>`、`Error` 和 `ErrorCode`，业务可以据此判断超时、上下文错误与关闭失败。
-- Service、Component 和 Actor 由 `CoApp` 管理。构造、handle 和 `Borrow()` 的有效期是业务接口的一部分。公共声明及扩展 hook 需说清调用上下文、所有权、错误与关闭语义。核心模板的头内定义、拆分与 Doxygen 导出验收见[框架契约](architecture/framework-contract.md#53-核心头文件模板与注释组织)。
+- Service、Component 和 Actor 由 `CoApp` 管理。构造、绑定代次和使用租约的有效期是业务接口的一部分。`ComponentHandle::lock()` 共享组件对象寿命。需要资源使用保证的调用方使用显式 `Borrow()`，详见 [组件寿命规则](architecture/framework-contract.md#31-必须实现的实际寿命规则)。公共声明及扩展 hook 需说清调用上下文、所有权、错误与关闭语义。核心模板的头内定义、拆分与 Doxygen 导出验收见[框架契约](architecture/framework-contract.md#53-核心头文件模板与注释组织)。
 - 引入上游能力时核对实际模块与链接来源。联调源码与固定依赖使用各自的验证记录，见[开发指南](guides/development.md#依赖版本选择)。
 
 ## 格式与文档

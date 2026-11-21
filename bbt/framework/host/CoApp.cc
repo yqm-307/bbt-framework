@@ -6,19 +6,20 @@
  * shared_ptr<void> 的 callback lease），回到锁内再 FindEntry 重查——deque
  * erase 会使全部指针/引用失效。
  *
- * 锁外业务代码访问纪律：取 owner 与裸指针在同一临界区完成；解锁后业务只经
- * owner 保活的指针执行 hook/OnBindingChanged——对象销毁一定排在 owner 释放
- * 之后，锁外访问不再悬空（并发卸载在 FinishDestroy 取走同一 owner 后无法
- * 先于本使用点析构对象）。
+ * 锁外业务代码访问纪律：owner 保证 C++ 对象寿命；绑定通知还需在锁内
+ * 取得回调资格，保证收口等通知的真实终态，不能只靠 shared_ptr。
  */
 
 #include <algorithm>
 #include <chrono>
 #include <mutex>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <stdexcept>
 #include <thread>
+
+#include <boost/scope/scope_exit.hpp>
+#include <boost/scope/scope_fail.hpp>
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
@@ -33,6 +34,10 @@
 namespace bbt::framework {
 
 namespace {
+
+bool IsStopState(AppState state) {
+    return state == AppState::Stopping || state == AppState::StopIncomplete || state == AppState::Stopped;
+}
 
 /**
  * hook 错误捕获：业务 hook 的错误返回原样透出；异常 → InternalError。
@@ -235,7 +240,8 @@ result<void> CoApp::_CheckCoContext() const {
     if (co == 0)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
                                            "lifecycle: Co* entry points require a managed coroutine context"));
-    if (m_hook_co->load(std::memory_order_acquire) == co)
+    if (m_hook_co->load(std::memory_order_acquire) == co ||
+        m_registry->InBindingCallback(co))
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
                                            "lifecycle: a lifecycle entry point called by its own hook would wait on itself"));
     return result<void>::ok();
@@ -337,31 +343,35 @@ result<void> WaitHooksSettledCo(
     const std::shared_ptr<detail::Registry>& reg, const ObjectId& id,
     bbt::coroutine::Deadline deadline) {
     using WS = bbt::coroutine::WaitStatus;
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> w;
-    {
-        std::unique_lock<std::mutex> lk(reg->Mutex());
-        auto* e = reg->FindEntryLocked(id);
-        if (!e || e->hooks_in_flight == 0)
-            return result<void>::ok();
-        w = reg->HookSettledWaiterLocked(*e);
-    }
-    bbt::coroutine::WaitOptions wo;
-    wo.deadline = deadline;
-    /**
-     * on_registered 复查：若在「取 waiter → 登记等待」窗口内前序 hook
-     * 已归零，自唤醒（PENDING 早到路径）避免空等到 deadline。
-     */
-    const auto ws = w->WaitWithCallback(wo, [reg, id, w] {
-        bool settled = false;
+    WS ws;
+    do {
+        std::shared_ptr<bbt::coroutine::sync::CoWaiter> w;
         {
-            std::lock_guard<std::mutex> lk(reg->Mutex());
+            std::unique_lock<std::mutex> lk(reg->Mutex());
             auto* e = reg->FindEntryLocked(id);
-            settled = (!e || e->hooks_in_flight == 0);
+            if (!e || e->hooks_in_flight == 0)
+                return result<void>::ok();
+            w = reg->HookSettledWaiterLocked(*e);
         }
-        if (settled)
-            w->Notify();
-        return true;
-    });
+        bbt::coroutine::WaitOptions wo;
+        wo.deadline = deadline;
+        /**
+         * on_registered 复查：若在「取 waiter → 登记等待」窗口内前序 hook
+         * 已归零，自唤醒（PENDING 早到路径）避免空等到 deadline。
+         */
+        ws = w->WaitWithCallback(wo, [reg, id, w] {
+            bool settled = false;
+            {
+                std::lock_guard<std::mutex> lk(reg->Mutex());
+                auto* e = reg->FindEntryLocked(id);
+                settled = (!e || e->hooks_in_flight == 0);
+            }
+            if (settled)
+                w->Notify();
+            return true;
+        });
+        // 唤醒后复查计数：上一批归零的通知可能晚于下一批的接纳。
+    } while (ws == WS::Completed);
     switch (ws) {
     case WS::Completed:
         return result<void>::ok();
@@ -446,7 +456,6 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
             f.message = r.error().message;
             m_registry->RecordFailure(std::move(f));
             _RollbackStart({}, deadline);
-            m_state.store(AppState::Stopped);
             return r;
         }
     }
@@ -460,7 +469,7 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         bool had_cycle = false;
-        auto order = m_registry->ComponentStartOrderLocked(&had_cycle);
+        auto order = m_registry->ComponentStartOrderLocked(m_registry->ComponentDependenciesLocked(), &had_cycle);
         if (had_cycle) {
             LifecycleFailure f;
             f.operation = "start";
@@ -525,18 +534,16 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
     /**
      * 网络相位：配置校验 → 分发表发布 → 宿主 Create/Start（开始接纳）。
      * 资源/服务就绪后再接纳（装配顺序约束）。任一步失败同样按启动失败
-     * 回退（宿主 Close + 已启动对象逆序收口），App 置 Stopped。
+     * 回退（宿主 Close + 已启动对象按当前依赖收口）。
      */
     if (m_network_host != nullptr &&
         (m_default_host == nullptr || m_options.ListenUri().has_value())) {
         if (auto r = _ValidateNetworkConfig(); !r) {
             _RollbackStart(started, deadline);
-            m_state.store(AppState::Stopped);
             return r;
         }
         if (auto r = _StartNetworkPhase(deadline); !r) {
             _RollbackStart(started, deadline);
-            m_state.store(AppState::Stopped);
             return r;
         }
     }
@@ -634,7 +641,11 @@ result<void> CoApp::_StopImpl(const LifecycleOptions& life) {
     const AppState s = m_state.load();
     if (s == AppState::Stopped)
         return result<void>::ok();
-    m_state.store(AppState::Stopping);
+    {
+        // 与绑定发布使用同一把锁，停止快照之后不会出现新依赖。
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        m_state.store(AppState::Stopping);
+    }
     const auto deadline = m_registry->ResolveShutdownDeadline(life);
 
     /**
@@ -655,7 +666,9 @@ result<void> CoApp::_StopImpl(const LifecycleOptions& life) {
          * 收口的 borrow/hook 等待负责——直接以本次新 deadline 推进
          * （Release 已在前次失败分支完成，幂等）。
          */
-        if (!m_network_host->CloseReason().has_value()) {
+        // 未发布网络的 StopIncomplete（包括启动回退）只需继续对象收口。
+        if (!(s == AppState::StopIncomplete && !m_network_published) &&
+            !m_network_host->CloseReason().has_value()) {
             m_network_host->StopAccepting();
             if (auto drained = _DrainNetwork(deadline); !drained) {
                 LifecycleFailure f;
@@ -729,69 +742,174 @@ bbt_co_async(result<void>) CoApp::CoWaitShutdownRequest(
                                        "shutdown request wait unavailable"));
 }
 
+namespace {
+
+class ComponentClosePass {
+public:
+    explicit ComponentClosePass(const detail::Registry::ComponentDependencies& deps)
+        : m_deps(deps) {}
+
+    template <class Close>
+    std::optional<Error> Run(const std::vector<ObjectId>& order, Close close) {
+        std::optional<Error> first_error;
+        for (const auto& id : order) {
+            if (m_kept.count(id))
+                continue;
+            if (auto r = close(id); !r) {
+                KeepDependencies(id);
+                if (!first_error)
+                    first_error = std::move(r.error());
+            }
+        }
+        return first_error;
+    }
+
+private:
+    void KeepDependencies(const ObjectId& id) {
+        for (const auto& dep : m_deps.at(id)) {
+            if (m_kept.insert(dep).second)
+                KeepDependencies(dep);
+        }
+    }
+
+    const detail::Registry::ComponentDependencies& m_deps;
+    std::unordered_set<ObjectId> m_kept;
+};
+
+// 只释放本次已取得的收口资格；回退异常不能让下一次 CoStop 永久 Busy。
+void ReleaseInterruptedClose(detail::Registry& registry, const ObjectId& id, ObjectState state) noexcept {
+    try {
+        std::lock_guard<std::mutex> lk(registry.Mutex());
+        if (auto* e = registry.FindEntryLocked(id)) {
+            registry.EndOpLocked(*e);
+            e->state = state;
+        }
+    } catch (...) {
+        // 避免异常守卫在栈展开期间再次抛出并终止进程。
+    }
+}
+
+bool ServiceOwnerReady(detail::Registry& registry, const ObjectId& id,
+                       const std::vector<const ObjectId*>& ready) {
+    std::lock_guard<std::mutex> lk(registry.Mutex());
+    const auto* e = registry.FindEntryLocked(id);
+    return !e || e->scope != ComponentScope::Service || !registry.FindEntryLocked(e->owner_id) ||
+           std::any_of(ready.begin(), ready.end(), [&](const ObjectId* owner) { return *owner == e->owner_id; });
+}
+
+} // namespace
+
 void CoApp::_RollbackStart(const std::vector<ObjectId>& started,
                            bbt::coroutine::Deadline deadline) noexcept {
-    /**
-     * 启动失败回退：逆序完整收口已启动对象。网络宿主若已 Create，
-     * 同步 Close（不排空——尚未对外接纳，Start 失败路径无在途 handler）。
-     * 各步独立推进；失败只记 LifecycleFailure，不中断其余回退。
-     */
-    if (m_network_host != nullptr)
-        m_network_host->Close();
-    if (m_network_published) {
-        m_runtime->Release();
-        m_network_published = false;
-    }
-    for (auto it = started.rbegin(); it != started.rend(); ++it) {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        auto* e = m_registry->FindEntryLocked(*it);
-        if (!e)
-            continue;
-        const ObjectKind kind = e->kind;
-        lk.unlock();
-        if (kind == ObjectKind::Service)
-            _DestroyService(*it, deadline);
-        else if (kind == ObjectKind::Component)
-            _DestroyComponent(*it, deadline);
+    try {
+        {
+            // 与绑定发布共锁：Close 或业务 hook 运行前就封住新绑定。
+            std::lock_guard<std::mutex> lk(m_registry->Mutex());
+            m_state.store(AppState::Stopping);
+        }
+        if (m_network_host != nullptr)
+            m_network_host->Close();
+        if (m_network_published) {
+            m_runtime->Release();
+            m_network_published = false;
+        }
+        if (started.empty()) {
+            m_state.store(AppState::Stopped);
+            return;
+        }
+
+        detail::Registry::ComponentDependencies deps;
+        std::vector<ObjectId> services, components;
+        {
+            std::lock_guard<std::mutex> lk(m_registry->Mutex());
+            const std::unordered_set<ObjectId> started_ids(started.begin(), started.end());
+            deps = m_registry->ComponentDependenciesLocked();
+            const auto order = m_registry->ComponentStartOrderLocked(deps);
+            for (auto it = order.rbegin(); it != order.rend(); ++it)
+                if (started_ids.count(*it))
+                    components.push_back(*it);
+            for (auto it = started.rbegin(); it != started.rend(); ++it) {
+                const auto* entry = m_registry->FindEntryLocked(*it);
+                if (entry && entry->kind == ObjectKind::Service)
+                    services.push_back(*it);
+            }
+        }
+
+        bool incomplete = false;
+        std::vector<const ObjectId*> services_to_finish;
+        services_to_finish.reserve(services.size());
+        auto release = boost::scope::make_scope_fail([&] {
+            for (const auto* id : services_to_finish)
+                if (id)
+                    ReleaseInterruptedClose(*m_registry, *id, ObjectState::StopIncomplete);
+        });
+        for (const auto& id : services) {
+            if (_DestroyService(id, deadline))
+                services_to_finish.push_back(&id);
+            else
+                incomplete = true;
+        }
+        ComponentClosePass pass(deps);
+        if (pass.Run(components, [&](const ObjectId& id) {
+                if (!ServiceOwnerReady(*m_registry, id, services_to_finish))
+                    return result<void>::err(MakeError(ErrorCode::Overloaded, "component cleanup: service owner not settled"));
+                return _DestroyComponent(id, deadline);
+            }))
+            incomplete = true;
+        for (auto*& id : services_to_finish) {
+            if (!_FinishService(*id, "stop", ObjectState::StopIncomplete))
+                incomplete = true;
+            id = nullptr;
+        }
+        m_state.store(incomplete ? AppState::StopIncomplete : AppState::Stopped);
+    } catch (...) {
+        // 保留原始启动错误；绝不能将未证实完成的回退标为 Stopped。
+        m_state.store(AppState::StopIncomplete);
     }
 }
 
 void CoApp::_StopAll(bbt::coroutine::Deadline deadline) {
-    /**
-     * 逆序收口：Service → Actor 实例 → scoped Component → App Component。
-     * 组件按依赖逆拓扑（使用者先于依赖）。各分支独立推进；
-     * 对象列表取 id 快照，跨锁不持指针。
-     */
+    // 同一快照贯穿 scoped/App 两段；scoped 失败也能保留其共享依赖。
+    detail::Registry::ComponentDependencies deps;
     std::vector<ObjectId> svcs, actors, scoped, app_scope;
     {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
         svcs = m_registry->ListIdsByKindLocked(ObjectKind::Service);
         actors = m_registry->ListIdsByKindLocked(ObjectKind::Actor);
-        bool had_cycle = false;
-        auto order = m_registry->ComponentStartOrderLocked(&had_cycle);
-        /**
-         * 逆拓扑：依赖图后序反转。scoped 先收、App scope 后收
-         * （contract：scoped Component → App Component）。
-         */
+        deps = m_registry->ComponentDependenciesLocked();
+        const auto order = m_registry->ComponentStartOrderLocked(deps);
         for (auto it = order.rbegin(); it != order.rend(); ++it) {
-            auto* e = m_registry->FindEntryLocked(*it);
-            if (!e)
-                continue;
-            if (e->scope == ComponentScope::App)
-                app_scope.push_back(*it);
-            else
-                scoped.push_back(*it);
+            const auto* e = m_registry->FindEntryLocked(*it);
+            (e->scope == ComponentScope::App ? app_scope : scoped).push_back(*it);
         }
     }
 
-    for (const auto& id : svcs)
-        _DestroyService(id, deadline);
+    std::vector<const ObjectId*> services_to_finish;
+    services_to_finish.reserve(svcs.size());
+    auto release = boost::scope::make_scope_fail([&] {
+        for (const auto* id : services_to_finish)
+            if (id)
+                ReleaseInterruptedClose(*m_registry, *id, ObjectState::StopIncomplete);
+    });
+    for (const auto& id : svcs) {
+        if (_DestroyService(id, deadline))
+            services_to_finish.push_back(&id);
+    }
     for (const auto& id : actors)
-        _DestroyActor(id);
-    for (const auto& id : scoped)
-        _DestroyComponent(id, deadline);
-    for (const auto& id : app_scope)
-        _DestroyComponent(id, deadline);
+        _DestroyActor(id, deadline);
+    ComponentClosePass pass(deps);
+    (void)pass.Run(scoped, [&](const ObjectId& id) {
+        // owner 尚有 hook 或并发卸载时，不接管其 owned 组件。
+        if (!ServiceOwnerReady(*m_registry, id, services_to_finish))
+            return result<void>::err(MakeError(ErrorCode::Overloaded, "component cleanup: service owner not settled"));
+        return _DestroyComponent(id, deadline);
+    });
+    for (auto*& id : services_to_finish) {
+        (void)_FinishService(*id, "stop", ObjectState::StopIncomplete);
+        id = nullptr;
+    }
+    release.set_active(false);
+    (void)pass.Run(app_scope, [&](const ObjectId& id) { return _DestroyComponent(id, deadline); });
 }
 
 /**
@@ -801,25 +919,24 @@ void CoApp::_StopAll(bbt::coroutine::Deadline deadline) {
 void CoApp::_AbortDestroy(const ObjectId& id, const char* operation,
                           const char* phase, const Error& err,
                           ObjectState incomplete_state) noexcept {
-    LifecycleFailure f;
-    f.object_id = id;
-    f.operation = operation;
-    f.phase = phase;
-    f.code = err.code;
-    f.at = std::chrono::system_clock::now();
-    f.message = err.message;
-    std::vector<std::pair<detail::ObserverRecord, ObjectStateEvent>> events;
-    {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        m_registry->RecordFailure(std::move(f));
-        auto* e = m_registry->FindEntryLocked(id);
-        if (e) {
-            e->destroy_phase = phase;
-            m_registry->EndOpLocked(*e);
-            events = m_registry->SetStateLocked(*e, incomplete_state);
+    try {
+        detail::ObserverEvents events;
+        {
+            std::lock_guard<std::mutex> lk(m_registry->Mutex());
+            auto* e = m_registry->FindEntryLocked(id);
+            if (e) {
+                m_registry->EndOpLocked(*e);
+                e->state = incomplete_state;
+                e->destroy_phase = phase;
+                events = m_registry->SetStateLocked(*e, incomplete_state);
+            }
+            m_registry->RecordFailure(LifecycleFailure{id, e ? e->generation : 0, operation, phase,
+                                                       err.code, std::chrono::system_clock::now(), err.message});
         }
+        m_registry->DispatchEvents(std::move(events));
+    } catch (...) {
+        // 诊断或事件分配失败不改变已保留的 owner 和重试状态。
     }
-    m_registry->DispatchEvents(std::move(events));
 }
 
 /**
@@ -833,7 +950,7 @@ result<void> CoApp::_EnsureHookSettled(
     const char* op_name, bbt::coroutine::Deadline deadline,
     Abort&& abort) {
     {
-        auto r = _RunHookCo(id, hook, "stop", deadline);
+        auto r = _RunHookCo(id, hook, "stop", deadline, true);
         if (!r) {
             Error err = std::move(r.error());
             abort("onstop", err);
@@ -854,18 +971,14 @@ result<void> CoApp::_EnsureHookSettled(
     return result<void>::ok();
 }
 
-void CoApp::_FinishObject(
-    const ObjectId& id,
-    const std::function<void(detail::RegistryEntry&)>& on_entry) {
+void CoApp::_FinishObject(const ObjectId& id) {
     std::shared_ptr<void> obj;
-    std::vector<std::pair<detail::ObserverRecord, ObjectStateEvent>> events;
+    detail::ObserverEvents events;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         m_registry->RevokeObserversOfLocked(id);
         auto* e = m_registry->FindEntryLocked(id);
         if (e) {
-            if (on_entry)
-                on_entry(*e);
             e->destroy_phase.clear();
             m_registry->EndOpLocked(*e);
             auto [o, ev] = m_registry->FinishDestroyLocked(*e);
@@ -877,7 +990,7 @@ void CoApp::_FinishObject(
      * 在途 observer 回调 lease 先排空再释放 owner（回调闭包的捕获对象
      * 寿命不得短于被观察对象）。
      */
-    m_registry->DrainInactiveObservers();
+    m_registry->DrainInactiveObserversOf(id);
     m_registry->DispatchEvents(std::move(events));
     /**
      * 业务析构锁外
@@ -907,148 +1020,127 @@ void CoApp::_NotifyBindingChanged(ObjectKind kind, void* subj,
     }
 }
 
-void CoApp::_DestroyService(const ObjectId& id,
-                            bbt::coroutine::Deadline deadline) {
+result<void> CoApp::_DestroyService(const ObjectId& id,
+                                    bbt::coroutine::Deadline deadline,
+                                    bool uninstall) {
+    const char* operation = uninstall ? "uninstall" : "stop";
+    const auto incomplete = uninstall ? ObjectState::UninstallIncomplete : ObjectState::StopIncomplete;
+    const auto abort = [&](const char* phase, const Error& err) {
+        _AbortDestroy(id, operation, phase, err, incomplete);
+    };
+    bool acquired = false;
+    auto release = boost::scope::make_scope_fail([&] {
+        if (acquired)
+            ReleaseInterruptedClose(*m_registry, id, incomplete);
+    });
     std::string service_name;
+    bool uninstall_hook_done;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        auto* e = m_registry->FindEntryLocked(id);
-        if (!e || !m_registry->BeginOpLocked(*e))
-            return;
-        /**
-         * 先摘分发表项（新分发 NotFound；gate 经 BeginOp/后继封口拒绝
-         * 新执行租约），在途执行由 _RunHookCo 的「前序 hook 归零」等待
-         * 覆盖（分发租约与 hook 共用 hooks_in_flight）。
-         */
+        auto r = m_registry->BeginDestroyLocked(id);
+        if (!r)
+            return result<void>::err(std::move(r.error()));
+        acquired = true;
+        auto* e = r.value();
         service_name = e->type_name;
+        uninstall_hook_done = e->uninstall_hook_done;
+        e->destroy_phase = operation;
+        m_registry->RetireSubjectBindingsLocked(id);
+        m_registry->RevokeObserversOfLocked(id);
+        auto ev = m_registry->SetStateLocked(*e, uninstall ? ObjectState::Uninstalling : ObjectState::Stopping);
         lk.unlock();
         m_runtime->RemoveDispatch(service_name);
-        lk.lock();
-        e = m_registry->FindEntryLocked(id);
-        if (!e)
-            return;
-        e->destroy_phase = "stop";
-        auto ev = m_registry->SetStateLocked(*e, ObjectState::Stopping);
-        /**
-         * 本 service 作为 subject 的全部 binding 封口并标 retiring；
-         * 排空在 OnStop 之前完成（先封边再排空再停 hook）。
-         */
-        for (const auto& cid :
-             m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
-            auto* x = m_registry->FindEntryLocked(cid);
-            if (!x)
-                continue;
-            for (const auto& b : x->bindings) {
-                if (b.subject_id == id && !b.retiring) {
-                    (void)m_registry->BeginUnbindLocked(*x, id, nullptr);
-                    break;
-                }
-            }
-        }
-        lk.unlock();
         m_registry->DispatchEvents(std::move(ev));
     }
 
-    /**
-     * 先排空本 service 作为 subject 的借用（旧 borrow 不得在 OnStop 之后
-     * 仍运行同一资源版本），再跑 OnStop（受管协程）。按边排空：只等本
-     * subject 名下 (component, subject, generation) 的 retiring 边归零——
-     * 共享组件上其他 subject 的合法 borrow 不阻塞本 service 收口。
-     */
-    std::vector<std::pair<ObjectId, std::uint64_t>> retiring_edges;
+    if (auto r = m_registry->DrainObserversOf(id, deadline); !r) {
+        abort("observer_drain", r.error());
+        return r;
+    }
+    if (auto r = m_registry->DrainSubjectBorrows(id, deadline); !r) {
+        abort("borrow_drain", r.error());
+        return r;
+    }
+    if (auto r = _EnsureHookSettled(id, &CoServiceBase::OnStop, operation, deadline, abort); !r)
+        return r;
+    if (!uninstall_hook_done) {
+        _RunVoidHook(id, &CoServiceBase::OnUninstall, "uninstall");
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        m_registry->FindEntryLocked(id)->uninstall_hook_done = true;
+    }
+    return result<void>::ok();
+}
+
+result<void> CoApp::_FinishService(const ObjectId& id, const char* operation,
+                                   ObjectState incomplete_state) {
+    std::string service_name;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        for (const auto& cid :
-             m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
-            auto* x = m_registry->FindEntryLocked(cid);
-            if (!x)
-                continue;
-            for (const auto& b : x->bindings) {
-                if (b.subject_id == id && b.retiring) {
-                    retiring_edges.emplace_back(cid, b.generation);
-                }
+        for (const auto& component : m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
+            const auto* e = m_registry->FindEntryLocked(component);
+            if (e->scope == ComponentScope::Service && e->owner_id == id) {
+                lk.unlock();
+                auto err = MakeError(ErrorCode::Overloaded, "service cleanup: owned components remain");
+                _AbortDestroy(id, operation, "owned_components", err, incomplete_state);
+                return result<void>::err(std::move(err));
             }
         }
+        service_name = m_registry->FindEntryLocked(id)->type_name;
     }
-    for (const auto& [cid, gen] : retiring_edges) {
-        auto r = m_registry->WaitBindingDrained(cid, id, gen, deadline);
-        if (!r) {
-            _AbortDestroy(id, "stop", "borrow_drain", r.error(),
-                          ObjectState::StopIncomplete);
-            return;
-        }
-    }
-    /**
-     * OnStop + 前序 hook 终态检查：超时同样保留 owner、不继续收口。
-     */
-    if (auto r = _EnsureHookSettled(
-            id, &CoServiceBase::OnStop, "stop", deadline,
-            [&](const char* ph, const Error& e) {
-                _AbortDestroy(id, "stop", ph, e,
-                              ObjectState::StopIncomplete);
-            });
-        !r)
-        return;
-    /**
-     * 收口 retiring 边（排空已由 WaitBindingDrained 按边证实）。
-     */
-    {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        for (const auto& cid :
-             m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
-            if (auto* x = m_registry->FindEntryLocked(cid))
-                m_registry->EraseSubjectBindingsLocked(*x, id);
-        }
-    }
-    _RunVoidHook(id, &CoServiceBase::OnUninstall, "uninstall");
-    _FinishObject(id, [](detail::RegistryEntry& e) {
-        static_cast<CoServiceBase*>(e.object.get())
-            ->_InvalidateComponentEntries();
-    });
-    /**
-     * 网络簿记与 Registry 登记同生命周期（登记已摘除，安装描述同步摘除——
-     * 停止后登记空档的重装不被残留描述误判 duplicate）。
-     */
+    _FinishObject(id);
     {
         std::lock_guard<std::mutex> lk(m_net_mtx);
         m_service_descriptions.erase(service_name);
     }
+    return result<void>::ok();
 }
 
-void CoApp::_DestroyActor(const ObjectId& id) {
-    _RunActorDestroy(id);
-    /**
-     * actor 实例不走 BeginDestroy：条目从未置 destroy_phase/
-     * op_in_progress，收口尾部无 EndOp/clear，与 service/component 不同。
-     */
-    std::shared_ptr<void> obj;
-    std::vector<std::pair<detail::ObserverRecord, ObjectStateEvent>> events;
+void CoApp::_DestroyActor(const ObjectId& id, bbt::coroutine::Deadline deadline) {
     {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        m_registry->RevokeObserversOfLocked(id);
-        auto* e = m_registry->FindEntryLocked(id);
-        if (e) {
-            auto [o, ev] = m_registry->FinishDestroyLocked(*e);
-            obj = std::move(o);
-            events = std::move(ev);
-        }
-    }
-    m_registry->DrainInactiveObservers();
-    m_registry->DispatchEvents(std::move(events));
-    /**
-     * 业务析构锁外
-     */
-    obj.reset();
-}
-
-void CoApp::_DestroyComponent(const ObjectId& id,
-                              bbt::coroutine::Deadline deadline) {
-    {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        auto* e = m_registry->FindEntryLocked(id);
-        if (!e || !m_registry->BeginOpLocked(*e))
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        auto* entry = m_registry->FindEntryLocked(id);
+        if (!entry || !m_registry->BeginOpLocked(*entry))
             return;
+        entry->gate_closed = true;
+        m_registry->RetireSubjectBindingsLocked(id);
+    }
+    if (auto r = m_registry->DrainSubjectBorrows(id, deadline); !r) {
+        _AbortDestroy(id, "destroy", "borrow_drain", r.error(), ObjectState::StopIncomplete);
+        return;
+    }
+    if (auto r = WaitHooksSettledCo(m_registry, id, deadline); !r) {
+        _AbortDestroy(id, "destroy", "hook_in_flight", r.error(), ObjectState::StopIncomplete);
+        return;
+    }
+    _RunActorDestroy(id);
+    _FinishObject(id);
+}
+
+result<void> CoApp::_DestroyComponent(const ObjectId& id,
+                                      bbt::coroutine::Deadline deadline) {
+    bool acquired = false;
+    auto release = boost::scope::make_scope_fail([&] {
+        if (acquired)
+            ReleaseInterruptedClose(*m_registry, id, ObjectState::StopIncomplete);
+    });
+    {
+        std::unique_lock<std::mutex> lk(m_registry->Mutex());
+        auto* e = m_registry->FindEntryLocked(id);
+        if (!e)
+            return result<void>::ok();
+        if (m_registry->HasComponentDependentsLocked(*e))
+            return result<void>::err(MakeError(ErrorCode::Overloaded, "component cleanup: dependent components remain"));
+        if (!m_registry->BeginOpLocked(*e)) {
+            if (e->destroy_phase.empty())
+                e->destroy_phase = "stop";
+            return result<void>::err(MakeError(ErrorCode::Overloaded,
+                                               "component cleanup: operation in progress"));
+        }
+        acquired = true;
         e->destroy_phase = "stop";
+        e->gate_closed = true;
+        m_registry->RetireTargetBindingsLocked(*e);
+        m_registry->RetireSubjectBindingsLocked(id);
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Stopping);
         lk.unlock();
         m_registry->DispatchEvents(std::move(ev));
@@ -1063,8 +1155,12 @@ void CoApp::_DestroyComponent(const ObjectId& id,
         if (!r) {
             _AbortDestroy(id, "stop", "borrow_drain", r.error(),
                           ObjectState::StopIncomplete);
-            return;
+            return r;
         }
+    }
+    if (auto r = m_registry->DrainSubjectBorrows(id, deadline); !r) {
+        _AbortDestroy(id, "stop", "borrow_drain", r.error(), ObjectState::StopIncomplete);
+        return r;
     }
     /**
      * OnStop + 前序 hook 终态检查：未达真实终态不跑 OnUninstall、
@@ -1077,9 +1173,10 @@ void CoApp::_DestroyComponent(const ObjectId& id,
                               ObjectState::StopIncomplete);
             });
         !r)
-        return;
+        return r;
     _RunVoidHook(id, &CoComponent::OnUninstall, "uninstall");
     _FinishObject(id);
+    return result<void>::ok();
 }
 
 /**
@@ -1093,7 +1190,7 @@ void CoApp::_DestroyComponent(const ObjectId& id,
 template <class T>
 result<void> CoApp::_RunHookCo(
     const ObjectId& id, result<void> (T::*hook)(),
-    const char* phase, bbt::coroutine::Deadline deadline) {
+    const char* phase, bbt::coroutine::Deadline deadline, bool remember_stop) {
     T* object = nullptr;
     std::shared_ptr<void> owner;
     auto slot = std::make_shared<Completion>();
@@ -1110,7 +1207,7 @@ result<void> CoApp::_RunHookCo(
         /**
          * 已消失：跳过
          */
-        if (!e)
+        if (!e || (remember_stop && e->stop_hook_done))
             return result<void>::ok();
         object = static_cast<T*>(e->object.get());
         owner = e->object;
@@ -1135,12 +1232,12 @@ result<void> CoApp::_RunHookCo(
      */
     auto reg = m_registry;
     auto hook_co = m_hook_co;
-    auto task = [object, hook, slot, reg, id, hook_co, owner]() {
+    auto task = [object, hook, slot, reg, id, hook_co, owner, remember_stop]() {
         hook_co->store(bbt::coroutine::GetLocalCoroutineId(),
                        std::memory_order_release);
         auto r = RunHookCaught([&] { return (object->*hook)(); });
         hook_co->store(0, std::memory_order_release);
-        reg->NoteHookSettled(id);
+        reg->NoteHookSettled(id, remember_stop && static_cast<bool>(r));
         slot->Publish(std::move(r));
     };
     try {
@@ -1264,8 +1361,7 @@ void CoApp::_RunActorDestroy(const ObjectId& id) noexcept {
     if (!a)
         return;
     /**
-                       * 条目收口由 _DestroyActor 的 FinishDestroyLocked
-                       * 完成（type entry 同样进入 Destroyed/移除）。
+                       * 条目收口由 _DestroyActor 完成。
                        */
     try {
         a->OnDestroy();
@@ -1346,37 +1442,16 @@ result<void> CoApp::_ValidateOwner(const ComponentOptions& placement,
  */
 bool CoApp::_WouldFormCycleLocked(const ObjectId& subject_id,
                                   const ObjectId& target_id) const {
-    if (subject_id == target_id)
-        return true;
-    /**
-     * 从 target 出发沿「X 的依赖」DFS，看能否回到 subject。
-     * 调用方已持 Registry 锁：经 ListIdsLocked + FindEntryLocked 构图。
-     */
-    std::unordered_map<ObjectId, std::vector<ObjectId>> deps;
-    std::vector<ObjectId> ids =
-        m_registry->ListIdsByKindLocked(ObjectKind::Component);
-    for (const auto& x : ids) {
-        auto& out = deps[x];
-        for (const auto& y : ids) {
-            auto* ye = m_registry->FindEntryLocked(y);
-            if (!ye)
-                continue;
-            for (const auto& b : ye->bindings)
-                if (b.subject_id == x)
-                    out.push_back(y);
-        }
-    }
-    std::unordered_map<ObjectId, int> mark;
+    const auto deps = m_registry->ComponentDependenciesLocked();
+    std::unordered_set<ObjectId> visited;
     std::function<bool(const ObjectId&)> reach = [&](const ObjectId& id) {
         if (id == subject_id)
             return true;
-        mark[id] = 1;
-        for (const auto& d : deps[id]) {
-            if (mark.count(d))
-                continue;
-            if (reach(d))
+        if (!visited.insert(id).second)
+            return false;
+        for (const auto& dep : deps.at(id))
+            if (reach(dep))
                 return true;
-        }
         return false;
     };
     return reach(target_id);
@@ -1387,10 +1462,6 @@ result<void> CoApp::_InstallComponentImpl(
     const ComponentOptions& placement, const LifecycleOptions& life,
     std::function<CoComponent*(detail::ConstructKey)> make,
     std::function<void(CoComponent*)> destroy) {
-    (void)life;
-    if (m_state.load() == AppState::Stopped)
-        return result<void>::err(MakeError(ErrorCode::Closed,
-                                           "InstallComponent: app stopped"));
     if (name.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
                                            "InstallComponent: empty name"));
@@ -1415,8 +1486,23 @@ result<void> CoApp::_InstallComponentImpl(
     }
 
     ObjectId id;
+    auto end_install = boost::scope::make_scope_exit([&] {
+        if (!id.empty()) {
+            std::lock_guard<std::mutex> lk(m_registry->Mutex());
+            m_registry->EndOpLocked(*m_registry->FindEntryLocked(id));
+        }
+    });
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
+        if (IsStopState(m_state.load()))
+            return result<void>::err(MakeError(ErrorCode::Closed,
+                                               "InstallComponent: app is stopping or stopped"));
+        if (placement.Owner()) {
+            const auto* owner = m_registry->FindEntryLocked(owner_id);
+            if (!owner || owner->generation != placement.Owner()->Generation() || owner->gate_closed)
+                return result<void>::err(MakeError(ErrorCode::Closed,
+                                                   "InstallComponent: scope owner is closing"));
+        }
         if (m_registry->FindComponentLocked(placement.Scope(), owner_id,
                                             ctype, name))
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
@@ -1428,6 +1514,8 @@ result<void> CoApp::_InstallComponentImpl(
             return result<void>::err(std::move(r.error()));
         auto* e = r.value();
         id = e->id;
+        // 收口若遇到已登记而尚未结束的安装，保留条目供后续重试。
+        m_registry->BeginOpLocked(*e);
         static_cast<CoComponent*>(e->object.get())
             ->_Bind(m_registry->MakeHandleLocked(*e));
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Installing);
@@ -1481,6 +1569,7 @@ result<void> CoApp::_UninstallComponentImpl(
             return result<void>::err(std::move(r.error()));
         id = e->id;
         e->destroy_phase = "uninstall";
+        m_registry->RetireSubjectBindingsLocked(id);
         auto ev = m_registry->SetStateLocked(*e, ObjectState::Uninstalling);
         lk.unlock();
         m_registry->DispatchEvents(std::move(ev));
@@ -1497,6 +1586,10 @@ result<void> CoApp::_UninstallComponentImpl(
                           ObjectState::UninstallIncomplete);
             return r;
         }
+    }
+    if (auto r = m_registry->DrainSubjectBorrows(id, deadline); !r) {
+        _AbortDestroy(id, "uninstall", "borrow_drain", r.error(), ObjectState::UninstallIncomplete);
+        return r;
     }
     /**
      * OnStop + 前序 hook 终态检查：未达真实终态不跑 OnUninstall、
@@ -1665,16 +1758,16 @@ result<void> CoApp::_ApplyServiceBindings(
         if (!svc->_AllowsComponent(*d.component_type)) {
             for (const auto* x : done)
                 (void)_UnbindComponentImpl(*x->component_type, svc_handle,
-                                           x->name, {}, life);
+                                           x->name, {}, &life);
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,
                                                "BindComponent: component type is not declared in this Service’s allowed set"));
         }
         auto r = _BindComponentImpl(*d.component_type, svc_handle,
-                                    d.name, {}, life);
+                                    d.name, d.name, {}, false);
         if (!r) {
             for (const auto* x : done)
                 (void)_UnbindComponentImpl(*x->component_type, svc_handle,
-                                           x->name, {}, life);
+                                           x->name, {}, &life);
             return result<void>::err(std::move(r.error()));
         }
         done.push_back(&d);
@@ -1686,123 +1779,42 @@ result<void> CoApp::_UninstallServiceImpl(std::string_view type_name,
                                           const LifecycleOptions& life) {
     ObjectId id;
     {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        auto* e = m_registry->FindByTypeNameLocked(ObjectKind::Service,
-                                                   type_name);
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        auto* e = m_registry->FindByTypeNameLocked(ObjectKind::Service, type_name);
         if (!e)
-            return result<void>::err(MakeError(ErrorCode::NotFound,
-                                               "UninstallService: not found"));
-        auto r = m_registry->BeginDestroyLocked(e->id);
-        if (!r)
-            return result<void>::err(std::move(r.error()));
+            return result<void>::err(MakeError(ErrorCode::NotFound, "UninstallService: not found"));
         id = e->id;
-        e->destroy_phase = "uninstall";
-        /**
-         * 先摘分发表项（新分发 NotFound），在途执行由收口路径的
-         * 「前序 hook 归零」等待覆盖（分发租约与 hook 共用计数）。
-         */
-        lk.unlock();
-        m_runtime->RemoveDispatch(std::string(type_name));
-        lk.lock();
-        e = m_registry->FindByTypeNameLocked(ObjectKind::Service, type_name);
-        if (!e)
-            return result<void>::err(MakeError(ErrorCode::InternalError,
-                                               "UninstallService: entry vanished after dispatch removal"));
-        auto ev = m_registry->SetStateLocked(*e, ObjectState::Uninstalling);
-        lk.unlock();
-        m_registry->DispatchEvents(std::move(ev));
     }
-
     const auto deadline = m_registry->ResolveDeadline(life);
-    /**
-     * 本 service 作为 subject 的 binding 逐个封门；排空在 OnStop 前
-     * 完成（先封边、再排空、再停 hook——与对象销毁路径同序）。
-     */
-    std::vector<std::pair<ObjectId, std::uint64_t>> retiring_edges;
-    {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        for (const auto& cid :
-             m_registry->ListIdsByKindLocked(ObjectKind::Component)) {
-            auto* x = m_registry->FindEntryLocked(cid);
-            if (!x)
-                continue;
-            /**
-             * 本 subject 在该组件上的边全部进收口集合：active 边先封门，
-             * 上次收口超时留下的 retiring 边沿用原 generation 续等——
-             * 重试跳过旧边会让未归还的 borrow 在 OnStop 之后继续使用同一
-             * 资源版本。
-             */
-            std::uint64_t active_gen = 0;
-            bool has_active = false;
-            std::vector<std::uint64_t> retiring;
-            for (const auto& b : x->bindings) {
-                if (b.subject_id != id)
-                    continue;
-                if (b.retiring)
-                    retiring.push_back(b.generation);
-                else {
-                    has_active = true;
-                }
-            }
-            if (has_active &&
-                m_registry->BeginUnbindLocked(*x, id, &active_gen)) {
-                retiring_edges.emplace_back(cid, active_gen);
-            }
-            for (const auto gen : retiring)
-                retiring_edges.emplace_back(cid, gen);
-        }
-        auto* e = m_registry->FindEntryLocked(id);
-        if (e)
-            static_cast<CoServiceBase*>(e->object.get())
-                ->_InvalidateComponentEntries();
-    }
-    /**
-     * 按边排空本 service 名下的借用：只等本 subject 的 retiring 边归零，
-     * 不等共享组件上其他 subject 的合法 borrow。
-     */
-    for (const auto& [cid, gen] : retiring_edges) {
-        auto r = m_registry->WaitBindingDrained(cid, id, gen, deadline);
-        if (!r) {
-            _AbortDestroy(id, "uninstall", "borrow_drain", r.error(),
-                          ObjectState::UninstallIncomplete);
-            return r;
-        }
-    }
-    /**
-     * 排空后收口本 service 作为 subject 的全部 retiring 边。
-     */
-    {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        for (const auto& [cid, gen] : retiring_edges) {
-            (void)gen;
-            if (auto* x = m_registry->FindEntryLocked(cid))
-                m_registry->EraseSubjectBindingsLocked(*x, id);
-        }
-    }
-
-    /**
-     * OnStop + 前序 hook 终态检查：未达真实终态不跑 OnUninstall、
-     * 不销毁（owner 保留）。
-     */
-    if (auto r = _EnsureHookSettled(
-            id, &CoServiceBase::OnStop, "uninstall", deadline,
-            [&](const char* ph, const Error& e) {
-                _AbortDestroy(id, "uninstall", ph, e,
-                              ObjectState::UninstallIncomplete);
-            });
-        !r)
+    if (auto r = _DestroyService(id, deadline, true); !r)
         return r;
-    _RunVoidHook(id, &CoServiceBase::OnUninstall, "uninstall");
-    _FinishObject(id);
-    /**
-     * 网络簿记与 Registry 登记同生命周期：登记已摘除，安装描述不同步摘除
-     * 会在同名服务重装时被 emplace 处误判 duplicate service record。
-     */
+    auto release = boost::scope::make_scope_fail([&] {
+        ReleaseInterruptedClose(*m_registry, id, ObjectState::UninstallIncomplete);
+    });
+
+    detail::Registry::ComponentDependencies deps;
+    std::vector<ObjectId> owned;
     {
-        std::lock_guard<std::mutex> lk(m_net_mtx);
-        m_service_descriptions.erase(std::string(type_name));
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        deps = m_registry->ComponentDependenciesLocked();
+        const auto order = m_registry->ComponentStartOrderLocked(deps);
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const auto* e = m_registry->FindEntryLocked(*it);
+            if (e->scope == ComponentScope::Service && e->owner_id == id)
+                owned.push_back(*it);
+        }
     }
-    return result<void>::ok();
+    ComponentClosePass pass(deps);
+    if (auto failure = pass.Run(owned, [&](const ObjectId& component) {
+            return _DestroyComponent(component, deadline);
+        })) {
+        _AbortDestroy(id, "uninstall", "owned_components", *failure, ObjectState::UninstallIncomplete);
+        release.set_active(false);
+        return result<void>::err(std::move(*failure));
+    }
+    auto finish_result = _FinishService(id, "uninstall", ObjectState::UninstallIncomplete);
+    release.set_active(false);
+    return finish_result;
 }
 
 result<void> CoApp::_RegisterActorType(const std::type_info& atype, std::string actor_type) {
@@ -1862,7 +1874,7 @@ result<void> CoApp::_UninstallActorTypeImpl(std::string_view actor_type,
      * owner。
      */
     std::shared_ptr<void> obj;
-    std::vector<std::pair<detail::ObserverRecord, ObjectStateEvent>> events;
+    detail::ObserverEvents events;
     {
         std::unique_lock<std::mutex> lk(m_registry->Mutex());
         auto* e = m_registry->FindEntryLocked(id);
@@ -1879,101 +1891,117 @@ result<void> CoApp::_UninstallActorTypeImpl(std::string_view actor_type,
     return result<void>::ok();
 }
 
-result<std::pair<ObjectHandle, std::uint64_t>> CoApp::_BindComponentImpl(
+namespace {
+BindingEvent MakeBindingEvent(const detail::RegistryEntry& subject,
+                              const detail::RegistryEntry& target,
+                              std::string_view slot, std::uint64_t binding_generation,
+                              bool bound) {
+    BindingEvent event;
+    event.subject_id = subject.id;
+    event.subject_generation = subject.generation;
+    event.target_id = target.id;
+    event.generation = target.generation;
+    event.binding_generation = binding_generation;
+    event.slot = slot;
+    event.bound = bound;
+    event.revision = target.revision;
+    event.observed_at = std::chrono::system_clock::now();
+    return event;
+}
+} // namespace
+
+result<detail::ComponentBindingSnapshot> CoApp::_BindComponentImpl(
     const std::type_info& ctype, const ObjectHandle& subject,
-    std::string_view name, const ComponentOptions& placement,
-    const LifecycleOptions& life) {
-    (void)life;
-    /**
-     * 跨 App 句柄拒绝：subject 必须属于本 Registry。
-     */
+    std::string_view slot, std::string_view target_name,
+    const ComponentOptions& placement, bool replace) {
+    using BindResult = result<detail::ComponentBindingSnapshot>;
     if (!m_registry->OwnsHandle(subject))
-        return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-            MakeError(ErrorCode::InvalidArgument,
-                      "BindComponent: subject handle belongs to another Registry"));
+        return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                         "BindComponent: subject handle belongs to another Registry"));
     ObjectId owner_id;
     if (auto r = _ValidateOwner(placement, &owner_id); !r)
-        return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-            std::move(r.error()));
+        return BindResult::err(std::move(r.error()));
 
-    ObjectHandle comp_handle;
-    std::uint64_t gen = 0;
-    BindingEvent be;
-    void* subj_obj = nullptr;
-    /**
-     * callback lease：锁外 hook 期保活
-     */
-    std::shared_ptr<void> subj_owner;
-    ObjectKind subj_kind;
+    detail::ComponentBindingSnapshot snapshot;
+    BindingEvent bound;
+    std::optional<BindingEvent> removed;
+    const auto co = bbt::coroutine::GetLocalCoroutineId();
+    std::shared_ptr<void> subject_owner;
+    ObjectKind subject_kind;
+    auto release = boost::scope::make_scope_exit([&] {
+        if (subject_owner)
+            m_registry->ReleaseBindingCallback(bound.subject_id, co);
+    });
     {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        if (IsStopState(m_state.load()))
+            return BindResult::err(MakeError(ErrorCode::Closed, "BindComponent: app is stopping or stopped"));
         auto* subj = m_registry->FindEntryLocked(subject.Id());
         if (!subj || subj->generation != subject.Generation())
-            return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                MakeError(ErrorCode::NotFound,
-                          "BindComponent: subject stale"));
-        if (subj->kind == ObjectKind::App)
-            return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "BindComponent: subject cannot be an App handle"));
-        if (subj->kind == ObjectKind::Service) {
-            auto* svc = static_cast<CoServiceBase*>(subj->object.get());
-            if (!svc->_AllowsComponent(ctype))
-                return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                    MakeError(ErrorCode::InvalidArgument,
-                              "BindComponent: component type is not declared in this Service’s allowed set"));
-        }
+            return BindResult::err(MakeError(ErrorCode::NotFound, "BindComponent: subject stale"));
+        if (subj->kind == ObjectKind::App || !subj->object)
+            return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                             "BindComponent: subject must be an object instance"));
+        if (subj->kind == ObjectKind::Service &&
+            !static_cast<CoServiceBase*>(subj->object.get())->_AllowsComponent(ctype))
+            return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                             "BindComponent: component type is not declared in this Service’s allowed set"));
 
-        auto* comp = m_registry->FindComponentLocked(placement.Scope(),
-                                                     owner_id, ctype, name);
-        if (!comp)
-            return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                MakeError(ErrorCode::NotFound,
-                          "BindComponent: component not found"));
-        /**
-         * 组件→组件依赖：加边不得成环（subject 依赖 target）。
-         */
-        if (subj->kind == ObjectKind::Component &&
-            _WouldFormCycleLocked(subject.Id(), comp->id))
-            return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "BindComponent: dependency would form a cycle"));
-        if (auto r = m_registry->BindLocked(*comp, *subj, subject.Id(), &gen); !r)
-            return result<std::pair<ObjectHandle, std::uint64_t>>::err(
-                std::move(r.error()));
+        auto* target = m_registry->FindComponentLocked(placement.Scope(), owner_id,
+                                                       ctype, target_name);
+        if (!target)
+            return BindResult::err(MakeError(ErrorCode::NotFound, "BindComponent: component not found"));
+        const auto owner_closed = [&](const detail::RegistryEntry& entry) {
+            if (entry.scope == ComponentScope::App)
+                return false;
+            const auto* owner = m_registry->FindEntryLocked(entry.owner_id);
+            return !owner || owner->gate_closed;
+        };
+        if (owner_closed(*subj) || owner_closed(*target))
+            return BindResult::err(MakeError(ErrorCode::Closed, "BindComponent: scope owner is closing"));
+        if (target->scope != ComponentScope::App && target->owner_id != subj->id &&
+            (subj->kind != ObjectKind::Component || subj->scope != target->scope ||
+             subj->owner_id != target->owner_id))
+            return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                             "BindComponent: component is outside the subject's scope"));
+        auto [previous, previous_binding] = m_registry->FindBindingLocked(subj->id, ctype, slot);
+        if (!replace && previous)
+            return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                             "BindComponent: slot already bound"));
+        if (replace && !previous)
+            return BindResult::err(MakeError(ErrorCode::NotFound, "RebindComponent: slot not bound"));
+        if (previous == target)
+            return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                             "RebindComponent: slot already points to target"));
+        if (subj->kind == ObjectKind::Component && _WouldFormCycleLocked(subj->id, target->id))
+            return BindResult::err(MakeError(ErrorCode::InvalidArgument,
+                                             "BindComponent: dependency would form a cycle"));
 
-        comp_handle = m_registry->MakeHandleLocked(*comp);
-        subj_obj = subj->object.get();
-        /**
-         * 锁外 OnBindingChanged 的保活 lease
-         */
-        subj_owner = subj->object;
-        subj_kind = subj->kind;
-        /**
-         * subject 绑定表回填：Service/Component/Actor 统一（
-         * GetComponent 只读；对象析构由 Registry owner 保证）。
-         */
-        static_cast<detail::ObjectBase*>(subj_obj)->_BindComponentEntry(
-            ctype, std::string(name), comp_handle, gen);
-        be.subject_id = subject.Id();
-        be.target_id = comp->id;
-        be.generation = comp->generation;
-        be.bound = true;
-        be.revision = comp->revision;
-        be.observed_at = std::chrono::system_clock::now();
+        snapshot = m_registry->SnapshotBindingLocked(*target, 0);
+        bound = MakeBindingEvent(*subj, *target, slot, 0, true);
+        if (previous)
+            removed = MakeBindingEvent(*subj, *previous, slot, previous_binding->generation, false);
+        if (subj->gate_closed)
+            return BindResult::err(MakeError(ErrorCode::Closed, "BindComponent: subject is closing"));
+        m_registry->AcquireBindingCallbackLocked(*subj, co);
+        subject_owner = subj->object;
+        subject_kind = subj->kind;
+        auto generation = m_registry->BindLocked(*target, *subj, slot, previous, previous_binding);
+        if (!generation)
+            return BindResult::err(std::move(generation.error()));
+        snapshot.binding_generation = generation.value();
+        bound.binding_generation = generation.value();
     }
-    _NotifyBindingChanged(subj_kind, subj_obj, be, "bind");
-    return result<std::pair<ObjectHandle, std::uint64_t>>::ok(
-        {std::move(comp_handle), gen});
+    if (removed)
+        _NotifyBindingChanged(subject_kind, subject_owner.get(), *removed, "rebind");
+    _NotifyBindingChanged(subject_kind, subject_owner.get(), bound, replace ? "rebind" : "bind");
+    return BindResult::ok(std::move(snapshot));
 }
 
 result<void> CoApp::_UnbindComponentImpl(
     const std::type_info& ctype, const ObjectHandle& subject,
-    std::string_view name, const ComponentOptions& placement,
-    const LifecycleOptions& life) {
-    /**
-     * 跨 App 句柄拒绝：subject 必须属于本 Registry。
-     */
+    std::string_view slot, const ComponentOptions& placement,
+    const LifecycleOptions* drain) {
     if (!m_registry->OwnsHandle(subject))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
                                            "UnbindComponent: subject handle belongs to another Registry"));
@@ -1981,78 +2009,69 @@ result<void> CoApp::_UnbindComponentImpl(
     if (auto r = _ValidateOwner(placement, &owner_id); !r)
         return r;
 
-    ObjectId comp_id;
-    std::uint64_t gen = 0;
-    {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        auto* comp = m_registry->FindComponentLocked(placement.Scope(),
-                                                     owner_id, ctype, name);
-        if (!comp)
-            return result<void>::err(MakeError(ErrorCode::NotFound,
-                                               "UnbindComponent: component not found"));
-        comp_id = comp->id;
-        auto r = m_registry->BeginUnbindLocked(*comp, subject.Id(), &gen);
-        if (!r) {
-            /**
-             * 无 active 边：若同一操作此前超时留下 retiring 边，继续收口
-             * （契约：deadline 到边为 invalidated，后续同一操作继续收口）。
-             */
-            if (r.error().code == ErrorCode::NotFound &&
-                m_registry->FindRetiringBindingLocked(
-                    *comp, subject.Id(), &gen)) {
-                /**
-                 * fallthrough：等既有 retiring 边归零
-                 */
-            } else {
-                return r;
-            }
+    BindingEvent removed;
+    const auto co = bbt::coroutine::GetLocalCoroutineId();
+    std::shared_ptr<void> subject_owner;
+    ObjectKind subject_kind;
+    auto release = boost::scope::make_scope_exit([&] {
+        if (subject_owner)
+            m_registry->ReleaseBindingCallback(removed.subject_id, co);
+    });
+    const auto qualify_locked = [&](detail::RegistryEntry& subj) {
+        if (!subj.gate_closed) {
+            m_registry->AcquireBindingCallbackLocked(subj, co);
+            subject_owner = subj.object;
+            subject_kind = subj.kind;
         }
-    }
-
-    const auto deadline = m_registry->ResolveDeadline(life);
-    auto r = m_registry->WaitBindingDrained(comp_id, subject.Id(), gen,
-                                            deadline);
-    if (!r) {
-        LifecycleFailure f;
-        f.object_id = comp_id;
-        f.operation = "unbind";
-        f.phase = "borrow_drain";
-        f.code = r.error().code;
-        f.at = std::chrono::system_clock::now();
-        f.message = r.error().message;
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        m_registry->RecordFailure(std::move(f));
-        return r;
-    }
-
-    /**
-     * 排空完成：收口 retiring 边、清理 subject 绑定表并锁外派发
-     * bound=false 事件（subject owner lease 保活到 hook 结束）。
-     */
-    void* subj_obj = nullptr;
-    std::shared_ptr<void> subj_owner;
-    ObjectKind subj_kind = ObjectKind::App;
+    };
     {
-        std::unique_lock<std::mutex> lk(m_registry->Mutex());
-        if (auto* comp = m_registry->FindEntryLocked(comp_id))
-            m_registry->EraseBindingLocked(*comp, subject.Id(), gen);
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
         auto* subj = m_registry->FindEntryLocked(subject.Id());
-        if (subj) {
-            subj_obj = subj->object.get();
-            subj_owner = subj->object;
-            subj_kind = subj->kind;
-            static_cast<detail::ObjectBase*>(subj_obj)
-                ->_UnbindComponentEntry(ctype, name);
+        if (!subj || subj->generation != subject.Generation())
+            return result<void>::err(MakeError(ErrorCode::NotFound, "UnbindComponent: subject stale"));
+        if (subj->kind == ObjectKind::App || !subj->object)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                                               "UnbindComponent: subject must be an object instance"));
+
+        // 先续等原代，避免超时后重试摘掉同槽位的新绑定。
+        auto [target, binding] = drain
+                                     ? m_registry->FindBindingLocked(subj->id, ctype, slot, &placement, true)
+                                     : std::pair<detail::RegistryEntry*, detail::Binding*>{};
+        if (!target) {
+            auto active = m_registry->FindBindingLocked(subj->id, ctype, slot, &placement);
+            target = active.first;
+            binding = active.second;
+        }
+        if (!target)
+            return result<void>::err(MakeError(ErrorCode::NotFound, "UnbindComponent: binding not found"));
+        removed = MakeBindingEvent(*subj, *target, slot, binding->generation, false);
+        if (!drain)
+            qualify_locked(*subj);
+        if (!binding->retiring)
+            m_registry->RetireBindingLocked(*target, *binding, drain != nullptr);
+    }
+
+    if (drain) {
+        auto r = m_registry->WaitBindingDrained(removed.target_id, removed.subject_id,
+                                                removed.binding_generation,
+                                                m_registry->ResolveDeadline(*drain));
+        std::lock_guard<std::mutex> lk(m_registry->Mutex());
+        if (!r) {
+            m_registry->RecordFailure(LifecycleFailure{
+                removed.target_id, removed.generation, "unbind", "borrow_drain", r.error().code,
+                std::chrono::system_clock::now(), r.error().message});
+            return r;
+        }
+        auto* target = m_registry->FindEntryLocked(removed.target_id);
+        if (target && m_registry->EraseBindingLocked(*target, removed.subject_id,
+                                                     removed.binding_generation)) {
+            // 排空期间收口可以接管旧代；封门后不得再取得新通知资格。
+            if (auto* subj = m_registry->FindEntryLocked(removed.subject_id))
+                qualify_locked(*subj);
         }
     }
-    if (subj_obj != nullptr) {
-        BindingEvent be;
-        be.subject_id = subject.Id();
-        be.target_id = comp_id;
-        be.bound = false;
-        be.observed_at = std::chrono::system_clock::now();
-        _NotifyBindingChanged(subj_kind, subj_obj, be, "unbind");
-    }
+    if (subject_owner)
+        _NotifyBindingChanged(subject_kind, subject_owner.get(), removed, "unbind");
     return result<void>::ok();
 }
 

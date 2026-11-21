@@ -3,9 +3,9 @@
  * Framework 网络宿主：同一 Engine 承担入站接纳与出站会话。
  * Create 在 Idle 装配；Start 在 native Run 线程监听后启动 server。
  * StopAccepting 先关闭业务门；WaitHandlersDone 等业务与回复写终态，再以
- * CoRpcServer::Shutdown 同步封口 RPC 入站（infra 会话层已收敛为统一
- * Close/Shutdown，物理回收由 Close 的 Engine 收口证明）。Close 立即发布
- * 原因、封 server/client、RequestClose 并 join 自有 Engine 线程（不 detach）；
+ * 统一 Close 封口入站（HTTP 优雅排空并等物理回收，RPC Immediate 逻辑封口，
+ * 物理回收由 Engine 收口证明）。Close 立即发布原因、以 Close(Immediate) 封
+ * server/client、Close 并 join 自有 Engine 线程（不 detach）；
  * 它不等 handler、也不再自带 5s 等待。
  * HandlerState 自持；业务对象寿命由运行时状态 shared_ptr（AppRuntimeState）
  * 保证——handler 闭包复制该指针，CoApp 先析构也不影响在途请求。

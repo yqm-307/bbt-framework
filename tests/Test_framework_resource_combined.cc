@@ -35,8 +35,9 @@
  *   同步等客户端明确结果 → 再次 CoStop 推进完整收口 → Stopped；
  *   最终对象销毁后 Service 句柄失效。客户端结果按 InfraHttpHost.hpp
  *   「Close 开始后尚未交给传输层的回复不承诺送达」契约判定：只接受
- *   「完整 HELD」或「TransportError(code=8)」，不接受空结果/未知
- *   错误（未过期不等于 Close 后必达）。观察者由外部状态独立持有，
+ *   「完整 HELD」，或会话关闭结算错误「OutcomeUnknown(code=13) +
+ *   request_phase == RequestCommitted」（请求已完整写出、会话随后丢失、
+ *   回复未知）；不接受空结果/未知错误，不放宽为任意传输错误。观察者由外部状态独立持有，
  *   测试不持 Service 实例（新模型无公开实例出口）。
  * C4a 后端 I/O 在途（服务端停顿）：同一自有实例 CLIENT PAUSE 1500 ALL
  *   后，业务 Get 在 cache 命中路径上被服务端**真实扣住**约 1500ms
@@ -99,8 +100,8 @@
 #include <bbt/framework/internal/InfraHttpHost.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
 using Clock = std::chrono::steady_clock;
 
@@ -110,7 +111,9 @@ using fw8test::KvSvc;
 
 constexpr std::chrono::milliseconds kWait{20000};
 
-const char* EnvOr(const char* k) { return std::getenv(k); }
+const char* EnvOr(const char* k) {
+    return std::getenv(k);
+}
 bool RedisEnabled() {
     const char* a = EnvOr("BBT_TEST_REDIS_ADDR");
     return a != nullptr && *a != '\0';
@@ -128,7 +131,8 @@ struct RequireBothEnv {
     RequireBothEnv() {
         if (!RedisEnabled() || !MongoEnabled()) {
             std::fputs("combined: 需要 BBT_TEST_REDIS_ADDR + "
-                       "BBT_TEST_MONGO_URI，标记 Skipped\n", stderr);
+                       "BBT_TEST_MONGO_URI，标记 Skipped\n",
+                       stderr);
             std::exit(77);
         }
     }
@@ -137,7 +141,8 @@ BOOST_GLOBAL_FIXTURE(RequireBothEnv);
 
 std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     const auto pos = addr.rfind(':');
-    if (pos == std::string::npos) return {addr, 0};
+    if (pos == std::string::npos)
+        return {addr, 0};
     return {addr.substr(0, pos),
             static_cast<std::uint16_t>(std::stoi(addr.substr(pos + 1)))};
 }
@@ -146,25 +151,29 @@ std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
  * 每次运行唯一的前缀：后端是保留状态的容器，避免与上次运行的文档/LRU 冲突。
  */
 std::string RunPrefix() {
-    return "f8c-" + std::to_string(
-        Clock::now().time_since_epoch().count()) + "-";
+    return "f8c-" + std::to_string(Clock::now().time_since_epoch().count()) + "-";
 }
 
 class TestLatch {
 public:
     explicit TestLatch(int n) : m_count(n) {}
     void CountDown() {
-        { std::lock_guard<std::mutex> lk(m_mtx); if (--m_count > 0) return; }
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (--m_count > 0)
+                return;
+        }
         m_cv.notify_all();
     }
     bool WaitFor(std::chrono::milliseconds ms) {
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    int                     m_count;
+    int m_count;
 };
 
 /**
@@ -178,8 +187,10 @@ public:
         wo.deadline = deadline;
         return waiter->WaitWithCallback(wo, [&]() -> bool {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_open) waiter->Notify();
-            else        m_waiter = waiter;
+            if (m_open)
+                waiter->Notify();
+            else
+                m_waiter = waiter;
             return true;
         });
     }
@@ -190,12 +201,14 @@ public:
             m_open = true;
             w = m_waiter;
         }
-        if (w) w->Notify();
+        if (w)
+            w->Notify();
     }
+
 private:
-    std::mutex                 m_mtx;
-    bool                       m_open = false;
-    co::sync::CoWaiter::SPtr   m_waiter;
+    std::mutex m_mtx;
+    bool m_open = false;
+    co::sync::CoWaiter::SPtr m_waiter;
 };
 
 /**
@@ -207,21 +220,24 @@ std::string RedisCliPath() {
 }
 
 struct CliResult {
-    int         rc{-1};
+    int rc{-1};
     std::string out;
 };
 
 CliResult RunRedisCli(const std::vector<std::string>& args) {
     CliResult res;
     const std::string cli = RedisCliPath();
-    if (cli.empty()) return res;
+    if (cli.empty())
+        return res;
     const auto [host, port] = SplitAddr(EnvOr("BBT_TEST_REDIS_ADDR"));
     std::string cmd = "'" + cli + "' -h " + host + " -p " +
-        std::to_string(port);
-    for (const auto& a : args) cmd += " " + a;
+                      std::to_string(port);
+    for (const auto& a : args)
+        cmd += " " + a;
     cmd += " 2>&1";
     FILE* f = ::popen(cmd.c_str(), "r");
-    if (f == nullptr) return res;
+    if (f == nullptr)
+        return res;
     char buf[256];
     std::size_t n = 0;
     while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
@@ -246,8 +262,10 @@ public:
     static constexpr std::string_view kServiceName = "peek";
     explicit CombinedPeek(fw::detail::ConstructKey k)
         : fw::CoService<fw::RedisNetResource, fw::MongoDbResource>(k) {}
+
 protected:
     ~CombinedPeek() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -284,8 +302,11 @@ fw::AppOptions AppOpts(std::chrono::milliseconds incoming_timeout,
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{30000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{30000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         /**
@@ -295,50 +316,55 @@ bool RunInManagedCoroutine(F&& fn,
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
 struct CombinedBox {
-    std::shared_ptr<fw::CoApp>                                   app;
-    fw::ObjectHandle                                             svc_handle;
-    std::shared_ptr<fw::InfraHttpHost>                           client_rt;
-    std::shared_ptr<fw::RpcEgress>                               client;
-    std::string                                                  endpoint;
+    std::shared_ptr<fw::CoApp> app;
+    fw::ObjectHandle svc_handle;
+    std::shared_ptr<fw::InfraHttpHost> client_rt;
+    std::shared_ptr<fw::RpcEgress> client;
+    std::string endpoint;
     /**
      * 测试侧组件借用（PeekSvc subject）：持有 lease 即保活资源对象
      * 版本，跨 CoStop 持有阻止收口（如实 StopIncomplete）。
      */
-    std::optional<fw::ComponentBorrow<fw::RedisNetResource>>     cache;
-    std::optional<fw::ComponentBorrow<fw::MongoDbResource>>      docs;
-    std::optional<fw::ComponentHandle<fw::RedisNetResource>>     cache_h;
-    std::optional<fw::ComponentHandle<fw::MongoDbResource>>      docs_h;
+    std::optional<fw::ComponentBorrow<fw::RedisNetResource>> cache;
+    std::optional<fw::ComponentBorrow<fw::MongoDbResource>> docs;
+    std::optional<fw::ComponentHandle<fw::RedisNetResource>> cache_h;
+    std::optional<fw::ComponentHandle<fw::MongoDbResource>> docs_h;
 
     CombinedBox() = default;
     ~CombinedBox() { Stop(); }
-    CombinedBox(CombinedBox&&)                 = default;
-    CombinedBox& operator=(CombinedBox&&)      = default;
-    CombinedBox(const CombinedBox&)            = delete;
+    CombinedBox(CombinedBox&&) = default;
+    CombinedBox& operator=(CombinedBox&&) = default;
+    CombinedBox(const CombinedBox&) = delete;
     CombinedBox& operator=(const CombinedBox&) = delete;
 
     /**
@@ -347,8 +373,12 @@ struct CombinedBox {
      * 收口。任何一步失败如实断言，不伪造终态。
      */
     void Stop() {
-        cache.reset(); docs.reset(); cache_h.reset(); docs_h.reset();
-        if (client_rt) client_rt->Close();
+        cache.reset();
+        docs.reset();
+        cache_h.reset();
+        docs_h.reset();
+        if (client_rt)
+            client_rt->Close();
         if (app) {
             app->RequestShutdown();
             auto a = app;
@@ -375,22 +405,23 @@ void RegisterResources(const std::shared_ptr<fw::CoApp>& app) {
     std::error_code addr_ec;
     auto address = inf::net::Address::Ip(rhost, rport, addr_ec);
     BOOST_REQUIRE_MESSAGE(!addr_ec,
-        "BBT_TEST_REDIS_ADDR 需为数值 IPv4/IPv6: " << addr_ec.message());
+                          "BBT_TEST_REDIS_ADDR 需为数值 IPv4/IPv6: " << addr_ec.message());
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<fw::RedisNetResource>(
         "cache", fw::RedisNetResource::Options{}.SetAddress(address)));
 
     inf::mongo::MongoRuntimeConfig rcfg;
-    rcfg.uri                      = EnvOr("BBT_TEST_MONGO_URI");
-    rcfg.worker_threads           = 2;
-    rcfg.max_queue                = 256;
+    rcfg.uri = EnvOr("BBT_TEST_MONGO_URI");
+    rcfg.worker_threads = 2;
+    rcfg.max_queue = 256;
     rcfg.server_selection_timeout = std::chrono::milliseconds{5000};
-    rcfg.connect_timeout          = std::chrono::milliseconds{5000};
-    rcfg.socket_timeout           = std::chrono::milliseconds{5000};
-    rcfg.wait_queue_timeout       = std::chrono::milliseconds{5000};
+    rcfg.connect_timeout = std::chrono::milliseconds{5000};
+    rcfg.socket_timeout = std::chrono::milliseconds{5000};
+    rcfg.wait_queue_timeout = std::chrono::milliseconds{5000};
     const inf::mongo::MongoTarget target{"bbt_f8_combined", "kv"};
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<fw::MongoDbResource>(
         "docs", fw::MongoDbResource::Options{}
-                    .SetConfig(rcfg).SetTarget(target)));
+                    .SetConfig(rcfg)
+                    .SetTarget(target)));
 }
 
 /**
@@ -443,8 +474,14 @@ CombinedBox StartCombined(std::chrono::milliseconds incoming_timeout,
          */
         inf::CallOptions connect_options{Clock::now() + kWait};
         auto connected = bbt_co_await box.cache->Get().Connect(connect_options);
-        BOOST_REQUIRE_MESSAGE(connected,
-            "redis explicit Connect 失败: " << connected.error().message);
+        /**
+         * BOOST_REQUIRE_MESSAGE 的消息在断言通过时同样求值，ok result 读
+         * error() 会抛 logic_error；失败细节只在失败分支取出。
+         */
+        if (!connected) {
+            BOOST_FAIL("redis explicit Connect 失败: "
+                       << connected.error().message);
+        }
         box.svc_handle = box.app->FindService("kv").value();
         box.endpoint = box.app->BoundEndpoint();
     }));
@@ -502,8 +539,8 @@ fw::result<inf::rpc::Response> CallRpc(
     std::chrono::milliseconds budget = kWait) {
     struct State {
         std::optional<fw::result<inf::rpc::Response>> out;
-        std::exception_ptr                          eptr;
-        TestLatch                                   done{1};
+        std::exception_ptr eptr;
+        TestLatch done{1};
     };
     auto st = std::make_shared<State>();
     /**
@@ -525,7 +562,8 @@ fw::result<inf::rpc::Response> CallRpc(
     if (!succ || !st->done.WaitFor(budget))
         return fw::result<inf::rpc::Response>::err(fw::MakeError(
             fw::ErrorCode::InternalError, "CallRpc did not complete"));
-    if (st->eptr) std::rethrow_exception(st->eptr);
+    if (st->eptr)
+        std::rethrow_exception(st->eptr);
     return std::move(*st->out);
 }
 
@@ -539,20 +577,23 @@ auto RunInCoroutine(Fn&& fn, std::chrono::milliseconds budget = kWait)
     struct State {
         std::optional<Out> out;
         std::exception_ptr eptr;
-        TestLatch          done{1};
+        TestLatch done{1};
     };
     auto st = std::make_shared<State>();
-    auto f  = std::decay_t<Fn>(std::forward<Fn>(fn));
+    auto f = std::decay_t<Fn>(std::forward<Fn>(fn));
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [st, f] {
-            try { st->out.emplace(f()); }
-            catch (...) { st->eptr = std::current_exception(); }
+            try {
+                st->out.emplace(f());
+            } catch (...) { st->eptr = std::current_exception(); }
             st->done.CountDown();
         },
         succ);
-    if (!succ || !st->done.WaitFor(budget)) return std::nullopt;
-    if (st->eptr) std::rethrow_exception(st->eptr);
+    if (!succ || !st->done.WaitFor(budget))
+        return std::nullopt;
+    if (st->eptr)
+        std::rethrow_exception(st->eptr);
     return std::move(st->out);
 }
 
@@ -561,24 +602,28 @@ auto RunInCoroutine(Fn&& fn, std::chrono::milliseconds budget = kWait)
  */
 struct Reply2 {
     std::int32_t status{0};
-    std::string  value;
+    std::string value;
 };
 fw::result<Reply2> Decode2(const fw::result<inf::rpc::Response>& r) {
-    if (!r) return fw::result<Reply2>::err(r.error());
+    if (!r)
+        return fw::result<Reply2>::err(r.error());
     auto d = fw::CoRpcReq(r.value().Payload()).Parse<std::int32_t, std::string>();
-    if (!d) return fw::result<Reply2>::err(d.error());
+    if (!d)
+        return fw::result<Reply2>::err(d.error());
     return fw::result<Reply2>::ok(Reply2{std::get<0>(d.value()),
                                          std::get<1>(d.value())});
 }
 
 fw::CoRpcReq Req1(std::string a) {
     auto req = fw::CoRpcReq::From(std::move(a));
-    if (!req) throw std::logic_error("encode failed");
+    if (!req)
+        throw std::logic_error("encode failed");
     return std::move(req).value();
 }
 fw::CoRpcReq Req2(std::string a, std::string b) {
     auto req = fw::CoRpcReq::From(std::tuple{std::move(a), std::move(b)});
-    if (!req) throw std::logic_error("encode failed");
+    if (!req)
+        throw std::logic_error("encode failed");
     return std::move(req).value();
 }
 
@@ -592,15 +637,15 @@ BOOST_AUTO_TEST_SUITE(framework_resource_combined)
  * mongo_reads 计数与借用观察口改为 fixture 静态成员/PeekSvc 绑定。
  */
 BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
-    auto box = StartCombined(/*incoming*/std::chrono::milliseconds{30000},
-                             /*shutdown*/std::chrono::milliseconds{300});
+    auto box = StartCombined(/*incoming*/ std::chrono::milliseconds{30000},
+                             /*shutdown*/ std::chrono::milliseconds{300});
     const std::string prefix = RunPrefix();
-    const std::string id     = prefix + "k1";
+    const std::string id = prefix + "k1";
 
     auto call = [&box](const char* method, const fw::CoRpcReq& req)
         -> fw::result<inf::rpc::Response> {
         return CallRpc(box, MakeEnv("kv", method,
-            std::string("c1-") + method, req));
+                                    std::string("c1-") + method, req));
     };
 
     /**
@@ -718,7 +763,7 @@ BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
         auto r = call("insert", Req2(id, "v3"));
         BOOST_REQUIRE(!r);
         BOOST_CHECK_EQUAL(static_cast<int>(r.error().code),
-            static_cast<int>(fw::ErrorCode::RemoteError));
+                          static_cast<int>(fw::ErrorCode::RemoteError));
         BOOST_CHECK_EQUAL(r.error().domain_code, "DuplicateKey");
     }
 
@@ -747,7 +792,7 @@ BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(alive.has_value() && *alive,
-            "StopIncomplete 期间真实 Ping 应成功（owner 保留）");
+                              "StopIncomplete 期间真实 Ping 应成功（owner 保留）");
     }
     box.cache.reset();
     box.docs.reset();
@@ -766,7 +811,8 @@ BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
         auto gone2 = box.app->FindComponent<fw::MongoDbResource>("docs");
         BOOST_CHECK(!gone2);
     }
-    if (box.client_rt) box.client_rt->Close();
+    if (box.client_rt)
+        box.client_rt->Close();
     box.app.reset();
 }
 
@@ -777,8 +823,8 @@ BOOST_AUTO_TEST_CASE(combined_cache_mongo_business) {
  * 在途超时（后者见 C4a/C4b）。
  */
 BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
-    auto box = StartCombined(/*incoming*/std::chrono::milliseconds{700},
-                             /*shutdown*/std::chrono::milliseconds{2000});
+    auto box = StartCombined(/*incoming*/ std::chrono::milliseconds{700},
+                             /*shutdown*/ std::chrono::milliseconds{2000});
 
     /**
      * handler 观察到的是有限父预算（非 Deadline::max()）。
@@ -794,55 +840,23 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
     }
 
     /**
-     * 过期请求：Set 期望在发起 I/O 前被拒。新入口的错误诚实性：deadline 在
-     * 写被接纳前到期 → TimedOut（零接纳，无副作用）；写已接纳后到期 →
-     * OutcomeUnknown（如实不推断 Redis 未执行）。两路都无「成功但键未写」，
-     * 真正副作用判别在下方 exists 断言。
+     * 过期请求：Set 恰好 TimedOut——deadline 在写被接纳前已到期，客户端
+     * 派发前本地拒绝，零接纳、无副作用。OutcomeUnknown 属于写已接纳后
+     * 到期的另一既有错误类别（真实在途，见 C4b），不是本例。
      */
     const std::string id = RunPrefix() + "exp";
     {
-        auto r = CallRpc(box, MakeEnv("kv", "expired_set", "c2-x",
-                                      Req2(id, "v")),
+        auto r = CallRpc(box, MakeEnv("kv", "expired_set", "c2-x", Req2(id, "v")),
                          std::chrono::milliseconds{5000});
         BOOST_REQUIRE(!r);
         const int code = static_cast<int>(r.error().code);
-        BOOST_CHECK_MESSAGE(code ==
-                static_cast<int>(fw::ErrorCode::TimedOut) ||
-            code == static_cast<int>(fw::ErrorCode::OutcomeUnknown),
-            "C2：过期 Set 应返回 TimedOut 或 OutcomeUnknown，实际=" << code
-                << " msg=\"" << r.error().message << "\"");
+        BOOST_CHECK_MESSAGE(code == static_cast<int>(fw::ErrorCode::TimedOut),
+                            "C2：发送前已过期 Set 应恰好 TimedOut，实际=" << code
+                                                                          << " msg=\"" << r.error().message << "\"");
     }
     /**
-     * 无副作用：过期 Set 未触达后端，键不存在。注意 OutcomeUnknown 路径下
-     * 连接可能已被退役（写已接纳后到期）——先用管理面探测；若连接已退役
-     * 则显式 Connect 重建再发 exists（新入口「explicit Connect required」语义），
-     * 不放宽「键不存在」这一副作用判别本身。
-     */
-    {
-        auto probe = RunInCoroutine([&box] {
-            inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
-            return bbt_co_await box.cache->Get().Ping(o);
-        });
-        if (!(probe.has_value() && *probe)) {
-            auto conn = RunInCoroutine([&box] {
-                inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
-                return bbt_co_await box.cache->Get().Connect(o);
-            });
-            BOOST_REQUIRE_MESSAGE(conn.has_value() && *conn,
-                "C2：连接退役后显式 Connect 重建失败");
-        }
-    }
-    {
-        auto r = CallRpc(box, MakeEnv("kv", "exists", "c2-e", Req1(id)));
-        BOOST_REQUIRE(r);
-        auto rep = Decode2(r);
-        BOOST_REQUIRE(rep);
-        BOOST_CHECK_EQUAL(rep.value().status, 0);
-    }
-
-    /**
-     * 过期 Set 不判连接失败：连接经显式 Connect 重建后健康（Ping 成功）；
-     * 与 C4b 的在途失败判别（那里 Ping/命令如实为错误路径直到显式 Connect）。
+     * 派发前拒绝不判连接失败：同一连接不重连即可用，与 C4b 写已接纳后
+     * 在途失败须显式 Connect 重建形成判别。
      */
     {
         auto ping = RunInCoroutine([&box] {
@@ -850,7 +864,17 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
-            "C2：显式 Connect 重建后 Ping 应成功");
+                              "C2：同一连接未重连应可 Ping");
+    }
+    /**
+     * 零写入：过期 Set 未触达后端，键不存在（EXISTS=0）。
+     */
+    {
+        auto r = CallRpc(box, MakeEnv("kv", "exists", "c2-e", Req1(id)));
+        BOOST_REQUIRE(r);
+        auto rep = Decode2(r);
+        BOOST_REQUIRE(rep);
+        BOOST_CHECK_EQUAL(rep.value().status, 0);
     }
 
     box.Stop();
@@ -868,8 +892,8 @@ BOOST_AUTO_TEST_CASE(combined_finite_deadline_propagation) {
  * Service 实例（新模型无公开实例出口，经静态成员注入）。
  */
 BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
-    auto box = StartCombined(/*incoming*/std::chrono::milliseconds{10000},
-                             /*shutdown*/std::chrono::milliseconds{300});
+    auto box = StartCombined(/*incoming*/ std::chrono::milliseconds{10000},
+                             /*shutdown*/ std::chrono::milliseconds{300});
 
     /**
      * 独立观察者：测试持有 RunState；Service 的两个钩子各捕获其 shared_ptr
@@ -878,10 +902,10 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
      */
     struct RunState {
         std::shared_ptr<CoGate> gate = std::make_shared<CoGate>();
-        TestLatch               arrived{1};
-        TestLatch               released{1};
-        TestLatch               op_done{1};
-        std::atomic<bool>       op_ok{false};
+        TestLatch arrived{1};
+        TestLatch released{1};
+        TestLatch op_done{1};
+        std::atomic<bool> op_ok{false};
     };
     auto st = std::make_shared<RunState>();
 
@@ -917,22 +941,25 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
      */
     struct ReleaseGuard {
         std::shared_ptr<RunState> st;
-        ~ReleaseGuard() { if (st) st->gate->Open(); }
+        ~ReleaseGuard() {
+            if (st)
+                st->gate->Open();
+        }
     } release{st};
 
     /**
-     * 在途响应 sink：显式等待并断言客户端得到**明确结果**（完整回包或契约
-     * 允许的传输错误）——删掉发送/响应即失败，不能只发不等仍绿。
+     * 在途响应 sink：显式等待并断言客户端得到**明确结果**（完整
+     * 回包或契约允许的终结错误）——删掉发送/响应即失败，不能只发不等仍绿。
      */
     auto sink = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
     auto sink_done = std::make_shared<TestLatch>(1);
-    auto client    = box.client;
-    auto endpoint  = box.endpoint;
+    auto client = box.client;
+    auto endpoint = box.endpoint;
     /**
      * hold 请求 id 每次运行唯一：Mongo 文档键不跨运行冲突（InsertOne 否则
      * 重复键）。
      */
-    auto hold_env  = MakeEnv("kv", "hold", "c3-h", Req1(RunPrefix() + "hold"));
+    auto hold_env = MakeEnv("kv", "hold", "c3-h", Req1(RunPrefix() + "hold"));
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [client, endpoint, sink, sink_done, hold_env] {
@@ -972,9 +999,10 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
     {
         bool saw_drain = false;
         for (const auto& f : box.app->LifecycleFailures())
-            if (f.phase == "wait_handlers_done") saw_drain = true;
+            if (f.phase == "wait_handlers_done")
+                saw_drain = true;
         BOOST_CHECK_MESSAGE(saw_drain,
-            "StopIncomplete 应有 wait_handlers_done 失败记录");
+                            "StopIncomplete 应有 wait_handlers_done 失败记录");
     }
     /**
      * StopIncomplete（handler 未排空）期间：资源尚未收口（borrow 保活
@@ -990,7 +1018,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(alive.has_value() && *alive,
-            "StopIncomplete 期间真实 Ping 应成功（资源未收口）");
+                              "StopIncomplete 期间真实 Ping 应成功（资源未收口）");
     }
 
     /**
@@ -1009,7 +1037,7 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
      */
     BOOST_REQUIRE(st->op_done.WaitFor(kWait));
     BOOST_CHECK_MESSAGE(st->op_ok.load(),
-        "StopIncomplete 期间经组件借用的真实 Redis/Mongo 操作未成功");
+                        "StopIncomplete 期间经组件借用的真实 Redis/Mongo 操作未成功");
     /**
      * 同步等客户端明确结果（不悬挂）
      */
@@ -1037,12 +1065,14 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
      * 未尽，并不等于 Close 后必达（见下方契约判定）。
      */
     BOOST_TEST_MESSAGE("C3 计时：shutdown→StopIncomplete="
-        << std::chrono::duration_cast<std::chrono::milliseconds>(
-               incomplete_at - shutdown_req_at).count()
-        << "ms, release→client结果="
-        << std::chrono::duration_cast<std::chrono::milliseconds>(
-               released_at - incomplete_at).count()
-        << "ms, incoming预算=10000ms（未到期）");
+                       << std::chrono::duration_cast<std::chrono::milliseconds>(
+                              incomplete_at - shutdown_req_at)
+                              .count()
+                       << "ms, release→client结果="
+                       << std::chrono::duration_cast<std::chrono::milliseconds>(
+                              released_at - incomplete_at)
+                              .count()
+                       << "ms, incoming预算=10000ms（未到期）");
     BOOST_CHECK(box.app->State() == fw::AppState::Stopped);
     BOOST_CHECK(box.app->PendingCleanup().empty());
     /**
@@ -1050,8 +1080,9 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
      * owner，故失效只能来自框架销毁）。
      */
     BOOST_CHECK_MESSAGE(!svc_handle.IsValid(),
-        "收口完成（对象销毁）后 Service 句柄应失效");
-    if (box.client_rt) box.client_rt->Close();
+                        "收口完成（对象销毁）后 Service 句柄应失效");
+    if (box.client_rt)
+        box.client_rt->Close();
     box.app.reset();
 
     /**
@@ -1059,23 +1090,33 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
      * 该请求 incoming 预算 10000ms、关闭预算 300ms：放行发生在 incoming
      * 到期之前。但「未过期」不等于「Close 后必达」：InfraHttpHost 契约明文
      * 规定「Close 开始后仍在途且尚未交给传输层的回复不承诺送达原客户端」；
-     * infra rpc::CoRpcServer 的 Shutdown 亦明确丢弃未发送数据。故客户端
-     * 结果只接受契约允许的两种：
-     * (a) 完整 HELD —— 回复在 Close 生效前已交给传输层送达；
-     * (b) TransportError(code=8) —— Close 开始后在途、尚未交给传输层而被截断。
-     * 空结果或其它未知错误仍判失败（不静默、不放宽为任意错误）。
+     * infra closeout 仲裁（固定依赖 f4c71dc，RpcSession.cc:334-345
+     * SettledPendingError）：未提交按 Closed，已提交则结算为
+     * OutcomeUnknown(code=13) + request_phase == RequestCommitted，
+     * 即 "session lost after commit"。该用例的请求在 handler 进入闸门
+     * 前已完整写出，故客户端可见的终结错误只接受这一种；TransportError
+     * 不是已提交请求的 closeout 终态类，不放宽。不可能的类别/阶段
+     * 仍判失败。
      */
     const auto& outcome = sink->value();
     if (!outcome) {
-        const int code = static_cast<int>(outcome.error().code);
+        const auto& err = outcome.error();
+        const int code = static_cast<int>(err.code);
+        const int phase = err.request_phase.has_value()
+                              ? static_cast<int>(*err.request_phase)
+                              : -1;
         BOOST_CHECK_MESSAGE(
-            code == static_cast<int>(fw::ErrorCode::TransportError),
-            "C3：客户端结果既非完整 HELD 也非契约允许的 TransportError"
-            "（拒绝空结果/未知错误）: code=" << code
-            << " msg=\"" << outcome.error().message << "\"");
-        BOOST_TEST_MESSAGE("C3：Close 开始后未交给传输层的回复按契约被截断 → "
-            "TransportError code=" << code
-            << " msg=\"" << outcome.error().message << "\"");
+            code == static_cast<int>(fw::ErrorCode::OutcomeUnknown) && err.request_phase.has_value() && *err.request_phase == inf::RequestPhase::RequestCommitted,
+            "C3：客户端结果既非完整 HELD 也非契约允许的终结错误"
+            "（拒绝空结果/未知错误）: code="
+                << code
+                << " request_phase=" << phase
+                << " msg=\"" << err.message << "\"");
+        BOOST_TEST_MESSAGE("C3：Close 开始后会话丢失、请求已提交但回复未知"
+                           "（infra closeout 结算）：code="
+                           << code
+                           << " request_phase=" << phase
+                           << " msg=\"" << err.message << "\"");
     } else {
         auto rep = Decode2(outcome);
         BOOST_REQUIRE(rep);
@@ -1094,14 +1135,14 @@ BOOST_AUTO_TEST_CASE(combined_shutdown_drains_inflight) {
  */
 BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
     BOOST_REQUIRE_MESSAGE(!RedisCliPath().empty(),
-        "需要 BBT_TEST_REDIS_CLI（redis-cli 路径由环境/runner 传入）");
-    auto box = StartCombined(/*incoming*/std::chrono::milliseconds{6000},
-                             /*shutdown*/std::chrono::milliseconds{2000});
+                          "需要 BBT_TEST_REDIS_CLI（redis-cli 路径由环境/runner 传入）");
+    auto box = StartCombined(/*incoming*/ std::chrono::milliseconds{6000},
+                             /*shutdown*/ std::chrono::milliseconds{2000});
     const std::string id = RunPrefix() + "inflight";
     auto call = [&box](const char* method, const fw::CoRpcReq& req)
         -> fw::result<inf::rpc::Response> {
         return CallRpc(box, MakeEnv("kv", method,
-            std::string("c4a-") + method, req));
+                                    std::string("c4a-") + method, req));
     };
 
     /**
@@ -1124,7 +1165,7 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
-            "C4a：预热后 Ping 应成功（连接健康）");
+                              "C4a：预热后 Ping 应成功（连接健康）");
     }
 
     /**
@@ -1132,8 +1173,8 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
      */
     auto pause = RunRedisCli({"CLIENT", "PAUSE", "1500", "ALL"});
     BOOST_REQUIRE_MESSAGE(pause.rc == 0 &&
-        pause.out.find("OK") != std::string::npos,
-        "CLIENT PAUSE 失败: rc=" << pause.rc << " out=" << pause.out);
+                              pause.out.find("OK") != std::string::npos,
+                          "CLIENT PAUSE 失败: rc=" << pause.rc << " out=" << pause.out);
 
     const auto t0 = Clock::now();
     /**
@@ -1141,14 +1182,15 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
      */
     auto r = call("get", Req1(id));
     const auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - t0).count();
+                             Clock::now() - t0)
+                             .count();
     BOOST_REQUIRE(r);
     auto rep = Decode2(r);
     BOOST_REQUIRE(rep);
     BOOST_CHECK_EQUAL(rep.value().status, 0);
     BOOST_CHECK_EQUAL(rep.value().value, "v1");
     BOOST_CHECK_MESSAGE(held_ms >= 1000,
-        "Get 未被服务端 pause 扣住（held=" << held_ms << "ms），在途证据不成立");
+                        "Get 未被服务端 pause 扣住（held=" << held_ms << "ms），在途证据不成立");
     BOOST_CHECK_LT(held_ms, 5000);
     /**
      * 新入口无 ConnectStatus；在途期间连接未被退役的事实由「pause 结束后
@@ -1160,7 +1202,7 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
-            "C4a：pause 放开后连接应仍健康（Ping 应成功）");
+                              "C4a：pause 放开后连接应仍健康（Ping 应成功）");
     }
 
     box.Stop();
@@ -1175,22 +1217,22 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_held_by_pause) {
  */
 BOOST_AUTO_TEST_CASE(combined_backend_inflight_deadline) {
     BOOST_REQUIRE_MESSAGE(!RedisCliPath().empty(),
-        "需要 BBT_TEST_REDIS_CLI（redis-cli 路径由环境/runner 传入）");
-    auto box = StartCombined(/*incoming*/std::chrono::milliseconds{900},
-                             /*shutdown*/std::chrono::milliseconds{2000});
+                          "需要 BBT_TEST_REDIS_CLI（redis-cli 路径由环境/runner 传入）");
+    auto box = StartCombined(/*incoming*/ std::chrono::milliseconds{900},
+                             /*shutdown*/ std::chrono::milliseconds{2000});
     {
         auto ping = RunInCoroutine([&box] {
             inf::CallOptions o{Clock::now() + std::chrono::milliseconds{5000}};
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
-            "C4b：装配后 Ping 应成功（连接健康）");
+                              "C4b：装配后 Ping 应成功（连接健康）");
     }
 
     auto pause = RunRedisCli({"CLIENT", "PAUSE", "1500", "ALL"});
     BOOST_REQUIRE_MESSAGE(pause.rc == 0 &&
-        pause.out.find("OK") != std::string::npos,
-        "CLIENT PAUSE 失败: rc=" << pause.rc << " out=" << pause.out);
+                              pause.out.find("OK") != std::string::npos,
+                          "CLIENT PAUSE 失败: rc=" << pause.rc << " out=" << pause.out);
 
     auto r = CallRpc(box, MakeEnv("kv", "ping", "c4b-p", Req1("x")),
                      std::chrono::milliseconds{5000});
@@ -1204,10 +1246,10 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_deadline) {
     {
         const int code = static_cast<int>(r.error().code);
         BOOST_CHECK_MESSAGE(code ==
-                static_cast<int>(fw::ErrorCode::TimedOut) ||
-            code == static_cast<int>(fw::ErrorCode::OutcomeUnknown),
-            "C4b：在途 deadline 应返回 TimedOut 或 OutcomeUnknown，实际=" << code
-                << " msg=\"" << r.error().message << "\"");
+                                    static_cast<int>(fw::ErrorCode::TimedOut) ||
+                                code == static_cast<int>(fw::ErrorCode::OutcomeUnknown),
+                            "C4b：在途 deadline 应返回 TimedOut 或 OutcomeUnknown，实际=" << code
+                                                                                          << " msg=\"" << r.error().message << "\"");
     }
     /**
      * 新入口语义（redis-net.md）：写已接纳、没有可信完整回复 →
@@ -1222,7 +1264,7 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_deadline) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(after.has_value() && !*after,
-            "C4b：在途 deadline 后连接应已退役（Ping 应失败），实际仍可用");
+                              "C4b：在途 deadline 后连接应已退役（Ping 应失败），实际仍可用");
     }
 
     /**
@@ -1254,7 +1296,7 @@ BOOST_AUTO_TEST_CASE(combined_backend_inflight_deadline) {
             return bbt_co_await box.cache->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(ping.has_value() && *ping,
-            "C4b：显式 Connect 重建后 Ping 应成功");
+                              "C4b：显式 Connect 重建后 Ping 应成功");
     }
 
     auto ok = CallRpc(box, MakeEnv("kv", "ping", "c4b-ok", Req1("x")));

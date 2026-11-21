@@ -96,14 +96,12 @@ struct Gate {
     std::mutex m;
     std::condition_variable cv;
     bool open = false;
-    void Open()
-    {
+    void Open() {
         std::lock_guard<std::mutex> lk(m);
         open = true;
         cv.notify_all();
     }
-    void Wait()
-    {
+    void Wait() {
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [this] { return open; });
     }
@@ -156,24 +154,20 @@ struct Latch {
     std::mutex m;
     std::condition_variable cv;
     int count;
-    explicit Latch(int n) : count(n)
-    {
+    explicit Latch(int n) : count(n) {
     }
-    void Down()
-    {
+    void Down() {
         std::lock_guard<std::mutex> lk(m);
         if (--count == 0)
             cv.notify_all();
     }
-    bool WaitFor(std::chrono::milliseconds ms)
-    {
+    bool WaitFor(std::chrono::milliseconds ms) {
         std::unique_lock<std::mutex> lk(m);
         return cv.wait_for(lk, ms, [this] { return count == 0; });
     }
 };
 
-inf::NetworkLimits Limits()
-{
+inf::NetworkLimits Limits() {
     return inf::NetworkLimits{/*max_connections*/ 64,
                               /*max_inflight   */ 64,
                               /*max_header_bytes*/ 64 * 1024,
@@ -181,8 +175,7 @@ inf::NetworkLimits Limits()
                               /*incoming_timeout*/ 30s};
 }
 
-int Code(const fw::Error& e)
-{
+int Code(const fw::Error& e) {
     return static_cast<int>(e.code);
 }
 
@@ -309,15 +302,14 @@ struct InterruptStubHost final : fw::INetworkHost {
      */
     Latch wait_started{1};
 
-    std::mutex              cv_mtx;
+    std::mutex cv_mtx;
     std::condition_variable cv;
-    bbt::infra::Error       reason{};
+    bbt::infra::Error reason{};
 
     fw::result<void> Create() override { return fw::result<void>::ok(); }
     fw::result<void> Start() override { return fw::result<void>::ok(); }
     void StopAccepting() noexcept override {}
-    fw::result<void> WaitHandlersDone(co::Deadline) override
-    {
+    fw::result<void> WaitHandlersDone(co::Deadline) override {
         ++wait_calls;
         wait_started.Down();
         if (fail_first_with_timeout.load() && wait_calls.load() == 1)
@@ -330,8 +322,7 @@ struct InterruptStubHost final : fw::INetworkHost {
                 ? reason
                 : fw::MakeError(fw::ErrorCode::Unavailable, "owner abort"));
     }
-    void Close() noexcept override
-    {
+    void Close() noexcept override {
         ++close_calls;
         {
             std::lock_guard<std::mutex> lk(cv_mtx);
@@ -340,18 +331,17 @@ struct InterruptStubHost final : fw::INetworkHost {
         }
         cv.notify_all();
     }
-    void Close(bbt::infra::Error r) noexcept override
-    {
+    void Close(bbt::infra::Error r) noexcept override {
         {
             std::lock_guard<std::mutex> lk(cv_mtx);
             reason = std::move(r);
         }
         Close();
     }
-    std::optional<bbt::infra::Error> CloseReason() const noexcept override
-    {
+    std::optional<bbt::infra::Error> CloseReason() const noexcept override {
         ++close_reason_calls;
-        if (!owner_closed.load()) return std::nullopt;
+        if (!owner_closed.load())
+            return std::nullopt;
         return reason;
     }
 };
@@ -546,8 +536,7 @@ BOOST_AUTO_TEST_CASE(direct_close_publishes_terminal_state) {
  * T2（R2）：真实 infra loopback（HTTP）——已过门 handler 不被 StopAccepting 抢占，
  * 关闭序列等到它完成后 WaitHandlersDone 返回 ok，回复路径不被 StopAccepting 关断。
  */
-BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
-{
+BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained) {
     if (!g_scheduler->IsInitialized()) {
         /**
          * Registered driver capacity: server 2 + host egress 1 + test client 1 + runnable worker 1.
@@ -596,7 +585,7 @@ BOOST_AUTO_TEST_CASE(entered_handler_not_preempted_and_drained)
             inf::CallOptions opt;
             opt.deadline = Clock::now() + 5s;
             http_state->out.emplace(bbt_co_await client->Get(
-                "http://" + endpoint + "/probe", {{}, {}, std::nullopt}, opt));
+                "http://" + endpoint + "/probe", {}, opt));
             http_state->done.Down();
         },
         succ);
@@ -745,7 +734,7 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
             inf::CallOptions opt;
             opt.deadline = Clock::now() + 5s;
             http_state->out.emplace(bbt_co_await client->Get(
-                "http://" + endpoint + "/probe", {{}, {}, std::nullopt}, opt));
+                "http://" + endpoint + "/probe", {}, opt));
             http_state->done.Down();
         },
         succ);
@@ -792,8 +781,7 @@ BOOST_AUTO_TEST_CASE(loopback_http_handler_exception_drains_inflight) {
  * 4) IsClosed() 为 true 证明封口已执行；随后宿主 Close() 释放
  * owner（rpc_server() 置空）且 close_error() 为空。
  */
-BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
-{
+BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -899,8 +887,7 @@ BOOST_AUTO_TEST_CASE(late_handler_waitstopped_failure_then_recover)
  * Close 也必须安全收口——同步 Shutdown 后正常释放（原同步关闭契约），
  * 不是把「未走 WaitHandlersDone」当永久失败保留 owner。
  */
-BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
-{
+BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -941,8 +928,7 @@ BOOST_AUTO_TEST_CASE(direct_close_on_started_host_releases_owners)
  * T8：Close 立即返回（不等暂停的 handler），析构不因 joinable 线程 terminate；
  * 关闭原因经公共读口发布，handler 放行后安全返回（HandlerState 自持）。
  */
-BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
-{
+BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting) {
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 6;
         g_bbt_coroutine_config->m_cfg_stack_size = 64 * 1024;
@@ -1037,34 +1023,42 @@ BOOST_AUTO_TEST_CASE(close_with_paused_handler_returns_without_waiting)
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{10000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{10000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     if (!g_scheduler->IsInitialized()) {
         g_bbt_coroutine_config->m_cfg_static_thread_num = 5;
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
@@ -1083,8 +1077,7 @@ fw::AppOptions CloseGateAppOpts() {
  * 旧 HostLifecycle「跳过 on_handlers_drained、走 on_release」在新模型的
  * 对应物：排空未证实时宿主同步 Close + 对象收口由再次推进承担。
  */
-BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
-{
+BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking) {
     RunInManagedCoroutine([] {
         auto host = std::make_shared<InterruptStubHost>();
         auto app = fw::MakeCoAppForTest(
@@ -1134,8 +1127,7 @@ BOOST_AUTO_TEST_CASE(lifecycle_close_interrupts_drain_without_parking)
  * 第二/后续 WaitHandlersDone 不再被调用（CloseReason 打断），收口至
  * Stopped；未完成项与失败清单在两次推进间可观察。
  */
-BOOST_AUTO_TEST_CASE(lifecycle_close_during_retry_skips_redrain)
-{
+BOOST_AUTO_TEST_CASE(lifecycle_close_during_retry_skips_redrain) {
     RunInManagedCoroutine([] {
         auto host = std::make_shared<InterruptStubHost>();
         host->fail_first_with_timeout.store(true);

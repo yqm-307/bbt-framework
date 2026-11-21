@@ -32,6 +32,7 @@
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -60,18 +61,22 @@ namespace detail {
 struct Binding {
     ObjectId subject_id;
     std::uint64_t generation = 0;
+    std::string slot;
     bool retiring = false;
+    bool drain_requested = false;
     /**
      * 本 binding 的在途借用数（Unbind 只等自身）
      */
     std::size_t borrows = 0;
+    // 组件封门后，旧代不再可借，但关闭顺序仍依赖这条边。
+    bool cleanup_dependency = false;
 };
 
 /**
  * @brief 一个受管对象的全部簿记。
  *
- * 对象本体经 `shared_ptr<void>` + 类型化 deleter 强持有，Registry 不向业务
- * 交出 `shared_ptr<T>`；状态推进、绑定边与在途 lifecycle hook 计数在此记录中，
+ * 对象本体经 `shared_ptr<void>` + 类型化 deleter 强持有。
+ * 状态推进、绑定边与在途 lifecycle hook 计数在此记录中，
  * 读写受 Registry 的 `m_mtx` 保护。观察者记录及其在途回调计数单独保存在
  * Registry 的 observer 表中，同样由 `m_mtx` 保护。
  */
@@ -106,9 +111,7 @@ struct RegistryEntry {
     const std::type_info* object_type = nullptr;
 
     /**
-     * 组件边簿记：每条 binding 的 generation 单调递增，Unbind 推进使旧
-     * ComponentHandle 失效；borrow 计数按组件本体合计（共享组件所有
-     * binding 的借用进同一计数）。
+     * 绑定与旧 Borrow 的计数独立于普通 shared_ptr。
      */
     std::vector<Binding> bindings;
     std::size_t component_borrows = 0;
@@ -119,10 +122,13 @@ struct RegistryEntry {
     std::size_t exec_leases = 0;
 
     /**
-     * 生命周期 hook 执行簿记：受管协程内仍有 hook 未达真实终态时 >0；
-     * 超时返回不预扣——owner 保留至 hook 真实完成，收口前不允许销毁。
+     * 生命周期 hook、绑定通知和入站执行共用在途计数。
+     * 超时不预扣，收口须等真实终态。
      */
     std::size_t hooks_in_flight = 0;
+    // 收口重试跳过已完成的 hook，包括等待超时后才成功的 OnStop。
+    bool stop_hook_done = false;
+    bool uninstall_hook_done = false;
     /**
      * 协程侧的「在途 hook 归零」等待位：宿主路径等 m_cv，Co* 入口不能
      * 在 worker 上 std::cv 阻塞，改在本 waiter 上挂起；任务体结束经
@@ -149,8 +155,7 @@ struct RegistryEntry {
  *
  * 状态变更先生成待派发事件快照；真正派发时在 `m_mtx` 下复查 active 并
  * 增加 `in_flight`，再于锁外调用回调。Revoke 在同一把锁下标记 inactive，
- * 并等待已取得 lease 的回调归零后移除注册记录；尚未派发的快照会被跳过，
- * 但其中的闭包副本可能保留到对应事件批次释放。
+ * 并等待已取得 lease 的回调归零后移除注册记录。待派发快照只存 token id。
  */
 struct ObserverRecord {
     std::uint64_t id = 0;
@@ -167,6 +172,8 @@ struct ObserverRecord {
      */
     std::size_t in_flight = 0;
 };
+
+using ObserverEvents = std::vector<std::pair<std::uint64_t, ObjectStateEvent>>;
 
 /**
  * @brief 组件借用租约：析构时把 borrow 计数归还 Registry 并唤醒等待者。
@@ -296,17 +303,17 @@ public:
      * 统一状态推进（锁内）：记录 revision/last_error 并收集目标观察者回调
      * 快照；返回待派发事件列表（锁外由 DispatchEvents 执行）。
      */
-    std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
+    ObserverEvents
     SetStateLocked(RegistryEntry& e, ObjectState s,
                    std::optional<ObjectError> err = std::nullopt);
     /**
      * 等价便捷形：按 id 查条目并 SetStateLocked；未找到时返回空。
      */
-    std::vector<std::pair<ObserverRecord, ObjectStateEvent>>
+    ObserverEvents
     SetStateAndGetEvents(const ObjectId& id, ObjectState s,
                          std::optional<ObjectError> err = std::nullopt);
     void DispatchEvents(
-        std::vector<std::pair<ObserverRecord, ObjectStateEvent>> events);
+        ObserverEvents events);
 
     /**
      * 控制面互斥：进入/退出一个对象的进行中的转换；进行中返回 Busy。
@@ -322,23 +329,22 @@ public:
                                   ObjectObserver callback);
     /**
      * 逻辑撤销：标记 active=false，并阻塞至已取得 callback lease 的回调归零
-     * 后抹除注册记录；尚未派发的事件快照会被跳过，但闭包副本可存活到批次释放。
+     * 后抹除注册记录；尚未派发的事件快照会被跳过。
      */
     void RevokeObserver(std::uint64_t token_id) noexcept;
     bool ObserverActive(std::uint64_t token_id) const noexcept;
     /**
      * observer 对象卸载时撤销其全部 token。Locked 版供已持锁路径调用：
-     * 只标记 inactive 并启动排空；真正抹除须由未持锁方继续
-     * DrainInactiveObservers 完成。
+     * 只标记 inactive；调用方解锁后继续排空。
      */
-    void RevokeObserversOf(std::string_view observer_id);
     void RevokeObserversOfLocked(std::string_view observer_id);
+    result<void> DrainObserversOf(const ObjectId& observer_id, bbt::coroutine::Deadline deadline);
     /**
-     * 排空并抹除全部 inactive observer 记录（等其 in_flight 归零；
+     * 排空并抹除指定对象的 inactive observer 记录（等其 in_flight 归零；
      * 调用方不得持 m_mtx）。已取得 lease 的回调在返回前完成；尚未派发的
-     * 事件快照会被跳过，但其闭包副本可能存活到事件批次释放。
+     * 事件快照会被跳过。
      */
-    void DrainInactiveObservers() noexcept;
+    void DrainInactiveObserversOf(const ObjectId& observer_id) noexcept;
 
     /**
      * ---- handle 观察面 ----
@@ -358,63 +364,36 @@ public:
      * ---- 组件 binding / borrow ----
      * subject_id 为绑定发起方（Service/Actor/其他组件的 id；App scope 由
      * CoApp 直接绑定给 service 时 subject 为 service id）。subject_entry
-     * 在同一临界区提供 subject gate 判定——已封口/销毁/进行中控制面操作
+     * 在同一临界区提供 subject gate 判定——已封口或销毁
      * 的 subject 不得再接纳新 binding（销毁只擦除 retiring 边，新增
      * active 边会留下指向已销毁 subject 的悬挂关系）。
      */
-    result<void> BindLocked(RegistryEntry& component_entry,
-                            const RegistryEntry& subject_entry,
-                            const ObjectId& subject_id,
-                            std::uint64_t* out_generation);
-    /**
-     * 进入 retiring 后拒绝新借用，
-     * generation 保持不变以便在途 BindingLease 仍按原代归还计数。
-     * 若该 binding 无在途 borrow → 立即移除边，返回 ok。仍有 borrow →
-     * 标记 retiring，等本 binding borrow 归零后完成（waiter 驱动）。
-     * out_generation 回填该 binding 的 generation，供按边等待。
-     */
-    result<void> BeginUnbindLocked(RegistryEntry& component_entry,
-                                   const ObjectId& subject_id,
-                                   std::uint64_t* out_generation);
-    /**
-     * BindingLease 析构归还：按 (component, subject, gen) 减计数并在
-     * retiring 且归零时移除边；唤醒等待者。
-     */
+    std::pair<RegistryEntry*, Binding*> FindBindingLocked(
+        const ObjectId& subject_id, const std::type_info& type,
+        std::string_view slot, const ComponentOptions* placement = nullptr,
+        bool pending_drain = false);
+    ComponentBindingSnapshot SnapshotBindingLocked(const RegistryEntry& target,
+                                                   std::uint64_t generation);
+    result<std::uint64_t> BindLocked(RegistryEntry& target,
+                                     const RegistryEntry& subject,
+                                     std::string_view slot, RegistryEntry* previous,
+                                     Binding* previous_binding);
+    void RetireBindingLocked(RegistryEntry& target, Binding& binding, bool drain);
+    void RetireSubjectBindingsLocked(const ObjectId& subject_id);
+    void RetireTargetBindingsLocked(RegistryEntry& target);
+    result<void> DrainSubjectBorrows(const ObjectId& subject_id,
+                                     bbt::coroutine::Deadline deadline);
     void ReleaseBorrow(const ObjectId& component_id,
                        const ObjectId& subject_id,
                        std::uint64_t binding_generation) noexcept;
-
-    /**
-     * 等组件全部 borrow 归零（deadline 有限；供 Uninstall/销毁收口）。
-     */
     result<void> WaitBorrowsDrained(std::string_view component_id,
                                     bbt::coroutine::Deadline deadline);
-    /**
-     * 等指定 binding（subject + generation）的在途 borrow 归零；
-     * binding 边已被移除视为归零。Unbind 只等自身，不看其他 subject。
-     */
     result<void> WaitBindingDrained(const ObjectId& component_id,
                                     const ObjectId& subject_id,
                                     std::uint64_t binding_generation,
                                     bbt::coroutine::Deadline deadline);
-    /**
-     * 找指定 subject 的 retiring binding（Unbind 超时后的续等入口）。
-     * 返回 true 时经 out_generation 回填该边的代。
-     */
-    bool FindRetiringBindingLocked(const RegistryEntry& component_entry,
-                                   const ObjectId& subject_id,
-                                   std::uint64_t* out_generation) const;
-    /**
-     * 排空确认后收口：抹除指定 (subject, generation) 的 retiring 边。
-     */
-    void EraseBindingLocked(RegistryEntry& component_entry,
-                            const ObjectId& subject_id,
-                            std::uint64_t generation);
-    /**
-     * 收口指定 subject 的全部 retiring 边（供 subject 销毁路径）。
-     */
-    void EraseSubjectBindingsLocked(RegistryEntry& component_entry,
-                                    const ObjectId& subject_id);
+    bool EraseBindingLocked(RegistryEntry& target,
+                            const ObjectId& subject_id, std::uint64_t generation);
 
     /**
      * ---- hook 执行簿记（锁内）----
@@ -436,7 +415,10 @@ public:
     /**
      * hook 协程结束时由任务体归还：--hooks_in_flight 并唤醒等待者。
      */
-    void NoteHookSettled(const ObjectId& id) noexcept;
+    void NoteHookSettled(const ObjectId& id, bool stop_completed = false) noexcept;
+    void AcquireBindingCallbackLocked(RegistryEntry& subject, std::uint64_t coroutine_id);
+    void ReleaseBindingCallback(const ObjectId& id, std::uint64_t coroutine_id) noexcept;
+    bool InBindingCallback(std::uint64_t coroutine_id);
     /**
      * 入站分发执行租约：与生命周期 hook 共用 hooks_in_flight 计数与
      * 收口等待（对象销毁路径经「等前序 hook 归零」自动覆盖在途分发）。
@@ -452,12 +434,15 @@ public:
      * 环在 Bind 期拒绝；若仍残留（防御），环内节点按登记顺序附尾并返回
      * had_cycle=true。
      */
-    std::vector<ObjectId> ComponentStartOrderLocked(bool* had_cycle) const;
+    using ComponentDependencies = std::unordered_map<ObjectId, std::vector<ObjectId>>;
+    ComponentDependencies ComponentDependenciesLocked() const;
+    std::vector<ObjectId> ComponentStartOrderLocked(const ComponentDependencies& deps, bool* had_cycle = nullptr) const;
+    bool HasComponentDependentsLocked(const RegistryEntry& target) const;
 
     /**
      * ---- Uninstall ----
      * 封 gate → 标 destroying/op → 供调用方随后锁外跑 OnStop/OnUninstall。
-     * 仍有 active 或 retiring binding → Busy（组件被其他使用者绑定中）。
+     * 组件仍有 active binding 或关闭顺序依赖 → Busy。
      */
     result<RegistryEntry*> BeginDestroyLocked(std::string_view id);
     /**
@@ -465,7 +450,7 @@ public:
      * 锁外释放（业务析构不得在锁内执行），events 锁外派发。
      */
     std::pair<std::shared_ptr<void>,
-              std::vector<std::pair<ObserverRecord, ObjectStateEvent>>>
+              ObserverEvents>
     FinishDestroyLocked(RegistryEntry& e);
 
     /**
@@ -521,14 +506,16 @@ private:
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> m_waiters;
     };
 
-    result<void> _WaitBorrows(const std::function<bool()>& ready,
-                              bbt::coroutine::Deadline deadline);
+    result<void> _WaitCoDrain(WaitList& waiters, const std::function<bool()>& ready,
+                              bbt::coroutine::Deadline deadline, const char* context);
     /**
      * observer lease 排空等待（双域）：协程内挂起在 m_observer_waiters
      * 上的 CoWaiter，native 线程走 m_cv；谓词每次均在 m_mtx 内复查。
      * 供 noexcept 撤销路径使用——协程等待无期限（撤销终态唯一），
      * 等待通道异常时降级为让出后轮询，不吞责任也不死等断言。
      */
+    bool _ObserversDrainedLocked(const ObjectId& observer_id) const;
+    void _EraseInactiveObserversOf(const ObjectId& observer_id);
     void _WaitObserversDone(const std::function<bool()>& done) noexcept;
     WaitList m_borrow_waiters;
     WaitList m_observer_waiters;
@@ -537,6 +524,8 @@ private:
 
     Limits m_limits;
     mutable std::mutex m_mtx;
+    // 按协程而非线程辨别重入，回调允许挂起。
+    std::unordered_set<std::uint64_t> m_binding_callback_coroutines;
     /**
      * borrow/lease 归零唤醒
      */
