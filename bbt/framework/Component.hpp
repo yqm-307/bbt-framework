@@ -43,14 +43,12 @@ protected:
     /**
      * @brief 取本组件已绑定依赖的类型化句柄。
      *
-     * 组件依赖是 CoBindComponent 的 subject；绑定表由 CoApp::CoBindComponent
-     * 成功后回填。OnInstall（装配窗口）内可借 Installed 依赖做纯内存装配；
-     * 其他阶段仅可借 Running 且 binding active 的组件。
+     * 借用 Installed 依赖仅用于 OnInstall 装配窗口内的纯内存装配。
      *
      * @tparam C 依赖组件类型。
-     * @param name 绑定时使用的组件逻辑名。
-     * @return 成功时返回携带当前 binding generation 的 ComponentHandle<C>；
-     *         name 未绑定返回 NotFound。
+     * @param name 绑定槽位名。
+     * @return 成功时返回指向当前实例的弱句柄；
+     *         非协程返回 InvalidContext，name 未绑定返回 NotFound。lock() 只保活对象。
      */
     template <class C>
     result<ComponentHandle<C>> GetComponent(std::string_view name) const;

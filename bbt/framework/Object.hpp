@@ -230,16 +230,18 @@ result<std::pair<std::shared_ptr<void>, CoComponent*>> BorrowImpl(
 template <class C>
 result<ComponentBorrow<C>> MakeComponentBorrow(std::shared_ptr<void> lease,
                                                C* obj);
+class ObjectBase;
+struct ComponentBindingSnapshot;
 /**
  * @brief 构造携带绑定代的类型化组件句柄（Registry/CoApp 专用）。
  * @tparam C 组件类型。
- * @param object 组件对象句柄。
- * @param binding_generation 绑定代。
+ * @param binding 在 Registry 锁内发放的实例及绑定快照。
  * @return ComponentHandle<C> 值。
  */
 template <class C>
-ComponentHandle<C> MakeComponentHandle(ObjectHandle object,
-                                       std::uint64_t binding_generation);
+ComponentHandle<C> MakeComponentHandle(ComponentBindingSnapshot binding);
+bool IsComponentBound(const ObjectHandle& object,
+                      std::uint64_t binding_generation) noexcept;
 } // namespace detail
 
 /**
@@ -371,7 +373,7 @@ using ObjectObserver = std::function<void(const ObjectStateEvent&)>;
  * 不持有对象所有权；对象由 Registry 强持有并最终归 CoApp。
  * IsValid 只表示「对象仍登记且 generation 未变」，是观察值，不能据此随后
  * 解引用——Service/Actor 根本不解引用（无 borrow），Component 使用方必须经
- * ComponentHandle::Borrow() 拿实际 lease。
+ * ComponentHandle::lock() 保活对象，或以 Borrow() 获得资源使用租约。
  */
 class ObjectHandle {
 public:
@@ -414,11 +416,20 @@ private:
     ObjectKind m_kind = ObjectKind::App;
 
     friend class detail::Registry;
+    friend class detail::ObjectBase;
     friend class CoApp;
-    friend class CoApp;
+    friend bool detail::IsComponentBound(const ObjectHandle&, std::uint64_t) noexcept;
     friend result<std::pair<std::shared_ptr<void>, CoComponent*>>
     detail::BorrowImpl(const ObjectHandle&, std::uint64_t);
 };
+
+namespace detail {
+struct ComponentBindingSnapshot {
+    ObjectHandle object;
+    std::weak_ptr<CoComponent> instance;
+    std::uint64_t binding_generation = 0;
+};
+} // namespace detail
 
 /**
  * @brief 在借用期间访问组件。借用对象只能移动，析构时自动归还。
@@ -461,7 +472,7 @@ private:
  * @brief 类型化组件句柄。
  *
  * @par 职责
- * registry 身份 + generation + binding generation + 失效位。
+ * 记录发放时的组件实例和绑定代。
  *
  * @par 不负责
  * 不拥有 C；Borrow() 在 Registry 同一临界区内校验对象/绑定状态后才发 lease。
@@ -480,6 +491,12 @@ public:
      * @brief 对象是否仍登记且 generation 未变。
      */
     bool IsValid() const noexcept;
+    /** @brief 发放本句柄的绑定代是否仍挂载。结果只代表查询时刻。 */
+    bool IsBound() const noexcept;
+    /** @brief 取得该实例的共享 owner，仅保证 C++ 对象寿命。 */
+    std::shared_ptr<C> lock() const noexcept;
+    /** @brief 发放本句柄的绑定代。 */
+    std::uint64_t BindingGeneration() const noexcept { return m_binding_gen; }
     /**
      * @brief 借用句柄指向的组件。
      * @return 成功时返回持有借用的对象。对象或绑定已失效、状态不允许借用时返回 Closed 或 Overloaded。
@@ -487,14 +504,15 @@ public:
     result<ComponentBorrow<C>> Borrow() const;
 
 private:
-    ComponentHandle(ObjectHandle object, std::uint64_t binding_generation);
+    explicit ComponentHandle(detail::ComponentBindingSnapshot binding);
 
     ObjectHandle m_object;
+    std::weak_ptr<CoComponent> m_instance;
     std::uint64_t m_binding_gen = 0;
 
     template <class T>
     friend ComponentHandle<T> detail::MakeComponentHandle(
-        ObjectHandle, std::uint64_t);
+        detail::ComponentBindingSnapshot);
     /**
      * 装配窗口借 Installed 依赖
      */
@@ -954,7 +972,7 @@ struct BindingEvent {
      */
     std::uint64_t generation = 0;
     /**
-     * true=绑定发布，false=解绑完成。
+     * true=绑定发布，false=绑定已摘除。
      */
     bool bound = false;
     /**
@@ -965,6 +983,12 @@ struct BindingEvent {
      * 事件时间。
      */
     std::chrono::system_clock::time_point observed_at;
+    /** 发起方对象代。 */
+    std::uint64_t subject_generation = 0;
+    /** 实际发生变更的绑定代。 */
+    std::uint64_t binding_generation = 0;
+    /** 业务查询使用的槽位名。 */
+    std::string slot;
 };
 
 } // namespace bbt::framework

@@ -1,5 +1,5 @@
 /**
- * framework 受管对象基类实现：身份观察面与 subject 绑定表。
+ * framework 受管对象基类实现：身份观察与当前绑定查询。
  */
 
 #include <mutex>
@@ -27,52 +27,6 @@ ObjectInfo detail::ObjectBase::_ObjectInfo() const {
     return info;
 }
 
-void detail::ObjectBase::_BindComponentEntry(const std::type_info& type,
-                                             std::string name,
-                                             ObjectHandle object,
-                                             std::uint64_t gen) {
-    std::lock_guard<std::mutex> lk(m_bound_mtx);
-    for (auto& b : m_bound_components) {
-        if (*b.type == type && b.name == name) {
-            b.object = std::move(object);
-            b.binding_generation = gen;
-            return;
-        }
-    }
-    m_bound_components.push_back(BoundComponent{
-        &type, std::move(name), std::move(object), gen});
-}
-
-void detail::ObjectBase::_UnbindComponentEntry(const std::type_info& type,
-                                               std::string_view name) {
-    std::lock_guard<std::mutex> lk(m_bound_mtx);
-    for (auto it = m_bound_components.begin();
-         it != m_bound_components.end(); ++it) {
-        if (*it->type == type && it->name == name) {
-            m_bound_components.erase(it);
-            return;
-        }
-    }
-}
-
-void detail::ObjectBase::_InvalidateComponentEntries() noexcept {
-    std::lock_guard<std::mutex> lk(m_bound_mtx);
-    m_bound_components.clear();
-}
-
-bool detail::ObjectBase::_FindBoundCopy(const std::type_info& type,
-                                        std::string_view name,
-                                        BoundComponent* out) const {
-    std::lock_guard<std::mutex> lk(m_bound_mtx);
-    for (const auto& b : m_bound_components) {
-        if (*b.type == type && b.name == name) {
-            *out = b;
-            return true;
-        }
-    }
-    return false;
-}
-
 result<void> detail::ObjectBase::_CheckGetComponentContext() {
     if (!bbt::coroutine::IsInCoroutineContext())
         return result<void>::err(MakeError(
@@ -80,15 +34,19 @@ result<void> detail::ObjectBase::_CheckGetComponentContext() {
     return result<void>::ok();
 }
 
-result<detail::ObjectBase::BoundComponent>
+result<detail::ComponentBindingSnapshot>
 detail::ObjectBase::_GetComponentLookup(const std::type_info& type,
                                         std::string_view name) const {
-    BoundComponent b;
-    if (!_FindBoundCopy(type, name, &b))
-        return result<BoundComponent>::err(MakeError(
-            ErrorCode::NotFound,
-            "GetComponent: component '" + std::string(name) + "' is not bound"));
-    return result<BoundComponent>::ok(std::move(b));
+    if (auto registry = m_handle.m_reg.lock()) {
+        std::lock_guard<std::mutex> lk(registry->Mutex());
+        auto [component, binding] = registry->FindBindingLocked(m_handle.Id(), type, name);
+        if (component)
+            return result<ComponentBindingSnapshot>::ok(
+                registry->SnapshotBindingLocked(*component, binding->generation));
+    }
+    return result<ComponentBindingSnapshot>::err(MakeError(
+        ErrorCode::NotFound,
+        "GetComponent: component '" + std::string(name) + "' is not bound"));
 }
 
 ObjectInfo CoComponent::Info() const {

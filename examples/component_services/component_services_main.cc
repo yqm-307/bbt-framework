@@ -186,7 +186,7 @@ void RunSharedScenario() {
           bool(catalog_h) && bool(cart_h) ? "ok" : "missing");
 
     /**
-     * 运行期显式绑定：CartService 在 OnBindingChanged 里借用同一实例写购物车。
+     * 运行期显式绑定：CartService 在 OnBindingChanged 里取得当前价格本的强引用并写入购物车。
      */
     auto cart_binding = bbt_co_await app->CoBindComponent<shop::PriceBook>(
         cart_h.value(), std::string(shop::kPricingSlot));

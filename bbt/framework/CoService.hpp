@@ -52,10 +52,10 @@ protected:
      * 绑定在 OnBindingChanged 通知前生效。
      *
      * @tparam C 组件类型，必须在 Components... 中声明。
-     * @param name 绑定时使用的组件逻辑名。
-     * @return 成功时返回携带当前 binding generation 的 ComponentHandle<C>；
+     * @param name 绑定槽位名。
+     * @return 成功时返回指向当前实例的弱句柄；
      *         非协程返回 InvalidContext，C 未声明返回 InvalidArgument，
-     *         name 未绑定返回 NotFound。
+     *         name 未绑定返回 NotFound。lock() 只保活对象。
      */
     template <class C>
     result<ComponentHandle<C>> GetComponent(std::string_view name) const;

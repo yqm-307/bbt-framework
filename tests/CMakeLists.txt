@@ -166,6 +166,22 @@ add_test(NAME framework.resource_lifecycle
 set_tests_properties(framework.resource_lifecycle PROPERTIES
     TIMEOUT 30 LABELS "smoke;unit")
 
+# 内置资源组件的关闭收口与强引用寿命：真实 RedisNetResource 经 CoApp
+# 装配/启动/绑定；lock() 强引用不阻塞成功关闭，关闭后经同一强引用发起
+# 命令返回 Closed（Closed 判定不依赖真实后端；真实往返见 resource_live_*，
+# 仅在 bbt::infra_redis_net 在场时注册）。
+if(TARGET bbt::infra_redis_net)
+    add_executable(Test_framework_component_resource
+        Test_framework_component_resource.cc)
+    target_link_libraries(Test_framework_component_resource PRIVATE
+        bbt::framework bbt::infra_redis_net)
+    target_compile_options(Test_framework_component_resource PRIVATE -Wall -Wextra)
+    add_test(NAME framework.component_resource
+        COMMAND Test_framework_component_resource)
+    set_tests_properties(framework.component_resource PROPERTIES
+        TIMEOUT 30 LABELS "smoke;integration")
+endif()
+
 # 强制 live 验收开关（默认 OFF）：live runner/CI 显式
 # -DBBT_REQUIRE_RESOURCE_LIVE_TESTS=ON 时，Redis/Mongo 任一 infra 模块未注册即
 # configure 阶段 FATAL——不允许静默缺模块导致验收证据缺口（与 framework.rpc_xlang
