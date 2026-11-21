@@ -44,7 +44,7 @@
 | AppNetwork | CoApp 私有持有 | 本 App 的 Engine/Client/Server 装配及只读汇总 | 不成为业务 Service，不重造 socket、reader、writer、pool。 |
 | AppSession | AppNetwork 管理的逻辑视图 | RemoteAppId、State、Epoch、Stats，均不泄漏连接 | 不拥有第二份 infra 会话表；不供业务创建/Close；观测缺失不编造值。 |
 
-Registry 可以为借用/队列/回调保留内部强引用，但它们都属于同一个 CoApp 管理域，不能向业务交出 `shared_ptr<T>`。对象不可复制、不可移动。三种受管对象的构造都要求不能由业务制造的 ConstructKey——其私有构造显式提供（非 `= default`），不是 aggregate，业务不能以 `detail::ConstructKey{}` 聚合初始化绕过 Registry creator；基类与具体派生类析构均 protected/private 且 noexcept；具体类型声明对应 Registry 为友元，由其类型化 deleter 销毁。Install 对公开可析构的具体类型做负向静态检查，不能只保护基类析构却让 `delete C*` 合法。受管对象的类型擦除 owner 一律由「静态类型指针 + 类型化 deleter」构成，不经 `void*` 反向 `static_cast` 派生调整；`ComponentHandle::Borrow` 的对象地址以 `CoComponent*` 交付，由 `CoComponent*→C*` 的编译器转换完成多继承下的正确指针调整。业务不得 delete 从 borrow 借出的地址；C++ 访问控制不防御恶意类型自身的 delete-this/UB，也不能替代线上授权。
+Registry 可以为借用、队列和回调保留内部强引用。业务可通过 `ComponentHandle<C>::lock()` 分享组件安装时的同一个控制块。对象不可复制、不可移动。三种受管对象的构造都要求不能由业务制造的 ConstructKey——其私有构造显式提供（非 `= default`），不是 aggregate，业务不能以 `detail::ConstructKey{}` 聚合初始化绕过 Registry creator；基类与具体派生类析构均 protected/private 且 noexcept；具体类型声明对应 Registry 为友元，由其类型化 deleter 销毁。Install 对公开可析构的具体类型做负向静态检查，不能只保护基类析构却让 `delete C*` 合法。受管对象的类型擦除 owner 一律由「静态类型指针 + 类型化 deleter」构成，不经 `void*` 反向 `static_cast` 派生调整；`ComponentHandle::Borrow` 的对象地址以 `CoComponent*` 交付，由 `CoComponent*→C*` 的编译器转换完成多继承下的正确指针调整。业务不得 delete 从 borrow 借出的地址；C++ 访问控制不防御恶意类型自身的 delete-this/UB，也不能替代线上授权。
 
 App scope 键为 `(component type, logical name)`；Service/Actor scope 键还包括所属对象的 id/generation。相同类型、不同名字不共享；同名不同类型不是同一实例。scope 是默认可见范围和收口策略，不是 C++ 所有权。App scope 在最后一个绑定解除后仍存在，直到显式 Uninstall；Service/Actor scope 只能绑定所属对象以及它受控的依赖，不得逃到其他对象。Component 依赖可绑定 App scope 或相同 scope/owner 的 Component。没有匹配的显式安装项则 NotFound，不自动降级到另一个 scope。
 
@@ -88,6 +88,9 @@ template<class C> class ComponentHandle {
 public:
     ObjectHandle Object() const;
     bool IsValid() const noexcept;
+    bool IsBound() const noexcept;
+    std::uint64_t BindingGeneration() const noexcept;
+    std::shared_ptr<C> lock() const noexcept;
     result<ComponentBorrow<C>> Borrow() const;
 };
 
@@ -107,13 +110,13 @@ public:
 
 ### 3.1 必须实现的实际寿命规则
 
-1. `ComponentHandle` 只保存 registry 身份、对象 generation、binding generation 和失效状态，不拥有 C。`Borrow()` 在同一临界区内校验对象/绑定 generation、状态和 closing gate，并增加实际 borrow 计数/固定资源版本，成功后才返回引用。禁止 `weak.lock/check → unlock → raw pointer use`。
-2. 安装期 OnInstall 可借 Installed 的依赖做纯内存装配；普通业务仅可借 Running 且 binding active 的组件。其他阶段返回明确 Closed/Busy/NotFound；不得把半启动的客户端当可用。
-3. Unbind 原子关闭该 binding 的新 borrow，旧 handle 随 binding generation 失效；已经取得的 borrow 继续保有同一资源版本。Unbind 等到该 binding 的 borrow 归零才返回成功；deadline 到则返回 TimedOut，边为 invalidated，仍保留 retiring 记录和 owner，后续同一操作继续收口。不得在旧 borrow 仍运行时 Close 底层客户端。
-4. UninstallComponent 若还有任何 active 或 retiring binding，返回 Busy，**不自动解绑所有使用者**。无绑定后封对象 gate，等待其他内部 lease/在途调用，再 OnStop/OnUninstall 和析构。共享组件的其他使用者不因一个使用者解绑而中断。
+1. Actor、Service 与 Component 的 `GetComponent<C>(name)` 在受管协程中查当前 `(subject, C, name)` 槽位。成功返回特定实例的弱句柄及该次绑定的代次。`lock()` 分享安装时的控制块，可跨解绑、换绑及关闭保活同一个 C++ 对象。对象释放的时机由最后一个强引用决定。`IsValid()` 查询原实例是否仍登记，`IsBound()` 查询原绑定代是否仍挂载，两者均为瞬时快照。即使在同一槽位重新绑定原实例，旧句柄的 `IsBound()` 也保持 false。普通 `lock()` 只保证对象寿命。资源访问仍遵守组件的协程、状态和关闭约束。
+2. `Borrow()` 是显式资源使用租约。在同一 Registry 临界区校验发放时的实例和绑定代、运行状态及接纳门，并增加实际借用计数。OnInstall 可借 Installed 依赖做纯内存装配。普通业务只可借 Running 且仍挂载的组件。已取得的 Borrow 保有原资源使用保证，直至归还。
+3. 默认 `CoUnbindComponent<C>(subject, slot[, placement])` 摘除关系、拒绝该代的新 Borrow，并锁外通知。四参数 `CoUnbindComponent<C>(subject, slot, placement, life)` 在摘除后等待该代的显式 Borrow，排空再通知。排空超时返回 TimedOut。同一四参数入口可优先续等该代，同时保留该槽位后续发布的绑定。subject 或目标的生命周期收口可接管该代的清理。通知资格在 Registry 锁内取得；四参数入口在排空后复查 subject 门禁再取得资格。已接纳的通知在锁外执行，subject 收口等待通知真实退出。
+4. `CoRebindComponent<C>(subject, slot, target_name[, placement])` 原子替换当前槽位，验证失败保留旧关系。退役和发布两条通知共用一次 subject 回调资格。`max_bindings` 同时计入活动绑定和仍保留的旧代（含待显式排空的记录）；满额时仅当被替换代可立即移除，才允许复用该配额。`CoUninstallComponent` 在目标仍有挂载关系时返回 Overloaded。挂载关系摘除后，组件封门并排空显式 Borrow，再执行 OnStop、OnUninstall 并移除登记。涉及同一组件的其他使用者的关系保持独立。普通 `shared_ptr` 可跨越这些操作延长 C++ 对象寿命。
 5. Service/Actor 不提供 public borrow 或对象指针。接纳队列持有内部执行 lease；Call 延续到 handler 和 reply 写责任结束，Tell 延续到框架 mailbox 中的业务处理结束。观察回调、Router handler、自定义采集任务分别持有内部 callback lease。
 6. Borrow 可跨协程挂起，但必须保持在该受管任务的 RAII 栈上；禁止把 Get() 的引用、Client() 返回值、this 或成员引用交给不持该 lease 的任务。派生 Component 若创建后台任务，必须登记在自己的受管任务/计数内，OnStop 等待真实终态。不允许用 detached 裸捕获绕过 owner。
-7. 析构条件是 admission 已封、业务 queue/inflight 为零、borrow/callback/route lease 为零、底层物理完成已确认，不是 `IsClosed()==true` 或 weak 已失效。超时保留 Registry owner、资源版本和 cleanup 记录，继续驱动；宿主必须保留 CoApp，不能用析构或硬释放伪装完成。
+7. 生命周期收口须先封 admission，再确认对应业务 queue/inflight、borrow/callback/route lease 和底层资源已完成。组件完成框架收口后，普通 `shared_ptr` 仍可继续保活对象。超时保留 Registry owner、资源版本和 cleanup 记录，继续驱动；宿主必须保留 CoApp，不能用析构或硬释放伪装完成。
 8. 控制面不得在持 Registry 锁时调用用户 hook、回调、Close、join 或析构。控制面操作串行发布不可变 dispatch/binding 快照，锁外执行 hook；同一对象转换期间冲突操作 Busy。hook 内递归同步调用同一控制面返回 Busy，避免自等待。
 
 ## 4. CoApp：唯一装配和动态控制接口
@@ -177,7 +180,7 @@ public:
 
 `ObjectObserver = std::function<void(const ObjectStateEvent&)>`；事件是 owning 值，含 id、generation、state、revision、observed_at、稳定错误 code/phase，以及可选 ActorInfo，不含引用或 payload。Component 依赖也是 BindComponent 的 subject；BindObject 只记录非拥有的关系，不授权直接调用对象、不隐式建立组件启动依赖。Find 只查已存在对象，失败安装对象仍可通过名字找到以清理；Actor Find 不会激活对象。UninstallActor 先拒新建，按预算销毁已建实例，再撤登记；失败保留类型及残留实例记录。
 
-上面未带 `Co` 的安装、卸载、绑定、Observe 签名是宿主控制面的目标设计。已实现的 `CoBindComponent` / `CoUnbindComponent` 在受管协程调用，误上下文返回 `InvalidContext`。动态创建/销毁 Actor 只能通过下节 Co 入口在受管协程执行，不在 admission reader 内执行。读值快照和 RequestShutdown 可任意线程调用。需要异步停机时用 RequestShutdown，不从本 App handler 调会等待自身的 CoStop/CoPause；这种调用返回 InvalidContext。
+上面未带 `Co` 的安装、卸载、绑定、Observe 签名是宿主控制面的目标设计。已实现的 `CoBindComponent`、`CoRebindComponent`、两个 `CoUnbindComponent` 重载在受管协程调用，误上下文返回 `InvalidContext`。首次 Bind 使用目标安装名作为槽位名。Rebind 独立指定槽位和新目标安装名。Unbind 的 `placement` 匹配目标归属，默认为 App scope。动态创建/销毁 Actor 只能通过下节 Co 入口在受管协程执行，不在 admission reader 内执行。读值快照和 RequestShutdown 可任意线程调用。需要异步停机时用 RequestShutdown，不从本 App handler 调会等待自身的 CoStop/CoPause；这种调用返回 InvalidContext。
 
 ### 4.1 Options 的完整装配面
 
@@ -275,7 +278,7 @@ protected:
 
 `detail::ObjectBase` 为 Service/Actor 复用 ICoObject 信息、请求上下文和消息实现，不是新公共实体。它及 Component 显式删除 copy/move；各基类将对应 Registry 设为友元。Registry 调用入口 private；业务只覆盖 protected hook。ConstructKey 是构造函数私有、仅 `detail::Registry` 为友元的 passkey 值，由 Registryry 独占，禁止泄给业务。新 hook 只能兼容式新增并带空默认实现。
 
-`BindingEvent` 含 subject/target id、generation、绑定状态、revision 和 observed_at。`OnBindingChanged` 是事后通知，在受管协程中于 Registry 锁外同步调用。派发 `bound=true` 前绑定已生效，回调可用 `GetComponent` 查到句柄，并按正常借用规则 `Borrow`。解绑先拒绝该绑定的新借用，旧借用排空并移除绑定后才派发 `bound=false`。通知抛异常只记录 `LifecycleFailure`，绑定和解绑的结果保持不变。回调看到的对象身份不授予裸指针访问权。
+`BindingEvent` 记录 `subject_id`、`subject_generation`、`slot`、`target_id`、目标对象代 `generation`、实际 `binding_generation`、`bound`、目标 revision 和 `observed_at`。`OnBindingChanged` 在受管协程中于 Registry 锁外同步调用，关系在通知前已生效。原子换绑依次通知旧代摘除和新代挂载。两个回调都可查询已发布的新绑定。并发控制操作可能再次改变槽位，事件始终描述其携带的那一代。通知异常只记录 `LifecycleFailure`。
 
 ### 5.1 唯一地址、消息和调用语义
 
@@ -356,9 +359,9 @@ framework 适配器对 Request 的业务映射也只有一份：Service target �
 ## 6. 动态控制、观察与失败兜底
 
 - Install：无副作用参数/额度/名字校验 → Registry 登记 Installing → 构造 → 显式依赖检查 → OnInstall → Installed；App 已 Running 时再 OnStart 成功才发布业务 dispatch。构造失败不发布空实例；hook 失败已登记对象为 InstallFailed，可 Find/卸载，不能返回“全部回滚”。
-- 组件先 Install 并按依赖拓扑启动，Service 再 Start；Actor 创建先确认依赖 ready，再 OnCreate，最后允许消息。Stop 反序：拒新 → 每个对象先封其 subject 绑定边并排**空在途 borrow** → 再 Service OnStop/Actor OnDestroy → scoped Component → App Component（旧 borrow 不得在 OnStop 关闭资源后仍运行同一资源版本；OnStop 失败/超时同样保留 owner 记 LifecycleFailure 并继续其他对象收口）。**排空粒度是该 subject 自己的 binding 边**（per-(component, subject, generation) `WaitBindingDrained`），不是组件全量 borrow：共享组件上其他 subject 的合法借用不阻塞本对象收口。subject 已封口（gate_closed/op_in_progress/关闭语义状态）后在同一 Registry 临界区内拒绝新增 Bind——销毁路径只擦除 retiring 边，关闭期间新增的 active 边不会被收口看到。
+- 组件先按依赖拓扑启动，Service 随后 Start。Stop 时先封各对象作为 subject 的关系，等该 subject 的显式 Borrow 归还，再执行 OnStop 或 OnDestroy。共享组件上其他 subject 的借用可继续。组件关闭还等待所有指向本实例的显式 Borrow，包含已摘除或替换的关系。超时保留对象及未归还的记账，生命周期重试继续等待。App 停机在 Registry 锁内关闭新绑定发布，再按组件依赖的逆拓扑推进；普通绑定和换绑均不可越过停机门禁。
 - Pause：拒新并排空在途后 OnPause；Resume 的 OnResume 成功后重新接纳。Stop 后不能 Start；StopIncomplete 允许再次 Stop 使用更晚期限推进 cleanup，不重开入口。
-- UninstallService：移除新 dispatch、撤自己的 observer/Router token、等 execution/callback/borrow 终态、OnStop/OnUninstall、解绑、收口 owned-scope Component、最后销毁。各安全独立清理分支继续运行，任一未完为 UninstallIncomplete。逆序指实际已成功登记/启动的依赖图，不只反转名字列表。
+- UninstallService：移除新 dispatch、撤自己的 observer/Router token、等 execution/callback/borrow 终态、OnStop/OnUninstall、解绑、收口 owned-scope Component、最后销毁。owner 封门与 scoped 组件登记使用同一把锁，封门后不再接纳新的 owned 组件。只按实际依赖图的逆拓扑收口本 Service 拥有的组件，不关闭共享 App 组件。各安全独立清理分支继续运行；任一 owned 组件未收口则保留 Service owner 为 UninstallIncomplete，重试不重跑已完成的 hook。
 - `CleanupInfo` 为 object id/generation、phase、pending borrows/tasks/callbacks、stable error code；`LifecycleFailure` 为 object id/generation、operation、phase、code、发生时间及本地脱敏说明。诊断列表受 App 的 max_objects/有界 ring 限制，溢出计 dropped；原始异常文本、URI、凭据不得直接导出 Monitor。
 - 所有 hook 的 error return 和 std/非 std 异常均捕获，转 InternalError/原 error 并记录 phase；OnUninstall/OnDestroy 虽 void，抛异常仍记录并继续其他安全清理。析构 noexcept。try/catch 不保证 UB、数据竞争、死循环、进程崩溃或泄漏协程可恢复。
 - Observe 只建立非拥有边。ObserverToken 绑定 observer generation，observer 卸载时 Registry 自动撤销；target 销毁时先发布一次终结事件再使 token 失效。事件队列有界、best-effort，终结事件也可能因队列满/观察者退出未交付；不能靠“必收 Destroyed”维持安全，handle gate 的实际失效才是依据。回调在锁外受管执行，回调抛异常计数，不拖垮业务。**在途 callback lease**：派发方在锁内校验 active 并取得 lease（在途计数）后才执行业务回调；Revoke 先标 inactive 阻断新派发，等待已派发 lease 归零后抹除记录与闭包——闭包捕获对象不会在回调仍在途时被销毁，撤销返回时闭包已确定释放。通知/序列缺口后用 Inspector 重新取快照。
@@ -396,7 +399,7 @@ public:
 | ADR 0014 §4.1、§4.3 | RequireRemoteAcceptance 对应 SendOptions 同名值及 wire acceptance_requested，不把 SendAccepted 当业务结果；mailbox 满计 dead-letter/drop，确认式投递 Overloaded | 满一 Actor 不阻塞共享 reader/System/Service/其他 Actor；发送方不自动补发。 |
 | ADR 0014 §5 | Codec/正式 v2 proto 与 u32be 归 infra；framework 只做 Payload/schema、route/fw 字段和 opaque ordering_key/sequence。metadata 仅 fw/route/trace，32项、key64/value256字节且无重复 | Call1→Tell2→Call3 同目标按序接纳；字段/长度/过期/关联拒绝；默认 frame8MiB，硬上限1GiB，握手≤64KiB。 |
 | ADR 0014 §5.3–§6 | 同发送方/目标以发送队列接纳为序；旧 epoch 不能复用新代额度；已 mailbox 接纳的不回滚。OutcomeUnknown 保留 request_phase，不推断未执行 | 部分写退役、不重放；旧 callback 只能结算既有责任，不捕获 framework 裸指针。 |
-| ADR 0014 §2.3、§6 | 宿主 StopAccepting 关闭业务门 → WaitHandlersDone 等宿主在途责任归零 → CoRpcServer::Shutdown() → 宿主 Close 对 RPC server/client 调用 Shutdown(reason) 并收口 Engine；HTTP 分支独立遵循其关闭接口 | RPC Shutdown/IsClosed 不证明物理释放；尚未结束的驱动线程仍由宿主持有并最终 join，StopIncomplete 可追踪。 |
+| ADR 0014 §2.3、§6 | 宿主 StopAccepting 关闭业务门 → WaitHandlersDone 等宿主在途责任归零 → RPC `Close(CloseOptions::Immediate())` 逻辑封口、HTTP `Close(Graceful+wait_release)` 排空并等物理回收 → 宿主 Close 对 RPC/HTTP server/client 统一 `Close(Immediate(reason))` 并收口 Engine | RPC Close/IsClosed 不证明物理释放；尚未结束的驱动线程仍由宿主持有并最终 join，StopIncomplete 可追踪。 |
 | ADR 0014 §8 | 仅消费稳定 net/http/rpc/redis/mongo 面；HTTP Router/Request/Response/stream/pool、Redis Acquire/AUTH/SELECT、Mongo Collection/Document/worker 语义原样保留；Payload codec 归 framework | 模块 owner 实施对应 api/include/真实后端回归；不把本轮文档当作上述模块完成。 |
 | ADR 0014 §8 | HttpComponent Freeze 前结构注册，token owner 为注册 Service；Revoke 先封新 dispatch，再等 handler lease；运行时新 path Busy | 并发撤销/Uninstall 不悬空；不偷偷重建 Router 或增加 route。 |
 | ADR 0014 §9–§11 | 授权/Resolver/mailbox/重试/业务 idempotency 归 framework；Monitor 只读、显式、opt-in；删除 LegacyHeaders/x-bbt-*、旧 envelope/transport/WaitStopped 稳定入口 | examples/API consumer、正反向 include、Monitor/schema、真实两 App 和关闭验收。 |
@@ -583,7 +586,7 @@ return app.Run();
 
 `Report`、redis_options、admin_http_options、operator_access_check 是应用提供且显式校验的配置/错误处理，不是框架新增入口。生产示例必须真实处理 result，不能照抄忽略失败。
 
-运行期动态 Actor-scope 组件使用同一接口：先 `FindActor(id)` 取得 ObjectHandle，`ComponentOptions{}.SetScope(ComponentScope::Actor).SetOwner(handle)`，再 InstallComponent、BindComponent；Service-scope 同理。解绑一个使用者不能影响另一个；仍有 binding 的 App Component Uninstall 返回 Busy。动态绑定成功只替换该 binding generation，不迁移业务状态。
+运行期动态 Actor-scope 组件使用同一接口：先 `FindActor(id)` 取得 ObjectHandle，`ComponentOptions{}.SetScope(ComponentScope::Actor).SetOwner(handle)`，再 InstallComponent、BindComponent；Service-scope 同理。解绑一个使用者不能影响另一个；仍有 binding 的 App Component Uninstall 返回 Busy。原子换绑为同一 subject 的槽位发布新的绑定代，业务状态仍属于各自实例。
 
 ## 11. 验收台账与验证边界
 
@@ -592,9 +595,9 @@ return app.Run();
 
 | 要求 | 本文位置 | 判定证据 / 当前状态 |
 |---|---|---|
-| 唯一强 owner、禁业务构造/销毁 | §2–4 ConstructKey/Registry/handle | 已实现：`framework.v2_core`、`framework.rpc_surface`。负向编译（栈构造、make_shared、copy/move、delete）为目标。 |
+| 唯一控制块、禁业务构造/销毁 | §2–4 ConstructKey/Registry/handle | 已实现：`framework.v2_core`、`framework.rpc_surface`。负向编译（栈构造、make_shared、copy/move、delete）为目标。 |
 | scope、显式共享、Busy | §2–4、§10 | 目标：两 Service 同 type/name 同实例，一方 Unbind 不关闭池；最后解绑仍存在；三 scope 隔离、错误 owner、环依赖、缺依赖。 |
-| 真实 borrow，非 weak 检查 | §3.1 | 目标：Borrow 已取、解绑封口、旧任务挂起三阶段交错后，新 borrow 拒绝、旧借用可完成、最后引用结束前无 Close/析构。 |
+| 真实 borrow，非 weak 检查 | §3.1 | 待验证：默认解绑可在旧 Borrow 未归还时返回，拒绝旧代的新 Borrow，关闭等到旧 Borrow 归还。另覆盖四参数超时续等、保留普通 owner 的关闭、原子换绑、同实例 ABA 和失败保留旧绑定。 |
 | 观察无指针、自动撤销 | §3、§6 | 目标：target/observer 同时销毁、回调在途、队列满、回调抛异常；handle 即刻失效，callback lease 排空后释放。 |
 | 动态失败兜底 | §4、§6 | 目标：OnInstall/OnStart/OnStop/OnUninstall 异常与错误返回，部分成功记录、逆序独立清理、StopIncomplete/UninstallIncomplete，不虚报事务回滚。 |
 | 消息与网络 | §5、§7 | 目标：真实两 App、四方向 CoCall/CoTell、单 link、Call1/Tell2/Call3、Actor 满队列隔离、epoch 缺口/未知终态、lease/drain/物理收口。 |

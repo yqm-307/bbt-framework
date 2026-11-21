@@ -25,7 +25,7 @@
  * 收口前提，owner 与资源版本保留（IsClosed 仍为 false、真实命令仍
  * 可完成），该窗口本身是「不提前收口」的正面证据；借用归还后再次
  * CoStop 推进至 Stopped，组件销毁意味着其同步 OnStop 已落定
- * （RedisNetResource::OnStop = client Close + Engine RequestClose/
+ * （RedisNetResource::OnStop = client Close + Engine Close/
  * join/Stopped 核验；MongoDbResource::OnStop = 集合句柄门禁 + owner
  * Close 同步物理收口）。IsClosed/engine_stopped/coll_closed 只读
  * 观测口在对象销毁后不可读——旧「shutdown 后 IsClosed」断言映射为
@@ -85,8 +85,8 @@
 #include <bbt/framework/internal/CoAppSeam.hpp>
 #include <bbt/framework/internal/NetworkHost.hpp>
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
 using Clock = std::chrono::steady_clock;
 
@@ -102,7 +102,9 @@ constexpr std::chrono::milliseconds kWait{15000};
  */
 std::atomic<int> g_dispatch_pending{0};
 
-const char* EnvOr(const char* k) { return std::getenv(k); }
+const char* EnvOr(const char* k) {
+    return std::getenv(k);
+}
 
 #ifdef BBT_LIVE_HAS_REDIS
 bool RedisEnabled() {
@@ -127,13 +129,15 @@ struct RequireLiveEnv {
 #if defined(BBT_LIVE_HAS_REDIS)
         if (!RedisEnabled()) {
             std::fputs("live.redis: BBT_TEST_REDIS_ADDR 未设置，"
-                       "标记 Skipped\n", stderr);
+                       "标记 Skipped\n",
+                       stderr);
             std::exit(77);
         }
 #elif defined(BBT_LIVE_HAS_MONGO)
         if (!MongoEnabled()) {
             std::fputs("live.mongo: BBT_TEST_MONGO_URI 未设置，"
-                       "标记 Skipped\n", stderr);
+                       "标记 Skipped\n",
+                       stderr);
             std::exit(77);
         }
 #else
@@ -154,7 +158,8 @@ BOOST_GLOBAL_FIXTURE(RequireLiveEnv);
  */
 std::pair<std::string, std::uint16_t> SplitAddr(const std::string& addr) {
     const auto pos = addr.rfind(':');
-    if (pos == std::string::npos) return {addr, 0};
+    if (pos == std::string::npos)
+        return {addr, 0};
     return {addr.substr(0, pos),
             static_cast<std::uint16_t>(std::stoi(addr.substr(pos + 1)))};
 }
@@ -167,17 +172,22 @@ class TestLatch {
 public:
     explicit TestLatch(int n) : m_count(n) {}
     void CountDown() {
-        { std::lock_guard<std::mutex> lk(m_mtx); if (--m_count > 0) return; }
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (--m_count > 0)
+                return;
+        }
         m_cv.notify_all();
     }
     bool WaitFor(std::chrono::milliseconds ms) {
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    int                     m_count;
+    int m_count;
 };
 
 /**
@@ -189,7 +199,9 @@ public:
     TestLatch start_seen{1};
     fw::result<void> Create() override { return fw::result<void>::ok(); }
     fw::result<void> Start() override {
-        start_seen.CountDown(); return fw::result<void>::ok(); }
+        start_seen.CountDown();
+        return fw::result<void>::ok();
+    }
     void StopAccepting() noexcept override {}
     fw::result<void> WaitHandlersDone(co::Deadline) override {
         return fw::result<void>::ok();
@@ -209,7 +221,8 @@ void BsonPutI32(std::vector<std::uint8_t>& b, std::int32_t v) {
     b.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFF));
 }
 void BsonPutCStr(std::vector<std::uint8_t>& b, std::string_view s) {
-    for (char c : s) b.push_back(static_cast<std::uint8_t>(c));
+    for (char c : s)
+        b.push_back(static_cast<std::uint8_t>(c));
     b.push_back(0x00);
 }
 void BsonElemString(std::vector<std::uint8_t>& b,
@@ -233,14 +246,16 @@ void BsonElemI32(std::vector<std::uint8_t>& b,
 }
 inf::mongo::MongoDocument BsonDoc(
     const std::vector<std::pair<std::string_view,
-        std::pair<bool, std::pair<std::string_view, std::int32_t>>>>& elems) {
+                                std::pair<bool, std::pair<std::string_view, std::int32_t>>>>& elems) {
     /**
      * elems: (key, (is_string, (sval, ival)))
      */
     std::vector<std::uint8_t> body;
     for (const auto& [k, spec] : elems) {
-        if (spec.first) BsonElemString(body, k, spec.second.first);
-        else            BsonElemI32(body, k, spec.second.second);
+        if (spec.first)
+            BsonElemString(body, k, spec.second.first);
+        else
+            BsonElemI32(body, k, spec.second.second);
     }
     inf::mongo::MongoDocument doc;
     const std::int32_t total =
@@ -255,8 +270,8 @@ inf::mongo::MongoDocument BsonDoc(
     return doc;
 }
 inf::mongo::MongoDocument DocIdVal(std::string_view id, std::int32_t v) {
-    return BsonDoc({{"_id", {true,  {id, 0}}},
-                    {"v",   {false, {"", v}}}});
+    return BsonDoc({{"_id", {true, {id, 0}}},
+                    {"v", {false, {"", v}}}});
 }
 inf::mongo::MongoDocument DocId(std::string_view id) {
     return BsonDoc({{"_id", {true, {id, 0}}}});
@@ -299,12 +314,14 @@ inf::mongo::MongoDocument DocSetV(std::int32_t v) {
  */
 fw::CoRpcReq RequestStr(std::string a, std::string b) {
     auto req = fw::CoRpcReq::From(std::tuple{std::move(a), std::move(b)});
-    if (!req) throw std::logic_error("request encode failed");
+    if (!req)
+        throw std::logic_error("request encode failed");
     return std::move(req).value();
 }
 fw::CoRpcReq RequestOne(std::string a) {
     auto req = fw::CoRpcReq::From(std::move(a));
-    if (!req) throw std::logic_error("request encode failed");
+    if (!req)
+        throw std::logic_error("request encode failed");
     return std::move(req).value();
 }
 
@@ -338,34 +355,40 @@ public:
 
     fw::CoRpcResp Set(fw::CoRpcReq req) {
         auto args = req.Parse<std::string, std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto cli_r = Res();
         if (!cli_r)
             return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::Unavailable, "resource 'cache' missing"));
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         inf::CallOptions o;
         o.deadline = ctx.value()->deadline;
         auto r = bbt_co_await cli_r.value().Get().Set(
             std::get<0>(args.value()), std::get<1>(args.value()), o);
-        if (!r) return fw::CoRpcResp::Error(r.error());
+        if (!r)
+            return fw::CoRpcResp::Error(r.error());
         return fw::CoRpcResp::From(std::tuple{0, std::string{"OK"}});
     }
 
     fw::CoRpcResp Get(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto cli_r = Res();
         if (!cli_r)
             return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::Unavailable, "resource 'cache' missing"));
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         inf::CallOptions o;
         o.deadline = ctx.value()->deadline;
         auto r = bbt_co_await cli_r.value().Get().Get(args.value(), o);
-        if (!r) return fw::CoRpcResp::Error(r.error());
+        if (!r)
+            return fw::CoRpcResp::Error(r.error());
         return fw::CoRpcResp::From(std::tuple{
             0, r.value().value_or(std::string{"<nil>"})});
     }
@@ -377,17 +400,20 @@ public:
         if (s_pings_observer)
             s_pings_observer->fetch_add(1, std::memory_order_acq_rel);
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto cli_r = Res();
         if (!cli_r)
             return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::Unavailable, "resource 'cache' missing"));
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         inf::CallOptions o;
         o.deadline = ctx.value()->deadline;
         auto r = bbt_co_await cli_r.value().Get().Ping(o);
-        if (!r) return fw::CoRpcResp::Error(r.error());
+        if (!r)
+            return fw::CoRpcResp::Error(r.error());
         return fw::CoRpcResp::From(std::tuple{0, std::string{"PONG"}});
     }
 
@@ -432,8 +458,10 @@ public:
     static constexpr std::string_view kServiceName = "peek";
     explicit RedisPeek(fw::detail::ConstructKey k)
         : fw::CoService<fw::RedisNetResource>(k) {}
+
 protected:
     ~RedisPeek() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -467,13 +495,15 @@ public:
 
     fw::CoRpcResp Put(fw::CoRpcReq req) {
         auto args = req.Parse<std::string, std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto cli_r = Res();
         if (!cli_r)
             return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::Unavailable, "resource 'docs' missing"));
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         inf::CallOptions o;
         o.deadline = ctx.value()->deadline;
         const auto& [id, sval] = args.value();
@@ -484,24 +514,28 @@ public:
             std::stoi(sval));
         auto doc = DocIdVal(id, v);
         auto r = bbt_co_await cli_r.value().Get().InsertOne(doc, o);
-        if (!r) return fw::CoRpcResp::Error(r.error());
+        if (!r)
+            return fw::CoRpcResp::Error(r.error());
         return fw::CoRpcResp::From(std::tuple{0, std::string{"INS"}});
     }
 
     fw::CoRpcResp Get(fw::CoRpcReq req) {
         auto args = req.Parse<std::string>();
-        if (!args) return fw::CoRpcResp::Error(args.error());
+        if (!args)
+            return fw::CoRpcResp::Error(args.error());
         auto cli_r = Res();
         if (!cli_r)
             return fw::CoRpcResp::Error(fw::MakeError(
                 fw::ErrorCode::Unavailable, "resource 'docs' missing"));
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         inf::CallOptions o;
         o.deadline = ctx.value()->deadline;
         auto r = bbt_co_await cli_r.value().Get().FindOne(
             DocId(args.value()), o);
-        if (!r) return fw::CoRpcResp::Error(r.error());
+        if (!r)
+            return fw::CoRpcResp::Error(r.error());
         return fw::CoRpcResp::From(std::tuple{
             0, r.value().has_value() ? std::string{"HIT"}
                                      : std::string{"MISS"}});
@@ -535,8 +569,10 @@ public:
     static constexpr std::string_view kServiceName = "peek";
     explicit MongoPeek(fw::detail::ConstructKey k)
         : fw::CoService<fw::MongoDbResource>(k) {}
+
 protected:
     ~MongoPeek() noexcept override = default;
+
 private:
     friend class fw::detail::Registry;
 };
@@ -596,8 +632,11 @@ std::shared_ptr<fw::CoApp> MakeApp(const std::shared_ptr<NullNetHost>& host) {
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{30000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{30000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     /**
      * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
      */
@@ -607,22 +646,26 @@ bool RunInManagedCoroutine(F&& fn,
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     /**
@@ -630,7 +673,8 @@ bool RunInManagedCoroutine(F&& fn,
      */
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
@@ -653,10 +697,10 @@ auto DispatchRpc(fw::CoApp& app, Fn&& fn,
      */
     struct State {
         explicit State(std::decay_t<Fn> f) : fn(std::move(f)) {}
-        std::decay_t<Fn>   fn;
+        std::decay_t<Fn> fn;
         std::optional<Out> out;
         std::exception_ptr eptr;
-        TestLatch          done{1};
+        TestLatch done{1};
     };
     auto st = std::make_shared<State>(std::forward<Fn>(fn));
     fw::CoApp* app_ptr = &app;
@@ -685,7 +729,8 @@ auto DispatchRpc(fw::CoApp& app, Fn&& fn,
         g_dispatch_pending.fetch_sub(1, std::memory_order_acq_rel);
         return std::nullopt;
     }
-    if (!st->done.WaitFor(budget)) return std::nullopt;
+    if (!st->done.WaitFor(budget))
+        return std::nullopt;
     /**
      * 协程异常真实通知等待者
      */
@@ -721,7 +766,8 @@ inline bool RunRedisCleanup(fw::RedisNetResource& cli,
                             const std::string& key,
                             const inf::CallOptions& o) {
     auto removed = bbt_co_await cli.Delete({key}, o);
-    if (!removed || removed.value() != 1) return false;
+    if (!removed || removed.value() != 1)
+        return false;
     auto remaining = bbt_co_await cli.Exists(key, o);
     return remaining && !remaining.value();
 }
@@ -749,7 +795,7 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
         std::error_code addr_ec;
         auto address = inf::net::Address::Ip(rhost, rport, addr_ec);
         BOOST_REQUIRE_MESSAGE(!addr_ec,
-            "BBT_TEST_REDIS_ADDR 需为数值 IPv4/IPv6: " << addr_ec.message());
+                              "BBT_TEST_REDIS_ADDR 需为数值 IPv4/IPv6: " << addr_ec.message());
 
         /**
          * 新入口只接受数值 IP：loopback 地址经 net::Address::Ip 装配（不解析
@@ -776,8 +822,14 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
          */
         inf::CallOptions connect_options{Clock::now() + kWait};
         auto connected = bbt_co_await cli->Get().Connect(connect_options);
-        BOOST_REQUIRE_MESSAGE(connected,
-            "redis explicit Connect 失败: " << connected.error().message);
+        /**
+         * BOOST_REQUIRE_MESSAGE 的消息在断言通过时同样求值，ok result 读
+         * error() 会抛 logic_error；失败细节只在失败分支取出。
+         */
+        if (!connected) {
+            BOOST_FAIL("redis explicit Connect 失败: "
+                       << connected.error().message);
+        }
     }));
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
 
@@ -786,8 +838,7 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
      * 清理只删本用例写入的键并以 EXISTS 读回证明。
      */
     const std::string key_prefix =
-        "bbt:fw-live:" + std::to_string(
-            Clock::now().time_since_epoch().count()) + ":";
+        "bbt:fw-live:" + std::to_string(Clock::now().time_since_epoch().count()) + ":";
     const std::string test_key = key_prefix + "k";
 
     /**
@@ -813,8 +864,8 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
     auto ping = rpc("ping", RequestOne("x"));
     if (ping.has_value() && !*ping)
         std::fprintf(stderr, "ping error: %s code=%d\n",
-            (*ping).error().message.c_str(),
-            static_cast<int>((*ping).error().code));
+                     (*ping).error().message.c_str(),
+                     static_cast<int>((*ping).error().code));
     BOOST_REQUIRE(ping.has_value());
     BOOST_REQUIRE(*ping);
     auto p = DecodeStrReply(fw::CoRpcResp::FromPayload((*ping).value().Payload()));
@@ -845,7 +896,7 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
             return RunRedisCleanup(cli->Get(), test_key, o);
         });
         BOOST_REQUIRE_MESSAGE(done.has_value() && done.value(),
-            "live.redis: 唯一键清理/读回失败");
+                              "live.redis: 唯一键清理/读回失败");
     }
 
     /**
@@ -877,7 +928,7 @@ BOOST_AUTO_TEST_CASE(live_redis_resource_lifecycle) {
             return bbt_co_await cli->Get().Ping(o);
         });
         BOOST_REQUIRE_MESSAGE(alive.has_value() && alive.value(),
-            "StopIncomplete 期间真实 Ping 应成功（owner 保留）");
+                              "StopIncomplete 期间真实 Ping 应成功（owner 保留）");
     }
     cli.reset();
     peek_h.reset();
@@ -909,7 +960,8 @@ inline bool RunMongoCleanup(
     const inf::mongo::MongoDocument& filter,
     const inf::CallOptions& o) {
     auto removed = bbt_co_await res.DeleteMany(filter, o);
-    if (!removed) return false;
+    if (!removed)
+        return false;
     auto remaining = bbt_co_await res.CountDocuments(filter, o);
     return remaining && remaining.value() == 0;
 }
@@ -933,6 +985,8 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
     std::shared_ptr<fw::CoApp> app;
     std::optional<fw::ComponentBorrow<fw::MongoDbResource>> res;
     std::optional<fw::ComponentHandle<fw::MongoDbResource>> peek_h;
+    /** 跨关闭保活的普通强引用：有效期内持有、关闭后仍可直调组件公开 API */
+    std::shared_ptr<fw::MongoDbResource> strong;
 
     /**
      * 独占命名空间：库名按 pid 区分、集合名按时间戳区分；不触碰共享
@@ -943,23 +997,24 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
         "bbt_f8_fw_live_" + std::to_string(::getpid());
     const std::string coll_name =
         "docs_" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+                      std::chrono::steady_clock::now().time_since_epoch().count());
     const std::string doc_id = coll_name + "-k1";
 
     BOOST_REQUIRE(RunInManagedCoroutine([&] {
         app = MakeApp(host);
         inf::mongo::MongoRuntimeConfig rcfg;
-        rcfg.uri                      = EnvOr("BBT_TEST_MONGO_URI");
-        rcfg.worker_threads           = 2;
-        rcfg.max_queue                = 256;
+        rcfg.uri = EnvOr("BBT_TEST_MONGO_URI");
+        rcfg.worker_threads = 2;
+        rcfg.max_queue = 256;
         rcfg.server_selection_timeout = std::chrono::milliseconds{5000};
-        rcfg.connect_timeout          = std::chrono::milliseconds{5000};
-        rcfg.socket_timeout           = std::chrono::milliseconds{5000};
-        rcfg.wait_queue_timeout       = std::chrono::milliseconds{5000};
+        rcfg.connect_timeout = std::chrono::milliseconds{5000};
+        rcfg.socket_timeout = std::chrono::milliseconds{5000};
+        rcfg.wait_queue_timeout = std::chrono::milliseconds{5000};
         const inf::mongo::MongoTarget target{db_name, coll_name};
         BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<fw::MongoDbResource>(
             "docs", fw::MongoDbResource::Options{}
-                        .SetConfig(rcfg).SetTarget(target)));
+                        .SetConfig(rcfg)
+                        .SetTarget(target)));
         BOOST_REQUIRE(bbt_co_await app->CoInstallService<DocSvc>(DocSvcOpts()));
         BOOST_REQUIRE(bbt_co_await app->CoInstallService<MongoPeek>(
             ConcurrentOpts()));
@@ -970,6 +1025,13 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
         auto br = peek_h->Borrow();
         BOOST_REQUIRE(br);
         res.emplace(std::move(br).value());
+        /**
+         * 有效期内经 peek_h->lock() 持有普通强引用，并显式断言非空；
+         * 该引用保活组件本体，供归还 Borrow 与两阶段 CoStop 之后
+         * 直调组件公开 API。
+         */
+        strong = peek_h->lock();
+        BOOST_REQUIRE(static_cast<bool>(strong));
     }));
     BOOST_REQUIRE(host->start_seen.WaitFor(kWait));
 
@@ -995,7 +1057,7 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
     auto p = DecodeStrReply(fw::CoRpcResp::FromPayload((*put).value().Payload()));
     if (!p)
         BOOST_TEST_MESSAGE("put error: " << p.error().message
-            << " code=" << static_cast<int>(p.error().code));
+                                         << " code=" << static_cast<int>(p.error().code));
     BOOST_REQUIRE(p);
     BOOST_CHECK_EQUAL(std::get<1>(p.value()), "INS");
 
@@ -1049,9 +1111,9 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
         BOOST_REQUIRE(updated.has_value());
         if (!updated.value())
             BOOST_TEST_MESSAGE("UpdateMany error: "
-                << updated.value().error().message
-                << " code=" << static_cast<int>(updated.value().error().code)
-                << " domain=" << updated.value().error().domain_code);
+                               << updated.value().error().message
+                               << " code=" << static_cast<int>(updated.value().error().code)
+                               << " domain=" << updated.value().error().domain_code);
         BOOST_REQUIRE(updated.value());
         BOOST_CHECK_EQUAL(updated.value().value().matched, std::uint64_t{1});
     }
@@ -1108,7 +1170,7 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
             return RunMongoCleanup(res->Get(), match_all, o);
         });
         BOOST_REQUIRE_MESSAGE(done.has_value() && done.value(),
-            "live.mongo: 独占集合清理/读回失败");
+                              "live.mongo: 独占集合清理/读回失败");
     }
 
     /**
@@ -1166,9 +1228,28 @@ BOOST_AUTO_TEST_CASE(live_mongo_resource_lifecycle) {
         });
         BOOST_REQUIRE(after.has_value());
         BOOST_REQUIRE_MESSAGE(!after.value(),
-            "owner Close 后兄弟句柄命令应失败（Closed），实际成功");
+                              "owner Close 后兄弟句柄命令应失败（Closed），实际成功");
         BOOST_CHECK_EQUAL(
             static_cast<int>(after.value().error().code),
+            static_cast<int>(inf::ErrorCode::Closed));
+    }
+    /**
+     * 经 peek_h->lock() 持有的强引用直调组件公开 FindOne：不走
+     * DispatchRpc，故返回 Closed 即组件自身终态，排除 harness 层异常；
+     * 只接受 Closed，不放宽为任意错误。
+     */
+    {
+        inf::CallOptions o{Clock::now() + kWait};
+        std::optional<fw::result<std::optional<inf::mongo::MongoDocument>>>
+            held;
+        BOOST_REQUIRE(RunInManagedCoroutine([&] {
+            held.emplace(bbt_co_await strong->FindOne(DocId("x"), o));
+        }));
+        BOOST_REQUIRE(held);
+        BOOST_REQUIRE_MESSAGE(!*held,
+                              "强引用直调关闭后组件公开 FindOne 应失败，实际成功");
+        BOOST_CHECK_EQUAL(
+            static_cast<int>((*held).error().code),
             static_cast<int>(inf::ErrorCode::Closed));
     }
 }
@@ -1207,8 +1288,7 @@ BOOST_AUTO_TEST_CASE(live_dispatch_drain_outlives_budget) {
         wo.deadline = Clock::now() + std::chrono::milliseconds{600};
         (void)w->Wait(wo);
         ran.store(true, std::memory_order_release);
-        return 7;
-    }, std::chrono::milliseconds{100});
+        return 7; }, std::chrono::milliseconds{100});
     /**
      * 超预算提前返回
      */

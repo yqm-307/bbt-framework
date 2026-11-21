@@ -1,8 +1,8 @@
 #pragma once
 /**
- * @brief 把一个 Redis 客户端作为组件供服务借用。
+ * @brief 多个服务可共享同一个 Redis 客户端。调整绑定只影响后续查找。
  * 组件启动时只启动自己的网络线程，不连接 Redis。业务须在协程中显式 Connect，再执行命令。
- * 地址须为数值 IPv4 或 IPv6，不解析主机名。关闭由组件负责，不要在借用结束后保存组件引用。
+ * 地址须为数值 IPv4 或 IPv6。持有组件强引用期间可发起命令，组件关闭后返回 Closed。
  */
 
 #include <atomic>
@@ -10,12 +10,12 @@
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <mutex>
+
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
+
 #include <utility>
 #include <vector>
 
@@ -69,7 +69,7 @@ public:
     RedisNetResource(detail::ConstructKey key, Options options);
 
     /**
-     * @brief 在持有组件借用的协程中，用 bbt_co_await 执行 Redis 命令；客户端错误原样返回。
+     * @brief 已启动时在协程中用 bbt_co_await 执行 Redis 命令，客户端错误原样返回。
      */
     bbt_co_async(bbt::infra::result<void>) Connect(
         const bbt::infra::CallOptions& options);
@@ -119,18 +119,27 @@ protected:
 private:
     /**
      * 先关闭客户端，再停止 Engine 并等待线程退出。OnStop 和析构都可调用。
+     * Run 返回错误且引擎仍在 Closing 时，首次调用报告原错误并保留引擎。
+     * 后续调用在原生线程重试，返回这次清理的结果。
      */
-    void Close() noexcept;
+    std::error_code Close() noexcept;
 
+    enum class Closure {
+        Open,
+        Sealed,
+        Stopped
+    };
+
+    struct EngineExit;
     const Options m_options;
     std::shared_ptr<bbt::infra::net::Engine> m_engine;
     std::shared_ptr<bbt::infra::redis::CoRedisCli> m_client;
-    std::thread m_engine_thread;
+    std::shared_ptr<EngineExit> m_engine_exit;
     std::future<std::error_code> m_engine_result;
+    std::shared_ptr<EngineExit> m_engine_finalize_exit;
+    std::future<std::error_code> m_engine_finalize;
 
-    mutable std::mutex m_mtx;
-    bool m_closed{false};
-    bool m_engine_stopped{false};
+    std::atomic<Closure> m_closure{Closure::Open};
 
     friend class detail::Registry;
 };

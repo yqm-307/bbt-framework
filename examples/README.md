@@ -5,7 +5,7 @@
 
 | 需求 | 例程 | 公开面 | 边界 |
 |---|---|---|---|
-| 组件式业务复用：两个 Service 共享一个受管组件实例 | [`component_services/`](component_services/README.md) | `CoApp::CoInstallComponent/CoInstallService`、`ServiceOptions::BindComponent`、服务内的 `BorrowComponent` | 同进程、同一 App/Registry 内共享实例；跨进程只能复用代码/协议 |
+| 组件式业务复用：两个 Service 共享一个受管组件实例 | [`component_services/`](component_services/README.md) | `CoApp::CoInstallComponent/CoInstallService`、`ServiceOptions::BindComponent`、`GetComponent` 与 `lock()` | 同进程、同一 App/Registry 内共享实例；跨进程只能复用代码/协议 |
 | 组件热拔插与 hook | 同上 | `CoBindComponent/CoUnbindComponent`、`CoUninstallComponent/CoInstallComponent`、`CoComponent` 生命周期/`OnBindingChanged`、`CoObserve`/`ObserverToken`、`LifecycleFailures` | 换的是受管组件实例，不是 dlopen/代码热更新；不跨进程热共享 |
 | 跨进程模块复用（代码层） | 同上（`node` 模式） | 同一业务头 `store.hpp` 在独立进程各自装配 | 两个进程各有独立组件实例，不是 RPC、不是集群、不是服务发现 |
 | 结构化 RPC / 跨语言 wire | [`getvalue/`](getvalue/README.md) | `CoService` + `kRpcMethods`（`ProtoMethod`）、V2 会话（`SessionFrame`）+ `ProtoCodec` | 需要 protobuf 前缀与 `BBT_INFRA_RPC_NET=ON`；单服务 |

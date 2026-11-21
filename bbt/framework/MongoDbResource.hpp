@@ -1,12 +1,12 @@
 #pragma once
 /**
- * @brief 把一个 MongoDB 集合绑定为组件，供业务借用后读写。
- * 在协程内用 bbt_co_await 执行命令，不要保存超出借用期的组件引用。
+ * @brief 在多个服务间共享一个 MongoDB 集合，组件所有者负责关闭数据库。
+ * 协程持有组件强引用即可读写。组件关闭后，新调用返回 Closed。
  * 组件管理数据库工作线程；关闭单个集合句柄只影响该句柄，不会停止同一数据库的其他集合。
  */
 
+#include <atomic>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,7 +16,9 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/mongo/Bson.hpp>
-#include <bbt/infra/mongo/Client.hpp>
+#include <bbt/infra/mongo/CoMongoColl.hpp>
+#include <bbt/infra/mongo/CoMongoDb.hpp>
+#include <bbt/infra/mongo/MongoTypes.hpp>
 
 #include <bbt/framework/Component.hpp>
 #include <bbt/framework/Object.hpp>
@@ -69,7 +71,7 @@ public:
     MongoDbResource(detail::ConstructKey key, Options options);
 
     /**
-     * @brief 在持有组件借用的协程中，用 bbt_co_await 调用集合命令。
+     * @brief 在协程中用 bbt_co_await 调用已启动的集合。
      * UpdateMany 和 DeleteMany 不接受空过滤条件；Find 必须指定 limit。超过允许范围返回 InvalidArgument。
      */
     bbt_co_async(bbt::infra::result<void>) InsertOne(
@@ -144,12 +146,17 @@ private:
     void Close() noexcept;
 
     const Options m_options;
-    std::shared_ptr<bbt::infra::mongo::CoMongoDb> m_db;
-    std::shared_ptr<bbt::infra::mongo::CoMongoColl> m_coll;
-
-    mutable std::mutex m_mtx;
-    bool m_closed{false};
-    bool m_coll_closed{false};
+    struct Handles {
+        std::shared_ptr<bbt::infra::mongo::CoMongoDb> db;
+        std::shared_ptr<bbt::infra::mongo::CoMongoColl> coll;
+    };
+    std::shared_ptr<Handles> m_handles;
+    enum class Closure {
+        Open,
+        NoCollection,
+        CollectionClosed
+    };
+    std::atomic<Closure> m_closure{Closure::Open};
 
     friend class detail::Registry;
 };

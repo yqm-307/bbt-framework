@@ -21,8 +21,8 @@
 1. **显式装配**：`CoInstallComponent<PriceBook>("pricing", v1)`；
    `CatalogService` 安装时用 `ServiceOptions::BindComponent<PriceBook>("pricing")`
    声明式绑定；`CartService` 安装后由场景用 `CoBindComponent` 运行期绑定。
-2. **受管借用**：服务在启动 hook 中用 `BorrowComponent<PriceBook>("pricing")`
-   查找绑定并取得 RAII 借用后读写。需要保留代次句柄时，仍可分开调用 `GetComponent` 和 `Borrow`。
+2. **共享实例**：服务在启动 hook 中用 `GetComponent<PriceBook>("pricing")` 查找当前绑定，
+   用句柄的 `lock()` 取得强引用后读写。同一次操作持有同一本价格本。显式 `Borrow()` 用于需要在操作期间延迟组件关闭的场景。
    组件的 `s_constructed == 1` 与场景借用读到的 `catalog_items=1`、
    `cart_qty=2` 共同证明两个 subject 用的是同一个实例。
 3. **热拔插**：解绑两个 subject → `CoUninstallComponent` 卸载旧实例（`OnStop`

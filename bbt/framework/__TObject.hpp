@@ -13,9 +13,8 @@ result<ComponentBorrow<C>> MakeComponentBorrow(std::shared_ptr<void> lease,
         ComponentBorrow<C>(std::move(lease), obj));
 }
 template <class C>
-ComponentHandle<C> MakeComponentHandle(ObjectHandle object,
-                                       std::uint64_t binding_generation) {
-    return ComponentHandle<C>(std::move(object), binding_generation);
+ComponentHandle<C> MakeComponentHandle(ComponentBindingSnapshot binding) {
+    return ComponentHandle<C>(std::move(binding));
 }
 } // namespace detail
 
@@ -44,8 +43,20 @@ bool ComponentHandle<C>::IsValid() const noexcept {
 }
 
 template <class C>
-ComponentHandle<C>::ComponentHandle(ObjectHandle object, std::uint64_t binding_generation)
-    : m_object(std::move(object)), m_binding_gen(binding_generation) {}
+bool ComponentHandle<C>::IsBound() const noexcept {
+    return detail::IsComponentBound(m_object, m_binding_gen);
+}
+
+template <class C>
+std::shared_ptr<C> ComponentHandle<C>::lock() const noexcept {
+    return std::static_pointer_cast<C>(m_instance.lock());
+}
+
+template <class C>
+ComponentHandle<C>::ComponentHandle(detail::ComponentBindingSnapshot binding)
+    : m_object(std::move(binding.object)),
+      m_instance(std::move(binding.instance)),
+      m_binding_gen(binding.binding_generation) {}
 
 template <class C>
 ComponentBorrow<C>::ComponentBorrow(ComponentBorrow&& o) noexcept

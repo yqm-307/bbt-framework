@@ -201,18 +201,29 @@ public:
         const ComponentOptions& placement = {},
         const LifecycleOptions& life = {});
     /**
-     * @brief 解绑组件：封该绑定新 borrow 并等已有 borrow 排空。
-     * @return 成功 ok；目标/subject 未找到 NotFound，subject 属其他
-     *         Registry InvalidArgument；排空超时原错误透出并记
-     *         LifecycleFailure（retiring 边保留待再次调用收口）。
-     *         排空并移除绑定后锁外派发 bound=false 事件，通知抛异常只记
-     *         LifecycleFailure，解绑结果保持不变。
+     * @brief 原子替换 subject 的 (C, slot) 所指实例。
+     * @return 新绑定的快照；验证失败时保留原关系。
+     */
+    template <class C>
+    bbt_co_async(result<ComponentHandle<C>>) CoRebindComponent(
+        const ObjectHandle& subject, std::string_view slot, std::string_view target_name,
+        const ComponentOptions& placement = {});
+    /**
+     * @brief 摘除 subject 的 (C, slot) 关系并锁外通知。
+     * placement 匹配当前目标归属。已取得的 Borrow 可继续使用原资源。
      */
     template <class C>
     bbt_co_async(result<void>) CoUnbindComponent(
-        const ObjectHandle& subject, std::string_view name,
-        const ComponentOptions& placement = {},
-        const LifecycleOptions& life = {});
+        const ObjectHandle& subject, std::string_view slot,
+        const ComponentOptions& placement = {});
+    /**
+     * @brief 摘除绑定并排空该代的显式 Borrow，排空后才通知。
+     * 超时保留该代以供四参数入口重试。普通 shared_ptr 不参与排空。
+     */
+    template <class C>
+    bbt_co_async(result<void>) CoUnbindComponent(
+        const ObjectHandle& subject, std::string_view slot,
+        const ComponentOptions& placement, const LifecycleOptions& life);
     /**
      * @brief 非拥有关系边（本切片未实现）。
      * @return 恒 UnsupportedRoute。
@@ -353,7 +364,8 @@ private:
     template <class T>
     result<void> _RunHookCo(
         const ObjectId& id, result<void> (T::*hook)(),
-        const char* phase, bbt::coroutine::Deadline deadline);
+        const char* phase, bbt::coroutine::Deadline deadline,
+        bool remember_stop = false);
     /**
      * 安装/卸载 hook 在已通过门禁的调用协程内、Registry 锁外执行。
      */
@@ -381,14 +393,11 @@ private:
     /**
      * 对象收口尾部：撤销其签发的 observer token、FinishDestroy 移除登记、
      * 排空 inactive observer lease、锁外派发事件并归还 owner。
-     * `on_entry`（可空）在持锁且条目存在时执行服务侧清理。
      */
-    void _FinishObject(
-        const ObjectId& id,
-        const std::function<void(detail::RegistryEntry&)>& on_entry = {});
+    void _FinishObject(const ObjectId& id);
     /**
-     * OnBindingChanged 锁外派发：subject 经 owner lease 保活（并发卸载不能
-     * 先于本调用销毁对象），异常只记 LifecycleFailure——绑定/解绑不回滚。
+     * OnBindingChanged 锁外派发：调用方在锁内取得 subject 的回调资格，
+     * 收口等已接纳通知退出。异常只记 LifecycleFailure，不回滚关系。
      */
     void _NotifyBindingChanged(ObjectKind kind, void* subj,
                                const BindingEvent& be, const char* op);
@@ -423,14 +432,14 @@ private:
     result<void> _UninstallActorTypeImpl(std::string_view actor_type,
                                          const LifecycleOptions& life);
 
-    result<std::pair<ObjectHandle, std::uint64_t>> _BindComponentImpl(
+    result<detail::ComponentBindingSnapshot> _BindComponentImpl(
         const std::type_info& ctype, const ObjectHandle& subject,
-        std::string_view name, const ComponentOptions& placement,
-        const LifecycleOptions& life);
+        std::string_view slot, std::string_view target_name,
+        const ComponentOptions& placement, bool replace);
     result<void> _UnbindComponentImpl(
         const std::type_info& ctype, const ObjectHandle& subject,
-        std::string_view name, const ComponentOptions& placement,
-        const LifecycleOptions& life);
+        std::string_view slot, const ComponentOptions& placement,
+        const LifecycleOptions* drain);
     result<ObjectHandle> _FindComponentImpl(
         const std::type_info& ctype, std::string_view name,
         const ComponentOptions& placement) const;
@@ -512,11 +521,14 @@ private:
      * LifecycleFailure 并继续。
      */
     void _StopAll(bbt::coroutine::Deadline deadline);
-    void _DestroyService(const ObjectId& id,
-                         bbt::coroutine::Deadline deadline);
-    void _DestroyComponent(const ObjectId& id,
-                           bbt::coroutine::Deadline deadline);
-    void _DestroyActor(const ObjectId& id);
+    result<void> _DestroyService(const ObjectId& id,
+                                 bbt::coroutine::Deadline deadline,
+                                 bool uninstall = false);
+    result<void> _FinishService(const ObjectId& id, const char* operation,
+                                ObjectState incomplete_state);
+    result<void> _DestroyComponent(const ObjectId& id,
+                                   bbt::coroutine::Deadline deadline);
+    void _DestroyActor(const ObjectId& id, bbt::coroutine::Deadline deadline);
     /**
      * 记录清理失败的原因，标记未完成并结束本次操作。
      */

@@ -51,7 +51,9 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/syntax/Async.hpp>
 
-#include <bbt/infra/mongo/Client.hpp>
+#include <bbt/infra/mongo/CoMongoColl.hpp>
+#include <bbt/infra/mongo/CoMongoDb.hpp>
+#include <bbt/infra/mongo/MongoTypes.hpp>
 #include <bbt/infra/net/Address.hpp>
 
 #include <bbt/framework/Framework.hpp>

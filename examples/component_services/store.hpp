@@ -252,20 +252,19 @@ protected:
     result<void> OnStart() override {
         Emit("event=service_hook service=catalog phase=start");
         /**
-         * 声明式绑定在安装时建立；此时组件已 Running，可借用并写共享状态。
+         * 这次调用固定当前价格本。后续改绑只影响下一次查找。
          */
-        auto b = BorrowComponent<PriceBook>(kPricingSlot);
-        if (!b) {
-            Emit("event=catalog_start error=borrow code=" +
-                 std::to_string(int(b.error().code)));
-            return result<void>::err(std::move(b.error()));
-        }
-        PriceBook& book = b.value().Get();
-        book.AddCatalogItem("sku-widget", book.UnitPriceCents());
+        auto binding = GetComponent<PriceBook>(kPricingSlot);
+        if (!binding)
+            return result<void>::err(std::move(binding.error()));
+        auto book = binding.value().lock();
+        if (!book)
+            return result<void>::err(MakeError(ErrorCode::Closed, "price book expired"));
+        book->AddCatalogItem("sku-widget", book->UnitPriceCents());
         Emit("event=catalog_start instance_seq=" +
-             std::to_string(book.InstanceSeq()) + " unit_price=" +
-             std::to_string(book.UnitPriceCents()) + " catalog_items=" +
-             std::to_string(book.CatalogSize()));
+             std::to_string(book->InstanceSeq()) + " unit_price=" +
+             std::to_string(book->UnitPriceCents()) + " catalog_items=" +
+             std::to_string(book->CatalogSize()));
         return result<void>::ok();
     }
 
@@ -280,21 +279,14 @@ protected:
 
     void OnBindingChanged(const BindingEvent& ev) override {
         /**
-         * 安装期绑定发生在服务 Installing 的装配窗口内，Registry 允许借
-         * Installed 依赖做纯内存装配；运行期重绑同样可借。这里只记录事实。
+         * 通知到达时查当前绑定，记录此刻可见的实例。
          */
         std::string line = "event=binding_hook service=catalog bound=";
         line += ev.bound ? "1" : "0";
         auto h = GetComponent<PriceBook>(kPricingSlot);
-        if (h) {
-            auto b = h.value().Borrow();
-            line += " borrow=";
-            line += b ? "1" : "0";
-            line += " instance_seq=";
-            line += b ? std::to_string(b.value().Get().InstanceSeq()) : "-";
-        } else {
-            line += " borrow=0 instance_seq=-";
-        }
+        auto book = h ? h.value().lock() : nullptr;
+        line += " instance_seq=";
+        line += book ? std::to_string(book->InstanceSeq()) : "-";
         Emit(line);
     }
 
@@ -347,18 +339,16 @@ protected:
             Emit("event=cart_binding error=not_bound");
             return;
         }
-        auto b = h.value().Borrow();
-        if (!b) {
-            Emit("event=cart_binding error=borrow code=" +
-                 std::to_string(int(b.error().code)));
+        auto book = h.value().lock();
+        if (!book) {
+            Emit("event=cart_binding error=expired");
             return;
         }
-        PriceBook& book = b.value().Get();
-        book.AddCartLine("sku-widget", kQtyPerBinding, book.UnitPriceCents());
+        book->AddCartLine("sku-widget", kQtyPerBinding, book->UnitPriceCents());
         Emit("event=cart_binding bound=1 instance_seq=" +
-             std::to_string(book.InstanceSeq()) + " unit_price=" +
-             std::to_string(book.UnitPriceCents()) + " cart_total=" +
-             std::to_string(book.CartTotalCents()));
+             std::to_string(book->InstanceSeq()) + " unit_price=" +
+             std::to_string(book->UnitPriceCents()) + " cart_total=" +
+             std::to_string(book->CartTotalCents()));
     }
 
     friend class bbt::framework::detail::Registry;
