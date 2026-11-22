@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-22",
+  "commit": "fee7433377c750acdba8606d324c617f69a5bc23",
+  "base": "9d94cdcd558c66f4c579813df7b7fe3bcc3eea74",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_a2dbc04a/task-0）",
+  "summary": "本次增量只改 deps.lock 的两个 SHA。两者均已进入对应上游 main，infra 的 coroutine pin 与 framework 一致。无阻塞项。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对实际构建依赖清单、链接来源和 smoke JUnit；18 项通过，含此前失败的 ordered_ingress_rpc 和 coapp_lifecycle。远端 CI 不在本审查结论内。",
+      "evidence": {
+        "reviewer": "独立只读审查子代理（deleg_a2dbc04a/task-0）",
+        "scope": "9d94cdc..fee7433 的 deps.lock 增量与 pub gitlink；coroutine dc338e9 和 infra f6e011a 的上游 main 祖先关系；infra 的 cmake/coroutine.sha；本地 Release 冒烟结果。"
+      }
+    }
+  ]
+}
