@@ -1,4 +1,4 @@
 # 固定可复现依赖 SHA。CI 与 scripts/fetch_deps.sh 只认本文件。
 # 格式：name repo=<url> sha=<40hex> dir=<BBT_DEPS_DIR 下目录名>
-coroutine repo=https://github.com/yqm-307/bbtools-coroutine.git sha=b60a924e401c3f40d684988e4b1977c5aadeb92c dir=coroutine-main
-infra repo=https://github.com/yqm-307/bbtools-infra.git sha=a52bcf69c32428e7317867463b92b0b266d8836e dir=infra-main
+coroutine repo=https://github.com/yqm-307/bbtools-coroutine.git sha=dc338e9b0c463a3a2a156b003485c801c2fad60f dir=coroutine-main
+infra repo=https://github.com/yqm-307/bbtools-infra.git sha=f6e011ac9f50487d1f66b095bda0a33b43f8aee6 dir=infra-main
