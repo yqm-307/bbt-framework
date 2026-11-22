@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-22",
+  "commit": "571cdf6f8244f37aa96119904cf9b7a24d5393f0",
+  "base": "5dd17757d5d437428f1852bb18ce9515baabcebf",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_5dc2e796/task-0）",
+  "summary": "确认 framework 代码提交只更新 bbtools-pub gitlink，目标 pub 与嵌套 toolkit 均已合入各自 main，旧新 SHA、提交说明、作者和工作树状态符合门禁。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "独立只读复核通过，确认依赖指针 provenance、提交范围和 framework 门禁要求。",
+      "evidence": {
+        "reviewer": "独立只读审查子代理（deleg_5dc2e796/task-0）",
+        "scope": "571cdf6f8244f37aa96119904cf9b7a24d5393f 相对 5dd17757d5d437428f1852bb18ce9515baabcebf 的完整 diff、framework AGENTS.md、docs/guides/development.md、pub/toolkit gitlink 与 main ancestry"
+      }
+    }
+  ]
+}
