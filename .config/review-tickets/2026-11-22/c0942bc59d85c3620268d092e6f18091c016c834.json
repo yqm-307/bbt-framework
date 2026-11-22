@@ -1,0 +1,21 @@
+{
+    "schema_version": 1,
+    "date": "2026-11-22",
+    "commit": "c0942bc59d85c3620268d092e6f18091c016c834",
+    "base": "5dd17757d5d437428f1852bb18ce9515baabcebf",
+    "result": "pass",
+    "reviewer": "独立只读审查子代理（deleg_16ce36af/task-0）",
+    "summary": "确认 framework 依赖锁修复为最小变更，coroutine pin 与 infra 当前固定消费版本一致，既有 bbtools-pub 指针 provenance 和完整变更范围符合门禁。",
+    "checks": [
+        {
+            "id": "llm-review",
+            "kind": "attested",
+            "status": "pass",
+            "summary": "独立只读复核通过，确认 deps.lock 修复、依赖 SHA provenance、pub 指针连续性和提交范围。",
+            "evidence": {
+                "reviewer": "独立只读审查子代理（deleg_16ce36af/task-0）",
+                "scope": "c0942bc 相对 5dd1775 的完整 diff、framework AGENTS.md、docs/guides/development.md、deps.lock、bbtools-infra cmake/coroutine.sha 与 provenance、bbtools-pub/toolkit main ancestry"
+            }
+        }
+    ]
+}
