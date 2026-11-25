@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-26",
+  "commit": "ff8eb65e47b0f1f2d9f466fe1c60caed3818b4d8",
+  "base": "ed4857f5ce60a9aff1f873085013bdb4863566b2",
+  "result": "pass",
+  "reviewer": "GPT-6.2 Astra",
+  "summary": "独立审查已固定的完整候选，未发现阻断项。核对 lint 覆盖与错误区分、hook/CI 接线及协程注册语义；关闭用例的同一偶发失败在未改动基线也复现。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "独立审查核对门禁、文档及调度替换，不改变现有 push 规则与显式栈要求。",
+      "evidence": {
+        "reviewer": "GPT-6.2 Astra",
+        "scope": "ed4857f5ce60a9aff1f873085013bdb4863566b2..ff8eb65e47b0f1f2d9f466fe1c60caed3818b4d8 (tree 3d6691dfa182a85524505d0b3092f68e97af811e)"
+      }
+    }
+  ]
+}
