@@ -6,11 +6,15 @@
 
 新 clone 或 worktree 按 [README](../../README.md#构建与测试) 初始化两级 submodule。按 `third-party/bbtools-pub/README.md` 选择职责提示词与规范，本仓补充见 [AGENTS.md](../../AGENTS.md#规范与真源入口)。升级 pub 时核对目标提交已合入其 `main`，检查新旧提交间的规范和工具变化，单独提交 gitlink 并注明两个 SHA。
 
-以下命令从 framework 仓库根执行。检查范围分别由源码目录和 Git 基准决定。
+以下命令从 framework 仓库根执行。检查范围分别由源码目录、`.config/lint.toml` 和 Git 基准决定。
 
 ```sh
-# C++ 候选扫描。只读取框架库，避免将 submodule、构建产物或 fork 业务算进结果。
-python3 -I third-party/bbtools-pub/tools/lint/lint.py --root bbt/framework
+# 与 CI 相同的 C++ 候选报告；建议在干净工作树运行。
+python3 -I scripts/ci/check_lint.py --root .
+
+# 需要机器处理的原始报告（不转换退出码）。
+python3 -IB third-party/bbtools-pub/tools/lint/lint.py --root . \
+  --config .config/lint.toml --format json
 
 # C++ 接口或实现的复杂度审查。需在已有 Python 3.11+、lizard 1.25.0 环境中运行。
 python3 third-party/bbtools-pub/tools/complexity/complexity.py scan --root . \
@@ -18,14 +22,14 @@ python3 third-party/bbtools-pub/tools/complexity/complexity.py scan --root . \
   --base origin/main --format markdown
 ```
 
-- **lint** 需要 Python 3.11+。手动扫描采用 pub 默认 C++ 规则。退出 0 表示工具未报告扫描覆盖错误，诊断项仍须人工判断。退出 2 时先看 `T000` 报出的输入或覆盖问题。规则与输出见 `third-party/bbtools-pub/tools/lint/README.md`。
+- **lint** 需要 Python 3.11+，使用 pub 的词法候选扫描；报告包含框架库、示例和测试。原始扫描退出 `0` 只表示未报告覆盖错误，退出 `2` 表示覆盖不足或工具错误。候选不是缺陷判定；已知词法局限与工具失败在 [CI](ci.md#1-组成) 中区别处理。规则与输出见 `third-party/bbtools-pub/tools/lint/README.md`。
 - **复杂度** 用 pub 的示例配置比较 `bbt/` 下的库代码与 `origin/main` 的共同基准。结果供 reviewer 定位新增或恶化项。缺少依赖、分析失败或覆盖不全时注明原因。工具环境与评分方法见 `third-party/bbtools-pub/tools/complexity/README.md`。
 
-## 本地 push 门禁
+## 本地 Git 门禁
 
-`.config/bbt-git-hooks/pre-push` 转发到 pub 的公开 hook。framework 只提供 pre-push 包装脚本。启用后的检查项和顺序由 `.config/bbt-git-hooks.toml`（schema 1）定义。上面的手动扫描独立于这份推送配置。
+`.config/bbt-git-hooks/` 的 `commit-msg` 和 `pre-push` 转发到 pub 的公开 hook，和手动扫描共用 `.config/lint.toml`（schema 2）。启用后，提交检查暂存快照，推送按实际提交和远端基准校验。候选扫描不在 hook 中运行；头文件实现规则只提示，整文件格式仍只在推送阶段检查。
 
-- 启用前用 `git config --get core.hooksPath` 和 `git rev-parse --git-path hooks` 核对现有配置与 hook 目录，保留已有 hook 系统。确认可用后，单次推送可用 `git -c core.hooksPath=.config/bbt-git-hooks push`。
+- 启用前用 `git config --get core.hooksPath` 和 `git rev-parse --git-path hooks` 核对现有配置与 hook 目录，保留已有 hook 系统。确认可用后，单次操作可用 `git -c core.hooksPath=.config/bbt-git-hooks commit` 或同样方式执行 `push`。
 - 需要持久启用时，`git config --local core.hooksPath .config/bbt-git-hooks` 会影响同仓所有 linked worktree。先确认共享影响。已有 `extensions.worktreeConfig` 时可仅设置当前 worktree。
 - 审查通过后为被审提交生成 ticket，并以仅含 `.config/review-tickets/` 的下一笔提交保存。范围与生成命令见 `third-party/bbtools-pub/tools/lint/rules/review-ticket/README.md`。hook 校验已有审查凭据，实际独立审查按根 AGENTS 的门禁执行。
 

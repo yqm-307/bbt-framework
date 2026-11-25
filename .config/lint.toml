@@ -1,0 +1,24 @@
+schema_version = 2
+timeout_seconds = 60
+
+[scan]
+rules = ["coroutine-sugar", "T101", "T301", "T401", "T501"]
+
+[commit]
+rules = ["whitespace", "comment-form", "template-layout", "new-root", "third-party-layout", "header-implementation"]
+
+[push]
+rules = ["review-ticket", "llm-review", "format"]
+
+[layout]
+allowed_roots = ["bbt", "tests", "examples", "docs", "scripts", ".github", ".config", "docker", "third-party"]
+allowed_gitlinks = ["third-party/bbtools-pub"]
+
+[scope]
+exclude = ["third-party/*", "build/*", "Build/*", "build-*/*", ".worktrees/*", ".deps/*", ".ci-work/*", "boost-prefix/*"]
+
+[format]
+binary = "clang-format"
+
+[rules.header-implementation]
+level = "notice"

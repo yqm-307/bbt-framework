@@ -11,7 +11,7 @@
 
 ## 格式与文档
 
-- 机械格式取仓根 `.clang-format` 和 `.editorconfig`。framework 保留手工折行（`ColumnLimit: 0`）与函数左花括号同行的风格。CI 的 format-diff 检查改动行。本地 pre-push 的 format 规则对推送中改动的 C/C++ 文件做整文件检查。全仓迁移须单独决策和提交。
+- 机械格式取仓根 `.clang-format` 和 `.editorconfig`。framework 保留手工折行（`ColumnLimit: 0`）与函数左花括号同行的风格。CI 的 format-diff 检查改动行。本地 pre-push 的 format 规则对推送中改动的 C/C++ 文件做整文件检查。全仓迁移须单独决策和提交。其它 lint 检查入口见[开发指南](guides/development.md#固定规范与本地工具)。
 - 注释采用 `third-party/bbtools-pub/docs/cpp/comments.md`。需要解释关闭时序或责任转移时，可在实现旁放 ASCII 图或 PlantUML。`TODO` 写明改进方向和触发条件。
 - `README.md` 提供现状、最短用法及文档入口，上限 200 行。架构契约放 `docs/architecture/`，操作说明放 `docs/guides/`。ADR 按 `docs/decisions/NNNN-<slug>.md` 唯一递增编号，合入后只追加取代关系。文件名用主题，ADR 以外不加过程编号。
 - 同一事实只在一处写全，文档与对应代码同一 PR 更新。运行日志、原始报告、构建产物与本机路径留在仓外。文档检查命令见[开发指南](guides/development.md#本地验证)。

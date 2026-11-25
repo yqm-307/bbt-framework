@@ -53,7 +53,7 @@
 
 - 提交标题使用 `<type>(<scope>): <简洁中文说明>`，单次提交不混无关变更；目标测试通过且无新增警告后才允许 commit。交付前检查无意外改动并报告未覆盖项。
 - Author 固定为用户本人 `yqm-307`：用本机 git 配置（`user.name=yqm-307`）直接提交，不加 `--author`，不使用 agent 身份。
-- 代码 commit 审查通过后单独提交 review ticket，再推送。本仓只接入 pre-push；启用方式见 `docs/guides/development.md`「本地 push 门禁」。
+- 代码 commit 审查通过后单独提交 review ticket，再推送。提交和推送 hook 的启用方式见 `docs/guides/development.md`「本地 Git 门禁」。
 - 不直推 `main`、不自行合并或发布；远端写入后回读确认目标对象。CI 失败先读日志定位根因，不靠重跑掩盖；业务代码修复可自主做，CI/CD 配置修改须先获确认。
 
 ### 审查门禁

@@ -32,8 +32,9 @@ result<void> ActorMailbox::TryEnqueue(Task task) {
 
     // 持锁注册唯一 drain，使它取队前看到 m_draining。注册失败时只回滚队尾。
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [self = shared_from_this()]() { self->_Drain(); }, succ);
+    bbtco_noexcept(&succ)[self = shared_from_this()]() {
+        self->_Drain();
+    };
     if (!succ) {
         m_queue.pop_back();
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,

@@ -1242,7 +1242,7 @@ result<void> CoApp::_RunHookCo(
     };
     try {
         bool submitted = false;
-        g_scheduler->RegistCoroutineTask(task, submitted);
+        bbtco_noexcept(&submitted) task;
         if (!submitted) {
             m_registry->NoteHookSettled(id);
             return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
