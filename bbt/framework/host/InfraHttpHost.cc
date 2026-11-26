@@ -148,6 +148,7 @@ result<void> InfraHttpHost::_AdmitRpc(const std::shared_ptr<HandlerState>& state
         return result<void>::err(MakeError(ErrorCode::Overloaded, "inbound rpc: queue full"));
     state->queue.push_back(std::move(item));
     bool registered = false;
+    // NOLINTNEXTLINE(coroutine-sugar) 保留 RPC worker 的 256 KiB 栈；语法糖尚不支持显式栈大小。
     g_scheduler->RegistCoroutineTask(256 * 1024, [state] { _RunRpc(state); }, registered);
     if (!registered) {
         /**

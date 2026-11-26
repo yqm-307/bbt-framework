@@ -1,14 +1,15 @@
 # bbt-framework CI 说明
 
 本文说明 bbt-framework 当前
-`.github/workflows/ci.yml` 与 `.github/workflows/manual.yml` 的组成、门禁清单与固定
+`.github/workflows/ci.yml`、`.github/workflows/lint.yml` 与 `.github/workflows/manual.yml` 的组成、门禁清单与固定
 输入；workflow 文件本身是权威定义，本文不复制其步骤，只给门禁索引与语义。
 
 ## 1. 组成
 
 | 文件 | 作用 |
-|---|---|---|
-| `.github/workflows/ci.yml` | 普通 CI 唯一入口：`changes → docs_check → build_test → result` 四个 hosted job（`ubuntu-24.04`）。`build_test` 在单 runner 内完成 Release 构建 + smoke profile 测试（必要时同一构建树追加 focused），不跨 runner 传归档；`workflow_dispatch` 仅用于手动重跑同一普通流程 |
+|---|---|
+| `.github/workflows/ci.yml` | 构建与必过检查入口：`changes → docs_check → build_test → result` 四个 hosted job（`ubuntu-24.04`）。`build_test` 在单 runner 内完成 Release 构建 + smoke profile 测试（必要时同一构建树追加 focused），不跨 runner 传归档；`workflow_dispatch` 仅用于手动重跑同一普通流程 |
+| `.github/workflows/lint.yml` | 独立的 `C++ lint report`，在指向 `main` 的 PR、推送到 `main` 或手动触发时，初始化固定版 pub 并运行 `scripts/ci/check_lint.py`。不进入原有 `result`，不新增 required check。普通候选只报告；有效报告中的已知词法覆盖不足发告警；配置、输入、工具或报告错误令此 job 失败。|
 | `.github/workflows/manual.yml` | 手动任务（仅 `workflow_dispatch`，非 required）：`toolchain-verify` 与 `resource-acceptance`（`arc-s4-framework`），见 §7 |
 | `scripts/ci/changed_files.py` | 从真实 git diff 归一受限变更集，完成路径分类（本仓内联，见 §2），并按 `FOCUSED_MAP` 前缀映射产出 `focused_regex`（见 §5 必要 focused） |
 | `scripts/ci/result.py` | result job 的本仓内联汇总：needs.*.result → verdict，fail-closed（见 §3） |

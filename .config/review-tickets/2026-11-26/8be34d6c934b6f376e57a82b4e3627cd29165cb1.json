@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-26",
+  "commit": "8be34d6c934b6f376e57a82b4e3627cd29165cb1",
+  "base": "ed4857f5ce60a9aff1f873085013bdb4863566b2",
+  "result": "pass",
+  "reviewer": "GPT-6.2 Astra",
+  "summary": "既有 lint 接入范围已有独立审查；本次增量只修测试夹具的原生阻塞等待，独立审查通过。之后仅按提交门禁修正注释形态，重新编译与关闭用例通过。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对协作等待、早晚放行、夹具清理、未改变的真实 RPC 断言及两分钟等待上限。",
+      "evidence": {
+        "reviewer": "GPT-6.2 Astra",
+        "scope": "ed4857f5ce60a9aff1f873085013bdb4863566b2..ff8eb65e47b0f1f2d9f466fe1c60caed3818b4d8 + d0c7920790eacdaf16d0dc7403d931ef0cb3a222..8be34d6c934b6f376e57a82b4e3627cd29165cb1；增量审查 tree fe5583de5548b7d4fe9ed712e3741815c49bb9a8，后续仅调整注释及空白"
+      }
+    }
+  ]
+}
