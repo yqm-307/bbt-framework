@@ -683,12 +683,9 @@ struct AppBox {
         std::make_shared<std::shared_ptr<fw::CoApp>>();
     std::unique_ptr<RunHandle> run;
     std::string endpoint;
-    /**
-     * 首次 CoStop 后推进第二次收口的放行闩（StopIncomplete 用例使用）；
-     * 默认立即放行（正常关闭用例不依赖）。
-     */
-    std::shared_ptr<TestLatch> after_first_stop =
-        std::make_shared<TestLatch>(0);
+
+    /* 首次收口未竟才等测试放行；未安装闩时直接推进。 */
+    std::shared_ptr<CoGate> after_first_stop;
 
     std::shared_ptr<fw::CoApp> App() const { return *app_slot; }
 
@@ -706,7 +703,8 @@ struct AppBox {
     void Stop() {
         if (g_probe)
             g_probe->CompleteGate();
-        after_first_stop->CountDown();
+        if (after_first_stop)
+            after_first_stop->Open();
         if (egress_rt)
             egress_rt->Close();
         if (App())
@@ -725,7 +723,7 @@ struct AppBox {
  */
 void ServerTaskBody(
     const std::shared_ptr<std::shared_ptr<fw::CoApp>>& app_slot,
-    const std::shared_ptr<TestLatch>& after_first_stop,
+    const std::shared_ptr<CoGate>& after_first_stop,
     RunHandle* h,
     const std::function<fw::result<void>(fw::CoApp&)>& register_fn) {
     auto set_rc = [&](int rc) {
@@ -758,13 +756,15 @@ void ServerTaskBody(
             auto _r = bbt_co_await app->CoStop();
             (void)_r;
         }
+
         /**
-         * 收口未竟（Stopping/StopIncomplete）才等测试放行推进；已 Stopped
-         * 不等闩（避免每个用例白等闩窗期）。
+         * 收口未竟（Stopping/StopIncomplete）才等测试放行推进。等待必须让出
+         * 协程 worker：该线程也可能负责推进迟到出站的网络驱动。
          */
         if (app->State() == fw::AppState::StopIncomplete ||
             app->State() == fw::AppState::Stopping) {
-            after_first_stop->WaitFor(std::chrono::minutes{2});
+            if (after_first_stop)
+                (void)after_first_stop->Wait(Clock::now() + std::chrono::minutes{2});
             {
                 auto _r2 = bbt_co_await app->CoStop();
                 (void)_r2;
@@ -1315,7 +1315,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
         [](fw::CoApp& app) {
             return bbt_co_await app.CoInstallService<AcctRelaySvc>(ActorOpts());
         },
-        [](AppBox& b) { b.after_first_stop = std::make_shared<TestLatch>(1); });
+        [](AppBox& b) { b.after_first_stop = std::make_shared<CoGate>(); });
     auto peer = StartEchoPeer(Limits(std::chrono::milliseconds{30000}));
     box.peer_ep->Set(peer->endpoint);
     auto tc = StartClient(Limits(std::chrono::milliseconds{30000}));
@@ -1395,7 +1395,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
      * 迟到操作全部结束后放行第二次推进：完整收束，rc 非零
      * （记录曾超预算），不是「优雅关闭成功」。
      */
-    box.after_first_stop->CountDown();
+    box.after_first_stop->Open();
     JoinRun(box.run);
     BOOST_CHECK(box.run->rc == kExitStopIncomplete);
     BOOST_CHECK(box.App()->State() == fw::AppState::Stopped);
@@ -1424,7 +1424,7 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
         [](fw::CoApp& app) {
             return bbt_co_await app.CoInstallService<RelaySvc>(ConcurrentOpts());
         },
-        [](AppBox& b) { b.after_first_stop = std::make_shared<TestLatch>(1); });
+        [](AppBox& b) { b.after_first_stop = std::make_shared<CoGate>(); });
     auto peer = StartEchoPeer(Limits(std::chrono::milliseconds{30000}));
     box.peer_ep->Set(peer->endpoint);
     auto tc = StartClient(Limits(std::chrono::milliseconds{400}));
@@ -1495,7 +1495,7 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
     BOOST_CHECK(g_probe->HasEvent("late_handler_resumed"));
     BOOST_CHECK(peer->hits.load() == 0);
 
-    box.after_first_stop->CountDown();
+    box.after_first_stop->Open();
     JoinRun(box.run);
     BOOST_CHECK(box.run->rc == kExitStopIncomplete);
     BOOST_CHECK(box.App()->State() == fw::AppState::Stopped);
