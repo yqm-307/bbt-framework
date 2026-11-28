@@ -68,6 +68,10 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# Python 字节码缓存（scripts/ci 与 tests 下的脚本运行时生成）
+__pycache__/
+*.py[cod]
+
 # git worktree 工作区
 .worktrees/
 
