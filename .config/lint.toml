@@ -5,10 +5,11 @@ timeout_seconds = 60
 rules = ["coroutine-sugar", "T101", "T301", "T401", "T501"]
 
 [commit]
-rules = ["whitespace", "comment-form", "template-layout", "new-root", "third-party-layout", "header-implementation"]
+rules = ["whitespace", "format", "comment-form", "template-layout", "new-root", "third-party-layout", "header-implementation"]
 
+# 显式列表会覆盖 pub 默认集，secrets 须写出才会运行。
 [push]
-rules = ["review-ticket", "llm-review", "format"]
+rules = ["review-ticket", "llm-review", "format", "secrets"]
 
 [layout]
 allowed_roots = ["bbt", "tests", "examples", "docs", "scripts", ".github", ".config", "docker", "third-party"]

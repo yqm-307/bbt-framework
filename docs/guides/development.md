@@ -27,7 +27,7 @@ python3 third-party/bbtools-pub/tools/complexity/complexity.py scan --root . \
 
 ## 本地 Git 门禁
 
-`.config/bbt-git-hooks/` 的 `commit-msg` 和 `pre-push` 转发到 pub 的公开 hook，和手动扫描共用 `.config/lint.toml`（schema 2）。启用后，提交检查暂存快照，推送按实际提交和远端基准校验。候选扫描不在 hook 中运行；头文件实现规则只提示，整文件格式仍只在推送阶段检查。
+`.config/bbt-git-hooks/` 的 `commit-msg` 和 `pre-push` 转发到 pub 的 commit/push 阶段入口，和手动扫描共用 `.config/lint.toml`（schema 2）。启用后，提交检查暂存快照，推送按实际提交和远端基准校验。候选扫描不在 hook 中运行；头文件实现规则只提示，整文件格式在提交和推送阶段都检查，密钥扫描只在推送阶段查新增行。
 
 - 启用前用 `git config --get core.hooksPath` 和 `git rev-parse --git-path hooks` 核对现有配置与 hook 目录，保留已有 hook 系统。确认可用后，单次操作可用 `git -c core.hooksPath=.config/bbt-git-hooks commit` 或同样方式执行 `push`。
 - 需要持久启用时，`git config --local core.hooksPath .config/bbt-git-hooks` 会影响同仓所有 linked worktree。先确认共享影响。已有 `extensions.worktreeConfig` 时可仅设置当前 worktree。

@@ -14,16 +14,20 @@ using namespace bbt::framework;
 
 #ifdef EC_STORAGE_AVAILABLE
 result<void> SettlementService::OnStart() {
-    if (!Storage().enabled) return result<void>::ok();
+    if (!Storage().enabled)
+        return result<void>::ok();
     /**
      * 启动探针：读一次空文档，Mongo 不可达即启动失败（fail-closed）。
      */
     auto db = GetComponent<MongoDbResource>("bills");
-    if (!db) return result<void>::err(std::move(db.error()));
+    if (!db)
+        return result<void>::err(std::move(db.error()));
     auto borrow = db.value().Borrow();
-    if (!borrow) return result<void>::err(std::move(borrow.error()));
+    if (!borrow)
+        return result<void>::err(std::move(borrow.error()));
     auto filter = bbt::infra::mongo::MongoDocument::FromJson("{}");
-    if (!filter) return result<void>::err(std::move(filter.error()));
+    if (!filter)
+        return result<void>::err(std::move(filter.error()));
     auto read = bbt_co_await borrow.value().Get().FindOne(
         filter.value(),
         bbt::infra::CallOptions{std::chrono::steady_clock::now() + std::chrono::seconds{3}});
@@ -51,11 +55,14 @@ CoRpcResp SettlementService::Settle(CoRpcReq req) {
 #ifdef EC_STORAGE_AVAILABLE
     if (Storage().enabled) {
         auto db = GetComponent<MongoDbResource>("bills");
-        if (!db) return fail(db.error());
+        if (!db)
+            return fail(db.error());
         auto borrow = db.value().Borrow();
-        if (!borrow) return fail(borrow.error());
+        if (!borrow)
+            return fail(borrow.error());
         auto budget = StorageBudget();
-        if (!budget) return fail(budget.error());
+        if (!budget)
+            return fail(budget.error());
         MongoDbResource& coll = borrow.value().Get();
         auto old = ReadRecord(coll, order.order_id(), budget.value());
         if (!old && old.error().code != ErrorCode::NotFound)

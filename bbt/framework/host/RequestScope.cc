@@ -22,7 +22,7 @@ std::mutex g_scope_mtx;
 /**
  * 协程内受管上下文：键 = 协程 id（协程跨 worker 迁移时 id 不变）。
  */
-std::unordered_map<std::uint64_t, std::vector<ScopeEntry>>   g_co_scopes;
+std::unordered_map<std::uint64_t, std::vector<ScopeEntry>> g_co_scopes;
 /**
  * 非协程执行（宿主启动代码）：键 = 线程 id。
  */
@@ -31,7 +31,8 @@ std::unordered_map<std::thread::id, std::vector<ScopeEntry>> g_thread_scopes;
 template <class Map, class Key>
 void EraseScopeEntry(Map& map, const Key& key, const void* owner) {
     auto it = map.find(key);
-    if (it == map.end()) return;
+    if (it == map.end())
+        return;
     auto& stack = it->second;
     for (auto e = stack.rbegin(); e != stack.rend(); ++e) {
         if (e->owner == owner) {
@@ -39,16 +40,18 @@ void EraseScopeEntry(Map& map, const Key& key, const void* owner) {
             break;
         }
     }
-    if (stack.empty()) map.erase(it);
+    if (stack.empty())
+        map.erase(it);
 }
 
 } // namespace
 
 RequestScope::RequestScope(std::shared_ptr<const RequestContext> ctx)
     : ctx_(std::move(ctx)) {
-    if (!ctx_) return;
-    co_id_     = bbt::coroutine::GetLocalCoroutineId();
-    co_bound_  = (co_id_ != 0);
+    if (!ctx_)
+        return;
+    co_id_ = bbt::coroutine::GetLocalCoroutineId();
+    co_bound_ = (co_id_ != 0);
     thread_id_ = std::this_thread::get_id();
     std::lock_guard<std::mutex> lk(g_scope_mtx);
     if (co_bound_)
@@ -58,7 +61,8 @@ RequestScope::RequestScope(std::shared_ptr<const RequestContext> ctx)
 }
 
 RequestScope::~RequestScope() {
-    if (!ctx_) return;
+    if (!ctx_)
+        return;
     std::lock_guard<std::mutex> lk(g_scope_mtx);
     if (co_bound_)
         EraseScopeEntry(g_co_scopes, co_id_, this);

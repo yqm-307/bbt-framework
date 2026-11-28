@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "d730757ffa9798d6328afc36cacf3773157076ab",
+  "base": "00628db5006a5bea59080b7b0063b6f019393665",
+  "result": "pass",
+  "reviewer": "Hermes Agent（独立审查，GPT-6.2 Astra）",
+  "summary": "审查完整三提交范围，未发现 P0/P1 阻塞。pub gitlink 指向 pub origin/main 的 3cd7920；26 个 C/C++ 文件除排版外只删 3 条参数名注释、调整 2 处 using 顺序，宏续行与字符串字面量未变；lint.toml、两份 hook 入口与文档描述一致。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "审查对象为提交前的暂存区候选，与 base..commit 的 diff 逐字节一致（cmp 校验）。逐文件 token 对比确认只有排版变化；核对 pub 3cd7920 的 git-hooks 与 lint README。未构建或重跑测试；作者侧证据：Debug 构建 216/216，smoke 18/18，focused 20/20。",
+      "evidence": {
+        "reviewer": "Hermes Agent（独立审查，GPT-6.2 Astra）",
+        "scope": "00628db5006a5bea59080b7b0063b6f019393665..d730757ffa9798d6328afc36cacf3773157076ab：pub gitlink、26 个 C/C++ 文件、.config/lint.toml、.config/bbt-git-hooks/{commit-msg,pre-push}、docs/conventions.md、docs/guides/development.md。"
+      }
+    }
+  ]
+}

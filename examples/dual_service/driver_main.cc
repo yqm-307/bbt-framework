@@ -252,7 +252,7 @@ Reply Send(const std::string& service, const std::string& method,
         Reply reply;
     };
     auto slot = std::make_shared<Slot>();
-    bbtco[request, slot, budget, want_request_id]() mutable {
+    bbtco [request, slot, budget, want_request_id]() mutable {
         inf::CallOptions o;
         o.deadline = Clock::now() + budget;
         auto res = bbt_co_await g_runtime->client->Call(

@@ -51,10 +51,10 @@ struct AppRuntimeState {
     /**
      * 出站回调强持有同一动态表，不借用 CoApp；表内同步保护后续快照更新。
      */
-    std::shared_ptr<DynamicRouteTable>           dynamic_routes;
-    std::shared_ptr<RpcPolicy>                    rpc_policy;
+    std::shared_ptr<DynamicRouteTable> dynamic_routes;
+    std::shared_ptr<RpcPolicy> rpc_policy;
     std::shared_ptr<RpcEgress> default_egress;
-    RpcSendAppFn                                  seam_send;
+    RpcSendAppFn seam_send;
 
     /**
      * run 期受管对象（mtx 保护）。Publish 填入；Release 全部放弃。

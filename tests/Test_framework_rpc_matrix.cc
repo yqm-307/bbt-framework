@@ -76,8 +76,8 @@
  */
 #include "getvalue_service.hpp"
 
-namespace fw  = bbt::framework;
-namespace co  = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace co = bbt::coroutine;
 namespace inf = bbt::infra;
 using Clock = std::chrono::steady_clock;
 
@@ -109,7 +109,8 @@ public:
     void CountDown() {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (--m_count > 0) return;
+            if (--m_count > 0)
+                return;
         }
         m_cv.notify_all();
     }
@@ -117,10 +118,11 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    int                     m_count;
+    int m_count;
 };
 
 /**
@@ -135,7 +137,8 @@ public:
             m_open = true;
             notify.swap(m_waiters);
         }
-        for (auto& w : notify) w->Notify();
+        for (auto& w : notify)
+            w->Notify();
     }
     co::WaitStatus Wait(co::Deadline deadline) {
         auto waiter = co::sync::CoWaiter::Create();
@@ -143,14 +146,17 @@ public:
         wo.deadline = deadline;
         return waiter->WaitWithCallback(wo, [&]() -> bool {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_open) waiter->Notify();
-            else        m_waiters.push_back(waiter);
+            if (m_open)
+                waiter->Notify();
+            else
+                m_waiters.push_back(waiter);
             return true;
         });
     }
+
 private:
-    std::mutex                            m_mtx;
-    bool                                  m_open = false;
+    std::mutex m_mtx;
+    bool m_open = false;
     std::vector<co::sync::CoWaiter::SPtr> m_waiters;
 };
 
@@ -159,15 +165,15 @@ private:
  */
 
 struct CtxSnapshot {
-    bool          valid = false;
-    std::string   request_id;
-    std::string   peer_principal;
-    co::Deadline  deadline{};
+    bool valid = false;
+    std::string request_id;
+    std::string peer_principal;
+    co::Deadline deadline{};
     std::uint64_t co_id = 0;
 };
 
 struct SequenceLog {
-    std::mutex               mtx;
+    std::mutex mtx;
     std::vector<std::string> events;
     void Push(const std::string& e) {
         std::lock_guard<std::mutex> lk(mtx);
@@ -176,7 +182,8 @@ struct SequenceLog {
     int IndexOf(const std::string& e) {
         std::lock_guard<std::mutex> lk(mtx);
         for (std::size_t i = 0; i < events.size(); ++i)
-            if (events[i] == e) return static_cast<int>(i);
+            if (events[i] == e)
+                return static_cast<int>(i);
         return -1;
     }
 };
@@ -195,19 +202,20 @@ struct ProbeState {
      */
     TestLatch handler_done{1};
 
-    std::mutex                                        mtx;
-    std::map<std::string, std::shared_ptr<CoGate>>    gates;
-    std::map<std::string, CtxSnapshot>                before;
-    std::map<std::string, CtxSnapshot>                after;
-    std::map<std::string, bool>                       active;
-    std::vector<std::string>                          completed;
-    int                                               cur_active  = 0;
-    int                                               peak_active = 0;
+    std::mutex mtx;
+    std::map<std::string, std::shared_ptr<CoGate>> gates;
+    std::map<std::string, CtxSnapshot> before;
+    std::map<std::string, CtxSnapshot> after;
+    std::map<std::string, bool> active;
+    std::vector<std::string> completed;
+    int cur_active = 0;
+    int peak_active = 0;
 
     std::shared_ptr<CoGate> GateFor(const std::string& rid) {
         std::lock_guard<std::mutex> lk(mtx);
         auto& g = gates[rid];
-        if (!g) g = std::make_shared<CoGate>();
+        if (!g)
+            g = std::make_shared<CoGate>();
         return g;
     }
     bool Active(const std::string& rid) {
@@ -233,9 +241,11 @@ struct ProbeState {
         std::vector<std::shared_ptr<CoGate>> all;
         {
             std::lock_guard<std::mutex> lk(mtx);
-            for (auto& kv : gates) all.push_back(kv.second);
+            for (auto& kv : gates)
+                all.push_back(kv.second);
         }
-        for (auto& g : all) g->Open();
+        for (auto& g : all)
+            g->Open();
     }
 };
 
@@ -243,11 +253,11 @@ std::shared_ptr<ProbeState> g_probe;
 
 CtxSnapshot SnapCtx(const fw::RequestContext& c) {
     CtxSnapshot s;
-    s.valid          = true;
-    s.request_id     = c.request_id;
+    s.valid = true;
+    s.request_id = c.request_id;
     s.peer_principal = c.peer_principal;
-    s.deadline       = c.deadline;
-    s.co_id          = co::GetLocalCoroutineId();
+    s.deadline = c.deadline;
+    s.co_id = co::GetLocalCoroutineId();
     return s;
 }
 
@@ -256,13 +266,15 @@ CtxSnapshot SnapCtx(const fw::RequestContext& c) {
  * 不伪造计数。外部观测经 Options 注入的共享状态（受管对象本体不可直取）。──
  */
 struct ResShared {
-    std::atomic<int>  close_calls{0};
+    std::atomic<int> close_calls{0};
     std::atomic<bool> closed{false};
 };
 
 class OwnerResComponent final : public fw::CoComponent {
 public:
-    struct Options { std::shared_ptr<ResShared> s; };
+    struct Options {
+        std::shared_ptr<ResShared> s;
+    };
 
     explicit OwnerResComponent(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), m_s(std::move(o.s)) {}
@@ -276,7 +288,8 @@ protected:
     fw::result<void> OnStop() override {
         m_s->close_calls.fetch_add(1);
         m_s->closed.store(true, std::memory_order_release);
-        if (g_seq) g_seq->Push("resource_close");
+        if (g_seq)
+            g_seq->Push("resource_close");
         return fw::result<void>::ok();
     }
 
@@ -301,19 +314,23 @@ public:
      */
     fw::CoRpcResp Hold(fw::CoRpcReq req) {
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
-        if (!parsed) return fw::CoRpcResp::Error(parsed.error());
+        if (!parsed)
+            return fw::CoRpcResp::Error(parsed.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         auto p = g_probe;
-        if (!p) return fw::CoRpcResp::Error(fw::MakeError(
-            fw::ErrorCode::InternalError, "no probe"));
+        if (!p)
+            return fw::CoRpcResp::Error(fw::MakeError(
+                fw::ErrorCode::InternalError, "no probe"));
         const std::string rid = ctx.value()->request_id;
         {
             std::lock_guard<std::mutex> lk(p->mtx);
             p->before[rid] = SnapCtx(*ctx.value());
             p->active[rid] = true;
             ++p->cur_active;
-            if (p->cur_active > p->peak_active) p->peak_active = p->cur_active;
+            if (p->cur_active > p->peak_active)
+                p->peak_active = p->cur_active;
         }
         auto gate = p->GateFor(rid);
         p->arrived.CountDown();
@@ -326,9 +343,11 @@ public:
                  * 恢复后重新取受管上下文
                  */
                 auto ctx2 = fw::CurrentRequestContext();
-                if (ctx2) p->after[rid] = SnapCtx(*ctx2.value());
+                if (ctx2)
+                    p->after[rid] = SnapCtx(*ctx2.value());
                 p->completed.push_back(rid);
-                if (g_seq) g_seq->Push("handler_done:" + rid);
+                if (g_seq)
+                    g_seq->Push("handler_done:" + rid);
             }
             p->active[rid] = false;
             --p->cur_active;
@@ -345,7 +364,8 @@ public:
 
     fw::CoRpcResp Fast(fw::CoRpcReq req) {
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
-        if (!parsed) return fw::CoRpcResp::Error(parsed.error());
+        if (!parsed)
+            return fw::CoRpcResp::Error(parsed.error());
         bbt::example::v1::GetValueResponse out;
         out.set_found(true);
         out.set_value("fast:" + parsed.value().key());
@@ -393,34 +413,40 @@ fw::AppOptions AppOpts(std::chrono::milliseconds lifecycle_budget) {
 }
 
 struct ServerHandle {
-    std::thread                              th;
+    std::thread th;
     std::promise<std::shared_ptr<fw::CoApp>> app_ready;
-    std::promise<bool>                       started;
-    std::atomic<bool>                        done{false};
+    std::promise<bool> started;
+    std::atomic<bool> done{false};
     /**
      * 首次 CoStop 的返回（T5 记录 drain 未竟的诚实结果）。
      */
-    std::optional<fw::result<void>>          first_stop;
-    int                                      rc{-1};
+    std::optional<fw::result<void>> first_stop;
+    int rc{-1};
     /**
      * T5 用：首次 CoStop 后任务挂在本闩上等待测试放行再次推进；
      * 设置时任务在 StopIncomplete 与二次 CoStop 之间保持「未返回」。
      */
-    std::shared_ptr<TestLatch>               after_first_stop;
+    std::shared_ptr<TestLatch> after_first_stop;
 };
 
 struct RunJoinOnExit {
     std::shared_ptr<fw::CoApp>* app = nullptr;
-    ServerHandle*               h   = nullptr;
-    void JoinNow() { if (h && h->th.joinable()) h->th.join(); }
+    ServerHandle* h = nullptr;
+    void JoinNow() {
+        if (h && h->th.joinable())
+            h->th.join();
+    }
     /**
      * 失败/异常退出也必须安全收尾：先 RequestShutdown 再释放全部挂起 gate，
      * 避免存在在途 handler 时 join 无界阻塞（不依赖 ctest 超时兜底）。
      */
     ~RunJoinOnExit() {
-        if (app && *app) (*app)->RequestShutdown();
-        if (h && h->after_first_stop) h->after_first_stop->CountDown();
-        if (g_probe) g_probe->CompleteAll();
+        if (app && *app)
+            (*app)->RequestShutdown();
+        if (h && h->after_first_stop)
+            h->after_first_stop->CountDown();
+        if (g_probe)
+            g_probe->CompleteAll();
         JoinNow();
     }
 };
@@ -443,19 +469,31 @@ void ServerTaskBody(ServerHandle* h, fw::AppOptions opts,
         h->app_ready.set_value(app);
         for (auto& [name, s] : components) {
             auto installed = bbt_co_await
-                app->CoInstallComponent<OwnerResComponent>(
-                    name, OwnerResComponent::Options{std::move(s)});
-            if (!installed) { set_rc(kExitStartFailed); return; }
+                                 app->CoInstallComponent<OwnerResComponent>(
+                                     name, OwnerResComponent::Options{std::move(s)});
+            if (!installed) {
+                set_rc(kExitStartFailed);
+                return;
+            }
         }
         auto installed = bbt_co_await app->CoInstallService<NetMatrixSvc>(
             ConcurrentOpts(max_inflight));
-        if (!installed) { set_rc(kExitStartFailed); return; }
+        if (!installed) {
+            set_rc(kExitStartFailed);
+            return;
+        }
         auto started = bbt_co_await app->CoStart();
-        if (!started) { set_rc(kExitStartFailed); return; }
+        if (!started) {
+            set_rc(kExitStartFailed);
+            return;
+        }
         h->started.set_value(true);
 
         auto waited = bbt_co_await app->CoWaitShutdownRequest();
-        if (!waited) { set_rc(kExitStopIncomplete); return; }
+        if (!waited) {
+            set_rc(kExitStopIncomplete);
+            return;
+        }
 
         auto first = bbt_co_await app->CoStop();
         h->first_stop.emplace(first);
@@ -469,7 +507,8 @@ void ServerTaskBody(ServerHandle* h, fw::AppOptions opts,
             (void)second;
         }
         set_rc(app->State() == fw::AppState::Stopped
-                   ? kExitOk : kExitStopIncomplete);
+                   ? kExitOk
+                   : kExitStopIncomplete);
     } catch (...) {
         set_rc(kExitStartFailed);
     }
@@ -507,7 +546,8 @@ std::unique_ptr<ServerHandle> RunServer(
              components = std::move(components)]() mutable {
                 ServerTaskBody(p, std::move(opts), max_inflight,
                                std::move(components));
-            }, submitted);
+            },
+            submitted);
         if (!submitted) {
             p->rc = kExitStartFailed;
             p->done.store(true, std::memory_order_release);
@@ -528,7 +568,8 @@ std::string WaitEndpoint(fw::CoApp& app) {
     const auto end = Clock::now() + kWait;
     while (Clock::now() < end) {
         auto ep = app.BoundEndpoint();
-        if (!ep.empty()) return ep;
+        if (!ep.empty())
+            return ep;
         std::this_thread::yield();
     }
     return {};
@@ -538,7 +579,8 @@ bool WaitAppState(fw::CoApp& app, fw::AppState want,
                   std::chrono::milliseconds ms = kWait) {
     const auto end = Clock::now() + ms;
     while (Clock::now() < end) {
-        if (app.State() == want) return true;
+        if (app.State() == want)
+            return true;
         std::this_thread::yield();
     }
     return app.State() == want;
@@ -554,32 +596,41 @@ struct ClientEnv {
 
     bool Start() {
         inf::NetworkLimits lim{};
-        lim.max_connections  = 64;
-        lim.max_inflight     = 64;
+        lim.max_connections = 64;
+        lim.max_inflight = 64;
         lim.max_header_bytes = 16 * 1024;
-        lim.max_body_bytes   = 64 * 1024;
+        lim.max_body_bytes = 64 * 1024;
         lim.incoming_timeout = std::chrono::milliseconds{30000};
         auto r = std::make_shared<fw::InfraHttpHost>(
             lim, inf::ListenAddress{"127.0.0.1", 0}, "matrix-client");
-        if (!r) return false;
+        if (!r)
+            return false;
         rt = r;
-        if (auto s = rt->Create(); !s) return false;
-        if (auto s = rt->Start(); !s) return false;
+        if (auto s = rt->Create(); !s)
+            return false;
+        if (auto s = rt->Start(); !s)
+            return false;
         if (!rt->rpc_client())
             return false;
         egress = std::make_shared<fw::RpcEgress>(rt);
         return true;
     }
-    void Stop() { if (rt) rt->Close(); }
+    void Stop() {
+        if (rt)
+            rt->Close();
+    }
 };
 struct ClientStopOnExit {
     ClientEnv* c;
-    ~ClientStopOnExit() { if (c) c->Stop(); }
+    ~ClientStopOnExit() {
+        if (c)
+            c->Stop();
+    }
 };
 
 struct ClientCallOut {
     std::optional<fw::result<inf::rpc::Response>> r;
-    TestLatch                                     done{1};
+    TestLatch done{1};
 };
 
 /**
@@ -639,7 +690,8 @@ bool WaitCall(const std::shared_ptr<ClientCallOut>& out,
  */
 bool GetReply(const std::shared_ptr<ClientCallOut>& out,
               inf::rpc::Response& reply) {
-    if (!out || !out->r.has_value()) return false;
+    if (!out || !out->r.has_value())
+        return false;
     if (!out->r.value())
         /**
          * 业务/协议错误分支
@@ -649,7 +701,9 @@ bool GetReply(const std::shared_ptr<ClientCallOut>& out,
     return true;
 }
 
-int CodeOf(fw::ErrorCode c) { return static_cast<int>(c); }
+int CodeOf(fw::ErrorCode c) {
+    return static_cast<int>(c);
+}
 
 } // namespace
 
@@ -773,7 +827,7 @@ BOOST_AUTO_TEST_CASE(r6_concurrent_context_not_crossed) {
  */
 BOOST_AUTO_TEST_CASE(r6_client_timeout_inflight_holds_capacity) {
     g_probe = std::make_shared<ProbeState>(1);
-    g_seq   = std::make_shared<SequenceLog>();
+    g_seq = std::make_shared<SequenceLog>();
     auto res = std::make_shared<ResShared>();
     auto rh = RunServer(AppOpts(std::chrono::milliseconds{2000}), 1,
                         {{"owner-res", res}});
@@ -944,7 +998,7 @@ BOOST_AUTO_TEST_CASE(r7_capacity_overloaded_then_recovers_net) {
  */
 BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
     g_probe = std::make_shared<ProbeState>(0);
-    g_seq   = std::make_shared<SequenceLog>();
+    g_seq = std::make_shared<SequenceLog>();
     auto res = std::make_shared<ResShared>();
     auto rh = RunServer(AppOpts(std::chrono::milliseconds{2000}), 4,
                         {{"owner-res", res}});
@@ -982,7 +1036,7 @@ BOOST_AUTO_TEST_CASE(r8_normal_shutdown_after_drain) {
  */
 BOOST_AUTO_TEST_CASE(r8_shutdown_incomplete_late_completion) {
     g_probe = std::make_shared<ProbeState>(1);
-    g_seq   = std::make_shared<SequenceLog>();
+    g_seq = std::make_shared<SequenceLog>();
     auto res = std::make_shared<ResShared>();
     /**
      * 小步预算：在途 handler 让首次 CoStop 的排空步超预算 → StopIncomplete。

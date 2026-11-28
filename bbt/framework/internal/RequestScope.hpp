@@ -32,13 +32,14 @@ public:
     ~RequestScope();
     RequestScope(const RequestScope&) = delete;
     RequestScope& operator=(const RequestScope&) = delete;
+
 private:
     std::shared_ptr<const RequestContext> ctx_;
     /**
      * 登记键类型：协程 id or 线程 id
      */
     bool co_bound_ = false;
-    std::uint64_t   co_id_ = 0;
+    std::uint64_t co_id_ = 0;
     std::thread::id thread_id_;
 };
 

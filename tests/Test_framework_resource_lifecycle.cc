@@ -63,9 +63,9 @@
 #include <bbt/framework/internal/CoAppSeam.hpp>
 #include <bbt/framework/internal/NetworkHost.hpp>
 
-namespace fw  = bbt::framework;
-using bbt::framework::result;
+namespace fw = bbt::framework;
 using bbt::framework::ErrorCode;
+using bbt::framework::result;
 using Clock = std::chrono::steady_clock;
 
 namespace {
@@ -82,10 +82,14 @@ constexpr int kExitStartFailed = 1;
  */
 class StubNetHost final : public fw::INetworkHost {
 public:
-    fw::result<void> Create() override { _Record("net.create");
-        return fw::result<void>::ok(); }
-    fw::result<void> Start() override { _Record("net.start");
-        return fw::result<void>::ok(); }
+    fw::result<void> Create() override {
+        _Record("net.create");
+        return fw::result<void>::ok();
+    }
+    fw::result<void> Start() override {
+        _Record("net.start");
+        return fw::result<void>::ok();
+    }
     void StopAccepting() noexcept override { _Record("net.stop_accepting"); }
     fw::result<void> WaitHandlersDone(bbt::coroutine::Deadline) override {
         _Record("net.wait_handlers");
@@ -103,12 +107,13 @@ public:
             std::count(m_calls.begin(), m_calls.end(), name));
     }
     bool Saw(const std::string& name) const { return CountOf(name) > 0; }
+
 private:
     void _Record(const char* name) {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_calls.emplace_back(name);
     }
-    mutable std::mutex      m_mtx;
+    mutable std::mutex m_mtx;
     std::vector<std::string> m_calls;
 };
 
@@ -145,7 +150,9 @@ struct ResourceShared {
  */
 class StubResource final : public fw::CoComponent {
 public:
-    struct Options { std::shared_ptr<ResourceShared> s; };
+    struct Options {
+        std::shared_ptr<ResourceShared> s;
+    };
 
     explicit StubResource(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), m_s(std::move(o.s)) {}
@@ -181,7 +188,8 @@ protected:
      */
     result<void> OnStop() override {
         m_s->close_calls.fetch_add(1);
-        if (m_s->on_close) m_s->on_close();
+        if (m_s->on_close)
+            m_s->on_close();
         m_s->closed.store(true);
         return result<void>::ok();
     }
@@ -196,12 +204,16 @@ private:
  */
 class PlainResource final : public fw::CoComponent {
 public:
-    struct Options { int n = 0; };
+    struct Options {
+        int n = 0;
+    };
     explicit PlainResource(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), m_n(o.n) {}
     int Value() const noexcept { return m_n; }
+
 protected:
     ~PlainResource() noexcept override = default;
+
 private:
     int m_n;
     friend class fw::detail::Registry;
@@ -217,7 +229,8 @@ public:
         : fw::CoService<StubResource, PlainResource>(k) {}
     fw::CoRpcResp Ping(fw::CoRpcReq req) {
         auto v = req.Parse<std::int32_t>();
-        if (!v) return fw::CoRpcResp::Error(v.error());
+        if (!v)
+            return fw::CoRpcResp::Error(v.error());
         return fw::CoRpcResp::From(v.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
@@ -237,7 +250,8 @@ public:
         : fw::CoService<StubResource>(k) {}
     fw::CoRpcResp Ping(fw::CoRpcReq req) {
         auto v = req.Parse<std::int32_t>();
-        if (!v) return fw::CoRpcResp::Error(v.error());
+        if (!v)
+            return fw::CoRpcResp::Error(v.error());
         return fw::CoRpcResp::From(v.value());
     }
     static constexpr auto kRpcMethods = fw::RpcMethods(
@@ -289,8 +303,11 @@ void CheckNetworkNeverStarted(const StubNetHost& host) {
  */
 template <class F>
 bool RunInManagedCoroutine(F&& fn,
-    std::chrono::milliseconds budget = std::chrono::milliseconds{10000}) {
-    if (bbt::coroutine::IsInCoroutineContext()) { fn(); return true; }
+                           std::chrono::milliseconds budget = std::chrono::milliseconds{10000}) {
+    if (bbt::coroutine::IsInCoroutineContext()) {
+        fn();
+        return true;
+    }
     /**
      * native 测试宿主负责初始化唯一 runtime，产品 App 不启动 runtime。
      */
@@ -299,22 +316,26 @@ bool RunInManagedCoroutine(F&& fn,
         g_scheduler->Start();
     }
     struct Slot {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done = false;
-        std::exception_ptr      error;
+        bool done = false;
+        std::exception_ptr error;
     };
     auto slot = std::make_shared<Slot>();
     auto f = std::forward<F>(fn);
     bool submitted = false;
     g_scheduler->RegistCoroutineTask(
         [slot, f = std::move(f)]() mutable {
-            try { f(); } catch (...) { slot->error = std::current_exception(); }
+            try {
+                f();
+            } catch (...) { slot->error = std::current_exception(); }
             std::lock_guard<std::mutex> lk(slot->mtx);
             slot->done = true;
             slot->cv.notify_all();
-        }, submitted);
-    if (!submitted) throw std::runtime_error("test coroutine submission rejected");
+        },
+        submitted);
+    if (!submitted)
+        throw std::runtime_error("test coroutine submission rejected");
     std::unique_lock<std::mutex> lk(slot->mtx);
     const bool done = slot->cv.wait_for(lk, budget, [&] { return slot->done; });
     /**
@@ -322,13 +343,16 @@ bool RunInManagedCoroutine(F&& fn,
      */
     if (!done)
         std::terminate();
-    if (slot->error) std::rethrow_exception(slot->error);
+    if (slot->error)
+        std::rethrow_exception(slot->error);
     return done;
 }
 
-#define CO_TEST_CASE(name) \
-    static void name##_body(); \
-    BOOST_AUTO_TEST_CASE(name) { BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); } \
+#define CO_TEST_CASE(name)                                 \
+    static void name##_body();                             \
+    BOOST_AUTO_TEST_CASE(name) {                           \
+        BOOST_REQUIRE(RunInManagedCoroutine(name##_body)); \
+    }                                                      \
     static void name##_body()
 
 BOOST_AUTO_TEST_SUITE(framework_resource)
@@ -339,9 +363,9 @@ BOOST_AUTO_TEST_SUITE(framework_resource)
  */
 CO_TEST_CASE(factory_resources_start_and_close_in_order) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
-    auto cache_s   = std::make_shared<ResourceShared>();
+    auto cache_s = std::make_shared<ResourceShared>();
     auto session_s = std::make_shared<ResourceShared>();
     /**
      * Close 时观测：handler 排空已记录、网络宿主尚未 Close（顺序证据）。
@@ -398,7 +422,7 @@ CO_TEST_CASE(factory_resources_start_and_close_in_order) {
         BOOST_REQUIRE(svc1 && svc2);
         auto cache1 = bbt_co_await app->CoBindComponent<StubResource>(svc1.value(), "cache");
         auto cache2 = bbt_co_await app->CoBindComponent<StubResource>(svc2.value(), "cache");
-        auto sess1  = bbt_co_await app->CoBindComponent<StubResource>(svc1.value(), "session");
+        auto sess1 = bbt_co_await app->CoBindComponent<StubResource>(svc1.value(), "session");
         BOOST_REQUIRE(cache1 && cache2 && sess1);
         auto b1 = cache1.value().Borrow();
         auto b2 = cache2.value().Borrow();
@@ -457,9 +481,9 @@ CO_TEST_CASE(factory_resources_start_and_close_in_order) {
  */
 CO_TEST_CASE(factory_create_failure_rolls_back) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
-    auto ok_s   = std::make_shared<ResourceShared>();
+    auto ok_s = std::make_shared<ResourceShared>();
     auto fail_s = std::make_shared<ResourceShared>();
     /**
      * 下一次 Create 失败
@@ -521,7 +545,7 @@ CO_TEST_CASE(factory_create_failure_rolls_back) {
  */
 CO_TEST_CASE(factory_start_failure_rolls_back) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
     auto fail_s = std::make_shared<ResourceShared>();
     fail_s->fail_start.store(true);
@@ -560,8 +584,8 @@ CO_TEST_CASE(factory_start_failure_rolls_back) {
  */
 CO_TEST_CASE(resource_registration_validation) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
-    auto s    = std::make_shared<ResourceShared>();
+    auto app = MakeApp(AppOpts(), host);
+    auto s = std::make_shared<ResourceShared>();
 
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<StubResource>("a",
         StubResource::Options{s}));
@@ -569,7 +593,7 @@ CO_TEST_CASE(resource_registration_validation) {
      * 同名重复登记失败。
      */
     auto dup = bbt_co_await app->CoInstallComponent<StubResource>("a",
-        StubResource::Options{s});
+                                                                  StubResource::Options{s});
     BOOST_REQUIRE(!dup);
     BOOST_CHECK(dup.error().code == ErrorCode::InvalidArgument);
 
@@ -581,7 +605,7 @@ CO_TEST_CASE(resource_registration_validation) {
      * App 已 Stopped：登记返回 Closed。
      */
     auto late = bbt_co_await app->CoInstallComponent<StubResource>("late",
-        StubResource::Options{s});
+                                                                   StubResource::Options{s});
     BOOST_REQUIRE(!late);
     BOOST_CHECK(late.error().code == ErrorCode::Closed);
 }
@@ -592,7 +616,7 @@ CO_TEST_CASE(resource_registration_validation) {
  */
 CO_TEST_CASE(resource_close_after_handler_drain) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
     auto s = std::make_shared<ResourceShared>();
     std::atomic<bool> drained{false};
@@ -627,7 +651,7 @@ CO_TEST_CASE(resource_close_after_handler_drain) {
  */
 CO_TEST_CASE(resource_close_synchronous_and_idempotent) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
     auto s = std::make_shared<ResourceShared>();
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<StubResource>("r",
@@ -661,11 +685,13 @@ public:
     struct Options {};
     explicit ThrowingResource(fw::detail::ConstructKey k, Options)
         : fw::CoComponent(k) {}
+
 protected:
     ~ThrowingResource() noexcept override = default;
     result<void> OnStart() override {
         throw std::runtime_error("factory boom");
     }
+
 private:
     friend class fw::detail::Registry;
 };
@@ -677,7 +703,7 @@ private:
  */
 CO_TEST_CASE(factory_throw_rolls_back_via_exception_boundary) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
     auto ok_s = std::make_shared<ResourceShared>();
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<StubResource>("ok",
@@ -728,9 +754,12 @@ CO_TEST_CASE(factory_throw_rolls_back_via_exception_boundary) {
  */
 class ThrowingStartResource final : public fw::CoComponent {
 public:
-    struct Options { std::shared_ptr<ResourceShared> s; };
+    struct Options {
+        std::shared_ptr<ResourceShared> s;
+    };
     explicit ThrowingStartResource(fw::detail::ConstructKey k, Options o)
         : fw::CoComponent(k), m_s(std::move(o.s)) {}
+
 protected:
     ~ThrowingStartResource() noexcept override = default;
     result<void> OnStart() override {
@@ -747,6 +776,7 @@ protected:
         m_s->closed.store(true);
         return result<void>::ok();
     }
+
 private:
     std::shared_ptr<ResourceShared> m_s;
     friend class fw::detail::Registry;
@@ -754,7 +784,7 @@ private:
 
 CO_TEST_CASE(resource_start_throw_rolls_back_via_exception_boundary) {
     auto host = std::make_shared<StubNetHost>();
-    auto app  = MakeApp(AppOpts(), host);
+    auto app = MakeApp(AppOpts(), host);
 
     auto s = std::make_shared<ResourceShared>();
     BOOST_REQUIRE(bbt_co_await app->CoInstallComponent<ThrowingStartResource>(

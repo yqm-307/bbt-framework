@@ -34,7 +34,9 @@ NodeInfo& MutableNodeInfo() {
     return info;
 }
 
-const NodeInfo& Node() { return MutableNodeInfo(); }
+const NodeInfo& Node() {
+    return MutableNodeInfo();
+}
 
 std::string MakeInstanceId(std::string_view service) {
     return std::string(service) + "-" + std::to_string(::getpid()) + "-" +

@@ -60,9 +60,9 @@ namespace bbt::framework {
  * - is_ok == false：error 为终态错误（业务失败、取消、排队到期……）。
  */
 struct OrderedTerminalReply {
-    bool        is_ok = false;
+    bool is_ok = false;
     std::string payload;
-    Error       error;
+    Error error;
 };
 
 /**
@@ -70,7 +70,7 @@ struct OrderedTerminalReply {
  * 提取后填入；本组件只读不改，不从 user custom 推导这些值。
  */
 struct OrderedIngressRequest {
-    std::string   method;
+    std::string method;
     /**
      * 目标 Actor key（单 Actor 服务为固定 key）
      */
@@ -83,9 +83,9 @@ struct OrderedIngressRequest {
      * 是否携带有序票据（fw.* 四元组 + sequence）
      */
     bool has_ordered_stamp = false;
-    std::string   producer_id;
-    std::string   producer_epoch;
-    std::string   receiver_epoch;
+    std::string producer_id;
+    std::string producer_epoch;
+    std::string receiver_epoch;
     std::uint64_t sequence = 0;
     /**
      * rpc::Request 顶层字段，不写 metadata
@@ -105,9 +105,9 @@ struct OrderedIngressRequest {
  */
 struct OrderedIngressConfig {
     std::string service;
-    std::size_t max_ordered_streams      = 0;
-    std::size_t max_cached_results       = 0;
-    std::size_t max_cached_result_bytes  = 0;
+    std::size_t max_ordered_streams = 0;
+    std::size_t max_cached_results = 0;
+    std::size_t max_cached_result_bytes = 0;
 };
 
 /**
@@ -144,14 +144,14 @@ public:
     };
 
     struct Admission {
-        DecisionKind          kind     = DecisionKind::Execute;
-        std::uint64_t         sequence = 0;
+        DecisionKind kind = DecisionKind::Execute;
+        std::uint64_t sequence = 0;
         /**
          * 本票据所属流（Complete 据此定位序号状态；由 Admit 填充）。
          */
-        std::string           actor_key;
-        std::string           producer_id;
-        std::string           producer_epoch;
+        std::string actor_key;
+        std::string producer_id;
+        std::string producer_epoch;
         /**
          * 仅 kind == Replay 有效
          */
@@ -243,12 +243,12 @@ private:
      * 服务级终态缓存条目：sequence 为所属流内序号（键已含流标识，不再单列）。
      */
     struct CachedResult {
-        StreamKey            stream;
-        std::uint64_t        sequence = 0;
-        std::string          request_id;
-        std::string          digest;
+        StreamKey stream;
+        std::uint64_t sequence = 0;
+        std::string request_id;
+        std::string digest;
         OrderedTerminalReply reply;
-        std::size_t          bytes = 0;
+        std::size_t bytes = 0;
     };
     struct StreamState {
         /**
@@ -272,7 +272,7 @@ private:
      * 跨流可重复，必须连同 StreamKey 一起作主键。
      */
     struct CachedKey {
-        StreamKey     stream;
+        StreamKey stream;
         std::uint64_t sequence = 0;
         bool operator==(const CachedKey& o) const {
             return sequence == o.sequence && stream == o.stream;
@@ -306,9 +306,9 @@ private:
     Error _GapError(std::uint64_t next_sequence) const;
 
     const OrderedIngressConfig config_;
-    const std::string         service_;
+    const std::string service_;
 
-    mutable std::mutex        m_mtx;
+    mutable std::mutex m_mtx;
     /**
      * 已授权流
      */
@@ -319,8 +319,8 @@ private:
      * 服务级去重终态缓存（跨流共享，按全局完成序 FIFO 淘汰）。
      */
     std::unordered_map<CachedKey, CachedResult, CachedKeyHash> cached_;
-    std::deque<CachedKey>                                      cached_order_;
-    std::size_t                                                cached_bytes_ = 0;
+    std::deque<CachedKey> cached_order_;
+    std::size_t cached_bytes_ = 0;
 };
 
 } // namespace bbt::framework

@@ -45,9 +45,9 @@
 
 namespace lifecycle {
 
-namespace co  = bbt::coroutine;
-namespace fw  = bbt::framework;
-namespace pb  = bbt::example::v1;
+namespace co = bbt::coroutine;
+namespace fw = bbt::framework;
+namespace pb = bbt::example::v1;
 
 inline constexpr const char* kAuthState = "unauthenticated_loopback";
 
@@ -59,9 +59,12 @@ inline JournalFn& JournalFnRef() {
     static JournalFn fn;
     return fn;
 }
-inline void SetJournal(JournalFn fn) { JournalFnRef() = std::move(fn); }
+inline void SetJournal(JournalFn fn) {
+    JournalFnRef() = std::move(fn);
+}
 inline void Journal(const std::string& line) {
-    if (JournalFnRef()) JournalFnRef()(line);
+    if (JournalFnRef())
+        JournalFnRef()(line);
 }
 
 /**
@@ -78,7 +81,8 @@ public:
             m_open = true;
             notify.swap(m_waiters);
         }
-        for (auto& w : notify) w->Notify();
+        for (auto& w : notify)
+            w->Notify();
     }
     co::WaitStatus Wait(co::Deadline deadline) {
         auto waiter = co::sync::CoWaiter::Create();
@@ -86,15 +90,17 @@ public:
         wo.deadline = deadline;
         return waiter->WaitWithCallback(wo, [&]() -> bool {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_open) waiter->Notify();
-            else        m_waiters.push_back(waiter);
+            if (m_open)
+                waiter->Notify();
+            else
+                m_waiters.push_back(waiter);
             return true;
         });
     }
 
 private:
-    std::mutex                            m_mtx;
-    bool                                  m_open = false;
+    std::mutex m_mtx;
+    bool m_open = false;
     std::vector<co::sync::CoWaiter::SPtr> m_waiters;
 };
 
@@ -122,7 +128,6 @@ private:
     friend class bbt::framework::detail::Registry;
 
 public:
-
     /**
      * Hold：快照受管上下文 → 记录 entered → 在验收闩上以无界期限挂起
      * （让出 worker、保持物理在途、占服务容量）→ 放行后重取上下文并记录
@@ -130,9 +135,11 @@ public:
      */
     fw::CoRpcResp Hold(fw::CoRpcReq req) {
         auto parsed = req.ParseProto<pb::GetValueRequest>();
-        if (!parsed) return fw::CoRpcResp::Error(parsed.error());
+        if (!parsed)
+            return fw::CoRpcResp::Error(parsed.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
 
         const std::string rid = ctx.value()->request_id;
         const std::uint64_t co_id =
@@ -149,7 +156,7 @@ public:
         std::uint64_t co2 = 0;
         if (auto ctx2 = fw::CurrentRequestContext()) {
             rid2 = ctx2.value()->request_id;
-            co2  = static_cast<std::uint64_t>(co::GetLocalCoroutineId());
+            co2 = static_cast<std::uint64_t>(co::GetLocalCoroutineId());
         }
         Journal("event=handler_resumed req=" + rid + " ctx_id=" + rid2 +
                 " co_id=" + std::to_string(co2) +
@@ -178,9 +185,11 @@ public:
      */
     fw::CoRpcResp Fast(fw::CoRpcReq req) {
         auto parsed = req.ParseProto<pb::GetValueRequest>();
-        if (!parsed) return fw::CoRpcResp::Error(parsed.error());
+        if (!parsed)
+            return fw::CoRpcResp::Error(parsed.error());
         auto ctx = fw::CurrentRequestContext();
-        if (!ctx) return fw::CoRpcResp::Error(ctx.error());
+        if (!ctx)
+            return fw::CoRpcResp::Error(ctx.error());
         Journal("event=handler_entered method=Fast req=" +
                 ctx.value()->request_id + " auth_state=" + kAuthState);
         pb::GetValueResponse out;
