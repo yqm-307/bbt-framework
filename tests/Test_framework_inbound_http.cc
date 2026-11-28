@@ -1016,10 +1016,10 @@ AppBox StartApp(std::chrono::milliseconds incoming_timeout,
         if (ep == "self")
             ep = host->bound_endpoint();
         if (ep.empty())
-            return fw::result<inf::rpc::Response>::err(fw::MakeError(
+            bbt_co_return fw::result<inf::rpc::Response>::err(fw::MakeError(
                 fw::ErrorCode::RuntimeUnavailable,
                 "egress self endpoint not installed"));
-        return bbt_co_await egress->Call("tcp://" + ep, env, o);
+        bbt_co_return bbt_co_await egress->Call("tcp://" + ep, env, o);
     };
 
     /**

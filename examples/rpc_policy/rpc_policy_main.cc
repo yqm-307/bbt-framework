@@ -192,12 +192,12 @@ private:
     bbt_co_async(fw::CoRpcResp) _Forward(fw::CoRpcReq req, std::string_view target) {
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
         if (!parsed)
-            return fw::CoRpcResp::Error(parsed.error());
+            bbt_co_return fw::CoRpcResp::Error(parsed.error());
         auto reply = bbt_co_await call<bbt::example::v1::GetValueRequest, bbt::example::v1::GetValueResponse>(
             target, "GetValue", parsed.value(), {}, fw::CallOptions{});
         if (!reply)
-            return fw::CoRpcResp::Error(reply.error());
-        return fw::CoRpcResp::FromProto(reply.value());
+            bbt_co_return fw::CoRpcResp::Error(reply.error());
+        bbt_co_return fw::CoRpcResp::FromProto(reply.value());
     }
 };
 

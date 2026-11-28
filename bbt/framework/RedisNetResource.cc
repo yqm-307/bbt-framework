@@ -19,36 +19,36 @@ RedisNetResource::RedisNetResource(detail::ConstructKey key, Options options)
 
 bbt_co_async(bbt::infra::result<void>) RedisNetResource::Connect(
     const bbt::infra::CallOptions& options) {
-    return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Connect(options); });
+    bbt_co_return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Connect(options); });
 }
 
 bbt_co_async(bbt::infra::result<void>) RedisNetResource::Ping(
     const bbt::infra::CallOptions& options) {
-    return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Ping(options); });
+    bbt_co_return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Ping(options); });
 }
 
 bbt_co_async(bbt::infra::result<std::optional<std::string>>) RedisNetResource::Get(
     std::string_view key,
     const bbt::infra::CallOptions& options) {
-    return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Get(key, options); });
+    bbt_co_return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Get(key, options); });
 }
 
 bbt_co_async(bbt::infra::result<void>) RedisNetResource::Set(
     std::string_view key, std::string_view value,
     const bbt::infra::CallOptions& options) {
-    return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Set(key, value, options); });
+    bbt_co_return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Set(key, value, options); });
 }
 
 bbt_co_async(bbt::infra::result<bool>) RedisNetResource::Exists(
     std::string_view key,
     const bbt::infra::CallOptions& options) {
-    return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Exists(key, options); });
+    bbt_co_return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Exists(key, options); });
 }
 
 bbt_co_async(bbt::infra::result<std::uint64_t>) RedisNetResource::Delete(
     std::vector<std::string> keys,
     const bbt::infra::CallOptions& options) {
-    return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Delete(std::move(keys), options); });
+    bbt_co_return detail::WithPublishedResource(m_client, [&](auto& cli) { return bbt_co_await cli.Delete(std::move(keys), options); });
 }
 
 bool RedisNetResource::IsClosed() const noexcept {

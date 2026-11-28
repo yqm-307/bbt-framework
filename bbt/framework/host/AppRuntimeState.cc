@@ -27,7 +27,7 @@ bbt_co_async(result<bbt::infra::rpc::Response>) AppRuntimeState::Send(
     const bbt::infra::CallOptions& options) const {
     auto endpoint = FindRoute(env.Service());
     if (!endpoint)
-        return result<bbt::infra::rpc::Response>::err(std::move(endpoint.error()));
+        bbt_co_return result<bbt::infra::rpc::Response>::err(std::move(endpoint.error()));
 
     const std::string target = "tcp://" + endpoint.value();
 
@@ -41,11 +41,11 @@ bbt_co_async(result<bbt::infra::rpc::Response>) AppRuntimeState::Send(
         auto d = rpc_policy->Preflight(
             RpcCallView{target, env, opt.deadline});
         if (!d)
-            return result<bbt::infra::rpc::Response>::err(d.error());
+            bbt_co_return result<bbt::infra::rpc::Response>::err(d.error());
         const auto& decision = d.value();
 
         if (decision.kind == RpcPolicyDecision::Kind::Reject)
-            return result<bbt::infra::rpc::Response>::err(decision.reject_error);
+            bbt_co_return result<bbt::infra::rpc::Response>::err(decision.reject_error);
 
         /**
          * 只收紧：框架取 min(原期限, 收紧值)，绝不放大策略结果。
@@ -59,17 +59,17 @@ bbt_co_async(result<bbt::infra::rpc::Response>) AppRuntimeState::Send(
          * 此处复查的是策略生效后的期限。
          */
         if (opt.deadline <= std::chrono::steady_clock::now())
-            return result<bbt::infra::rpc::Response>::err(
+            bbt_co_return result<bbt::infra::rpc::Response>::err(
                 MakeError(ErrorCode::TimedOut,
                           "rpc policy tightened deadline already expired"));
     }
     if (default_egress)
-        return bbt_co_await default_egress->Call(target, env, opt);
+        bbt_co_return bbt_co_await default_egress->Call(target, env, opt);
     if (!seam_send)
-        return result<bbt::infra::rpc::Response>::err(MakeError(
+        bbt_co_return result<bbt::infra::rpc::Response>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
             "CoApp: rpc_send egress not configured"));
-    return bbt_co_await seam_send(target, env, opt);
+    bbt_co_return bbt_co_await seam_send(target, env, opt);
 }
 
 void AppRuntimeState::Publish(std::shared_ptr<InboundDispatcher> d) {

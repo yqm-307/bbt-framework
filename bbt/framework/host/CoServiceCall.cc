@@ -24,11 +24,11 @@ bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
     using Err = result<std::vector<std::uint8_t>>;
 
     if (!m_send)
-        return Err::err(MakeError(ErrorCode::RuntimeUnavailable,
-                                  "call: service is not hosted by CoApp"));
+        bbt_co_return Err::err(MakeError(ErrorCode::RuntimeUnavailable,
+                                         "call: service is not hosted by CoApp"));
     auto ctx = CurrentRequestContext();
     if (!ctx)
-        return Err::err(ctx.error());
+        bbt_co_return Err::err(ctx.error());
 
     /**
      * 业务路由字段统一加 route. 前缀，不能覆盖框架的系统字段。
@@ -44,8 +44,8 @@ bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
     for (const auto& [k, v] : custom.values) {
         if (k.empty() || k.size() > 64 || v.size() > 256 ||
             metadata.size() >= 16)
-            return Err::err(MakeError(ErrorCode::InvalidArgument,
-                                      "call: custom route field out of bounds"));
+            bbt_co_return Err::err(MakeError(ErrorCode::InvalidArgument,
+                                             "call: custom route field out of bounds"));
         metadata.emplace_back("route." + k, v);
     }
 
@@ -57,8 +57,8 @@ bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
         if (options.ordered->state_)
             ordered_session = options.ordered->state_->session.lock();
         if (!ordered_session)
-            return Err::err(MakeError(ErrorCode::InvalidArgument,
-                                      "call: ordered stamp has no live session"));
+            bbt_co_return Err::err(MakeError(ErrorCode::InvalidArgument,
+                                             "call: ordered stamp has no live session"));
         const auto& g = ordered_session->grant();
         metadata.emplace_back("fw.producer_id", g.producer_id);
         metadata.emplace_back("fw.producer_epoch", g.producer_epoch);
@@ -72,7 +72,7 @@ bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
     const auto deadline = ResolveCallDeadline(
         ctx.value().get(), options.deadline, std::chrono::steady_clock::now());
     if (!deadline)
-        return Err::err(deadline.error());
+        bbt_co_return Err::err(deadline.error());
 
     // 票据在宿主查路由和执行策略前绑定，重试仍校验同一份请求内容。
     if (ordered_session) {
@@ -91,13 +91,13 @@ bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
         content.request_bytes.assign(env.Payload().begin(), env.Payload().end());
         auto bound = ordered_session->BindForSend(*options.ordered, content);
         if (!bound)
-            return Err::err(std::move(bound.error()));
+            bbt_co_return Err::err(std::move(bound.error()));
     }
 
     const bbt::infra::CallOptions send_options{deadline.value()};
     auto reply = bbt_co_await m_send(env, send_options);
     if (!reply)
-        return Err::err(std::move(reply.error()));
+        bbt_co_return Err::err(std::move(reply.error()));
     const auto& reply_env = reply.value();
 
     /**
@@ -108,9 +108,9 @@ bbt_co_async(result<std::vector<std::uint8_t>>) CoServiceBase::_CallSend(
         reply_env.RequestSchema() != env.RequestSchema() ||
         reply_env.RequestId() != env.RequestId() ||
         reply_env.ResponseSchema() != env.ResponseSchema())
-        return Err::err(MakeError(ErrorCode::ProtocolError,
-                                  "call: reply envelope mismatch"));
-    return Err::ok(reply_env.Payload());
+        bbt_co_return Err::err(MakeError(ErrorCode::ProtocolError,
+                                         "call: reply envelope mismatch"));
+    bbt_co_return Err::ok(reply_env.Payload());
 }
 
 /**
@@ -126,8 +126,8 @@ bbt_co_async(result<CoRpcResp>) CoServiceBase::call(
         std::string(kCoRpcPositionalSchema),
         request.payload(), custom, options);
     if (!reply)
-        return result<CoRpcResp>::err(std::move(reply.error()));
-    return result<CoRpcResp>::ok(
+        bbt_co_return result<CoRpcResp>::err(std::move(reply.error()));
+    bbt_co_return result<CoRpcResp>::ok(
         CoRpcResp::FromPayload(std::move(reply.value())));
 }
 

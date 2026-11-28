@@ -207,12 +207,13 @@ bool StartRuntime() {
 void StopRuntime() {
     if (!g_runtime)
         return;
+
     /**
-     * 控制线程不在协程域：统一 Close 的 Immediate 任意域可调用，立即封口；
-     * 连接物理回收由 Engine Close 后 Run 返回收口。
+     * 控制线程不在协程域：RPC 的 Close 是须 await 的惰性操作，这里用同步的
+     * CloseImmediate 立即封口；连接物理回收由 Engine Close 后 Run 返回收口。
      */
     if (g_runtime->client)
-        (void)g_runtime->client->Close(bbt::infra::CloseOptions::Immediate());
+        (void)g_runtime->client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     if (g_runtime->engine)
         g_runtime->engine->Close();
     if (g_runtime->runner.joinable())
@@ -462,7 +463,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     /**
-     * 收口：Client Close(Immediate) 后 Engine Close，Run 返回才表示本代网络资源
+     * 收口：Client CloseImmediate 后 Engine Close，Run 返回才表示本代网络资源
      * 收口；显式 reset 后于 Close 即可（coroutine Scheduler 无 Stop）。
      */
     StopRuntime();

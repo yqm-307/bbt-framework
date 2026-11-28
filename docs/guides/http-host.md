@@ -52,8 +52,8 @@ HTTP 能力（`HttpComponent`/`MonitorService`）继续消费 `bbt::infra::http`
 - 入站 Engine 在 Idle 时装配唯一 server 接纳消费者，`Run` 在自有 native 线程执行；Running 且绑定地址可读后才调用 `CoRpcServer::Start`。
 - 宿主占 1 个 server driver 槽 + 1 个 client driver 槽（同一 Engine 的双向会话），另留 1 个业务 worker，即至少 3 个固定 scheduler worker；纯出站至少 2 个。独立测试客户端与多宿主按实际同时存活的 driver 数相加，不按机器核数扩并发。
 - 宿主 `StopAccepting` 在 `HandlerState` 的同一锁内关闭业务门，RPC 迟到请求由 admission 同步拒绝；不会调用已删除的 RPC `StopAccepting`。HTTP 分支仍调用 `http::Server::StopAccepting`。已过门的 handler 继续记账。
-- `WaitHandlersDone(deadline)` 等宿主 `inflight` 归零后，在同一业务门锁内拒新。HTTP 分支调用 `http::Server::Close(CloseOptions::Graceful(deadline))` 并置 `wait_release=true`，在同一期限排空已授权请求并等物理回收；RPC 分支调用 `CoRpcServer::Close(CloseOptions::Immediate())` 立即逻辑封口（本入口在 native 宿主控制线程，属合法等待域），不以该返回证明物理释放，会话物理回收由 Engine 收口证明。
-- 宿主 `Close(reason)` 发布首次关闭原因，对 RPC server/client 与 HTTP server/client 统一调用 `Close(CloseOptions::Immediate(reason))`，再 `Close` Engine；不等待业务 handler 返回，正在等待排空的宿主收到关闭原因后不得当作已排空。
+- `WaitHandlersDone(deadline)` 等宿主 `inflight` 归零后，在同一业务门锁内拒新。HTTP 分支调用 `http::Server::Close(CloseOptions::Graceful(deadline))` 并置 `wait_release=true`，在同一期限排空已授权请求并等物理回收；RPC 分支调用 `CoRpcServer::CloseImmediate(CloseOptions::Immediate())` 立即逻辑封口（RPC 的 `Close` 返回须 `bbt_co_await` 的惰性操作，native 宿主控制线程不能丢弃它代替封口），不以该返回证明物理释放，会话物理回收由 Engine 收口证明。
+- 宿主 `Close(reason)` 发布首次关闭原因，对 RPC server/client 调用 `CloseImmediate(CloseOptions::Immediate(reason))`、对 HTTP server/client 调用 `Close(CloseOptions::Immediate(reason))`，再 `Close` Engine；不等待业务 handler 返回，正在等待排空的宿主收到关闭原因后不得当作已排空。
 - 业务对象与方法表放进 `AppRuntimeState`（shared_ptr 运行时状态）：入站接纳闭包与出站回调复制该指针，不借用 CoApp 成员、不捕获 CoApp this，CoApp 先析构也不影响在途请求。关闭序列经 `Release` 收回对业务对象的引用；在途分发靠本地强引用与自持分发表项收尾。
 - 网络线程已结束时由 `Close` 回收；尚未结束的线程留给宿主析构 join，因此析构仍可能等待迟到 handler。`Close` 返回不证明 callback 销毁、连接 Released 或线程已全部回收。
 

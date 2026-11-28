@@ -939,7 +939,7 @@ CO_TEST_CASE(unconfigured_route_target_rejected) {
                         const bbt::infra::CallOptions&)
         -> bbt_co_async(fw::result<bbt::infra::rpc::Response>) {
         sends->fetch_add(1, std::memory_order_acq_rel);
-        return fw::result<bbt::infra::rpc::Response>::err(fw::MakeError(
+        bbt_co_return fw::result<bbt::infra::rpc::Response>::err(fw::MakeError(
             fw::ErrorCode::RuntimeUnavailable, "test seam send"));
     };
     auto app = MakeApp(

@@ -25,17 +25,17 @@ bbt_co_async(result<bbt::infra::rpc::Response>) RpcEgress::Call(std::string_view
     auto host = m_host.lock();
     auto client = host ? host->rpc_client() : nullptr;
     if (!client)
-        return result<bbt::infra::rpc::Response>::err(MakeError(
+        bbt_co_return result<bbt::infra::rpc::Response>::err(MakeError(
             ErrorCode::RuntimeUnavailable, "rpc egress: host client unavailable"));
     if (request.Payload().size() > host->network_limits().max_body_bytes)
-        return result<bbt::infra::rpc::Response>::err(MakeError(
+        bbt_co_return result<bbt::infra::rpc::Response>::err(MakeError(
             ErrorCode::InvalidArgument, "rpc egress: request body exceeds host limit"));
     auto reply = bbt_co_await client->Call(target, request, options);
     if (!reply) {
         if (auto valid = ValidateErrorAtBoundary(reply.error()); !valid)
-            return result<bbt::infra::rpc::Response>::err(std::move(valid.error()));
+            bbt_co_return result<bbt::infra::rpc::Response>::err(std::move(valid.error()));
     }
-    return reply;
+    bbt_co_return reply;
 }
 
 bbt_co_async(result<void>) RpcEgress::Send(std::string_view target, const bbt::infra::rpc::Request& request,
@@ -43,11 +43,11 @@ bbt_co_async(result<void>) RpcEgress::Send(std::string_view target, const bbt::i
     auto host = m_host.lock();
     auto client = host ? host->rpc_client() : nullptr;
     if (!client)
-        return result<void>::err(MakeError(
+        bbt_co_return result<void>::err(MakeError(
             ErrorCode::RuntimeUnavailable, "rpc egress: host client unavailable"));
     if (request.Payload().size() > host->network_limits().max_body_bytes)
-        return result<void>::err(MakeError(
+        bbt_co_return result<void>::err(MakeError(
             ErrorCode::InvalidArgument, "rpc egress: request body exceeds host limit"));
-    return bbt_co_await client->Send(target, request, options);
+    bbt_co_return bbt_co_await client->Send(target, request, options);
 }
 } // namespace bbt::framework
