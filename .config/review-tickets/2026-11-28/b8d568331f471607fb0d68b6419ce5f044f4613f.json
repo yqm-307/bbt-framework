@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "b8d568331f471607fb0d68b6419ce5f044f4613f",
+  "base": "569545a338113a54dec6cb5953c790eea10c5adc",
+  "result": "pass",
+  "reviewer": "Independent LLM reviewer",
+  "summary": "Only examples/ecommerce_cluster/discovery.hpp changed. The removal of the ICoCloseable include, base class and three override specifiers matches the reviewed patch. All other edits change only member declaration spacing. No close implementation or call site changed.",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "git diff --check and clang-format --dry-run --Werror passed. Prior build logs show ecommerce_cluster and Test_framework_dynamic_routes linked successfully; the CTest log records framework.dynamic_routes passing (1/1).",
+      "evidence": {
+        "reviewer": "Independent LLM reviewer",
+        "scope": "569545a338113a54dec6cb5953c790eea10c5adc..b8d568331f471607fb0d68b6419ce5f044f4613f (complete diff)"
+      }
+    }
+  ]
+}
