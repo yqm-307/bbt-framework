@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "ab6ea0b57052c518b2cf4c62ad2f39e6e7281691",
+  "base": "8940314039416aa7911307fc37c4b35a9bdc213f",
+  "result": "pass",
+  "reviewer": "alice-self-review",
+  "summary": ".gitignore 只追加忽略项，非受保护文件，按仓规自审：git ls-files -ci 为 0（无已跟踪文件被误忽略）；跑 scripts/ci 单测后 __pycache__ 不出现在 git status。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "self-review: additive ignore patterns only; no tracked file newly ignored",
+      "evidence": {
+        "reviewer": "author self-review (non-protected file, per AGENTS.md)",
+        "scope": "origin/main..ab6ea0b"
+      }
+    }
+  ]
+}
