@@ -317,13 +317,14 @@ result<void> InfraHttpHost::WaitHandlersDone(bbt::coroutine::Deadline deadline) 
             return r;
         }
     }
+
     /**
-     * RPC 统一 Close 入口：业务 handler 与 reply 写终态已由 inflight 归零证明，
-     * 剩余只是会话/连接责任。Immediate 任意域可调用，立即逻辑封口；物理回收由
-     * 下面 Engine 收口统一证明。
+     * RPC 立即逻辑封口：业务 handler 与 reply 写终态已由 inflight 归零证明，
+     * 剩余只是会话/连接责任；物理回收由下面 Engine 收口统一证明。CoRpcServer::Close
+     * 返回须 bbt_co_await 的惰性操作，丢弃即不执行，原生控制线程用 CloseImmediate。
      */
     if (auto server = rpc_server()) {
-        (void)server->Close(bbt::infra::CloseOptions::Immediate());
+        (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     }
     return result<void>::ok();
 }
@@ -392,18 +393,19 @@ void InfraHttpHost::_Close(bbt::infra::Error reason) noexcept {
         if (auto server = http_server()) {
             server->Close(bbt::infra::CloseOptions::Immediate(reason));
         }
+
         /**
-         * RPC 统一 Close 的 Immediate：任意域、幂等、不等 handler。业务完成后
-         * 的物理回收由下面的 Engine 收口统一证明。
+         * RPC 立即封口：幂等、不等 handler。RPC 的 Close 是惰性操作，丢弃即不执行，
+         * 这里用同步的 CloseImmediate。业务完成后的物理回收由下面的 Engine 收口统一证明。
          */
         if (auto server = rpc_server()) {
-            (void)server->Close(bbt::infra::CloseOptions::Immediate(reason));
+            (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate(reason));
         }
         if (auto client = http_client()) {
             client->Close(bbt::infra::CloseOptions::Immediate(reason));
         }
         if (auto client = rpc_client()) {
-            (void)client->Close(bbt::infra::CloseOptions::Immediate(reason));
+            (void)client->CloseImmediate(bbt::infra::CloseOptions::Immediate(reason));
         }
         /**
          * 无条件 join：旧路径失败即 return 会保留 joinable 线程，析构时

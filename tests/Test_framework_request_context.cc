@@ -131,9 +131,9 @@ struct SendProbe {
                 if (k == "fw.sequence")
                     last_sequence = v;
             if (!reply_ok)
-                return fw::result<bbt::infra::rpc::Response>::err(fw::MakeError(
+                bbt_co_return fw::result<bbt::infra::rpc::Response>::err(fw::MakeError(
                     fw::ErrorCode::TransportError, "probe seam send failed"));
-            return fw::result<bbt::infra::rpc::Response>::ok(ReplyFor(env));
+            bbt_co_return fw::result<bbt::infra::rpc::Response>::ok(ReplyFor(env));
         };
     }
 };

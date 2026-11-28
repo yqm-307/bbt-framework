@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "35155f9ffa77e9d853060f7229ba1a6957af727a",
+  "base": "e4cb4a9c277bc1b0ebdcced8819cc12fc7b37010",
+  "result": "pass",
+  "reviewer": "Hermes Agent（独立审查，GPT-6.2 Astra）",
+  "summary": "审查完整两提交范围，未发现 P0/P1 阻塞。deps.lock 两个 SHA 均在各自 origin/main，且与 infra 的 coroutine 锁定一致；107 处 return→bbt_co_return 都位于 bbt_co_async 函数体词法层，嵌套普通 lambda 未误改，求值时机与所有权等价；4 处 RPC CloseImmediate 与旧版同步 Close 的 Immediate 分支逐行等价，infra 其余 Close 仍为同步接口，无其他被丢弃的惰性操作；check_docs 只剪枝 third-party 目录。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "只读复查 git diff origin/main 全部改动、新 coroutine Async.hpp/async-usage.md、infra 新旧两版 Close 实现与全部 Close 签名。审查后的增量仅为 3 行注释前空行与 driver_main.cc 一行注释措辞，代码行未变。未构建或重跑测试；作者侧证据：两套配置构建通过、smoke 18/18、focused 17/17、失败用例各 3 次复跑通过。",
+      "evidence": {
+        "reviewer": "Hermes Agent（独立审查，GPT-6.2 Astra）",
+        "scope": "e4cb4a9c277bc1b0ebdcced8819cc12fc7b37010..35155f9ffa77e9d853060f7229ba1a6957af727a：deps.lock、bbt/framework 公共头与 host 实现、Redis/Mongo 资源、examples、tests、docs/guides/http-host.md、docs/architecture/framework-contract.md、scripts/ci/check_docs.py 与其单测。"
+      }
+    }
+  ]
+}

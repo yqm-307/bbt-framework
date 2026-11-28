@@ -837,10 +837,10 @@ AppBox PrepareApp(std::chrono::milliseconds incoming_timeout,
                     if (ep == "peer" || ep == "self")
                         ep = eps->Get();
                     if (ep.empty())
-                        return fw::result<inf::rpc::Response>::err(fw::MakeError(
+                        bbt_co_return fw::result<inf::rpc::Response>::err(fw::MakeError(
                             fw::ErrorCode::RuntimeUnavailable,
                             "egress peer endpoint not installed"));
-                    return bbt_co_await egress->Call("tcp://" + ep, env, o);
+                    bbt_co_return bbt_co_await egress->Call("tcp://" + ep, env, o);
                 };
                 try {
                     *app_slot = fw::MakeCoAppForTest(
@@ -2057,9 +2057,9 @@ fw::RpcSendAppFn HopSeamSend(std::shared_ptr<EndpointSlot> eps,
         if (ep == "self" || ep == "peer")
             ep = eps->Get();
         if (ep.empty())
-            return fw::result<inf::rpc::Response>::err(
+            bbt_co_return fw::result<inf::rpc::Response>::err(
                 fw::MakeError(fw::ErrorCode::RuntimeUnavailable, "hop egress self endpoint not installed"));
-        return bbt_co_await egress->Call("tcp://" + ep, env, o);
+        bbt_co_return bbt_co_await egress->Call("tcp://" + ep, env, o);
     };
 }
 

@@ -352,7 +352,7 @@ CO_TEST_CASE(runtime_send_uses_live_dynamic_view_before_policy) {
         -> bbt_co_async(fw::result<bbt::infra::rpc::Response>) {
         BOOST_CHECK_EQUAL(policy->endpoint, std::string(target));
         sent.push_back(std::string(target));
-        return fw::result<bbt::infra::rpc::Response>::ok(
+        bbt_co_return fw::result<bbt::infra::rpc::Response>::ok(
             bbt::infra::rpc::Response::FromRequest(env));
     };
     bbt::infra::rpc::Request env;

@@ -115,13 +115,13 @@ private:
         using bbt::framework::CoRpcResp;
         auto parsed = req.ParseProto<bbt::example::v1::GetValueRequest>();
         if (!parsed)
-            return CoRpcResp::Error(parsed.error());
+            bbt_co_return CoRpcResp::Error(parsed.error());
         auto reply = bbt_co_await call<bbt::example::v1::GetValueRequest,
                                        bbt::example::v1::GetValueResponse>(
             target, "GetValue", parsed.value(), {}, opt);
         if (!reply)
-            return CoRpcResp::Error(reply.error());
-        return CoRpcResp::FromProto(reply.value());
+            bbt_co_return CoRpcResp::Error(reply.error());
+        bbt_co_return CoRpcResp::FromProto(reply.value());
     }
 };
 

@@ -219,8 +219,8 @@ bbt_co_async(result<ObserverToken>) CoApp::CoObserve(const ObjectHandle& observe
                                                      const ObjectHandle& target,
                                                      ObjectObserver callback) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<ObserverToken>::err(std::move(ctx.error()));
-    return m_registry->Observe(observer, target, std::move(callback));
+        bbt_co_return result<ObserverToken>::err(std::move(ctx.error()));
+    bbt_co_return m_registry->Observe(observer, target, std::move(callback));
 }
 
 ObjectHandle CoApp::Handle() const {
@@ -407,8 +407,8 @@ struct LifecycleActiveGuard {
 
 bbt_co_async(result<void>) CoApp::CoStart(const LifecycleOptions& life) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<void>::err(std::move(ctx.error()));
-    return _StartImpl(life);
+        bbt_co_return result<void>::err(std::move(ctx.error()));
+    bbt_co_return _StartImpl(life);
 }
 
 result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
@@ -553,8 +553,8 @@ result<void> CoApp::_StartImpl(const LifecycleOptions& life) {
 
 bbt_co_async(result<void>) CoApp::CoPause(const LifecycleOptions& life) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<void>::err(std::move(ctx.error()));
-    return _PauseImpl(life);
+        bbt_co_return result<void>::err(std::move(ctx.error()));
+    bbt_co_return _PauseImpl(life);
 }
 
 result<void> CoApp::_PauseImpl(const LifecycleOptions& life) {
@@ -591,8 +591,8 @@ result<void> CoApp::_PauseImpl(const LifecycleOptions& life) {
 
 bbt_co_async(result<void>) CoApp::CoResume(const LifecycleOptions& life) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<void>::err(std::move(ctx.error()));
-    return _ResumeImpl(life);
+        bbt_co_return result<void>::err(std::move(ctx.error()));
+    bbt_co_return _ResumeImpl(life);
 }
 
 result<void> CoApp::_ResumeImpl(const LifecycleOptions& life) {
@@ -629,8 +629,8 @@ result<void> CoApp::_ResumeImpl(const LifecycleOptions& life) {
 
 bbt_co_async(result<void>) CoApp::CoStop(const LifecycleOptions& life) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<void>::err(std::move(ctx.error()));
-    return _StopImpl(life);
+        bbt_co_return result<void>::err(std::move(ctx.error()));
+    bbt_co_return _StopImpl(life);
 }
 
 result<void> CoApp::_StopImpl(const LifecycleOptions& life) {
@@ -712,15 +712,15 @@ void CoApp::RequestShutdown() noexcept {
 bbt_co_async(result<void>) CoApp::CoWaitShutdownRequest(
     const bbt::coroutine::WaitOptions& wait) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return ctx;
+        bbt_co_return ctx;
     auto waiter = bbt::coroutine::sync::CoWaiter::Create();
     {
         std::lock_guard<std::mutex> lk(m_run_mtx);
         if (m_shutdown_waiter)
-            return result<void>::err(MakeError(ErrorCode::Overloaded,
-                                               "shutdown request already has a waiter"));
+            bbt_co_return result<void>::err(MakeError(ErrorCode::Overloaded,
+                                                      "shutdown request already has a waiter"));
         if (m_shutdown_req.load(std::memory_order_acquire))
-            return result<void>::ok();
+            bbt_co_return result<void>::ok();
         m_shutdown_waiter = waiter;
     }
     const auto status = waiter->WaitWithCallback(wait, [this, waiter] {
@@ -733,13 +733,13 @@ bbt_co_async(result<void>) CoApp::CoWaitShutdownRequest(
         m_shutdown_waiter.reset();
     }
     if (status == bbt::coroutine::WaitStatus::Completed)
-        return result<void>::ok();
+        bbt_co_return result<void>::ok();
     if (status == bbt::coroutine::WaitStatus::TimedOut)
-        return result<void>::err(MakeError(ErrorCode::TimedOut, "shutdown request timed out"));
+        bbt_co_return result<void>::err(MakeError(ErrorCode::TimedOut, "shutdown request timed out"));
     if (status == bbt::coroutine::WaitStatus::Cancelled)
-        return result<void>::err(MakeError(ErrorCode::Cancelled, "shutdown request cancelled"));
-    return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-                                       "shutdown request wait unavailable"));
+        bbt_co_return result<void>::err(MakeError(ErrorCode::Cancelled, "shutdown request cancelled"));
+    bbt_co_return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+                                              "shutdown request wait unavailable"));
 }
 
 namespace {
@@ -2078,21 +2078,21 @@ result<void> CoApp::_UnbindComponentImpl(
 bbt_co_async(result<void>) CoApp::CoBindObject(const ObjectHandle& subject,
                                                const ObjectHandle& target) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<void>::err(std::move(ctx.error()));
+        bbt_co_return result<void>::err(std::move(ctx.error()));
     (void)subject;
     (void)target;
-    return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
-                                       "BindObject: non-owning relationship edges are not supported"));
+    bbt_co_return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
+                                              "BindObject: non-owning relationship edges are not supported"));
 }
 
 bbt_co_async(result<void>) CoApp::CoUnbindObject(const ObjectHandle& subject,
                                                  const ObjectHandle& target) {
     if (auto ctx = _CheckCoContext(); !ctx)
-        return result<void>::err(std::move(ctx.error()));
+        bbt_co_return result<void>::err(std::move(ctx.error()));
     (void)subject;
     (void)target;
-    return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
-                                       "UnbindObject: non-owning relationship edges are not supported"));
+    bbt_co_return result<void>::err(MakeError(ErrorCode::UnsupportedRoute,
+                                              "UnbindObject: non-owning relationship edges are not supported"));
 }
 
 result<void> CoApp::_RunNetworkTask(std::function<result<void>()> task,

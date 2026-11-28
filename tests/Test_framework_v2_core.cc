@@ -1918,8 +1918,19 @@ CO_TEST_CASE(co_start_deadline_returns_timeout) {
 
     /**
      * 放行：hook 到真实终态并写回结果（责任链完整——hook 从未被强杀）。
+     * Open 只触发唤醒，被唤醒的 hook 协程恢复后仍要读写 CoGate/CoWaiter
+     * 自身成员直到退出 Wait；等同一对象在途 hook 到真实终态收口后闸门
+     * 才不再被访问，此时释放才是安全的。
      */
     GateService::s_start_gate->Open();
+    BOOST_REQUIRE(RunInManagedCoroutine([&] {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        auto r = bbt_co_await app->CoStop(
+            fw::LifecycleOptions{}.SetDeadline(deadline));
+        BOOST_CHECK(r);
+    }));
+    BOOST_CHECK(app->State() == fw::AppState::Stopped);
     GateService::s_start_gate.reset();
 }
 
