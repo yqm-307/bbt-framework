@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "428a78ea3f45b8ca59481b4162f530d6fb5a105d",
+  "base": "649168c0c60f09f2c23ebff0e8dbb5da88d3b81e",
+  "result": "pass",
+  "reviewer": "Hermes Agent（主线审查，未参与编写；修复由 QA 子代理编写）",
+  "summary": "单用例测试夹具修复，无阻塞。co_start_deadline_returns_timeout 原先 Open 后立即释放 CoGate，被唤醒的 OnStart hook 恢复后访问已释放的 CoWaiter；现放行后经 CoStop 等在途 hook 到真实终态再释放，沿用同文件约 1806-1821 行写法，原有 TimedOut 与部分启动断言保留。同文件另两处 Open→reset 在释放前已等待 hook 结束，无同类问题。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "逐行核对 11 行新增与注释形态；ASan 对照（协程栈临时调到 256 KiB 排除栈尺寸假象）：修复前新旧依赖 v2_core 均稳定报 heap-use-after-free（新 3/3、旧 5/5，访问栈 GateService::OnStart→CoGate::Wait），修复后 5/5 无错误；QA 侧 Release 构建 v2_core 连跑 5 次与单跑该用例通过。",
+      "evidence": {
+        "reviewer": "Hermes Agent（主线审查，未参与编写）",
+        "scope": "649168c0c60f09f2c23ebff0e8dbb5da88d3b81e..428a78ea3f45b8ca59481b4162f530d6fb5a105d：tests/Test_framework_v2_core.cc 的 co_start_deadline_returns_timeout 用例，及同文件 GateService/ClosingService 其余闸门释放点。"
+      }
+    }
+  ]
+}
