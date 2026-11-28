@@ -73,7 +73,8 @@ std::size_t OrderedIngress::ReplyBytes(const OrderedTerminalReply& reply) {
      * 只计被保留的文本字节：成功计回复体；失败计错误域/码/文本与 details。
      */
     std::size_t n = reply.payload.size();
-    if (reply.is_ok) return n;
+    if (reply.is_ok)
+        return n;
     n += reply.error.domain.size();
     n += reply.error.domain_code.size();
     n += reply.error.message.size();
@@ -89,11 +90,12 @@ Error OrderedIngress::_GapError(std::uint64_t next_sequence) const {
      * ValidateErrorAtBoundary；非法形态整体降级为 ProtocolError。
      */
     Error e = OrderedIngestError(ordered_domain_code::kSequenceGap,
-        "ordered sequence gap: future sequence not buffered");
+                                 "ordered sequence gap: future sequence not buffered");
     e.details.emplace_back(std::string(kErrorDetailExpectedSequence),
                            std::to_string(next_sequence));
     auto v = ValidateErrorAtBoundary(e);
-    if (!v) return v.error();
+    if (!v)
+        return v.error();
     return e;
 }
 
@@ -112,7 +114,8 @@ result<void> OrderedIngress::GrantStream(const OrderedGrant& grant) {
     std::lock_guard<std::mutex> lk(m_mtx);
 
     for (const auto& entry : grants_) {
-        if (!SameOrderedStreamId(entry.grant, grant)) continue;
+        if (!SameOrderedStreamId(entry.grant, grant))
+            continue;
         /**
          * 幂等重装
          */
@@ -184,7 +187,8 @@ result<OrderedIngress::Admission> OrderedIngress::Admit(
                 entry.grant.producer_id != request.producer_id) {
                 continue;
             }
-            if (entry.grant.producer_epoch != request.producer_epoch) continue;
+            if (entry.grant.producer_epoch != request.producer_epoch)
+                continue;
             if (entry.grant.receiver_epoch != request.receiver_epoch) {
                 /**
                  * 旧 receiver_epoch 会话：拒绝
@@ -246,12 +250,12 @@ result<OrderedIngress::Admission> OrderedIngress::Admit(
                     "ordered sequence already bound to a different request"));
             }
             Admission out;
-            out.kind           = DecisionKind::Replay;
-            out.sequence       = request.sequence;
-            out.actor_key      = request.actor_key;
-            out.producer_id    = request.producer_id;
+            out.kind = DecisionKind::Replay;
+            out.sequence = request.sequence;
+            out.actor_key = request.actor_key;
+            out.producer_id = request.producer_id;
             out.producer_epoch = request.producer_epoch;
-            out.replay         = cached->second.reply;
+            out.replay = cached->second.reply;
             return result<Admission>::ok(std::move(out));
         }
         return result<Admission>::err(OrderedIngestError(
@@ -267,40 +271,48 @@ result<OrderedIngress::Admission> OrderedIngress::Admit(
     ++state.next_sequence;
 
     Admission out;
-    out.kind           = DecisionKind::Execute;
-    out.sequence       = request.sequence;
-    out.actor_key      = request.actor_key;
-    out.producer_id    = request.producer_id;
+    out.kind = DecisionKind::Execute;
+    out.sequence = request.sequence;
+    out.actor_key = request.actor_key;
+    out.producer_id = request.producer_id;
     out.producer_epoch = request.producer_epoch;
     return result<Admission>::ok(std::move(out));
 }
 
 void OrderedIngress::_RemoveCached(const CachedKey& key) {
     auto it = cached_.find(key);
-    if (it == cached_.end()) return;
+    if (it == cached_.end())
+        return;
     cached_bytes_ -= it->second.bytes;
     cached_.erase(it);
     /**
      * cached_order_ 里同键只出现一次；线性移除（完成序保序由剩余元素维持）。
      */
     for (auto o = cached_order_.begin(); o != cached_order_.end(); ++o) {
-        if (*o == key) { cached_order_.erase(o); break; }
+        if (*o == key) {
+            cached_order_.erase(o);
+            break;
+        }
     }
     auto stream = streams_.find(key.stream);
-    if (stream != streams_.end()) stream->second.cached_seqs.erase(key.sequence);
+    if (stream != streams_.end())
+        stream->second.cached_seqs.erase(key.sequence);
 }
 
 void OrderedIngress::_DropStreamCache(const StreamKey& key) {
     auto stream = streams_.find(key);
-    if (stream == streams_.end()) return;
+    if (stream == streams_.end())
+        return;
     /**
      * 先收集序号再逐个移除：_RemoveCached 会同步 cached_seqs.erase，
      * 不能在遍历 cached_seqs 的同时删它的元素（迭代器失效）。
      */
     std::vector<std::uint64_t> seqs;
     seqs.reserve(stream->second.cached_seqs.size());
-    for (const auto& kv : stream->second.cached_seqs) seqs.push_back(kv.first);
-    for (const std::uint64_t s : seqs) _RemoveCached(CachedKey{key, s});
+    for (const auto& kv : stream->second.cached_seqs)
+        seqs.push_back(kv.first);
+    for (const std::uint64_t s : seqs)
+        _RemoveCached(CachedKey{key, s});
 }
 
 void OrderedIngress::_EvictToLimits() {
@@ -339,7 +351,7 @@ result<void> OrderedIngress::Complete(const Admission& admission,
     }
 
     const std::string request_id = in_flight->second.request_id;
-    const std::string digest     = in_flight->second.digest;
+    const std::string digest = in_flight->second.digest;
     state.in_flight.erase(in_flight);
 
     /**
@@ -355,7 +367,7 @@ result<void> OrderedIngress::Complete(const Admission& admission,
              * 边界校验自身返回的 ProtocolError
              */
             Error safe = v.error();
-            reply.error      = std::move(safe);
+            reply.error = std::move(safe);
             /**
              * 防御：确保无非法 details 入缓存
              */
@@ -378,7 +390,7 @@ result<void> OrderedIngress::Complete(const Admission& admission,
                          admission.producer_epoch};
     const CachedKey ckey{skey, admission.sequence};
     cached_.emplace(ckey, CachedResult{skey, admission.sequence, request_id,
-                                     digest, std::move(reply), bytes});
+                                       digest, std::move(reply), bytes});
     cached_order_.push_back(ckey);
     cached_bytes_ += bytes;
     state.cached_seqs.emplace(admission.sequence, '\0');
@@ -413,8 +425,8 @@ result<OrderedStreamObservation> OrderedIngress::ObserveStream(
     }
     OrderedStreamObservation out;
     out.next_sequence = it->second.next_sequence;
-    out.in_flight     = it->second.in_flight.size();
-    out.cached        = it->second.cached_seqs.size();
+    out.in_flight = it->second.in_flight.size();
+    out.cached = it->second.cached_seqs.size();
     return result<OrderedStreamObservation>::ok(out);
 }
 

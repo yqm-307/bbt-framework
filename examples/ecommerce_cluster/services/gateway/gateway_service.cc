@@ -26,7 +26,8 @@ CoRpcResp GatewayService::Checkout(CoRpcReq req) {
     };
 
     auto parsed = req.ParseProto<v1::CheckoutRequest>();
-    if (!parsed) return fail(parsed.error());
+    if (!parsed)
+        return fail(parsed.error());
 
     const std::string sku = parsed.value().sku();
     const std::int32_t qty = parsed.value().qty();
@@ -42,7 +43,8 @@ CoRpcResp GatewayService::Checkout(CoRpcReq req) {
     quote_req.set_qty(qty);
     auto quote = bbt_co_await call<v1::QuoteRequest, v1::QuoteResponse>(
         std::string(kOrderService), "Quote", quote_req);
-    if (!quote) return fail(quote.error());
+    if (!quote)
+        return fail(quote.error());
 
     v1::CheckoutResponse out;
     out.set_sku(sku);

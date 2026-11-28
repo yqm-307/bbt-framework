@@ -1227,7 +1227,7 @@ BOOST_AUTO_TEST_CASE(inflight_egress_during_closing) {
      */
     auto inflight_done = std::make_shared<TestLatch>(1);
     auto inflight_res = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
-    bbtco[tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
+    bbtco [tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
         inflight_res->emplace(
             SendRpc(tc_egress, endpoint,
                     MakeEnv("relay", "wait_dial", "t2-h", 9), kWait));
@@ -1325,7 +1325,7 @@ BOOST_AUTO_TEST_CASE(shutdown_incomplete_actor_late_egress) {
      */
     auto inflight_done = std::make_shared<TestLatch>(1);
     auto inflight_res = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
-    bbtco[tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
+    bbtco [tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
         inflight_res->emplace(
             SendRpc(tc_egress, endpoint,
                     MakeAcctEnv("park_dial", "t4-h", 3), kWait));
@@ -1436,7 +1436,7 @@ BOOST_AUTO_TEST_CASE(late_callback_past_logical_end) {
      */
     auto inflight_done = std::make_shared<TestLatch>(1);
     auto inflight_res = std::make_shared<std::optional<fw::result<inf::rpc::Response>>>();
-    bbtco[tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
+    bbtco [tc_egress = tc.egress, endpoint = box.endpoint, inflight_done, inflight_res]() {
         inflight_res->emplace(
             SendRpc(tc_egress, endpoint,
                     MakeEnv("relay", "wait_dial_long", "t5-h", 5),

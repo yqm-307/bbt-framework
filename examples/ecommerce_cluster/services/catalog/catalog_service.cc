@@ -21,15 +21,18 @@ using namespace bbt::framework;
 
 #ifdef EC_STORAGE_AVAILABLE
 result<void> CatalogService::OnStart() {
-    if (!Storage().enabled) return result<void>::ok();
+    if (!Storage().enabled)
+        return result<void>::ok();
     /**
      * 显式建连（组件命令面要求在受管协程调用；OnStart 相位天然满足）：
      * Redis 不可达即启动失败（fail-closed，等价旧工厂「Connected 才交付」）。
      */
     auto cache = GetComponent<RedisNetResource>("cache");
-    if (!cache) return result<void>::err(std::move(cache.error()));
+    if (!cache)
+        return result<void>::err(std::move(cache.error()));
     auto borrow = cache.value().Borrow();
-    if (!borrow) return result<void>::err(std::move(borrow.error()));
+    if (!borrow)
+        return result<void>::err(std::move(borrow.error()));
     const auto budget = bbt::infra::CallOptions{
         std::chrono::steady_clock::now() + std::chrono::seconds{3}};
     auto connected = bbt_co_await borrow.value().Get().Connect(budget);
@@ -46,17 +49,19 @@ namespace {
  * 目录价（分）：示例数据。未知 sku 返回 0，由 handler 转 NotFound。
  */
 std::int64_t UnitPriceCents(std::string_view sku) {
-    if (sku == "sku-book") return 1299;
-    if (sku == "sku-mug") return 899;
-    if (sku == "sku-pen") return 259;
+    if (sku == "sku-book")
+        return 1299;
+    if (sku == "sku-mug")
+        return 899;
+    if (sku == "sku-pen")
+        return 259;
     return 0;
 }
 
 } // namespace
 
 CoRpcResp CatalogService::Price(CoRpcReq req) {
-    HopRecord hop{kCatalogService, "Price", InboundRequestId(), {}, {},
-                  true, 0};
+    HopRecord hop{kCatalogService, "Price", InboundRequestId(), {}, {}, true, 0};
     auto fail = [&hop](Error error) {
         hop.ok = false;
         hop.error_code = static_cast<int>(error.code);
@@ -65,7 +70,8 @@ CoRpcResp CatalogService::Price(CoRpcReq req) {
     };
 
     auto parsed = req.ParseProto<v1::PriceRequest>();
-    if (!parsed) return fail(parsed.error());
+    if (!parsed)
+        return fail(parsed.error());
 
     const std::string& sku = parsed.value().sku();
     if (sku.empty())

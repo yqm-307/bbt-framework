@@ -42,9 +42,11 @@ inline constexpr std::string_view kErrorDetailExpectedSequence =
 namespace detail {
 
 inline bool IsUnsignedDecimal(std::string_view s) noexcept {
-    if (s.empty()) return false;
+    if (s.empty())
+        return false;
     for (char ch : s)
-        if (ch < '0' || ch > '9') return false;
+        if (ch < '0' || ch > '9')
+            return false;
     return true;
 }
 
@@ -73,13 +75,14 @@ inline constexpr ReservedKeyRule kReservedKeyRules[] = {
 inline result<void> ValidateErrorDomainRules(const Error& error) {
     for (const auto& [key, val] : error.details) {
         for (const auto& rule : detail::kReservedKeyRules) {
-            if (key != rule.key) continue;
+            if (key != rule.key)
+                continue;
             if (error.domain != rule.domain)
                 return result<void>::err(MakeError(ErrorCode::ProtocolError,
-                    "reserved key outside its owning domain"));
+                                                   "reserved key outside its owning domain"));
             if (!rule.value_ok(val))
                 return result<void>::err(MakeError(ErrorCode::ProtocolError,
-                    "reserved key value has invalid format"));
+                                                   "reserved key value has invalid format"));
         }
     }
     return result<void>::ok();
@@ -92,7 +95,8 @@ inline result<void> ValidateErrorDomainRules(const Error& error) {
  */
 inline result<void> ValidateErrorAtBoundary(const Error& error) {
     auto r = bbt::infra::ValidateErrorDetails(error);
-    if (!r) return r;
+    if (!r)
+        return r;
     return ValidateErrorDomainRules(error);
 }
 

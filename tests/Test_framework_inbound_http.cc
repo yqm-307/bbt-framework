@@ -539,7 +539,7 @@ public:
         };
         auto slot = std::make_shared<Slot>();
         auto gate = std::make_shared<CoGate>();
-        bbtco[this, req, slot, gate]() {
+        bbtco [this, req, slot, gate]() {
             slot->co_id = co::GetLocalCoroutineId();
             auto response = bbt_co_await this->call("echo", "ping", req);
             if (response)
@@ -1541,7 +1541,7 @@ BOOST_AUTO_TEST_CASE(unmanaged_coroutine_invalid_context_end_to_end) {
     BOOST_REQUIRE(caller != nullptr);
     TestLatch l{1};
     std::optional<fw::result<fw::CoRpcResp>> direct;
-    bbtco[caller, &direct, &l]() {
+    bbtco [caller, &direct, &l]() {
         direct.emplace(caller->DirectDial(RequestInt(5)));
         l.CountDown();
     };
@@ -1693,7 +1693,7 @@ BOOST_AUTO_TEST_CASE(handler_drain_shutdown_late) {
     auto inflight = MakeEnv("probe", "wait_echo", "t6-h", 9);
     TestLatch inflight_done{1};
     std::optional<fw::result<inf::rpc::Response>> inflight_res;
-    bbtco[&box, &inflight, &inflight_res, &inflight_done]() {
+    bbtco [&box, &inflight, &inflight_res, &inflight_done]() {
         inflight_res.emplace(
             SendRpc(box.client, box.endpoint, inflight, kWait));
         inflight_done.CountDown();

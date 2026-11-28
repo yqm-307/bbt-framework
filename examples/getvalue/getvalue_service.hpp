@@ -50,7 +50,7 @@ struct ProtoCodec<bbt::example::v1::GetValueRequest> {
         const std::vector<std::uint8_t>& bytes) {
         bbt::example::v1::GetValueRequest msg;
         if (bytes.size() > static_cast<std::size_t>(
-                                std::numeric_limits<int>::max()))
+                               std::numeric_limits<int>::max()))
             return result<bbt::example::v1::GetValueRequest>::err(MakeError(
                 ErrorCode::ProtocolError,
                 "getvalue: GetValueRequest payload exceeds int range"));
@@ -80,7 +80,7 @@ struct ProtoCodec<bbt::example::v1::GetValueResponse> {
         const std::vector<std::uint8_t>& bytes) {
         bbt::example::v1::GetValueResponse msg;
         if (bytes.size() > static_cast<std::size_t>(
-                                std::numeric_limits<int>::max()))
+                               std::numeric_limits<int>::max()))
             return result<bbt::example::v1::GetValueResponse>::err(MakeError(
                 ErrorCode::ProtocolError,
                 "getvalue: GetValueResponse payload exceeds int range"));
@@ -154,7 +154,6 @@ private:
     friend class bbt::framework::detail::Registry;
 
 public:
-
     bbt::framework::CoRpcResp GetValue(bbt::framework::CoRpcReq req) {
         using bbt::framework::CoRpcResp;
         using bbt::framework::ErrorCode;
@@ -170,7 +169,7 @@ public:
             std::string request_id;
             std::string peer_principal;
             if (auto ctx = bbt::framework::CurrentRequestContext()) {
-                request_id     = ctx.value()->request_id;
+                request_id = ctx.value()->request_id;
                 peer_principal = ctx.value()->peer_principal;
             }
             ServedHookRef()(request_id, peer_principal);

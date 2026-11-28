@@ -21,7 +21,7 @@ void InstallRpcAdmission(InfraHttpHost& host, std::shared_ptr<AppRuntimeState> s
 RpcEgress::RpcEgress(std::weak_ptr<InfraHttpHost> host) : m_host(std::move(host)) {}
 
 bbt_co_async(result<bbt::infra::rpc::Response>) RpcEgress::Call(std::string_view target,
-                                                              const bbt::infra::rpc::Request& request, const bbt::infra::CallOptions& options) {
+                                                                const bbt::infra::rpc::Request& request, const bbt::infra::CallOptions& options) {
     auto host = m_host.lock();
     auto client = host ? host->rpc_client() : nullptr;
     if (!client)

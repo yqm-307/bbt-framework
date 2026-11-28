@@ -18,16 +18,20 @@ using namespace bbt::framework;
 
 #ifdef EC_STORAGE_AVAILABLE
 result<void> OrderService::OnStart() {
-    if (!Storage().enabled) return result<void>::ok();
+    if (!Storage().enabled)
+        return result<void>::ok();
     /**
      * 启动探针：读一次空文档，Mongo 不可达即启动失败（fail-closed）。
      */
     auto db = GetComponent<MongoDbResource>("orders");
-    if (!db) return result<void>::err(std::move(db.error()));
+    if (!db)
+        return result<void>::err(std::move(db.error()));
     auto borrow = db.value().Borrow();
-    if (!borrow) return result<void>::err(std::move(borrow.error()));
+    if (!borrow)
+        return result<void>::err(std::move(borrow.error()));
     auto filter = bbt::infra::mongo::MongoDocument::FromJson("{}");
-    if (!filter) return result<void>::err(std::move(filter.error()));
+    if (!filter)
+        return result<void>::err(std::move(filter.error()));
     auto read = bbt_co_await borrow.value().Get().FindOne(
         filter.value(),
         bbt::infra::CallOptions{std::chrono::steady_clock::now() + std::chrono::seconds{3}});
@@ -49,7 +53,8 @@ CoRpcResp OrderService::Quote(CoRpcReq req) {
     };
 
     auto parsed = req.ParseProto<v1::QuoteRequest>();
-    if (!parsed) return fail(parsed.error());
+    if (!parsed)
+        return fail(parsed.error());
 
     const std::string sku = parsed.value().sku();
     const std::int32_t qty = parsed.value().qty();
@@ -67,7 +72,8 @@ CoRpcResp OrderService::Quote(CoRpcReq req) {
      */
     auto price = bbt_co_await call<v1::PriceRequest, v1::PriceResponse>(
         std::string(kCatalogService), "Price", price_req);
-    if (!price) return fail(price.error());
+    if (!price)
+        return fail(price.error());
 
     v1::QuoteResponse out;
     out.set_sku(sku);
@@ -95,11 +101,14 @@ CoRpcResp OrderService::CreateOrder(CoRpcReq req) {
 #ifdef EC_STORAGE_AVAILABLE
     if (Storage().enabled) {
         auto db = GetComponent<MongoDbResource>("orders");
-        if (!db) return fail(db.error());
+        if (!db)
+            return fail(db.error());
         auto borrow = db.value().Borrow();
-        if (!borrow) return fail(borrow.error());
+        if (!borrow)
+            return fail(borrow.error());
         auto budget = StorageBudget();
-        if (!budget) return fail(budget.error());
+        if (!budget)
+            return fail(budget.error());
         MongoDbResource& coll = borrow.value().Get();
         auto saved = ReadRecord(coll, order.order_id(), budget.value());
         if (!saved && saved.error().code != ErrorCode::NotFound)

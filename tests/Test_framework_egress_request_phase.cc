@@ -55,7 +55,7 @@
 #include <bbt/framework/Framework.hpp>
 #include <bbt/framework/internal/RpcBridge.hpp>
 
-namespace fw  = bbt::framework;
+namespace fw = bbt::framework;
 namespace inf = bbt::infra;
 using Clock = std::chrono::steady_clock;
 
@@ -89,7 +89,8 @@ public:
     void CountDown() {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (--m_count > 0) return;
+            if (--m_count > 0)
+                return;
         }
         m_cv.notify_all();
     }
@@ -97,10 +98,11 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    int                     m_count;
+    int m_count;
 };
 
 constexpr std::chrono::milliseconds kWait{15000};
@@ -339,35 +341,37 @@ bool HandshakeAndReadCall(int fd, std::string& call_body,
  * commit 标记，读失败/超时则不计。记录被连接次数，用于断言一次终态/无 retry。
  */
 struct LoopbackPeer {
-    int                listen_fd = -1;
-    std::uint16_t      port      = 0;
-    std::atomic<int>   accepts{0};
-    std::atomic<bool>  got_commit{false};
-    std::atomic<bool>  body_ready{false};
+    int listen_fd = -1;
+    std::uint16_t port = 0;
+    std::atomic<int> accepts{0};
+    std::atomic<bool> got_commit{false};
+    std::atomic<bool> body_ready{false};
     std::atomic<bool> ack_verified{false};
-    std::mutex         mtx;
-    std::string        received_body;
-    std::thread        th;
-    std::atomic<bool>  stop{false};
+    std::mutex mtx;
+    std::string received_body;
+    std::thread th;
+    std::atomic<bool> stop{false};
 
     ~LoopbackPeer() { Stop(); }
 
     bool Start() {
         listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd < 0) return false;
+        if (listen_fd < 0)
+            return false;
         int one = 1;
         ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in a{};
-        a.sin_family      = AF_INET;
+        a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        a.sin_port        = 0;
+        a.sin_port = 0;
         if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
             return false;
         socklen_t alen = sizeof(a);
         if (::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&a), &alen) != 0)
             return false;
         port = ntohs(a.sin_port);
-        if (::listen(listen_fd, 4) != 0) return false;
+        if (::listen(listen_fd, 4) != 0)
+            return false;
         const int flags = ::fcntl(listen_fd, F_GETFL, 0);
         if (flags < 0 || ::fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) != 0)
             return false;
@@ -385,9 +389,11 @@ struct LoopbackPeer {
              */
             timeval tv{0, 100000};
             const int r = ::select(listen_fd + 1, &rf, nullptr, nullptr, &tv);
-            if (r <= 0) continue;
+            if (r <= 0)
+                continue;
             const int c = ::accept(listen_fd, nullptr, nullptr);
-            if (c < 0) continue;
+            if (c < 0)
+                continue;
             accepts.fetch_add(1, std::memory_order_acq_rel);
             std::string body;
             const bool ok = HandshakeAndReadCall(c, body, &ack_verified);
@@ -408,7 +414,8 @@ struct LoopbackPeer {
 
     void Stop() {
         stop.store(true, std::memory_order_release);
-        if (th.joinable()) th.join();
+        if (th.joinable())
+            th.join();
         if (listen_fd >= 0) {
             ::close(listen_fd);
             listen_fd = -1;
@@ -425,11 +432,12 @@ struct LoopbackPeer {
  */
 std::uint16_t ReservedRefusedPort() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
+    if (fd < 0)
+        return 0;
     sockaddr_in a{};
-    a.sin_family      = AF_INET;
+    a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
+    a.sin_port = 0;
     if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
         ::close(fd);
         return 0;
@@ -465,20 +473,25 @@ struct EgressHost {
 
     bool Start() {
         inf::NetworkLimits limits{};
-        limits.max_connections  = 16;
-        limits.max_inflight     = 16;
+        limits.max_connections = 16;
+        limits.max_inflight = 16;
         limits.max_header_bytes = 16 * 1024;
-        limits.max_body_bytes   = 64 * 1024;
+        limits.max_body_bytes = 64 * 1024;
         limits.incoming_timeout = std::chrono::milliseconds{5000};
         host = std::make_shared<fw::InfraHttpHost>(
             limits, inf::ListenAddress{"127.0.0.1", 0}, "egress-phase-client");
-        if (!host->Create()) return false;
-        if (!host->Start())  return false;
+        if (!host->Create())
+            return false;
+        if (!host->Start())
+            return false;
         if (!host->rpc_client())
             return false;
         return true;
     }
-    void Stop() { if (host) host->Close(); }
+    void Stop() {
+        if (host)
+            host->Close();
+    }
 };
 
 /**
@@ -506,7 +519,7 @@ std::optional<fw::result<inf::rpc::Response>> CallEgress(
     std::shared_ptr<fw::InfraHttpHost> host, std::string endpoint,
     inf::rpc::Request env, inf::CallOptions opt) {
     auto state = std::make_shared<EgressCallState>();
-    state->host   = std::move(host);
+    state->host = std::move(host);
     state->egress = std::make_shared<fw::RpcEgress>(state->host);
     state->target = "tcp://" + endpoint;
     state->env = std::move(env);

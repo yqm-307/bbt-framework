@@ -92,20 +92,23 @@ inf::mongo::MongoDocument DocSetV(std::string_view v) {
 std::optional<std::string> ReadStrField(
     const inf::mongo::MongoDocument& d, std::string_view key) {
     const auto& b = d.bytes;
-    if (b.size() < 5) return std::nullopt;
+    if (b.size() < 5)
+        return std::nullopt;
     std::size_t pos = 4;
     while (pos < b.size() && b[pos] != 0x00) {
         const std::uint8_t type = b[pos++];
         std::string name;
         while (pos < b.size() && b[pos] != 0x00)
             name.push_back(static_cast<char>(b[pos++]));
-        if (pos >= b.size()) return std::nullopt;
+        if (pos >= b.size())
+            return std::nullopt;
         /**
          * skip name NUL
          */
         ++pos;
         if (type == 0x02) {
-            if (pos + 4 > b.size()) return std::nullopt;
+            if (pos + 4 > b.size())
+                return std::nullopt;
             const std::int32_t len = ReadI32(b, pos);
             pos += 4;
             if (len < 1 || pos + static_cast<std::size_t>(len) > b.size())
@@ -113,7 +116,8 @@ std::optional<std::string> ReadStrField(
             std::string val(reinterpret_cast<const char*>(b.data() + pos),
                             static_cast<std::size_t>(len - 1));
             pos += static_cast<std::size_t>(len);
-            if (name == key) return val;
+            if (name == key)
+                return val;
         } else if (type == 0x10) {
             pos += 4;
         } else {
@@ -147,18 +151,23 @@ fw::result<co::Deadline> KvSvc::CtxDeadline() {
 
 fw::CoRpcResp KvSvc::Get(fw::CoRpcReq req) {
     auto id = req.Parse<std::string>();
-    if (!id) return fw::CoRpcResp::Error(id.error());
+    if (!id)
+        return fw::CoRpcResp::Error(id.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     auto cache_r = Res<fw::RedisNetResource>("cache");
-    auto docs_r  = Res<fw::MongoDbResource>("docs");
-    if (!cache_r) return _Missing("cache");
-    if (!docs_r)  return _Missing("docs");
+    auto docs_r = Res<fw::MongoDbResource>("docs");
+    if (!cache_r)
+        return _Missing("cache");
+    if (!docs_r)
+        return _Missing("docs");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     const std::string key = "kv:" + id.value();
     auto c = bbt_co_await cache_r.value().Get().Get(key, o);
-    if (!c) return fw::CoRpcResp::Error(c.error());
+    if (!c)
+        return fw::CoRpcResp::Error(c.error());
     if (c.value().has_value())
         /**
          * cache hit
@@ -166,30 +175,36 @@ fw::CoRpcResp KvSvc::Get(fw::CoRpcReq req) {
         return _Reply(0, c.value().value());
     s_mongo_reads.fetch_add(1, std::memory_order_acq_rel);
     auto f = bbt_co_await docs_r.value().Get().FindOne(DocId(id.value()), o);
-    if (!f) return fw::CoRpcResp::Error(f.error());
+    if (!f)
+        return fw::CoRpcResp::Error(f.error());
     if (!f.value().has_value())
         /**
          * not-found
          */
         return _Reply(1, "");
     auto v = ReadStrField(f.value().value(), "v");
-    if (!v) return fw::CoRpcResp::Error(fw::MakeError(
-        fw::ErrorCode::ProtocolError, "kv: document missing 'v'"));
+    if (!v)
+        return fw::CoRpcResp::Error(fw::MakeError(
+            fw::ErrorCode::ProtocolError, "kv: document missing 'v'"));
     /**
      * 写回 cache
      */
     auto w = bbt_co_await cache_r.value().Get().Set(key, *v, o);
-    if (!w) return fw::CoRpcResp::Error(w.error());
+    if (!w)
+        return fw::CoRpcResp::Error(w.error());
     return _Reply(0, *v);
 }
 
 fw::CoRpcResp KvSvc::Insert(fw::CoRpcReq req) {
     auto args = req.Parse<std::string, std::string>();
-    if (!args) return fw::CoRpcResp::Error(args.error());
+    if (!args)
+        return fw::CoRpcResp::Error(args.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     auto docs_r = Res<fw::MongoDbResource>("docs");
-    if (!docs_r) return _Missing("docs");
+    if (!docs_r)
+        return _Missing("docs");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     const auto& [id, v] = args.value();
@@ -207,43 +222,54 @@ fw::CoRpcResp KvSvc::Insert(fw::CoRpcReq req) {
  */
 fw::CoRpcResp KvSvc::Update(fw::CoRpcReq req) {
     auto args = req.Parse<std::string, std::string>();
-    if (!args) return fw::CoRpcResp::Error(args.error());
+    if (!args)
+        return fw::CoRpcResp::Error(args.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     auto cache_r = Res<fw::RedisNetResource>("cache");
-    auto docs_r  = Res<fw::MongoDbResource>("docs");
-    if (!cache_r) return _Missing("cache");
-    if (!docs_r)  return _Missing("docs");
+    auto docs_r = Res<fw::MongoDbResource>("docs");
+    if (!cache_r)
+        return _Missing("cache");
+    if (!docs_r)
+        return _Missing("docs");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     const auto& [id, v] = args.value();
     const std::string key = "kv:" + id;
     auto u = bbt_co_await docs_r.value().Get().UpdateOne(DocId(id), DocSetV(v), o);
-    if (!u) return fw::CoRpcResp::Error(u.error());
+    if (!u)
+        return fw::CoRpcResp::Error(u.error());
     /**
      * 失效
      */
     auto d = bbt_co_await cache_r.value().Get().Delete({key}, o);
-    if (!d) return fw::CoRpcResp::Error(d.error());
+    if (!d)
+        return fw::CoRpcResp::Error(d.error());
     /**
      * 刷新
      */
     auto w = bbt_co_await cache_r.value().Get().Set(key, v, o);
-    if (!w) return fw::CoRpcResp::Error(w.error());
+    if (!w)
+        return fw::CoRpcResp::Error(w.error());
     return _Reply(static_cast<std::int32_t>(u.value().matched), v);
 }
 
 fw::CoRpcResp KvSvc::Exists(fw::CoRpcReq req) {
     auto id = req.Parse<std::string>();
-    if (!id) return fw::CoRpcResp::Error(id.error());
+    if (!id)
+        return fw::CoRpcResp::Error(id.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     auto cache_r = Res<fw::RedisNetResource>("cache");
-    if (!cache_r) return _Missing("cache");
+    if (!cache_r)
+        return _Missing("cache");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     auto e = bbt_co_await cache_r.value().Get().Exists("kv:" + id.value(), o);
-    if (!e) return fw::CoRpcResp::Error(e.error());
+    if (!e)
+        return fw::CoRpcResp::Error(e.error());
     return _Reply(e.value() ? 1 : 0, "");
 }
 
@@ -252,15 +278,19 @@ fw::CoRpcResp KvSvc::Ping(fw::CoRpcReq req) {
      * 占位参数，保持位置 codec 一致
      */
     auto id = req.Parse<std::string>();
-    if (!id) return fw::CoRpcResp::Error(id.error());
+    if (!id)
+        return fw::CoRpcResp::Error(id.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     auto cache_r = Res<fw::RedisNetResource>("cache");
-    if (!cache_r) return _Missing("cache");
+    if (!cache_r)
+        return _Missing("cache");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     auto r = bbt_co_await cache_r.value().Get().Ping(o);
-    if (!r) return fw::CoRpcResp::Error(r.error());
+    if (!r)
+        return fw::CoRpcResp::Error(r.error());
     return _Reply(0, "PONG");
 }
 
@@ -272,14 +302,17 @@ fw::CoRpcResp KvSvc::ProbeDeadline(fw::CoRpcReq req) {
      * 占位参数，保持位置 codec 一致
      */
     auto id = req.Parse<std::string>();
-    if (!id) return fw::CoRpcResp::Error(id.error());
+    if (!id)
+        return fw::CoRpcResp::Error(id.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     const auto d = deadline_r.value();
     if (d == co::Deadline::max())
         return _Reply(-1, "unbounded");
     const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(
-        d - Clock::now()).count();
+                            d - Clock::now())
+                            .count();
     return _Reply(static_cast<std::int32_t>(remain), "");
 }
 
@@ -290,11 +323,14 @@ fw::CoRpcResp KvSvc::ProbeDeadline(fw::CoRpcReq req) {
  */
 fw::CoRpcResp KvSvc::ExpiredSet(fw::CoRpcReq req) {
     auto args = req.Parse<std::string, std::string>();
-    if (!args) return fw::CoRpcResp::Error(args.error());
+    if (!args)
+        return fw::CoRpcResp::Error(args.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
     auto cache_r = Res<fw::RedisNetResource>("cache");
-    if (!cache_r) return _Missing("cache");
+    if (!cache_r)
+        return _Missing("cache");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     /**
@@ -309,7 +345,8 @@ fw::CoRpcResp KvSvc::ExpiredSet(fw::CoRpcReq req) {
      * 期望 TimedOut（无 I/O）
      */
     auto s = bbt_co_await cache_r.value().Get().Set("kv:" + id, v, o);
-    if (!s) return fw::CoRpcResp::Error(s.error());
+    if (!s)
+        return fw::CoRpcResp::Error(s.error());
     return _Reply(0, "SET");
 }
 
@@ -320,35 +357,43 @@ fw::CoRpcResp KvSvc::ExpiredSet(fw::CoRpcReq req) {
  */
 fw::CoRpcResp KvSvc::Hold(fw::CoRpcReq req) {
     auto id = req.Parse<std::string>();
-    if (!id) return fw::CoRpcResp::Error(id.error());
+    if (!id)
+        return fw::CoRpcResp::Error(id.error());
     auto deadline_r = CtxDeadline();
-    if (!deadline_r) return fw::CoRpcResp::Error(deadline_r.error());
-    if (!s_hold_gate) return fw::CoRpcResp::Error(fw::MakeError(
-        fw::ErrorCode::RuntimeUnavailable, "kv: hold gate absent"));
+    if (!deadline_r)
+        return fw::CoRpcResp::Error(deadline_r.error());
+    if (!s_hold_gate)
+        return fw::CoRpcResp::Error(fw::MakeError(
+            fw::ErrorCode::RuntimeUnavailable, "kv: hold gate absent"));
     s_hold_gate();
     /**
      * 放行后（排空期间）：真实 Redis 写-读回环 + Mongo 落库。失败路径原样
      * 回传底层错误（不泛化），并如实向观察者报告 false。
      */
     auto cache_r = Res<fw::RedisNetResource>("cache");
-    auto docs_r  = Res<fw::MongoDbResource>("docs");
-    if (!cache_r) return _Missing("cache");
-    if (!docs_r)  return _Missing("docs");
+    auto docs_r = Res<fw::MongoDbResource>("docs");
+    if (!cache_r)
+        return _Missing("cache");
+    if (!docs_r)
+        return _Missing("docs");
     inf::CallOptions o;
     o.deadline = deadline_r.value();
     const std::string key = "kv:" + id.value();
     auto s = bbt_co_await cache_r.value().Get().Set(key, "held", o);
     if (!s) {
-        if (s_hold_op_report) s_hold_op_report(false);
+        if (s_hold_op_report)
+            s_hold_op_report(false);
         return fw::CoRpcResp::Error(s.error());
     }
     auto g = bbt_co_await cache_r.value().Get().Get(key, o);
     if (!g) {
-        if (s_hold_op_report) s_hold_op_report(false);
+        if (s_hold_op_report)
+            s_hold_op_report(false);
         return fw::CoRpcResp::Error(g.error());
     }
     if (!g.value().has_value() || *g.value() != "held") {
-        if (s_hold_op_report) s_hold_op_report(false);
+        if (s_hold_op_report)
+            s_hold_op_report(false);
         return fw::CoRpcResp::Error(fw::MakeError(
             fw::ErrorCode::ProtocolError,
             "kv: hold readback mismatch during shutdown"));
@@ -356,10 +401,12 @@ fw::CoRpcResp KvSvc::Hold(fw::CoRpcReq req) {
     auto ins = bbt_co_await docs_r.value().Get().InsertOne(
         DocIdV("c3-held-" + id.value(), "held"), o);
     if (!ins) {
-        if (s_hold_op_report) s_hold_op_report(false);
+        if (s_hold_op_report)
+            s_hold_op_report(false);
         return fw::CoRpcResp::Error(ins.error());
     }
-    if (s_hold_op_report) s_hold_op_report(true);
+    if (s_hold_op_report)
+        s_hold_op_report(true);
     return _Reply(0, "HELD");
 }
 

@@ -73,7 +73,7 @@ public:
     bbt::framework::CoRpcResp ForwardExpired(bbt::framework::CoRpcReq req) {
         bbt::framework::CallOptions opt;
         opt.deadline = std::chrono::steady_clock::now() -
-            std::chrono::milliseconds{1};
+                       std::chrono::milliseconds{1};
         return bbt_co_await _ForwardTo(req, kCalleeService, opt);
     }
 
@@ -117,7 +117,7 @@ private:
         if (!parsed)
             return CoRpcResp::Error(parsed.error());
         auto reply = bbt_co_await call<bbt::example::v1::GetValueRequest,
-                                           bbt::example::v1::GetValueResponse>(
+                                       bbt::example::v1::GetValueResponse>(
             target, "GetValue", parsed.value(), {}, opt);
         if (!reply)
             return CoRpcResp::Error(reply.error());

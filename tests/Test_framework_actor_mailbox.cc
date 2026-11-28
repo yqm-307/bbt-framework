@@ -58,10 +58,11 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_open; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    bool                    m_open = false;
+    bool m_open = false;
 };
 
 /**
@@ -86,10 +87,11 @@ public:
         std::unique_lock<std::mutex> lk(m_mtx);
         return m_cv.wait_for(lk, ms, [this] { return m_count == 0; });
     }
+
 private:
-    std::mutex              m_mtx;
+    std::mutex m_mtx;
     std::condition_variable m_cv;
-    int                     m_count;
+    int m_count;
 };
 
 /**
@@ -120,7 +122,7 @@ struct OrderRecorder {
         return values;
     }
     mutable std::mutex m_mtx;
-    std::vector<int>   values;
+    std::vector<int> values;
 };
 
 /**
@@ -185,35 +187,32 @@ BOOST_AUTO_TEST_SUITE(framework_f2a)
  */
 BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
     const auto actor_base = fw::ServiceOptions{}
-        .SetExecution(fw::ExecutionPolicy::ActorSerial)
-        .SetMaxInflight(64)
-        .SetMaxSerialKeys(16)
-        .SetSerialQueueCapacity(64);
+                                .SetExecution(fw::ExecutionPolicy::ActorSerial)
+                                .SetMaxInflight(64)
+                                .SetMaxSerialKeys(16)
+                                .SetSerialQueueCapacity(64);
     /**
      * BOOST_CHECK 只记录表达式文本，不要求操作数可流式输出（result<T>）。
      */
     BOOST_CHECK(actor_base.Validate());
 
     auto concurrent = fw::ServiceOptions{}
-        .SetExecution(fw::ExecutionPolicy::Concurrent)
-        .SetMaxInflight(64);
+                          .SetExecution(fw::ExecutionPolicy::Concurrent)
+                          .SetMaxInflight(64);
     BOOST_CHECK(concurrent.Validate());
 
     auto ordered = fw::ServiceOptions{}
-        .SetExecution(fw::ExecutionPolicy::ActorSerial)
-        .SetMaxInflight(64)
-        .SetMaxSerialKeys(16)
-        .SetSerialQueueCapacity(64)
-        .SetOrderedIngress(fw::OrderedIngressOptions{
-            true, /*max_ordered_streams*/ 4,
-            /*max_cached_results*/ 32,
-            /*max_cached_result_bytes*/ 4096});
+                       .SetExecution(fw::ExecutionPolicy::ActorSerial)
+                       .SetMaxInflight(64)
+                       .SetMaxSerialKeys(16)
+                       .SetSerialQueueCapacity(64)
+                       .SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 32, 4096});
     BOOST_CHECK(ordered.Validate());
 
     const auto actor_opts = fw::ActorOptions{}
-        .SetMaxActors(8)
-        .SetMailboxCapacity(16)
-        .SetAggregateQueueCapacity(64);
+                                .SetMaxActors(8)
+                                .SetMailboxCapacity(16)
+                                .SetAggregateQueueCapacity(64);
     BOOST_CHECK(actor_opts.Validate());
 
     auto expect_invalid = [](auto r, const char* field) {
@@ -222,55 +221,93 @@ BOOST_AUTO_TEST_CASE(validate_service_options_rules) {
         BOOST_TEST(r.error().message.find(field) != std::string::npos);
     };
 
-    { auto o = actor_base; o.SetMaxInflight(0);
-      expect_invalid(o.Validate(), "max_inflight"); }
-    { auto o = actor_base; o.SetMaxSerialKeys(0);
-      expect_invalid(o.Validate(), "max_serial_keys"); }
-    { auto o = actor_base; o.SetSerialQueueCapacity(0);
-      expect_invalid(o.Validate(), "serial_queue_capacity"); }
+    {
+        auto o = actor_base;
+        o.SetMaxInflight(0);
+        expect_invalid(o.Validate(), "max_inflight");
+    }
+    {
+        auto o = actor_base;
+        o.SetMaxSerialKeys(0);
+        expect_invalid(o.Validate(), "max_serial_keys");
+    }
+    {
+        auto o = actor_base;
+        o.SetSerialQueueCapacity(0);
+        expect_invalid(o.Validate(), "serial_queue_capacity");
+    }
     /**
      * Concurrent 不得创建串行队列
      */
-    { auto o = concurrent; o.SetMaxSerialKeys(1);
-      expect_invalid(o.Validate(), "serial"); }
-    { auto o = concurrent; o.SetSerialQueueCapacity(1);
-      expect_invalid(o.Validate(), "serial"); }
+    {
+        auto o = concurrent;
+        o.SetMaxSerialKeys(1);
+        expect_invalid(o.Validate(), "serial");
+    }
+    {
+        auto o = concurrent;
+        o.SetSerialQueueCapacity(1);
+        expect_invalid(o.Validate(), "serial");
+    }
     /**
      * ordered_ingress 用在 Concurrent 上必须被拒。
      */
-    { auto o = concurrent;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 1, 1, 1});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
-    { auto o = ordered;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 0, 32, 4096});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
-    { auto o = ordered;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 0, 4096});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
-    { auto o = ordered;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 32, 0});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
+    {
+        auto o = concurrent;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{true, 1, 1, 1});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
+    {
+        auto o = ordered;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{true, 0, 32, 4096});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
+    {
+        auto o = ordered;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 0, 4096});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
+    {
+        auto o = ordered;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{true, 4, 32, 0});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
     /**
      * 禁用 ordered_ingress 时三项上限必须为 0。
      */
-    { auto o = actor_base;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{false, 1, 0, 0});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
-    { auto o = actor_base;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{false, 0, 1, 0});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
-    { auto o = actor_base;
-      o.SetOrderedIngress(fw::OrderedIngressOptions{false, 0, 0, 1});
-      expect_invalid(o.Validate(), "ordered_ingress"); }
+    {
+        auto o = actor_base;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{false, 1, 0, 0});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
+    {
+        auto o = actor_base;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{false, 0, 1, 0});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
+    {
+        auto o = actor_base;
+        o.SetOrderedIngress(fw::OrderedIngressOptions{false, 0, 0, 1});
+        expect_invalid(o.Validate(), "ordered_ingress");
+    }
     /**
      * Actor 类型额度三项均为有限正值。
      */
-    { auto o = actor_opts; o.SetMaxActors(0);
-      expect_invalid(o.Validate(), "max_actors"); }
-    { auto o = actor_opts; o.SetMailboxCapacity(0);
-      expect_invalid(o.Validate(), "mailbox_capacity"); }
-    { auto o = actor_opts; o.SetAggregateQueueCapacity(0);
-      expect_invalid(o.Validate(), "aggregate_queue_capacity"); }
+    {
+        auto o = actor_opts;
+        o.SetMaxActors(0);
+        expect_invalid(o.Validate(), "max_actors");
+    }
+    {
+        auto o = actor_opts;
+        o.SetMailboxCapacity(0);
+        expect_invalid(o.Validate(), "mailbox_capacity");
+    }
+    {
+        auto o = actor_opts;
+        o.SetAggregateQueueCapacity(0);
+        expect_invalid(o.Validate(), "aggregate_queue_capacity");
+    }
 }
 
 /**
@@ -404,8 +441,7 @@ BOOST_AUTO_TEST_CASE(mailbox_full_returns_overloaded) {
     auto r = mb->TryEnqueue([&] { rejected_ran = true; done.CountDown(); });
     BOOST_REQUIRE(!r);
     BOOST_CHECK(r.error().code == fw::ErrorCode::Overloaded);
-    BOOST_TEST(r.error().message.find("mailbox_capacity")
-               != std::string::npos);
+    BOOST_TEST(r.error().message.find("mailbox_capacity") != std::string::npos);
 
     release.Open();
     BOOST_REQUIRE(done.WaitFor(kWait));
@@ -419,7 +455,7 @@ BOOST_AUTO_TEST_CASE(mailbox_full_returns_overloaded) {
 BOOST_AUTO_TEST_CASE(mailbox_exception_continues_queue) {
     std::atomic<int> abnormal{0};
     auto mb = fw::ActorMailbox::Create(4,
-        [&abnormal](std::exception_ptr) { abnormal.fetch_add(1); });
+                                       [&abnormal](std::exception_ptr) { abnormal.fetch_add(1); });
     TestLatch done12(2), done3(1);
     OrderRecorder rec;
 

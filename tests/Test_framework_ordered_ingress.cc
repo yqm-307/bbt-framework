@@ -32,9 +32,9 @@ fw::OrderedIngressConfig MakeConfig(std::size_t streams,
                                     std::size_t results,
                                     std::size_t bytes) {
     fw::OrderedIngressConfig c;
-    c.service                 = kService;
-    c.max_ordered_streams     = streams;
-    c.max_cached_results      = results;
+    c.service = kService;
+    c.max_ordered_streams = streams;
+    c.max_cached_results = results;
     c.max_cached_result_bytes = bytes;
     return c;
 }
@@ -45,9 +45,9 @@ fw::OrderedGrant MakeGrant(const std::string& actor_key,
                            const std::string& receiver_epoch,
                            const std::string& peer = "peer.a") {
     fw::OrderedGrant g;
-    g.service        = kService;
-    g.actor_key      = actor_key;
-    g.producer_id    = producer_id;
+    g.service = kService;
+    g.actor_key = actor_key;
+    g.producer_id = producer_id;
     g.producer_epoch = producer_epoch;
     g.receiver_epoch = receiver_epoch;
     g.peer_principal = peer;
@@ -62,14 +62,14 @@ fw::OrderedIngressRequest MakeRequest(const fw::OrderedGrant& g,
                                       std::uint64_t sequence,
                                       const std::string& digest = "d1") {
     fw::OrderedIngressRequest r;
-    r.method            = "method";
-    r.actor_key         = g.actor_key;
-    r.peer_principal    = g.peer_principal;
+    r.method = "method";
+    r.actor_key = g.actor_key;
+    r.peer_principal = g.peer_principal;
     r.has_ordered_stamp = true;
-    r.producer_id       = g.producer_id;
-    r.producer_epoch    = g.producer_epoch;
-    r.receiver_epoch    = g.receiver_epoch;
-    r.sequence          = sequence;
+    r.producer_id = g.producer_id;
+    r.producer_epoch = g.producer_epoch;
+    r.receiver_epoch = g.receiver_epoch;
+    r.sequence = sequence;
     r.request_id = "req." + g.producer_id + "." + std::to_string(sequence);
     r.request_digest = digest;
     return r;
@@ -77,7 +77,7 @@ fw::OrderedIngressRequest MakeRequest(const fw::OrderedGrant& g,
 
 fw::OrderedTerminalReply OkReply(const std::string& payload) {
     fw::OrderedTerminalReply r;
-    r.is_ok  = true;
+    r.is_ok = true;
     r.payload = payload;
     return r;
 }
@@ -87,9 +87,9 @@ fw::OrderedTerminalReply ErrReply(fw::ErrorCode code,
                                   const std::string& domain = "framework.actor",
                                   const std::string& domain_code = "BusinessFailed") {
     fw::OrderedTerminalReply r;
-    r.is_ok          = false;
-    r.error          = fw::MakeError(code, message);
-    r.error.domain   = domain;
+    r.is_ok = false;
+    r.error = fw::MakeError(code, message);
+    r.error.domain = domain;
     r.error.domain_code = domain_code;
     return r;
 }
@@ -160,7 +160,8 @@ std::uint64_t NextSequenceOf(const fw::OrderedIngress::SPtr& ingress,
 
 const std::string* DetailValue(const fw::Error& e, const std::string& key) {
     for (const auto& kv : e.details) {
-        if (kv.first == key) return &kv.second;
+        if (kv.first == key)
+            return &kv.second;
     }
     return nullptr;
 }
@@ -180,6 +181,7 @@ public:
             cv_.wait(lk, [this] { return arrived_ == total_; });
         }
     }
+
 private:
     const std::size_t total_;
     std::size_t arrived_ = 0;
@@ -214,9 +216,9 @@ BOOST_AUTO_TEST_CASE(create_validates_config) {
  */
 BOOST_AUTO_TEST_CASE(sequence_starts_at_one_per_stream) {
     auto ing = MakeIngress();
-    const auto g_a  = MakeGrant("actor.a", "producer.1", "pe1", "re1");
-    const auto g_b  = MakeGrant("actor.b", "producer.1", "pe1", "re1");
-    const auto g_c  = MakeGrant("actor.a", "producer.2", "pe1", "re1");
+    const auto g_a = MakeGrant("actor.a", "producer.1", "pe1", "re1");
+    const auto g_b = MakeGrant("actor.b", "producer.1", "pe1", "re1");
+    const auto g_c = MakeGrant("actor.a", "producer.2", "pe1", "re1");
     BOOST_REQUIRE(ing->GrantStream(g_a));
     BOOST_REQUIRE(ing->GrantStream(g_b));
     BOOST_REQUIRE(ing->GrantStream(g_c));
@@ -784,7 +786,8 @@ BOOST_AUTO_TEST_CASE(concurrent_duplicate_admit_is_idempotent) {
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads)
+        th.join();
 
     /**
      * 恰好一个线程拿到 Execute，其余都在在途窗口内被判 InProgress
@@ -799,7 +802,9 @@ BOOST_AUTO_TEST_CASE(concurrent_duplicate_admit_is_idempotent) {
      * 序号只被消耗一次：Complete 胜出的票据后，next 从 5 → 6。
      */
     int w = -1;
-    for (int t = 0; t < kThreads; ++t) if (outcome[t] == 0) w = t;
+    for (int t = 0; t < kThreads; ++t)
+        if (outcome[t] == 0)
+            w = t;
     BOOST_REQUIRE_GE(w, 0);
     CompleteOk(ing, winner[w], "done");
     BOOST_CHECK_EQUAL(NextSequenceOf(ing, g), 6u);
@@ -837,10 +842,10 @@ BOOST_AUTO_TEST_CASE(complete_rejects_foreign_admission) {
      * 伪造票据（序号不在途、流不存在）→ 拒绝
      */
     fw::OrderedIngress::Admission forged;
-    forged.kind           = fw::OrderedIngress::DecisionKind::Execute;
-    forged.sequence       = 99;
-    forged.actor_key      = g.actor_key;
-    forged.producer_id    = g.producer_id;
+    forged.kind = fw::OrderedIngress::DecisionKind::Execute;
+    forged.sequence = 99;
+    forged.actor_key = g.actor_key;
+    forged.producer_id = g.producer_id;
     forged.producer_epoch = g.producer_epoch;
     auto r = ing->Complete(forged, OkReply("ok"));
     BOOST_REQUIRE(!r);
