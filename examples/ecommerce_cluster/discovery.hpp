@@ -32,7 +32,6 @@
 #include <vector>
 
 #include <bbt/coroutine/syntax/Async.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/consul/Client.hpp>
 #include <bbt/infra/http/Client.hpp>
@@ -42,7 +41,7 @@
 
 namespace ecommerce {
 
-class ConsulDiscoveryComponent final : public bbt::infra::ICoCloseable {
+class ConsulDiscoveryComponent final {
 public:
     struct Options {
         /**
@@ -61,7 +60,7 @@ public:
         Options options,
         std::shared_ptr<bbt::framework::DynamicRouteTable> table);
 
-    ~ConsulDiscoveryComponent() noexcept override;
+    ~ConsulDiscoveryComponent() noexcept;
 
     ConsulDiscoveryComponent(const ConsulDiscoveryComponent&) = delete;
     ConsulDiscoveryComponent& operator=(const ConsulDiscoveryComponent&) = delete;
@@ -85,8 +84,8 @@ public:
      */
     bbt_co_async(bbt::infra::result<void>) DeregisterSelf();
 
-    void Close() noexcept override;
-    bool IsClosed() const noexcept override;
+    void Close() noexcept;
+    bool IsClosed() const noexcept;
 
     /**
      * 观测口：某服务最近一次成功发布的 revision（0 表示尚无成功查询）。
