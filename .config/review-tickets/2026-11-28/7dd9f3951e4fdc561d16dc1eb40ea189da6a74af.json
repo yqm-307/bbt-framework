@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "7dd9f3951e4fdc561d16dc1eb40ea189da6a74af",
+  "base": "f9b786c4637191184b1fffd22fa46b9f0c42755b",
+  "result": "pass",
+  "reviewer": "alice-self-review",
+  "summary": "pub 指针 3cd7920 -> d80c415 自审：两者之间只差 pub 根 .gitignore（+4 行），d80c415 为 pub main 已合入提交；无代码、规则或工具变化。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "self-review: git -C pub diff --stat 3cd7920 d80c415 = 1 file, +4",
+      "evidence": {
+        "reviewer": "author self-review (submodule pointer, no rule change)",
+        "scope": "origin/main..7dd9f39"
+      }
+    }
+  ]
+}
