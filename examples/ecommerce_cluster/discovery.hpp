@@ -126,10 +126,10 @@ private:
     std::shared_ptr<bbt::framework::DynamicRouteTable> m_table;
 
     std::shared_ptr<bbt::infra::net::Engine> m_engine;
-    std::thread            m_engine_thread;
-    std::error_code        m_engine_error;
-    std::atomic<bool>      m_engine_returned{false};
-    std::shared_ptr<bbt::infra::http::Client>   m_http;
+    std::thread m_engine_thread;
+    std::error_code m_engine_error;
+    std::atomic<bool> m_engine_returned{false};
+    std::shared_ptr<bbt::infra::http::Client> m_http;
     std::shared_ptr<bbt::infra::consul::Client> m_consul;
 
     /**
@@ -140,11 +140,11 @@ private:
      * Start 首快照与 Close watcher 退出
      */
     std::condition_variable m_cv;
-    std::vector<Watch>      m_watches;
-    std::size_t             m_watchers_active{0};
-    std::string             m_last_error;
-    std::string             m_registered_id;
-    std::string             m_registered_service;
+    std::vector<Watch> m_watches;
+    std::size_t m_watchers_active{0};
+    std::string m_last_error;
+    std::string m_registered_id;
+    std::string m_registered_service;
 
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_closed{false};
